@@ -1104,6 +1104,53 @@ class TestArena(unittest.TestCase):
         self.assertEqual(ts.arena_refill_plan([5], [1, 0, 3, 3], 3, lambda k: k == 0), [2, 3, 5])
         self.assertEqual(ts.arena_refill_plan([5], [1, 0, 3, 3], 9, lambda k: k == 0), [2, 3, 5])
 
+    def test_lazy_regrow_leaves_the_slots_to_admission(self):
+        # #188 CROW_GLM_ARENA_LAZY_REFILL: the handed-back slots come back empty; the next misses take them
+        counts = np.asarray([[8.0, 7, 6, 5, 4, 3, 2, 1]])
+        score = counts.reshape(-1).tolist()
+        a = ts.EngineArena(4, 3, layers=1, experts=8)
+        a.warm(counts)
+        lent = a.disable(range(2, 4))
+        a.enable(range(2, 4))
+        self.assertEqual((a.vowner, a.dis), ([0, 1, -1, -1], [False] * 4))
+        self.assertEqual(a.step(0, [5, 7]), [ts.NVME, ts.NVME])
+        self.assertEqual(a.vowner, [0, 1, 5, 7], "the misses took the empty slots, no victim")
+        f = ts.FreqTiers(4, 3, prior=score, layers=1, experts=8)
+        f.warm(counts)
+        f.nv = 2
+        f.disable(lent)
+        f.regrow(4, lent, score, lazy=True)
+        self.assertEqual((sorted(f.vram_keys()), f.c["refill"]), ([0, 1], 0))
+        f.step(0, [6])
+        self.assertEqual(sorted(f.vram_keys()), [0, 1, 6], "an empty slot: in")
+
+    def test_lent_slots_fill_last_follow_their_victims_and_go_back_into_pinned(self):
+        # #188 CROW_GLM_ARENA_STAGE_LEND: 2 regular + 2 lent slots, 4 pinned; the lent ones are taken after the
+        # regular ones, an entrant inherits its victim's slot, the take-back writes them into pinned
+        f = ts.FreqTiers(2, 4, halflife=1e9, margin=1.0, layers=1, experts=8)
+        f.lcap = 2
+        f.lend_out(True, [0.0] * 8)
+        self.assertEqual((f.nl, f.lend_on), (2, True))
+        for ids in ([0], [1], [2], [3]):
+            f.step(0, ids)
+        self.assertEqual((sorted(f.vram_keys()), sorted(f.lset)), ([0, 1, 2, 3], [2, 3]))
+        for _ in range(3):
+            f.step(0, [4])                         # 3 > 2 x 1: 4 takes the lowest (0, regular)
+        self.assertEqual((sorted(f.vram_keys()), sorted(f.lset)), ([1, 2, 3, 4], [2, 3]))
+        f.lend_back()
+        self.assertEqual((sorted(f.vram_keys()), f.lend_lent, f.nl, f.c["lend_wb"]), ([1, 4], [2, 3], 0, 2))
+        self.assertTrue({2, 3} <= set(f.pinned_keys()))
+        f.lend_out(False, [0.0] * 8)               # eager: the take-back's experts come back into the lent slots
+        self.assertEqual((sorted(f.vram_keys()), sorted(f.lset)), ([1, 2, 3, 4], [2, 3]))
+        # the engine arena: the lent slots after the rest, disabled at the boot, lent at the first decode token
+        counts = np.ones((L, E))
+        a = ts.arena_boot("today", counts, (40 * 42, 30 * 42), 30 * 42, None, 64.0, 1.0, lend=21)
+        self.assertEqual((len(a.lend_slots), a.lend_on, sum(a.dis)), (21, False, 21))
+        ev = [("p", t) for t in xorshift_trace(3, L, E, K)] + [("d", t) for t in xorshift_trace(5, L, E, K)]
+        per, _ = ts.arena_replay(a, ev + ev, lazy=True, score=counts.reshape(-1).tolist())
+        self.assertEqual((a.lend_on, sum(a.dis)), (True, 0), "lent again after the second prompt")
+        self.assertEqual(sum(p["lend_wb"] for p in per), 21, "the second prompt took every lent expert back")
+
     def test_route_log_check_and_min_bounds_every_policy(self):
         tr = xorshift_trace(60, L, E, K)
         with tempfile.TemporaryDirectory() as d:

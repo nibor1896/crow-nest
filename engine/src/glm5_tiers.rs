@@ -1033,6 +1033,15 @@ pub const ARENA_FREQ_ENV: &str = "CROW_GLM_ARENA_FREQ";
 /// hand-back, at most [`ARENA_RESERVE_BYTES`] ([`regrow_floor`], [`elastic_regrow_chunks`]); `0`
 /// (default) = a chunk grows back only while the free VRAM stays above the reserve
 pub const ARENA_REGROW_ENV: &str = "CROW_GLM_ARENA_REGROW";
+/// #188 T: `1` = the VRAM slots that come (back) empty (a regrowth, an elastic chunk, the lent
+/// staging set) are left to the decode calls' own admissions ([`ExpertTiers::elastic_refill`]
+/// skips its synchronous refill); `0` (default) = they are refilled on the host thread first
+pub const ARENA_LAZY_REFILL_ENV: &str = "CROW_GLM_ARENA_LAZY_REFILL";
+/// #188: `1` = the prefill staging set (`ExpertTiers::alloc_prefill_stage`, idle in decode) is
+/// lent to the decode arena as VRAM expert slots after a prompt phase and taken back before the
+/// next prompt call ([`ExpertTiers::stage_lend_out`], [`ExpertTiers::stage_lend_back`]); `0`
+/// (default) = it stays idle through the decode
+pub const ARENA_STAGE_LEND_ENV: &str = "CROW_GLM_ARENA_STAGE_LEND";
 /// #188 frequency tiers: the scores' half-life in decode tokens (`tools/glm_tier_sim.py arena`, runs/glm53-flash/cache-sim-20261010)
 pub const FREQ_HALFLIFE_TOKENS: f64 = 64.0;
 /// #188 frequency tiers: an expert enters a full VRAM tier only above (1 + margin) x the lowest VRAM score
@@ -1053,11 +1062,15 @@ pub struct ArenaConfig {
     pub freq: bool,
     /// #188 `CROW_GLM_ARENA_REGROW=1`: the prompt phase's hand-back grows back at its end
     pub regrow: bool,
+    /// #188 `CROW_GLM_ARENA_LAZY_REFILL=1`: slots that come back empty are filled by admission
+    pub lazy_refill: bool,
+    /// #188 `CROW_GLM_ARENA_STAGE_LEND=1`: the prefill staging set lent to the decode arena
+    pub stage_lend: bool,
 }
 
 impl Default for ArenaConfig {
     fn default() -> ArenaConfig {
-        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false }
+        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false }
     }
 }
 
@@ -1115,7 +1128,33 @@ pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig,
         Some("1") => true,
         Some(v) => return Err(format!("{ARENA_REGROW_ENV}={v:?}: accepted 0 (default), 1")),
     };
+    c.lazy_refill = match val(ARENA_LAZY_REFILL_ENV).as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(v) => return Err(format!("{ARENA_LAZY_REFILL_ENV}={v:?}: accepted 0 (default), 1")),
+    };
+    c.stage_lend = match val(ARENA_STAGE_LEND_ENV).as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(v) => return Err(format!("{ARENA_STAGE_LEND_ENV}={v:?}: accepted 0 (default), 1")),
+    };
     Ok(c)
+}
+
+/// #188 `CROW_GLM_ARENA_STAGE_LEND`: the arena chunks a prefill staging set of `cap` slots lends,
+/// `vpl` slots per chunk, appended from chunk index `first`: `(chunk, its slots inside the set)`,
+/// the global slot range of each; the last chunk is partial when `vpl` does not divide `cap`
+/// (its slots beyond the set stay disabled for good). Empty without slots.
+pub fn stage_lend_chunks(cap: usize, vpl: usize, first: usize) -> Vec<(usize, std::ops::Range<usize>)> {
+    if vpl == 0 {
+        return Vec::new();
+    }
+    (0..cap.div_ceil(vpl))
+        .map(|i| {
+            let c = first + i;
+            (c, c * vpl..c * vpl + vpl.min(cap - i * vpl))
+        })
+        .collect()
 }
 
 /// #188: `CROW_GLM_ROUTE_LOG=<file>`: every routing call of the expert tiers appended as one text
@@ -2941,6 +2980,17 @@ pub struct ElasticStats {
     pub regrows: u64,
     pub regrown: u64,
     pub regrow_floor_bytes: u64,
+    /// #188 `CROW_GLM_ARENA_LAZY_REFILL`: refills left to the decode calls' admissions, and the
+    /// empty slots they left
+    pub lazy_refills: u64,
+    pub lazy_slots: u64,
+    /// #188 `CROW_GLM_ARENA_STAGE_LEND`: the prefill staging set's slots lent to the decode arena,
+    /// the lends (after a prompt phase), the take-backs (before a prompt call) and the experts the
+    /// take-backs wrote back into pinned
+    pub lend_slots: u64,
+    pub lends: u64,
+    pub take_backs: u64,
+    pub lend_write_backs: u64,
 }
 
 /// the staging buffers of large prompt calls (sybil's `GLM53_EC_STAGE_GB` / `GLM53_EC_STAGE_MIN`)
@@ -3427,11 +3477,15 @@ struct ArenaDev {
     /// #188 `CROW_GLM_ARENA_REGROW`: the floor ([`regrow_floor`]) of the prompt phase whose first
     /// hand-back set it, until its end regrows the chunks ([`ExpertTiers::decode_ready`])
     regrow_floor: Option<u64>,
+    /// #188 `CROW_GLM_ARENA_STAGE_LEND`: the chunks that alias the prefill staging set (never
+    /// elastic, never freed here) and the slots of each inside it ([`stage_lend_chunks`]); lent now
+    lend: Vec<(usize, std::ops::Range<usize>)>,
+    lend_on: bool,
 }
 
 impl ArenaDev {
     fn new(a: GlobalArena, cfg: ArenaConfig) -> ArenaDev {
-        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default(), refill_err: None, exit_refused: None, regrow_floor: None }
+        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default(), refill_err: None, exit_refused: None, regrow_floor: None, lend: Vec::new(), lend_on: false }
     }
 
     fn reset(&mut self) {
@@ -3442,9 +3496,10 @@ impl ArenaDev {
         self.a.reset();
     }
 
-    /// the elastic chunks (index into `chunks`)
-    fn flex(&self) -> std::ops::Range<usize> {
-        self.base_chunks..self.chunks.len()
+    /// the elastic chunks (index into `chunks`): the ones after the per-layer allocations, the
+    /// lent staging set's left out
+    fn flex(&self) -> impl Iterator<Item = usize> + '_ {
+        (self.base_chunks..self.chunks.len()).filter(move |c| !self.lend.iter().any(|x| x.0 == *c))
     }
 }
 
@@ -3567,7 +3622,7 @@ impl ExpertTiers {
     /// slots per chunk); `None` without the global arena
     pub fn elastic_live(&self) -> Option<(usize, usize, usize)> {
         let d = self.arena.as_ref()?;
-        Some((d.flex().filter(|&c| d.chunks[c] != 0).count(), d.flex().len(), self.sizes.vram))
+        Some((d.flex().filter(|&c| d.chunks[c] != 0).count(), d.flex().count(), self.sizes.vram))
     }
 
     /// `CROW_GLM_ARENA=global`: the decode phase begins on the host thread: a staged forward still
@@ -3602,6 +3657,9 @@ impl ExpertTiers {
         } else if self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
             self.elastic_exit();
         }
+        // #188 CROW_GLM_ARENA_STAGE_LEND: the idle prefill staging set joins the decode arena (its
+        // slots are refilled with the regrown ones, or left to admission)
+        self.stage_lend_out();
         if let Err(e) = self.elastic_refill() {
             self.arena.as_mut().expect("the global arena").refill_err.get_or_insert(e);
         }
@@ -3673,6 +3731,12 @@ impl ExpertTiers {
         self.arena.as_ref().and_then(|d| d.stage.as_ref()).map(|s| (s.stats, s.nst))
     }
 
+    /// #188: the VRAM the `CROW_GLM_ARENA_STAGE_GB` staging buffers hold now (with an elastic part
+    /// only while a staged forward is open); 0 without staging
+    pub fn arena_stage_vram_bytes(&self) -> u64 {
+        self.arena.as_ref().and_then(|d| d.stage.as_ref()).map_or(0, |s| s.bufs.iter().filter(|&&b| b != 0).count() as u64 * s.fwd as u64 * self.rb)
+    }
+
     /// `[vram, pinned, nvme]` per MoE layer: the tier each access was served from (the #175
     /// cache's counters, or the global arena's)
     pub fn tier_counters(&self) -> &[[u64; 3]] {
@@ -3685,7 +3749,7 @@ impl ExpertTiers {
     /// VRAM the global arena holds beyond the per-layer allocations (elastic chunks, staging)
     fn arena_extra_vram_bytes(&self) -> u64 {
         let Some(d) = self.arena.as_ref() else { return 0 };
-        let flex = d.chunks[d.base_chunks..].iter().filter(|&&c| c != 0).count() as u64 * self.sizes.vram as u64 * self.rb;
+        let flex = d.flex().filter(|&c| d.chunks[c] != 0).count() as u64 * self.sizes.vram as u64 * self.rb;
         let stage = d.stage.as_ref().map_or(0, |s| if s.bufs[0] != 0 { 2 * s.fwd as u64 * self.rb } else { 0 });
         flex + stage
     }
@@ -3956,6 +4020,14 @@ impl ExpertTiers {
         if !self.arena.as_ref().is_some_and(|d| d.a.refill_pending()) {
             return Ok(());
         }
+        // #188 T, CROW_GLM_ARENA_LAZY_REFILL: no refill on the host thread; the empty slots are
+        // taken by the decode calls' admissions (an empty enabled slot first, `GlobalArena::step`)
+        if let Some(d) = self.arena.as_mut().filter(|d| d.cfg.lazy_refill) {
+            d.elastic.lazy_refills += 1;
+            d.elastic.lazy_slots += d.a.refill_room() as u64;
+            d.a.refill_end();
+            return Ok(());
+        }
         cuda::sync();
         self.settle()?;
         self.drain_flying()?;
@@ -3985,6 +4057,80 @@ impl ExpertTiers {
         d.elastic.refilled += placed;
         d.elastic.refill_nvme += reads;
         Ok(())
+    }
+
+    /// #188 `CROW_GLM_ARENA_STAGE_LEND`: the prefill staging set (`pf_cap` slots, only prompt calls
+    /// stage through it) lent to the decode arena: the first time its memory becomes arena chunks
+    /// ([`stage_lend_chunks`]: chunk `c` aliases `pf_stage` at `(c - first) x vpl` records, a
+    /// partial last chunk's slots beyond the set disabled for good), later its slots are enabled
+    /// again. They come empty, as regrown slots ([`ExpertTiers::elastic_refill`] fills them, or
+    /// the admissions with `CROW_GLM_ARENA_LAZY_REFILL`). A no-op when lent, without the switch,
+    /// the set or VRAM slots. Nothing is allocated or freed.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn stage_lend_out(&mut self) {
+        let (rb, vpl, pf, cap) = (self.rb, self.sizes.vram, self.pf_stage, self.pf_cap);
+        let Some(d) = self.arena.as_mut() else { return };
+        if !d.cfg.stage_lend || d.lend_on || vpl == 0 || cap == 0 || pf == 0 {
+            return;
+        }
+        // the prompt's copies into the set and its kernels reading it are done
+        cuda::sync();
+        if d.lend.is_empty() {
+            let first = d.chunks.len();
+            for (c, r) in stage_lend_chunks(cap, vpl, first) {
+                d.chunks.push(pf + ((c - first) * vpl) as u64 * rb);
+                d.a.add_slots(vpl);
+                if r.end < (c + 1) * vpl {
+                    let ch = d.a.disable(r.end..(c + 1) * vpl);
+                    debug_assert!(ch.is_empty(), "added slots are empty");
+                }
+                d.lend.push((c, r));
+            }
+            d.elastic.lend_slots = cap as u64;
+        } else {
+            for (_, r) in d.lend.clone() {
+                d.a.enable(r);
+            }
+        }
+        d.lend_on = true;
+        d.elastic.lends += 1;
+    }
+
+    /// #188 `CROW_GLM_ARENA_STAGE_LEND`: the lent staging set back before a prompt call stages
+    /// through it: its slots disabled, their experts written back into pinned (or dropped), as an
+    /// elastic hand-back does ([`GlobalArena::disable`]); the next decode lends it again. A no-op
+    /// when not lent.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the arena is pending.
+    pub unsafe fn stage_lend_back(&mut self) -> Result<(), String> {
+        let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
+        let Some(d) = self.arena.as_mut() else { return Ok(()) };
+        if !d.lend_on {
+            return Ok(());
+        }
+        cuda::sync();
+        if let Some(r) = d.ring.as_mut() {
+            r.sync_all();
+        }
+        let mut ch = Vec::new();
+        for (_, r) in d.lend.clone() {
+            ch.extend(d.a.disable(r));
+        }
+        let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[0] };
+        let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: None, gpu_waits: 0 };
+        d.elastic.lend_write_backs += write_back(&ch, &mut m)?;
+        cuda::sync();
+        d.lend_on = false;
+        d.elastic.take_backs += 1;
+        Ok(())
+    }
+
+    /// #188 `CROW_GLM_ARENA_STAGE_LEND`: the prefill staging set is lent to the decode arena now
+    pub fn stage_lent(&self) -> bool {
+        self.arena.as_ref().is_some_and(|d| d.lend_on)
     }
 
     /// end a staged forward: the copy stream drained, per-forward buffers freed, the elastic part
@@ -4369,6 +4515,9 @@ impl ExpertTiers {
         // a prompt call reads pinned slots without joining a read still in flight
         self.drain_flying()?;
         crate::glm5_moe::lane::post(None);
+        // #188 CROW_GLM_ARENA_STAGE_LEND: the staging set this call may stage through comes back
+        // (`Glm5Run::prefill_with` takes it back at the prompt's start already)
+        self.stage_lend_back()?;
         let d = self.arena.as_ref().expect("tables_for_chunk_global without the global arena");
         if d.stage.is_some() && picks >= d.cfg.stage_min {
             if self.stage_call(l, sel, run)? {
@@ -4868,13 +5017,16 @@ impl ExpertTiers {
             }
             cuda::stream_destroy(st.stream);
         }
-        let flex = d.flex();
+        // the lent staging set's chunks alias `pf_stage` (freed by `free`)
+        let flex: Vec<usize> = d.flex().collect();
         for c in flex {
             if d.chunks[c] != 0 {
                 cuda::free_dev(&mut d.chunks[c]);
             }
         }
         d.chunks.truncate(d.base_chunks);
+        d.lend.clear();
+        d.lend_on = false;
     }
 }
 
@@ -4936,7 +5088,7 @@ mod arena_tests {
         }
         let none = |_: &str| None;
         assert_eq!(arena_config(&none).unwrap(), ArenaConfig::default());
-        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false });
+        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false });
         let set = |k: &str| match k {
             ARENA_ADMIT_MAX_ENV => Some("16".to_string()),
             ARENA_NOADMIT_ENV => Some("1".to_string()),
@@ -4948,7 +5100,7 @@ mod arena_tests {
             _ => None,
         };
         let c = arena_config(&set).unwrap();
-        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false, regrow: false });
+        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false, regrow: false, lazy_refill: false, stage_lend: false });
         for (k, v) in [(ARENA_ADMIT_MAX_ENV, "x"), (ARENA_NOADMIT_ENV, "yes"), (ARENA_VRING_ENV, "-1"), (ARENA_ELASTIC_ENV, "nan"), (ARENA_STAGE_MIN_ENV, "0")] {
             let one = |q: &str| (q == k).then(|| v.to_string());
             assert!(arena_config(&one).unwrap_err().contains(k), "{k}={v}");
@@ -5268,6 +5420,115 @@ mod arena_tests {
         assert!(after_empty < before, "left empty, the grown-back slots cost decode hits ({after_empty} vs {before})");
         assert!(after_filled >= before, "refilled, the decode hits come back ({after_filled} vs {before})");
         assert!(later_filled > later_empty, "and stay higher ({later_filled} vs {later_empty})");
+    }
+
+    /// #188 T / stage lend: the two switches are off unset and at 0, on at 1, refused otherwise
+    #[test]
+    fn the_lazy_refill_and_stage_lend_switches_parse_and_refuse_by_name() {
+        let lazy: fn(&ArenaConfig) -> bool = |c| c.lazy_refill;
+        let lend: fn(&ArenaConfig) -> bool = |c| c.stage_lend;
+        for (k, on) in [(ARENA_LAZY_REFILL_ENV, lazy), (ARENA_STAGE_LEND_ENV, lend)] {
+            for (v, want) in [(None, false), (Some(""), false), (Some("0"), false), (Some("1"), true), (Some(" 1 "), true)] {
+                let one = |q: &str| (q == k).then(|| v.map(str::to_string)).flatten();
+                let c = arena_config(&one).unwrap();
+                assert_eq!(on(&c), want, "{k}={v:?}");
+                assert_eq!(ArenaConfig { lazy_refill: false, stage_lend: false, ..c }, ArenaConfig::default(), "{k}={v:?} sets nothing else");
+            }
+            for bad in ["2", "on", "true"] {
+                let one = |q: &str| (q == k).then(|| bad.to_string());
+                assert!(arena_config(&one).unwrap_err().contains(k), "{k}={bad}");
+            }
+        }
+    }
+
+    /// #188 stage lend: the prefill staging set's chunks cover it, the last one partial
+    #[test]
+    fn stage_lend_chunks_cover_the_set_with_a_partial_last_chunk() {
+        // the operating set: 44 slots per chunk, 128 prefill staging slots after 1,848 base + 13 elastic chunks
+        let ch = stage_lend_chunks(128, 44, 42 + 13);
+        assert_eq!(ch, vec![(55, 2420..2464), (56, 2464..2508), (57, 2508..2548)]);
+        assert_eq!(ch.iter().map(|(_, r)| r.len()).sum::<usize>(), 128);
+        assert_eq!(stage_lend_chunks(16, 4, 3), vec![(3, 12..16), (4, 16..20), (5, 20..24), (6, 24..28)]);
+        assert!(stage_lend_chunks(128, 0, 0).is_empty() && stage_lend_chunks(0, 44, 7).is_empty());
+    }
+
+    /// #188 stage lend and T on the policy, as `ExpertTiers::stage_lend_out` / `stage_lend_back` /
+    /// `elastic_refill` drive it under the frequency tiers: the lent chunks' slots inside the set
+    /// come empty and the decode's admissions take them (lazy: no refill), never a slot beyond the
+    /// set; the take-back writes their experts into pinned, and an eager refill brings them back
+    /// first. With the lent slots the decode hits VRAM more often.
+    #[test]
+    fn lent_staging_slots_are_taken_by_admission_and_handed_back_into_pinned() {
+        let (nl, ex, vpl, cap) = (3usize, 32usize, 4usize, 10usize);
+        let tr = trace(300, nl, ex as u64, 4);
+        let hits = |a: &GlobalArena| a.counters().iter().map(|c| c[0]).sum::<u64>();
+        let decode = |a: &mut GlobalArena, toks: &[Vec<Vec<u32>>]| {
+            for tok in toks {
+                for (l, ids) in tok.iter().enumerate() {
+                    let sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                    a.freq_count(l, &sel);
+                    a.step(l, ids, true);
+                }
+            }
+        };
+        let fresh = |lend: bool| {
+            let mut a = GlobalArena::new(nl, ex, nl * vpl, nl * 8).unwrap();
+            a.set_freq(FREQ_HALFLIFE_TOKENS, FREQ_MARGIN, 4);
+            let mut lent = Vec::new();
+            if lend {
+                // stage_lend_out on the policy: chunks appended after the base ones, the tail disabled
+                for (c, r) in stage_lend_chunks(cap, vpl, nl) {
+                    a.add_slots(vpl);
+                    if r.end < (c + 1) * vpl {
+                        assert!(a.disable(r.end..(c + 1) * vpl).is_empty());
+                    }
+                    lent.push(r);
+                }
+                // lazy: the refill skipped
+                a.refill_end();
+            }
+            (a, lent)
+        };
+        let (mut off, _) = fresh(false);
+        let (mut on, lent) = fresh(true);
+        assert_eq!((off.enabled_vram(), on.enabled_vram()), (nl * vpl, nl * vpl + cap), "the lent slots are enabled, the tail is not");
+        decode(&mut off, &tr[..150]);
+        decode(&mut on, &tr[..150]);
+        let used = |a: &GlobalArena, s: usize| a.vowner[s] != NONE;
+        assert!(lent.iter().flat_map(|r| r.clone()).all(|s| used(&on, s)), "the admissions took every lent slot");
+        assert!(!used(&on, nl * vpl + 3 * vpl - 1) && !used(&on, nl * vpl + 3 * vpl - 2), "never a slot beyond the set");
+        assert!(hits(&on) > hits(&off), "more VRAM hits with the lent slots ({} vs {})", hits(&on), hits(&off));
+        on.check().unwrap();
+        // the take-back before a prompt call: every lent expert into pinned (or dropped), none left in VRAM
+        let owners: Vec<u32> = lent.iter().flat_map(|r| r.clone()).map(|s| on.vowner[s]).collect();
+        let wb0 = on.stats.write_backs + on.stats.wb_dropped;
+        let mut ch = Vec::new();
+        for r in &lent {
+            ch.extend(on.disable(r.clone()));
+        }
+        assert_eq!(on.stats.write_backs + on.stats.wb_dropped - wb0, cap as u64, "one write-back per lent slot");
+        // the lent experts leave VRAM (a write-back may push a pinned one out to the NVMe)
+        assert!(ch.iter().all(|&(_, _, a)| !matches!(a, Place::Vram(_))), "{ch:?}");
+        assert!(owners.iter().all(|&k| !matches!(on.place(k as usize / ex, k % ex as u32), Place::Vram(_))), "no lent expert left in VRAM");
+        assert_eq!(on.enabled_vram(), nl * vpl);
+        on.check().unwrap();
+        // lent again with the eager refill: the take-back's experts come back first
+        for r in &lent {
+            on.enable(r.clone());
+        }
+        let plan = on.refill_plan();
+        let back: Vec<u32> = plan.iter().enumerate().flat_map(|(l, ids)| ids.iter().map(move |&e| (l * ex) as u32 + e)).collect();
+        let mut want = owners.clone();
+        want.sort_unstable();
+        let mut got = back.clone();
+        got.sort_unstable();
+        assert_eq!(got, want, "the refill plan is the take-back's experts");
+        for (l, ids) in plan.iter().enumerate() {
+            on.fill(l, ids);
+        }
+        on.refill_end();
+        assert!(owners.iter().all(|&k| matches!(on.place(k as usize / ex, k % ex as u32), Place::Vram(_))), "every one back in VRAM");
+        on.check().unwrap();
     }
 
     /// The VRAM hits of the global CLOCK arena are sybil's `ec_step_k` as `tools/glm_tier_sim.py`
@@ -6046,6 +6307,10 @@ mod arena_gpu_tests {
                 PREFILL_NVPF_ENV,
                 PREFILL_NVPF_MIN_ROWS_ENV,
                 PREFILL_NVPF_EARLY_ENV,
+                ARENA_FREQ_ENV,
+                ARENA_REGROW_ENV,
+                ARENA_LAZY_REFILL_ENV,
+                ARENA_STAGE_LEND_ENV,
             ];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {
@@ -6221,6 +6486,118 @@ mod arena_gpu_tests {
                     check(&what, 0, tb, &tr[0][0]);
                     t.free();
                 }
+            }
+        }
+        drop(cnq);
+    }
+
+    /// #188 `CROW_GLM_ARENA_STAGE_LEND` and `CROW_GLM_ARENA_LAZY_REFILL` on the device, under the
+    /// frequency tiers with an elastic part that is handed back and regrown at every prompt: the
+    /// prefill staging set (16 slots, 3 per chunk: five chunks and a partial one) is lent at every
+    /// `decode_ready` and taken back by every prompt call; decode calls are served out of it (table
+    /// entries inside `pf_stage`) and every table entry, decode and prompt, holds its record
+    /// (`Cnq::read_range`), so the lent slots and the prompt's staging never overwrite each other.
+    /// Lazy: no refill runs, the admissions fill the slots; eager: the refill fills them.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM, a 455 MB synthetic container in the temp dir): cargo test --release --lib glm5_arena_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_arena_gpu_stage_lend_and_lazy_refill_tables_hold_their_records() {
+        let (nl, ex) = (3usize, 16u32);
+        let s = synth(nl as u32, ex);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (3 + nl, 3, ex as usize, 8);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<Vec<u8>>> =
+            (0..nl).map(|l| (0..ex).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3 + l as u32, e, "gate"), "text").clone(), 0, rb)).collect()).collect();
+        let tr = routing(40, nl, ex as u64, 8, 0x188);
+        let elastic_gb = format!("{}", 2.0 * 3.0 * REC as f64 / (1u64 << 30) as f64);
+        const PF: usize = 16;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            // (name, lend, lazy, stager)
+            for (name, lend, lazy, stager) in [("off", false, false, false), ("lazy", false, true, true), ("lend", true, false, false), ("lend+lazy", true, true, false), ("lend+lazy+stager", true, true, true)] {
+                let kv = vec![
+                    (ARENA_ENV, "global"),
+                    (ARENA_VRING_ENV, "0"),
+                    (ARENA_ELASTIC_ENV, elastic_gb.as_str()),
+                    (ARENA_FREQ_ENV, "1"),
+                    (ARENA_REGROW_ENV, "1"),
+                    (ARENA_STAGE_LEND_ENV, if lend { "1" } else { "0" }),
+                    (ARENA_LAZY_REFILL_ENV, if lazy { "1" } else { "0" }),
+                ];
+                let _env = Env::set(&kv);
+                let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 8 }, 1, 16).unwrap();
+                if stager {
+                    t.set_stager(true).unwrap();
+                }
+                t.alloc_prefill_stage(PF).unwrap();
+                let pf = (t.pf_stage, t.pf_stage + (PF * rb) as u64);
+                let base = t.arena().unwrap().enabled_vram();
+                t.decode_ready();
+                assert_eq!(t.stage_lent(), lend, "{name}: lent at the decode's start");
+                assert_eq!(t.arena().unwrap().enabled_vram(), base + if lend { PF } else { 0 }, "{name}: the set's slots, not the partial chunk's tail");
+                let mut from_set = 0usize;
+                let mut check = |what: &str, l: usize, tb: Dev, ids: &[u32], decode: bool| {
+                    cuda::sync();
+                    let table = cuda::dtoh_u64(tb, ex as usize);
+                    for e in 0..ex {
+                        assert_eq!(table[e as usize] != 0, ids.contains(&e), "{name} {what}: layer {l} table entry of expert {e}");
+                        if ids.contains(&e) {
+                            let got: Vec<u8> = cuda::dtoh_t(table[e as usize], rb);
+                            assert!(got == want[l][e as usize], "{name} {what}: layer {l} expert {e}: the bytes differ from read_range");
+                            if decode && (pf.0..pf.1).contains(&table[e as usize]) {
+                                from_set += 1;
+                            }
+                        }
+                    }
+                };
+                for (i, tok) in tr.iter().enumerate() {
+                    for (l, ids) in tok.iter().enumerate() {
+                        let sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                        let (tb, _) = t.table_for(3 + l, &sel).unwrap();
+                        check("decode", l, tb, ids, true);
+                    }
+                    // every tenth token a prompt phase: the elastic part handed back, prompt calls of
+                    // 4 rows per layer through the staging set, then the decode begins again
+                    if i % 10 == 9 {
+                        t.elastic_hand_back(1 << 40).unwrap();
+                        for l in 0..nl {
+                            let rows: Vec<&Vec<u32>> = (0..4).map(|r| &tr[i - r][l]).collect();
+                            let sel: Vec<i32> = rows.iter().flat_map(|r| r.iter().map(|&e| e as i32)).collect();
+                            t.tables_for_chunk(3 + l, &sel, &mut |r0, n, tb| {
+                                let mut ids: Vec<u32> = sel[r0 * 8..(r0 + n) * 8].iter().map(|&e| e as u32).collect();
+                                ids.sort_unstable();
+                                ids.dedup();
+                                check("prompt", l, tb, &ids, false);
+                                Ok(())
+                            })
+                            .unwrap();
+                            assert!(!t.stage_lent(), "{name}: taken back by the prompt call");
+                        }
+                        cuda::sync();
+                        t.decode_ready();
+                        assert_eq!(t.stage_lent(), lend, "{name}: lent again");
+                    }
+                }
+                let e = t.arena_elastic_stats().unwrap();
+                eprintln!("glm5_arena stage lend {name}: decode table entries in the staging set {from_set}, elastic {e:?}");
+                t.arena().unwrap().check().unwrap();
+                assert_eq!(e.regrows, 4, "{name}: regrown at every prompt's end ({e:?})");
+                if lend {
+                    assert!(from_set > 0, "{name}: decode calls served out of the lent set");
+                    assert_eq!((e.lend_slots, e.lends, e.take_backs), (PF as u64, 5, 4), "{name}: {e:?}");
+                    assert!(e.lend_write_backs > 0, "{name}: the take-backs wrote the lent experts into pinned ({e:?})");
+                } else {
+                    assert_eq!((from_set, e.lend_slots, e.lends, e.take_backs), (0, 0, 0, 0), "{name}: {e:?}");
+                }
+                if lazy {
+                    assert!(e.refills == 0 && e.refilled == 0 && e.lazy_refills >= 4 && e.lazy_slots > 0, "{name}: no refill, the slots left to admission ({e:?})");
+                } else {
+                    assert!(e.refills >= 4 && e.refilled > 0 && e.lazy_refills == 0, "{name}: refilled ({e:?})");
+                }
+                t.free();
             }
         }
         drop(cnq);
@@ -11553,6 +11930,9 @@ impl Glm5Run {
         // CROW_GLM_ARENA elastic: borrow the scratch this prompt's calls need, give it back
         // whatever happens
         let borrow_t = self.borrow.map_or(0, |b| prompt_borrow_rows(n, self.prompt_chunk, b.0));
+        // #188 CROW_GLM_ARENA_STAGE_LEND: the lent prefill staging set back before the prompt
+        // plans on the arena's places (the NVPF read-ahead, the staged forwards)
+        tiers.stage_lend_back()?;
         // #196 round 3: the staging buffers sized to what the scratch leaves, before it is taken
         tiers.stage_plan_prompt(self.borrow_bytes(borrow_t));
         if borrow_t > 0 {

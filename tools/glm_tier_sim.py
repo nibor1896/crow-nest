@@ -30,7 +30,7 @@
 
   # 6. the engine's global arena (today's policy, checked against a run's own routing) against alternatives (#188;
   #    docs/glm-tier-simulation.md section 9)
-  python -I tools/glm_tier_sim.py arena --corpus <dir>/corpus.json --runs <runs> --capture <capture-ids>       [--warm <warm.json>] [--route-log <CROW_GLM_ROUTE_LOG file> --decode-log <glm5_run log> --boot 1848:24:13:44:4[:1]]       [--vram 2220 --pinned 4956] [--policies today,promote,lfu,tinylfu,noadmit,freq,lru,min] [--halflife 64]       [--margin 1] [--json <out.json>]
+  python -I tools/glm_tier_sim.py arena --corpus <dir>/corpus.json --runs <runs> --capture <capture-ids>       [--warm <warm.json>] [--route-log <CROW_GLM_ROUTE_LOG file> --decode-log <glm5_run log> --boot 1848:24:13:44:4[:1]]       [--vram 2220 --pinned 4956] [--lend 128] [--lazy] [--policies today,promote,lfu,tinylfu,noadmit,freq,lru,min] [--halflife 64]       [--margin 1] [--json <out.json>]
 
 Policy per MoE layer (PREREG G1, ticket #147): the experts are ranked by their routed count over the
 GENERATED positions of the calibration files (the `G` rule of #106: frequency order, ties lower id);
@@ -1527,6 +1527,8 @@ class EngineArena:
         self.score = list(prior) if prior is not None else [0.0] * n
         self.grow, self.inc, self.heap = 2.0 ** (1.0 / halflife), 1.0, []
         self.c = dict.fromkeys(ARENA_COUNTERS, 0)
+        # #188 CROW_GLM_ARENA_STAGE_LEND: the lent slots (set by arena_boot), lent now, the last take-back's experts
+        self.lend_slots, self.lend_on, self.lend_lent = [], False, []
 
     def tick(self):
         """one decode token: later accesses weigh 2^(1/halflife) more (the decay, without touching every score)"""
@@ -1663,13 +1665,37 @@ class EngineArena:
         """#188 CROW_GLM_ARENA_REGROW: the handed-back slots enabled again at the prompt's end and refilled before the
         first decode call (GlobalArena::enable, refill_plan, fill; ExpertTiers::elastic_refill): arena_refill_plan's
         experts, ascending key, into the empty enabled slots lowest first; a pinned copy is freed"""
+        self.enable(slots)
+        free = [s for s in range(self.nv) if self.vowner[s] < 0 and not self.dis[s]]
+        plan = arena_refill_plan(lent, score, len(free), lambda x: self.vslot[x] >= 0)
+        for k, s in zip(plan, free):
+            self.ram.pop(k, None)
+            self.vowner[s], self.vslot[k], self.refb[s], self.vpin[s] = k, s, 1, self.ep
+        self.c["refill"] += min(len(plan), len(free))
+
+    def enable(self, slots):
+        """GlobalArena::enable: the (empty) slots usable again, left empty (#188 CROW_GLM_ARENA_LAZY_REFILL: the
+        decode calls' own admissions fill them)"""
         self.ep += 1
         for s in slots:
             self.dis[s], self.refb[s] = False, 0
-        free = [s for s in range(self.nv) if self.vowner[s] < 0 and not self.dis[s]]
-        for k, s in zip(arena_refill_plan(lent, score, len(free), lambda x: self.vslot[x] >= 0), free):
-            self.ram.pop(k, None)
-            self.vowner[s], self.vslot[k], self.refb[s], self.vpin[s] = k, s, 1, self.ep
+
+    def lend_out(self, lazy, score):
+        """#188 CROW_GLM_ARENA_STAGE_LEND: the prefill staging set's slots (`lend_slots`, the arena's last ones) lent
+        to the decode: enabled and refilled with the experts the last take-back wrote out, then the warm list (lazy:
+        left empty)"""
+        if lazy:
+            self.enable(self.lend_slots)
+        else:
+            self.regrow(self.lend_slots, self.lend_lent, score)
+        self.lend_on = True
+
+    def lend_back(self):
+        """#188 CROW_GLM_ARENA_STAGE_LEND: taken back before a prompt call: the experts in the lent slots written back
+        into pinned (GlobalArena::disable)"""
+        self.lend_lent = self.disable(self.lend_slots)
+        self.c["lend_wb"] += len(self.lend_lent)
+        self.lend_on = False
 
     def vram_keys(self):
         return [k for k in self.vowner if k >= 0]
@@ -1707,6 +1733,10 @@ class FreqTiers:
         self.prot, self.ep = [0] * n, 0
         self.grow, self.inc = 2.0 ** (1.0 / halflife), 1.0
         self.c = dict.fromkeys(ARENA_COUNTERS, 0)
+        # #188 CROW_GLM_ARENA_STAGE_LEND: `lcap` lent slots (the arena's last ones, so an empty regular slot is taken
+        # first: GlobalArena::freq_free_slot takes the lowest empty one), `nl` of them enabled now, the experts in
+        # them (an entrant takes its victim's slot, so it inherits the victim's membership), the last take-back's
+        self.lcap, self.nl, self.lset, self.lend_on, self.lend_lent = 0, 0, set(), False, []
 
     def tick(self):
         self.inc *= self.grow
@@ -1765,19 +1795,27 @@ class FreqTiers:
                 continue
             tier.append(PIN if k in self.rset else NVME)
             misses.append(k)
-        if admit and self.nv:
+        if admit and (self.nv or self.nl):
             for k in misses:
-                v = None
-                if len(self.vset) >= self.nv:
+                v, lent = None, False
+                if len(self.vset) - len(self.lset) < self.nv:
+                    pass                          # an empty regular slot
+                elif len(self.lset) < self.nl:
+                    lent = True                   # an empty lent slot
+                else:
                     v = self._low(self.vheap, self.vset)
                     if v is None or not self.score[k] > (1.0 + self.margin) * self.score[v]:
                         continue
+                    lent = v in self.lset
                 if k in self.rset:                # exclusive: its pinned slot is free for the write-back
                     self.rset.discard(k)
                     c["promotions"] += 1
                 if v is not None:
                     self.vset.discard(v)
+                    self.lset.discard(v)
                     c["d2h" if self._ram_insert(v) else "dropped"] += 1
+                if lent:
+                    self.lset.add(k)
                 self.vset.add(k)
                 self._push(self.vheap, self.vset, k)
                 c["h2d"] += 1
@@ -1802,18 +1840,44 @@ class FreqTiers:
         for k in keys:
             if k in self.vset:
                 self.vset.discard(k)
+                self.lset.discard(k)
                 self._ram_insert(k)
                 out.append(k)
         return out
 
-    def regrow(self, nv, lent, score):
-        """#188 CROW_GLM_ARENA_REGROW: VRAM back to `nv` slots at the prompt's end, refilled with arena_refill_plan's
-        experts (a pinned copy freed)"""
+    def regrow(self, nv, lent, score, lend=None, lazy=False):
+        """#188 CROW_GLM_ARENA_REGROW: VRAM back to `nv` regular slots (and `lend` lent ones, #188
+        CROW_GLM_ARENA_STAGE_LEND) at the prompt's end, refilled with arena_refill_plan's experts (a pinned copy
+        freed): ascending key into the regular room first, the rest into the lent slots (the engine fills per layer,
+        ascending ids, the lowest brought-back slot first). `lazy` (CROW_GLM_ARENA_LAZY_REFILL): left empty."""
         self.nv = nv
-        for k in arena_refill_plan(lent, score, nv - len(self.vset), lambda x: x in self.vset):
+        if lend is not None:
+            self.nl = lend
+        if lazy:
+            return
+        room = nv - (len(self.vset) - len(self.lset))
+        plan = arena_refill_plan(lent, score, room + self.nl - len(self.lset), lambda x: x in self.vset)
+        for i, k in enumerate(plan):
             self.rset.discard(k)
             self.vset.add(k)
+            if i >= room:
+                self.lset.add(k)
             self._push(self.vheap, self.vset, k)
+        self.c["refill"] += len(plan)
+
+    def lend_out(self, lazy, score):
+        """#188 CROW_GLM_ARENA_STAGE_LEND: the `lcap` lent slots enabled and refilled with the last take-back's
+        experts, then the warm list (lazy: left empty)"""
+        self.regrow(self.nv, self.lend_lent, score, self.lcap, lazy)
+        self.lend_on = True
+
+    def lend_back(self):
+        """#188 CROW_GLM_ARENA_STAGE_LEND: taken back before a prompt call: the experts in the lent slots written back
+        into pinned"""
+        self.lend_lent = self.disable(sorted(self.lset))
+        self.c["lend_wb"] += len(self.lend_lent)
+        self.nl = 0
+        self.lend_on = False
 
     def vram_keys(self):
         return list(self.vset)
@@ -1836,7 +1900,9 @@ class FreqTiers:
         self.c = dict.fromkeys(ARENA_COUNTERS, 0)
 
 
-ARENA_COUNTERS = ("h2d", "promotions", "d2h", "dropped", "pinned_served")
+# refill: records the synchronous refill placed (#195 S / REGROW / STAGE_LEND; a host-thread stall, not in the cost
+# model); lend_wb: experts the lent slots' take-backs wrote into pinned (#188 CROW_GLM_ARENA_STAGE_LEND)
+ARENA_COUNTERS = ("h2d", "promotions", "d2h", "dropped", "pinned_served", "refill", "lend_wb")
 
 
 def arena_prior(counts, tokens, k=SHAPE[2]):
@@ -1925,20 +1991,31 @@ def arena_refill_plan(lent, score, room, busy):
     return sorted(out)
 
 
-def arena_boot(pol, counts, boot, nr, prior, halflife, margin):
+def arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend=0, lazy=False):
     """The arena at the first decode call. boot = (V, P) slots, warmed at V; or the engine's elastic boot
     (base, ring, chunks, chunk, handback[, regrow]): base + chunks x chunk VRAM slots, the last `ring` base slots
     disabled (the write-back ring), warmed, then the last `handback` chunks disabled (handed back for the prompt
     scratch, written back into pinned); regrow 1 (#188 CROW_GLM_ARENA_REGROW) = those chunks enabled again at the
-    prompt's end and refilled from the hand-back's experts, then the warm scores (ExpertTiers::elastic_refill)."""
+    prompt's end and refilled from the hand-back's experts, then the warm scores (ExpertTiers::elastic_refill).
+    `lend` (#188 CROW_GLM_ARENA_STAGE_LEND): that many more slots after the rest (the prefill staging set), disabled
+    while a prompt runs: lent at the elastic boot's prompt end together with the regrowth (one refill), for (V, P)
+    at the first decode token (arena_replay). `lazy` (#188 CROW_GLM_ARENA_LAZY_REFILL): the regrown and lent slots
+    are left empty for the decode calls' admissions."""
+    score = np.asarray(counts, float).reshape(-1).tolist()
     if len(boot) == 2:
-        a = arena_make(pol, boot[0], nr, prior, halflife, margin)
+        if pol == "freq":
+            a = arena_make(pol, boot[0], nr, prior, halflife, margin)
+            a.lcap = lend
+        else:
+            a = arena_make(pol, boot[0] + lend, nr, prior, halflife, margin)
+            if lend:
+                a.lend_slots = list(range(boot[0], boot[0] + lend))
+                a.disable(a.lend_slots)
         a.warm(counts)
         return a
     base, ring, chunks, chunk, hb = boot[:5]
     regrow = len(boot) > 5 and boot[5] == 1
     top = base + chunks * chunk
-    score = np.asarray(counts, float).reshape(-1).tolist()
     if pol == "freq":
         # FreqTiers has no slot numbers: the same experts the engine's hand-back writes out
         t = arena_boot("today", counts, boot[:4] + (0,), nr, prior, halflife, margin)
@@ -1946,36 +2023,56 @@ def arena_boot(pol, counts, boot, nr, prior, halflife, margin):
         a = FreqTiers(top - ring, nr, halflife, margin, prior)
         a.warm(counts)
         a.nv = top - ring - hb * chunk
+        a.lcap = lend
         lent = a.disable(out)
-        if regrow:
-            a.regrow(top - ring, lent, score)
+        if regrow or lend:
+            a.regrow(top - ring if regrow else a.nv, lent, score, lend, lazy)
+        a.lend_on = lend > 0
         a.c = dict.fromkeys(ARENA_COUNTERS, 0)
         return a
-    a = arena_make(pol, top, nr, prior, halflife, margin)
+    a = arena_make(pol, top + lend, nr, prior, halflife, margin)
+    a.lend_slots = list(range(top, top + lend))
     a.disable(range(base - ring, base))
+    if lend:
+        a.disable(a.lend_slots)
     a.warm(counts)
     lent = a.disable(range(top - hb * chunk, top))
-    if regrow:
-        a.regrow(range(top - hb * chunk, top), lent, score)
+    back = (list(range(top - hb * chunk, top)) if regrow else []) + a.lend_slots
+    if back:
+        if lazy:
+            a.enable(back)
+        else:
+            a.regrow(back, lent, score)
+    a.lend_on = lend > 0
     a.c = dict.fromkeys(ARENA_COUNTERS, 0)
     return a
 
 
-def arena_replay(a, events):
-    """Replay events through an arena -> per decode token {counter: n} and the [tokens][L][3] v/p/n tiers"""
+def arena_replay(a, events, lazy=False, score=None):
+    """Replay events through an arena -> per decode token {counter: n} and the [tokens][L][3] v/p/n tiers. With lent
+    slots (#188 CROW_GLM_ARENA_STAGE_LEND) the first prompt call after a decode token takes them back and the first
+    decode token after a prompt lends them again (refilled from `score`, the warm list, unless `lazy`)."""
     per, tiers = [], []
+    lends = len(getattr(a, "lend_slots", ())) or getattr(a, "lcap", 0)
+    prev = None
+    c0 = dict(a.c)                                # a take-back / lend between tokens counts to the next token
     for kind, tok in events:
+        if lends and kind == "p" and prev == "d" and a.lend_on:
+            a.lend_back()
+        prev = kind
         if kind == "p":
             for l, ids in enumerate(tok):
                 a.mark(l, ids)
             continue
-        c0 = dict(a.c)
+        if lends and not a.lend_on:
+            a.lend_out(lazy, score)
         row = []
         for l, ids in enumerate(tok):
             t = a.step(l, ids, True)
             row.append((t.count(VRAM), t.count(PIN), t.count(NVME)))
         a.tick()
         d = {k: a.c[k] - c0[k] for k in ARENA_COUNTERS}
+        c0 = dict(a.c)
         d["vram"], d["pinned"], d["nvme"] = (sum(r[i] for r in row) for i in range(3))
         per.append(d)
         tiers.append(row)
@@ -2026,11 +2123,15 @@ def arena_cost_ms(row, rb=ARENA_RECORD):
             + row.get("promotions_per_token", 0.0) * rb / 1e9) * ARENA_MS_PER_GB_ZC)
 
 
-def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, prior_tokens=None, out=print):
-    """Every `arena` row: workloads = [(name, events, boot, check_rows or None)]; returns the --json document."""
+def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, prior_tokens=None, out=print, lend=0,
+                   lazy=False):
+    """Every `arena` row: workloads = [(name, events, boot, check_rows or None)]; returns the --json document. `lend`
+    and `lazy`: #188 CROW_GLM_ARENA_STAGE_LEND / CROW_GLM_ARENA_LAZY_REFILL (arena_boot, arena_replay)."""
     prior_tokens = 0.5 * halflife / math.log(2) if prior_tokens is None else prior_tokens
     prior = arena_prior(counts, prior_tokens)
+    score = np.asarray(counts, float).reshape(-1).tolist()
     res = {"halflife_tokens": halflife, "margin": margin, "prior_tokens": prior_tokens, "pinned_slots": nr,
+           "lend_slots": lend, "lazy_refill": lazy,
            "cost_model": {"ms_per_demand_read": ARENA_MS_DEMAND, "ms_per_zero_copy_gb": ARENA_MS_PER_GB_ZC,
                           "source": "decode Nsight profile ARM2 + RT2, crow-nest-wt-int runs/glm53-flash/"
                                     "profile-20261010j-decode/budget.txt (#202 comment 6099823660): 1.7 ms GPU idle per "
@@ -2044,7 +2145,8 @@ def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, p
         toks = sum(1 for k, _ in events if k == "d")
         w = {"name": wname, "decode_tokens": toks, "prompt_tokens": len(events) - toks, "boot": list(boot), "rows": []}
         out("\n%s: %d decode tokens, %d prompt positions/calls; boot %s, pinned %d; halflife %g tokens, margin %g, "
-            "prior %.1f tokens" % (wname, toks, len(events) - toks, boot, nr, halflife, margin, prior_tokens))
+            "prior %.1f tokens; lent slots %d, refill %s" % (wname, toks, len(events) - toks, boot, nr, halflife, margin,
+                                                           prior_tokens, lend, "lazy" if lazy else "eager"))
         out("  %-8s %8s %8s %8s %8s %8s %8s %8s %9s %8s %9s" % (
             "policy", "demand", "spec", "H2D/tok", "promo", "D2H/tok", "VRAM/tok", "pin/tok", "ZC GB/tok", "ms/tok",
             "check"))
@@ -2052,7 +2154,7 @@ def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, p
         for pol in policies:
             if pol in ("lru", "min"):
                 if warm_keys is None:
-                    t = arena_boot("today", counts, boot, nr, prior, halflife, margin)
+                    t = arena_boot("today", counts, boot, nr, prior, halflife, margin, lend)
                     warm_keys = t.vram_keys() + t.pinned_keys()
                     cap = len(warm_keys)
                 r = arena_union_reads(events, cap, warm_keys, pol)
@@ -2067,8 +2169,8 @@ def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, p
                                                                          "-", "-", "-", "-", "-", "-"))
                 w["rows"].append(row)
                 continue
-            a = arena_boot(pol, counts, boot, nr, prior, halflife, margin)
-            per, tiers = arena_replay(a, events)
+            a = arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend, lazy)
+            per, tiers = arena_replay(a, events, lazy, score)
             row = arena_row(pol, per)
             chk = "-"
             if check is not None and pol == "today":
@@ -2119,7 +2221,7 @@ def arena_cmd(a):
         workloads.append(("route log %s" % os.path.basename(a.route_log), arena_events_log(a.route_log), boot, check))
     if not workloads:
         raise SimError("arena needs --corpus or --route-log")
-    res = arena_simulate(workloads, pols, counts, nr, a.halflife, a.margin, a.prior_tokens)
+    res = arena_simulate(workloads, pols, counts, nr, a.halflife, a.margin, a.prior_tokens, lend=a.lend, lazy=a.lazy)
     res["calibration_routing"] = cal_src
     if a.json:
         jdump(res, a.json, indent=1, default=float)
@@ -2282,6 +2384,11 @@ def main(argv=None):
     r.add_argument("--margin", type=float, default=1.0, help="freq: promotion above (1 + margin) x the VRAM victim")
     r.add_argument("--prior-tokens", type=float, help="prior score = tokens x calibration rate "
                                                       "(default 0.5 x halflife / ln 2)")
+    r.add_argument("--lend", type=int, default=0, help="#188 CROW_GLM_ARENA_STAGE_LEND: VRAM slots of the prefill staging "
+                                                         "set lent to the decode (the engine: 128), taken back at "
+                                                         "every prompt")
+    r.add_argument("--lazy", action="store_true", help="#188 CROW_GLM_ARENA_LAZY_REFILL: regrown and lent slots left "
+                                                       "empty for the decode admissions instead of the refill")
     r.add_argument("--json")
     a = ap.parse_args(argv)
     try:

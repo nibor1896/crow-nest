@@ -1,0 +1,89 @@
+{
+ "halflife_tokens": 64.0,
+ "margin": 1.0,
+ "prior_tokens": 46.16624130844683,
+ "pinned_slots": 4956,
+ "lend_slots": 0,
+ "lazy_refill": true,
+ "cost_model": {
+  "ms_per_demand_read": 1.7,
+  "ms_per_zero_copy_gb": 32.472989195678274,
+  "source": "decode Nsight profile ARM2 + RT2, crow-nest-wt-int runs/glm53-flash/profile-20261010j-decode/budget.txt (#202 comment 6099823660): 1.7 ms GPU idle per demand read; zero-copy 0.833 GB in 27.05 ms; promotions charged at that rate, write-backs not"
+ },
+ "record_bytes": 9474048,
+ "zero_copy_share": 0.3517425580493689,
+ "zero_copy_share_source": "runs/glm53-flash/quick/q7-rt2-nopf/decode.json (crow-nest-wt-int): 8,165 of 23,213 pinned-served visits zero-copy, the rest on the CPU lane",
+ "workloads": [
+  {
+   "name": "route log route.log",
+   "decode_tokens": 127,
+   "prompt_tokens": 1,
+   "boot": [
+    1848,
+    24,
+    13,
+    44,
+    5,
+    1
+   ],
+   "rows": [
+    {
+     "policy": "today",
+     "tokens": 127,
+     "h2d_per_token": 30.299212598425196,
+     "promotions_per_token": 0.0,
+     "d2h_per_token": 28.566929133858267,
+     "dropped_per_token": 0.0,
+     "pinned_served_per_token": 178.61417322834646,
+     "refill_per_token": 0.0,
+     "lend_wb_per_token": 0.0,
+     "vram_per_token": 127.08661417322834,
+     "pinned_per_token": 178.61417322834646,
+     "nvme_per_token": 30.299212598425196,
+     "nvme_reads": {
+      "mean": 30.299212598425196,
+      "ci": [
+       NaN,
+       NaN
+      ],
+      "n": 127
+     },
+     "zero_copy_gb_per_token": 0.5952184931513329,
+     "nvme_demand_per_token": 30.299212598425196,
+     "nvme_speculative_per_token": 0.0,
+     "cost_ms_per_token": 70.83718511449396
+    },
+    {
+     "policy": "freq",
+     "tokens": 127,
+     "h2d_per_token": 19.244094488188978,
+     "promotions_per_token": 18.69291338582677,
+     "d2h_per_token": 17.511811023622048,
+     "dropped_per_token": 0.0,
+     "pinned_served_per_token": 130.70078740157481,
+     "refill_per_token": 0.0,
+     "lend_wb_per_token": 0.0,
+     "vram_per_token": 186.0551181102362,
+     "pinned_per_token": 122.18897637795276,
+     "nvme_per_token": 27.755905511811022,
+     "nvme_reads": {
+      "mean": 27.755905511811022,
+      "ci": [
+       NaN,
+       NaN
+      ],
+      "n": 127
+     },
+     "zero_copy_gb_per_token": 0.43555068629073246,
+     "nvme_demand_per_token": 27.755905511811022,
+     "nvme_speculative_per_token": 0.0,
+     "cost_ms_per_token": 67.07955920967254
+    }
+   ]
+  }
+ ],
+ "calibration_routing": {
+  "from": "warm file",
+  "path": "runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json"
+ }
+}

@@ -25,6 +25,8 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_ARENA_STAGE_MIN",
     "CROW_GLM_ARENA_FREQ",
     "CROW_GLM_ARENA_REGROW",
+    "CROW_GLM_ARENA_LAZY_REFILL",
+    "CROW_GLM_ARENA_STAGE_LEND",
     "CROW_GLM_STAGE_OVERLAP",
     "CROW_GLM_PREFILL_NVPF",
     "CROW_GLM_PREFILL_NVPF_MIN_ROWS",
@@ -1197,5 +1199,114 @@ fn glm5_int_gpu_the_prompts_chunks_grow_back_at_its_end() {
     let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
     eprintln!("glm5 int regrow on vs off: logits cosine min {cos:.7}, KL max {:.3e}, bits differ {:?}", r.iter().map(|x| x.1).fold(0.0, f64::max), bit_diff(&on.0.logits, &off.0.logits));
     assert!(cos >= 0.9999, "logits cosine {cos} under G3's 0.9999");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #188 T (`CROW_GLM_ARENA_LAZY_REFILL`) and the lent prefill staging set
+/// (`CROW_GLM_ARENA_STAGE_LEND`) on the operating set of `glm5_int_gpu_the_prompts_chunks_grow_back_at_its_end`
+/// (ARM2 + RT2 + FREQ + REGROW, the ballast that makes the prompt hand chunks back), two
+/// generations per arm (the second prompt takes the lent set back, its end lends it again). Only
+/// where records lie changes: every arm gives the off arm's ids, logits to G3 (cosine >= 0.9999).
+/// Lazy: the regrown (and lent) slots are not refilled; lend: the set's slots join the decode.
+#[test]
+#[ignore = "needs the GPU (most of its free VRAM as a ballast, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_lazy_refill_and_the_lent_staging_set_keep_the_ids() {
+    use crate::glm5_tiers::ARENA_RESERVE_BYTES;
+    let dir = std::env::temp_dir().join(format!("crow-int-lend-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let s = |v: &str| v.to_string();
+    let base: Vec<(&'static str, String)> = vec![
+        ("CROW_GLM_PINNED", s("zerocopy")),
+        ("CROW_GLM_FLAGS", s("1")),
+        ("CROW_GLM_STAGER", s("1")),
+        ("CROW_GLM_ARENA", s("global")),
+        ("CROW_GLM_ARENA_WARM", warm),
+        ("CROW_GLM_ARENA_ELASTIC_GB", format!("{}", 12.0 * 3.0 * REC as f64 / (1u64 << 30) as f64)),
+        ("CROW_GLM_ARENA_STAGE_GB", s("2.6")),
+        ("CROW_GLM_ARENA_FREQ", s("1")),
+        ("CROW_GLM_ARENA_REGROW", s("1")),
+        ("CROW_GLM_CPU_LANE", s("split")),
+        ("CROW_PINNED_ALLOC", s("host")),
+        ("CROW_GLM_PREFETCH", s("1")),
+        ("CROW_GLM_PREFETCH_SIDE", s("1")),
+        ("CROW_GLM_SHARED_OVERLAP", s("1")),
+        ("CROW_GLM_HCFUSE", s("1")),
+        ("CROW_GLM_DENSE_GEMM", s("1")),
+        ("CROW_CHUNK", s("8192")),
+        ("CROW_GLM_STAGE_OVERLAP", s("1")),
+        ("CROW_GLM_MOE_TC", s("2")),
+        ("CROW_GLM_ATTN2", s("1")),
+        ("CROW_GLM_PREFILL_NVPF", s("1")),
+        ("CROW_GLM_RT2", s("1")),
+    ];
+    let g = geo8();
+    let sy = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&sy.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&sy.path).unwrap();
+    let prompt: Vec<i64> = (0..40).map(|i| (i * 61 + 7) % 2048).collect();
+    let n = 8;
+    let pf = crate::glm5_tiers::prefill_stage_slots(g.topk);
+    // per arm: both generations, the VRAM slots in the second decode, the elastic part's counters
+    let mut outs: Vec<(&str, Vec<Generated>, usize)> = Vec::new();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        for (name, lazy, lend) in [("off", false, false), ("lazy", true, false), ("lend", false, true), ("lend+lazy", true, true)] {
+            let mut env = base.clone();
+            env.push(("CROW_GLM_ARENA_LAZY_REFILL", s(if lazy { "1" } else { "0" })));
+            env.push(("CROW_GLM_ARENA_STAGE_LEND", s(if lend { "1" } else { "0" })));
+            let _env = Env::set(&env);
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+            let mut tiers = ExpertTiers::new(&cnq, &sy.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+            let c = tiers.arena_config().unwrap();
+            assert_eq!((c.lazy_refill, c.stage_lend), (lazy, lend), "{name}: the switches");
+            tiers.alloc_prefill_stage(pf).unwrap();
+            let (_, _, vpl) = tiers.elastic_live().unwrap();
+            let leave = ARENA_RESERVE_BYTES - 5 * (vpl as u64 * REC) / 2;
+            let free = cuda::free_vram_bytes();
+            assert!(free > leave + (1 << 30), "{free} B free VRAM");
+            let mut ballast = cuda::try_alloc_zeroed("test ballast", (free - leave) as usize).unwrap();
+            let mut gens = Vec::new();
+            for _ in 0..2 {
+                gens.push(run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap());
+            }
+            let e = tiers.arena_elastic_stats().unwrap();
+            // the VRAM slots in decode beside the live elastic chunks (how many regrow depends on the
+            // free VRAM each arm reads)
+            let (live, _, _) = tiers.elastic_live().unwrap();
+            let all = tiers.arena().unwrap().enabled_vram();
+            let slots = all - live * vpl;
+            eprintln!("glm5 int lend {name}: ids {:?} / {:?}, {all} VRAM slots in decode ({live} elastic chunks live), lent {}, {e:?}", gens[0].ids, gens[1].ids, tiers.stage_lent());
+            assert!(e.regrows >= 2 && e.regrown > 0, "{name}: the prompts' chunks regrown ({e:?})");
+            if lazy {
+                assert!(e.refilled == 0 && e.lazy_refills >= 2 && e.lazy_slots > 0, "{name}: the slots left to admission ({e:?})");
+            } else {
+                assert!(e.refilled > 0 && e.lazy_refills == 0, "{name}: refilled ({e:?})");
+            }
+            if lend {
+                assert!(tiers.stage_lent(), "{name}: lent in the decode");
+                assert_eq!((e.lend_slots, e.lends, e.take_backs), (pf as u64, 2, 1), "{name}: lent after each prompt, taken back by the second ({e:?})");
+            } else {
+                assert!(!tiers.stage_lent() && e.lends == 0, "{name}: never lent");
+            }
+            cuda::free_dev(&mut ballast);
+            tiers.free();
+            run.free();
+            outs.push((name, gens, slots));
+        }
+    }
+    let off = &outs[0];
+    for (name, gens, slots) in &outs {
+        let lend = name.starts_with("lend");
+        assert_eq!(*slots, off.2 + if lend { pf } else { 0 }, "{name}: the VRAM slots in decode beside the elastic chunks");
+        for (i, (gen, base)) in gens.iter().zip(&off.1).enumerate() {
+            assert_eq!(gen.ids, base.ids, "{name}: ids of generation {i}");
+            let r: Vec<(f64, f64, bool)> = gen.logits.iter().zip(&base.logits).map(|(p, q)| g3(q, p)).collect();
+            let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
+            eprintln!("glm5 int lend {name} vs off, generation {i}: logits cosine min {cos:.7}, bits differ {:?}", bit_diff(&gen.logits, &base.logits));
+            assert!(cos >= 0.9999, "{name}: logits cosine {cos} under G3's 0.9999");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
