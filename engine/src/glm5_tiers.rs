@@ -817,13 +817,35 @@ pub fn serve_chunk_prefill(
 /// `record` bytes each, shared by every layer in the global arena) that fit the VRAM the plan
 /// leaves under its ceiling (`vram_ceiling - fixed_bytes - hot_bytes`), plus the prompt scratch
 /// `scratch` when the prompt borrows it instead of keeping it booked, above
-/// [`ARENA_RESERVE_BYTES`], at most `elastic_cap` bytes (`CROW_GLM_ARENA_ELASTIC_GB`).
+/// [`ARENA_RESERVE_BYTES`], at most `elastic_cap` bytes (`CROW_GLM_ARENA_ELASTIC_GB`) plus the
+/// borrowed scratch (`ExpertTiers::elastic_lift`: the cap does not hold the scratch back).
 /// Returns (elastic chunks, slots per layer).
 pub fn decode_hot_per_layer(plan: &crate::manager::TierPlan, scratch: u64, borrowed: bool, record: u64, moe_layers: usize, elastic_cap: u64) -> (u64, f64) {
-    let left = plan.vram_ceiling.saturating_sub(plan.fixed_bytes + plan.hot_bytes()) + if borrowed { scratch } else { 0 };
+    let lent = if borrowed { scratch } else { 0 };
+    let left = plan.vram_ceiling.saturating_sub(plan.fixed_bytes + plan.hot_bytes()) + lent;
     let cb = plan.hot as u64 * record;
-    let n = if cb == 0 { 0 } else { left.saturating_sub(ARENA_RESERVE_BYTES).min(elastic_cap) / cb };
+    let n = if cb == 0 { 0 } else { left.saturating_sub(ARENA_RESERVE_BYTES).min(elastic_cap.saturating_add(lent)) / cb };
     (n, plan.hot as f64 + (n * plan.hot as u64) as f64 / moe_layers as f64)
+}
+
+/// `CROW_GLM_ARENA` elastic: the rows of scratch a prompt of `n` rows borrows at `chunk` rows per
+/// call while the pass holds `held` rows: its largest call (`n`, at most `chunk`) rounded up to the
+/// plan sizes (`manager::glm5_prompt_call_sizes`); 0 = the held rows suffice, nothing is borrowed.
+pub fn prompt_borrow_rows(n: usize, chunk: usize, held: usize) -> usize {
+    let m = n.min(chunk);
+    if m <= held {
+        return 0;
+    }
+    crate::manager::glm5_prompt_call_sizes(chunk).into_iter().find(|&s| s >= m).unwrap_or(chunk)
+}
+
+/// `CROW_GLM_ARENA` elastic: the live elastic chunks of `cb` bytes (at most `live`) to hand back so
+/// that `need` more bytes fit above [`ARENA_RESERVE_BYTES`] at `free` bytes of free VRAM
+pub fn elastic_chunks_for(need: u64, free: u64, cb: u64, live: usize) -> usize {
+    if cb == 0 {
+        return 0;
+    }
+    need.saturating_add(ARENA_RESERVE_BYTES).saturating_sub(free).div_ceil(cb).min(live as u64) as usize
 }
 
 /// `CROW_GLM_ARENA` elastic: the prompt phase borrows its scratch (`Glm5Run::prefill_with`) when
@@ -1994,6 +2016,10 @@ pub struct ElasticStats {
     pub realloc_fail: u64,
     /// experts written back to pinned at a hand-back
     pub write_backs: u64,
+    /// chunks allocated by `ExpertTiers::elastic_lift` (the borrowed prompt scratch), and the
+    /// bytes it was asked for
+    pub lifted: usize,
+    pub lift_bytes: u64,
 }
 
 /// the staging buffers of large prompt calls (sybil's `GLM53_EC_STAGE_GB` / `GLM53_EC_STAGE_MIN`)
@@ -2103,18 +2129,50 @@ impl ExpertTiers {
         }
     }
 
-    /// `CROW_GLM_ARENA` elastic: hand the elastic chunks back before the prompt phase borrows
-    /// their memory (`Glm5Run::prefill_with`); a staged forward still open ends first. The next
-    /// decode call grows them back (`table_global`). A no-op without the global arena.
+    /// `CROW_GLM_ARENA` elastic: hand back the elastic chunks the prompt phase's `need` bytes of
+    /// scratch take (`Glm5Run::prefill_with`, [`elastic_chunks_for`]); a staged forward still open
+    /// ends first. The next decode call grows them back (`table_global`). A no-op without the
+    /// global arena.
     ///
     /// # Safety
     /// A CUDA context is current; no launch reading the arena is pending.
-    pub unsafe fn elastic_hand_back(&mut self) -> Result<(), String> {
+    pub unsafe fn elastic_hand_back(&mut self, need: u64) -> Result<(), String> {
         if self.arena.is_none() {
             return Ok(());
         }
         self.stage_end();
-        self.elastic_enter()
+        self.elastic_enter(need)
+    }
+
+    /// `CROW_GLM_ARENA` elastic with a borrowed prompt scratch: the elastic part grows by up to
+    /// `bytes` beyond `CROW_GLM_ARENA_ELASTIC_GB` (the scratch the plan books and the run holds
+    /// only during a prompt), every chunk that fits above [`ARENA_RESERVE_BYTES`] now. Asked once
+    /// per size: a repeated or smaller ask is a no-op. A no-op without an elastic part.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn elastic_lift(&mut self, bytes: u64) {
+        let (rb, vpl) = (self.rb, self.sizes.vram);
+        let Some(d) = self.arena.as_mut() else { return };
+        if d.cfg.elastic_bytes == 0 || vpl == 0 || bytes <= d.elastic.lift_bytes {
+            return;
+        }
+        let cb = vpl as u64 * rb;
+        let more = (bytes - d.elastic.lift_bytes).div_ceil(cb);
+        d.elastic.lift_bytes = bytes;
+        for _ in 0..more {
+            if cuda::free_vram_bytes() < cb + ARENA_RESERVE_BYTES {
+                break;
+            }
+            match cuda::try_alloc_zeroed("glm5 elastic VRAM expert slots", cb as usize) {
+                Ok(c) => {
+                    d.chunks.push(c);
+                    d.a.add_slots(vpl);
+                    d.elastic.lifted += 1;
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     /// the global arena's switches (`None` on the per-layer path)
@@ -2255,18 +2313,21 @@ impl ExpertTiers {
         Ok(())
     }
 
-    /// Hand the elastic chunks back: their experts written back to pinned (or dropped), their
-    /// slots disabled, their memory freed.
+    /// Hand back the elastic chunks `need` more bytes take above the reserve
+    /// ([`elastic_chunks_for`], the last live ones first): their experts written back to pinned
+    /// (or dropped), their slots disabled, their memory freed.
     ///
     /// # Safety
     /// A CUDA context is current; no launch reading the arena is pending.
-    unsafe fn elastic_enter(&mut self) -> Result<(), String> {
+    unsafe fn elastic_enter(&mut self, need: u64) -> Result<(), String> {
         let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("elastic_enter without the global arena");
-        let live: Vec<usize> = d.flex().filter(|&c| d.chunks[c] != 0).collect();
-        if live.is_empty() {
+        let mut live: Vec<usize> = d.flex().filter(|&c| d.chunks[c] != 0).collect();
+        let k = elastic_chunks_for(need, cuda::free_vram_bytes(), vpl as u64 * rb, live.len());
+        if k == 0 {
             return Ok(());
         }
+        live.drain(..live.len() - k);
         cuda::sync();
         if let Some(r) = d.ring.as_mut() {
             r.sync_all();
@@ -2481,7 +2542,7 @@ impl ExpertTiers {
             self.stage_end();
             // shrink with free VRAM: once per prompt call (its first MoE layer)
             if l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] != 0)) && cuda::free_vram_bytes() < ARENA_RESERVE_BYTES {
-                self.elastic_enter()?;
+                self.elastic_enter(0)?;
             }
         }
         let (rb, k, experts, vpl, ppl) = (self.rb, self.topk, self.cache.experts, self.sizes.vram, self.sizes.pinned);
@@ -2592,7 +2653,7 @@ impl ExpertTiers {
             }
             let permanent = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").permanent;
             if !permanent {
-                self.elastic_enter()?;
+                self.elastic_enter(2 * nst as u64 * rb)?;
                 let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
                 for i in 0..2 {
                     st.bufs[i] = cuda::try_alloc_zeroed("glm5 arena staging buffer", nst * rb as usize).map_err(|e| format!("{ARENA_STAGE_ENV}: a staging buffer does not fit after the elastic hand-back: {e:?}"))?;
@@ -6706,30 +6767,57 @@ impl Glm5Run {
             }
             return last.ok_or_else(|| "glm5_run: the last prompt row gave no id".to_string());
         }
-        // CROW_GLM_ARENA elastic: borrow the prompt scratch, give it back whatever happens
-        let borrowed = self.borrow.is_some_and(|b| self.prompt_chunk > b.0);
-        if borrowed {
-            self.borrow_scratch(tiers)?;
+        // CROW_GLM_ARENA elastic: borrow the scratch this prompt's calls need, give it back
+        // whatever happens
+        let borrow_t = self.borrow.map_or(0, |b| prompt_borrow_rows(n, self.prompt_chunk, b.0));
+        if borrow_t > 0 {
+            self.borrow_scratch(tiers, borrow_t)?;
         }
         let r = self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows);
-        if borrowed {
+        if borrow_t > 0 {
             self.return_scratch();
         }
         // the staged forward ends and the elastic part grows back here, on the host thread
         cuda::sync();
         tiers.decode_ready();
+        self.lift_elastic(tiers);
         r
     }
 
-    /// `CROW_GLM_ARENA` elastic: the elastic chunks handed back, the pass and the residual at the
-    /// prompt's rows; captured row graphs dropped (they hold the old buffers)
+    /// `CROW_GLM_ARENA` elastic: (decode rows held, prompt rows at most) when the prompt phase
+    /// borrows its scratch; `None` = the scratch stays allocated
+    pub fn borrow_rows(&self) -> Option<(usize, usize)> {
+        self.borrow
+    }
+
+    /// `CROW_GLM_ARENA` elastic: the device bytes a prompt scratch of `t` rows takes above the
+    /// held rows (`manager::glm5_chunk_scratch_bytes`); 0 without the borrow
+    pub fn borrow_bytes(&self, t: usize) -> u64 {
+        let Some((d, _)) = self.borrow else { return 0 };
+        let sc = |r: usize| crate::manager::glm5_chunk_scratch_bytes(&self.g, r, self.cap);
+        sc(t).saturating_sub(sc(d))
+    }
+
+    /// `CROW_GLM_ARENA` elastic: the elastic part takes the largest prompt scratch the plan books
+    /// on top of `CROW_GLM_ARENA_ELASTIC_GB` (`ExpertTiers::elastic_lift`); a no-op without the
+    /// borrow or once done
+    ///
+    /// # Safety
+    /// A CUDA context is current; `tiers` belongs to this model.
+    pub unsafe fn lift_elastic(&self, tiers: &mut ExpertTiers) {
+        if let Some((_, p)) = self.borrow {
+            tiers.elastic_lift(self.borrow_bytes(p));
+        }
+    }
+
+    /// `CROW_GLM_ARENA` elastic: the elastic chunks a scratch of `t` rows takes handed back, the
+    /// pass and the residual at `t` rows; captured row graphs dropped (they hold the old buffers)
     ///
     /// # Safety
     /// As [`Glm5Run::prefill`].
-    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers) -> Result<(), String> {
-        let (_, p) = self.borrow.expect("borrow_scratch without the borrow");
-        tiers.elastic_hand_back()?;
-        self.resize_rows(p);
+    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers, t: usize) -> Result<(), String> {
+        tiers.elastic_hand_back(self.borrow_bytes(t))?;
+        self.resize_rows(t);
         Ok(())
     }
 

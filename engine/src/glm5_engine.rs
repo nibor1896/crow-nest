@@ -258,6 +258,22 @@ impl Glm5Device {
             log(&format!("[glm5_run] {}={batch}: {batch} sequence slots, a decode step carries one row of each active sequence in one trunk pass", gt::MAX_BATCH_ENV));
         }
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        // CROW_GLM_ARENA elastic: the prompt scratch the plan books is held only during a prompt;
+        // between prompts it is elastic arena (on top of CROW_GLM_ARENA_ELASTIC_GB)
+        if let Some((_, p)) = run.borrow_rows() {
+            run.lift_elastic(&mut tiers);
+            let sc = run.borrow_bytes(p);
+            let cap = tiers.arena_config().map_or(0, |c| c.elastic_bytes);
+            let ml = gt::moe_layers(&o.g);
+            let (n, per) = gt::decode_hot_per_layer(&plan, sc, true, o.spec.bytes, ml, cap);
+            let (live, _, vpl) = tiers.elastic_live().unwrap_or((0, 0, 0));
+            log(&format!(
+                "[budget] prompt scratch of up to {p} rows ({:.2} GiB) borrowed per prompt, not held: decode VRAM experts per MoE layer {per:.1} on the plan's numbers (plan {} + {n} elastic chunks), {:.1} allocated ({live} elastic chunks of {vpl} slots)",
+                gib(sc),
+                plan.hot,
+                sizes.vram as f64 + (live * vpl) as f64 / ml as f64
+            ));
+        }
         log(&format!(
             "[budget] glm5_next tiers per MoE layer: VRAM {} / pinned {} / NVMe {} x {} MoE layers (plan {} / {} / {}; {}); {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start, NVMe readers {readers}",
             sizes.vram,
@@ -382,7 +398,8 @@ impl Rows for Glm5Device {
         self.run.settle_ahead(&mut self.tiers)
     }
     fn counters(&self) -> ([u64; 3], u64) {
-        let a = self.tiers.cache.counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
+        // the tier each access was served from on either path (the global arena keeps its own)
+        let a = self.tiers.tier_counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
         (a, self.tiers.nvme_bytes)
     }
     fn slots(&self) -> usize {
@@ -787,6 +804,51 @@ mod tests_186_plan {
         let ((ss, si, sp), (rs, ri, rp)) = (serve.unwrap(), run.unwrap());
         assert_eq!((si.chunk, si.chunk_scratch_bytes), (32, crate::manager::glm5_chunk_scratch_bytes(&g, 32, 200_000)), "serve books chunk 32");
         assert_eq!((ss.total(), si.chunk, si.chunk_scratch_bytes, si.host_pinned_budget, sp), (rs.total(), ri.chunk, ri.chunk_scratch_bytes, ri.host_pinned_budget, rp));
+    }
+
+    /// #195: `CROW_CHUNK=8192` with the prompt scratch borrowed from the elastic arena at the
+    /// template's `CROW_GLM_ARENA_ELASTIC_GB=10`, RTX 5090, 200,000 rows, the 3-bit record: the
+    /// scratch the plan books is not held between prompts, so the decode VRAM hot set per MoE
+    /// layer is the chunk-1 plan's within the elastic headroom (the 2.5 GiB reserve the elastic
+    /// part leaves free); the 10 GiB cap does not hold the scratch back.
+    #[test]
+    fn borrowed_prompt_scratch_gives_the_decode_hot_set_back() {
+        use crate::manager::{glm5_chunk_scratch_bytes, plan_glm5_next_chunk};
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (card, rec, ml) = (32_607u64 << 20, 9_474_048u64, g.moe_layers());
+        let plan = |chunk: usize| plan_glm5_next_chunk(&g, 200_000, card, HOST_PINNED_CAP, crate::geo::GLM5_NEXT_DENSE_BYTES, rec, 64, true, chunk).unwrap().2;
+        let (p1, p8) = (plan(1), plan(8192));
+        let sc = glm5_chunk_scratch_bytes(&g, 8192, 200_000);
+        let (n, hot) = gt::decode_hot_per_layer(&p8, sc, true, rec, ml, 10 << 30);
+        let headroom = gt::ARENA_RESERVE_BYTES.div_ceil(p1.unit_bytes) as f64;
+        eprintln!("#195 decode hot set per MoE layer: chunk 1 plan {}, chunk 8192 plan {} + {n} elastic chunks = {hot:.1} (borrowed {:.2} GiB, elastic headroom {headroom} slots)", p1.hot, p8.hot, sc as f64 / (1u64 << 30) as f64);
+        assert!(p8.hot < 10, "the plan of record at chunk 8192 books the scratch ({})", p8.hot);
+        assert!(hot <= p1.hot as f64 + 1.0 && hot >= p1.hot as f64 - headroom - 1.0, "decode hot set {hot:.1} vs chunk 1 {}", p1.hot);
+    }
+
+    /// #195: a 30-token prompt at `CROW_CHUNK=8192` borrows the scratch of 32 rows (its call rounded
+    /// up to the plan sizes) and hands back only the elastic chunks that takes; a prompt of a full
+    /// chunk borrows all 8192 rows; a one-row prompt borrows nothing.
+    #[test]
+    fn a_short_prompt_borrows_only_its_size() {
+        use crate::manager::glm5_chunk_scratch_bytes;
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        assert_eq!(gt::prompt_borrow_rows(30, 8192, 1), 32);
+        assert_eq!(gt::prompt_borrow_rows(5000, 8192, 1), 8192);
+        assert_eq!(gt::prompt_borrow_rows(20_000, 8192, 1), 8192);
+        assert_eq!(gt::prompt_borrow_rows(1, 8192, 1), 0);
+        assert_eq!(gt::prompt_borrow_rows(3, 8192, 4), 0, "the held rows (MTP / batch) suffice");
+        let sc = |t: usize| glm5_chunk_scratch_bytes(&g, t, 200_000);
+        // the elastic part at the 8192-row scratch's size, free VRAM at the reserve (it grew to it)
+        let cb = 3 * 9_474_048u64;
+        let live = sc(8192).div_ceil(cb) as usize;
+        let free = gt::ARENA_RESERVE_BYTES;
+        let k30 = gt::elastic_chunks_for(sc(32), free, cb, live);
+        assert!(k30 as u64 * cb >= sc(32) && (k30 as u64 - 1) * cb < sc(32), "{k30} chunks for {} B", sc(32));
+        assert!(k30 * 50 < live, "a 30-token prompt hands back {k30} of {live} chunks");
+        assert_eq!(gt::elastic_chunks_for(sc(8192), free, cb, live), live);
+        assert_eq!(gt::elastic_chunks_for(sc(32), free + sc(32), cb, live), 0, "free VRAM holds it: nothing handed back");
+        assert_eq!(gt::elastic_chunks_for(0, free, cb, live), 0);
     }
 }
 
