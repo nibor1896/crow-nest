@@ -1876,8 +1876,9 @@ mod tests {
     /// #188 CPU lane, synthetic GLM layer (the records of `glm5_moe_gpu_layer_matches_the_oracle`
     /// in cacheable pinned RAM, x = the oracle's MoE row 0, T 1). For combo masks from one CPU
     /// combo (first, last) through alternating, 6 of 8, 7 of 8 and all 8: every GPU combo's `ye`
-    /// row has the bits of the GPU-only run, every CPU combo's row the bits of
-    /// `expert_ffn_mul1_cpu` of its record (`ye` filled with NaN before each run, so a row the
+    /// row has the bits of the GPU-only run, every CPU combo's row is within 1 - cosine <= 1e-6 of
+    /// `expert_ffn_mul1_cpu` of its record (the lane's int16 branch at <= 2 rows is held to the
+    /// accuracy bar, not to bits; `ye` filled with NaN before each run, so a row the
     /// lane fails to write shows), `y` = `glm5_moe_combine` of that `ye`, cosine to the oracle >=
     /// `COS_MIN`; max abs and cosine against the GPU-only `y` printed. A post for another table,
     /// or without a CPU combo, runs the GPU path: `y` bit-identical to the GPU-only run.
@@ -1941,8 +1942,13 @@ mod tests {
                 want_experts += mask.count_ones() as u64;
                 let (y, ye) = (cuda::dtoh(yd, h), cuda::dtoh(plan.ye, k * h));
                 for c in 0..k {
-                    let (got, want) = (&ye[c * h..(c + 1) * h], if mask >> c & 1 == 1 { &ye_cpu[c][..] } else { &ye_gpu[c * h..(c + 1) * h] });
-                    assert!(bits(got) == bits(want), "mask {mask:08b} combo {c} ({}): the ye row differs", if mask >> c & 1 == 1 { "CPU" } else { "GPU" });
+                    let got = &ye[c * h..(c + 1) * h];
+                    if mask >> c & 1 == 1 {
+                        let d = 1.0 - cosine(got, &ye_cpu[c]);
+                        assert!(d <= 1e-6, "mask {mask:08b} combo {c} (CPU): the ye row is 1 - cos {d:.3e} from expert_ffn_mul1_cpu");
+                    } else {
+                        assert!(bits(got) == bits(&ye_gpu[c * h..(c + 1) * h]), "mask {mask:08b} combo {c} (GPU): the ye row differs");
+                    }
                 }
                 launch_v(gk.combine, h.div_ceil(256) as u32, 1, 1, 256, &[plan.ye, plan.wts, plan.ys, y2, plan.prm_kh2]);
                 cuda::sync();
@@ -1984,8 +1990,9 @@ mod tests {
     /// x reversed, so the rows route differently; every expert reads its record from pinned. For
     /// several CPU/GPU masks over the 16 combos (both rows mixed, one row all CPU, all CPU): every
     /// GPU combo's `ye` row has the bits of the GPU-only two-row run (its xg row moved to its
-    /// slot), every CPU combo's row the bits of `expert_ffn_mul1_cpu` of its record on its own
-    /// row's x, and `y` (both rows) is `glm5_moe_combine` of that `ye`.
+    /// slot), every CPU combo's row within 1 - cosine <= 1e-6 of `expert_ffn_mul1_cpu` of its
+    /// record on its own row's x (int16 branch: accuracy, not bits), and `y` (both rows) is
+    /// `glm5_moe_combine` of that `ye`.
     #[test]
     #[ignore = "needs the GPU: cargo test --release --lib glm5_moe_gpu -- --ignored --nocapture --test-threads 1"]
     fn glm5_moe_gpu_cpu_lane_rows_of_a_batched_step() {
@@ -2043,15 +2050,19 @@ mod tests {
                 cuda::sync();
                 let (y, ye) = (cuda::dtoh(yd, t * h), cuda::dtoh(plan.ye, t * k * h));
                 for c in 0..t * k {
-                    let cpu = mask >> c & 1 == 1;
-                    let (got, want) = (&ye[c * h..(c + 1) * h], if cpu { &ye_cpu[c][..] } else { &ye_gpu[c * h..(c + 1) * h] });
-                    assert!(bits(got) == bits(want), "mask {mask:016b} combo {c} ({}): the ye row differs", if cpu { "CPU" } else { "GPU" });
+                    let got = &ye[c * h..(c + 1) * h];
+                    if mask >> c & 1 == 1 {
+                        let d = 1.0 - cosine(got, &ye_cpu[c]);
+                        assert!(d <= 1e-6, "mask {mask:016b} combo {c} (CPU): the ye row is 1 - cos {d:.3e} from expert_ffn_mul1_cpu");
+                    } else {
+                        assert!(bits(got) == bits(&ye_gpu[c * h..(c + 1) * h]), "mask {mask:016b} combo {c} (GPU): the ye row differs");
+                    }
                 }
                 launch_v(gk.combine, h.div_ceil(256) as u32, t as u32, 1, 256, &[plan.ye, plan.wts, plan.ys, y2, plan.prm_kh2]);
                 cuda::sync();
                 assert!(bits(&y) == bits(&cuda::dtoh(y2, t * h)), "mask {mask:016b}: y is not the combine of ye");
             }
-            eprintln!("glm5_moe CPU lane, two rows: 8 masks, every ye row the GPU's or the CPU's bits");
+            eprintln!("glm5_moe CPU lane, two rows: 8 masks, every GPU ye row the GPU's bits, every CPU row within 1e-6 of the CPU's");
             plan.free();
             free_ffn(w.shared);
             let (mut wr, mut wb) = (w.router, w.bias);
