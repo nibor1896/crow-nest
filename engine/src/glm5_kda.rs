@@ -263,8 +263,8 @@ impl KdaState {
     /// A CUDA context is current.
     pub unsafe fn reset(&self) {
         cuda::sync();
-        cuda::ck(cudarc::driver::sys::cuMemsetD8_v2(self.s, 0, self.d.state_floats() * 4));
-        cuda::ck(cudarc::driver::sys::cuMemsetD8_v2(self.conv, 0, self.d.conv_floats() * 4));
+        cuda::memset_zero_sync(self.s, self.d.state_floats() * 4);
+        cuda::memset_zero_sync(self.conv, self.d.conv_floats() * 4);
     }
     /// # Safety
     /// A CUDA context is current; no launch still reads these buffers.

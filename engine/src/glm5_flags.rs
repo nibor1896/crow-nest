@@ -1598,7 +1598,7 @@ impl Ctl {
         let reply = Pinned::alloc(4096);
         std::ptr::write_bytes(reply.host as *mut u8, 0, reply.bytes);
         let ctr = cuda::alloc_named("glm5 controller counter", 8);
-        cuda::ck(sys::cuMemsetD8_v2(ctr, 0, 8));
+        cuda::memset_zero_sync(ctr, 8);
         let late = Pinned::alloc(CTL_RING * LATE_WORDS * 8);
         std::ptr::write_bytes(late.host as *mut u8, 0, late.bytes);
         Ctl {

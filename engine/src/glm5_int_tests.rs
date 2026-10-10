@@ -47,6 +47,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_MAX_BATCH",
     "CROW_GLM_LANES2",
     "CROW_GLM_RT2",
+    "CROW_GLM_ATTN2",
 ];
 
 pub(crate) struct Env(Vec<(String, Option<String>)>);
@@ -941,5 +942,116 @@ fn glm5_int_gpu_the_prefetch_store_does_not_wait_for_its_reads() {
         pf.free(&src).unwrap();
     }
     drop(src);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #202: the ARM2 measurement env of the real container (`runs/glm53-flash/quick/arm2.env`:
+/// global arena with warm start, 10 GB elastic / 2.6 GB stage, CPU lane split on host pinned
+/// memory, zero-copy pinned tier, flags + stager + router prefetch on the side stream + shared
+/// overlap, HC fuse, dense GEMM, MoE TC 2, ATTN2, prompt chunk 8192 with stage overlap and NVPF)
+/// on the synthetic model, a 40-id prompt and 8 greedy ids, two generations in one run (as
+/// `glm5_run --reps 2`): after the first decode row of a generation (its warm-up) no decode row
+/// allocates, frees, clears synchronously or reads the free VRAM (`cuda::mem_api_counts`). Then
+/// the real card's case after a long prompt: the elastic part handed back and the free VRAM
+/// held under the reserve by a ballast, so no chunk can grow back; a third generation's decode
+/// rows still read no free VRAM after the first one (before #202 every row read it once per
+/// chunk left down). Prints a digest of every generation's ids and logit bits (the before/after
+/// check of #202).
+#[test]
+#[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_decode_rows_allocate_nothing_after_warm_up() {
+    use crate::cuda::MemApiCounts;
+    use crate::glm5_tiers::ARENA_RESERVE_BYTES;
+    let dir = std::env::temp_dir().join(format!("crow-int-alloc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let s = |v: &str| v.to_string();
+    let env: Vec<(&'static str, String)> = vec![
+        ("CROW_GLM_PINNED", s("zerocopy")),
+        ("CROW_GLM_FLAGS", s("1")),
+        ("CROW_GLM_STAGER", s("1")),
+        ("CROW_GLM_ARENA", s("global")),
+        ("CROW_GLM_ARENA_WARM", warm),
+        ("CROW_GLM_ARENA_ELASTIC_GB", s("10")),
+        ("CROW_GLM_ARENA_STAGE_GB", s("2.6")),
+        ("CROW_GLM_CPU_LANE", s("split")),
+        ("CROW_PINNED_ALLOC", s("host")),
+        ("CROW_GLM_PREFETCH", s("1")),
+        ("CROW_GLM_PREFETCH_SIDE", s("1")),
+        ("CROW_GLM_SHARED_OVERLAP", s("1")),
+        ("CROW_GLM_HCFUSE", s("1")),
+        ("CROW_GLM_DENSE_GEMM", s("1")),
+        ("CROW_CHUNK", s("8192")),
+        ("CROW_GLM_STAGE_OVERLAP", s("1")),
+        ("CROW_GLM_MOE_TC", s("2")),
+        ("CROW_GLM_ATTN2", s("1")),
+        ("CROW_GLM_PREFILL_NVPF", s("1")),
+    ];
+    let g = geo8();
+    let sy = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&sy.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&sy.path).unwrap();
+    let prompt: Vec<i64> = (0..40).map(|i| (i * 61 + 7) % 2048).collect();
+    let n = 8;
+    let digest = |gen: &Generated| -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for v in gen.ids.iter().map(|&i| i as u64).chain(gen.logits.iter().flatten().map(|x| x.to_bits() as u64)) {
+            h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    };
+    // the calls of every decode row (the report after it, against the report before it)
+    let decode_rows = |run: &mut Glm5Run, cnq: &mut Cnq, tiers: &mut ExpertTiers| -> (Generated, Vec<MemApiCounts>) {
+        let mut last = cuda::mem_api_counts();
+        let mut rows = Vec::new();
+        let mut report = |r: &crate::glm5_tiers::TokenReport| {
+            let now = cuda::mem_api_counts();
+            if !r.prompt {
+                rows.push(now.since(&last));
+            }
+            last = now;
+        };
+        // SAFETY: the context is current for the whole test (`cuda::Ctx::init` below)
+        let gen = unsafe { run.generate(cnq, tiers, &prompt, n, true, &mut report) }.unwrap();
+        (gen, rows)
+    };
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        let _env = Env::set(&env);
+        let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+        let mut tiers = ExpertTiers::new(&cnq, &sy.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+        let mut gens = Vec::new();
+        for rep in 0..2 {
+            let (gen, rows) = decode_rows(&mut run, &mut cnq, &mut tiers);
+            eprintln!("glm5 int alloc rep {rep}: ids {:?}, digest {:016x}, decode rows {}, calls per decode row {rows:?}", gen.ids, digest(&gen), rows.len());
+            assert_eq!(rows.len(), n - 1, "rep {rep}: one report per decode row");
+            for (i, c) in rows.iter().enumerate().skip(1) {
+                assert_eq!(*c, MemApiCounts::default(), "rep {rep}: decode row {i} called the driver's memory API");
+            }
+            gens.push(gen);
+        }
+        assert_eq!(gens[1].ids, gens[0].ids, "the second generation's ids");
+        // every elastic chunk handed back, the free VRAM held under the reserve: none grows back
+        tiers.elastic_hand_back(1 << 40).unwrap();
+        let (live, all, vpl) = tiers.elastic_live().unwrap();
+        assert!(live == 0 && all > 0, "every elastic chunk handed back ({live} of {all} live)");
+        let leave = ARENA_RESERVE_BYTES + vpl as u64 * REC / 2;
+        let free = cuda::free_vram_bytes();
+        assert!(free > leave + (1 << 30), "{free} B free VRAM");
+        let mut ballast = cuda::try_alloc_zeroed("test ballast", (free - leave) as usize).unwrap();
+        let fail0 = tiers.arena_elastic_stats().unwrap().realloc_fail;
+        let (gen, rows) = decode_rows(&mut run, &mut cnq, &mut tiers);
+        let e = tiers.arena_elastic_stats().unwrap();
+        eprintln!("glm5 int alloc tight: ids {:?}, digest {:016x}, calls per decode row {rows:?}, elastic {e:?}", gen.ids, digest(&gen));
+        assert_eq!(tiers.elastic_live().unwrap().0, 0, "no elastic chunk grew back under the ballast");
+        assert!(e.realloc_fail > fail0, "the decode rows tried the chunks");
+        for (i, c) in rows.iter().enumerate().skip(1) {
+            assert_eq!(*c, MemApiCounts::default(), "tight: decode row {i} called the driver's memory API");
+        }
+        cuda::free_dev(&mut ballast);
+        tiers.free();
+        run.free();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
