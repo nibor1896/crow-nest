@@ -133,6 +133,8 @@ pub mod glm5_flags;
 pub mod glm5_graph;
 // #182: the glm5_next MTP (NextN) block - eh glue, MLA + DSA, MoE, shared head norm
 pub mod glm5_mtp;
+// #186: the prompt call's trunk input gathered and expanded on the device (CROW_GLM_EMBED_GATHER)
+pub mod glm5_embed;
 // the glm-flash-lite integration: GPU tests of the switches of several branches together
 #[cfg(test)]
 mod glm5_int_tests;
