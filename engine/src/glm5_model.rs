@@ -1201,6 +1201,11 @@ impl Glm5Pass {
                         }
                         // CROW_GLM_SHARED_OVERLAP: decided before the seam (a capture is open up to it)
                         let overlap = self.overlap && t == 1 && self.routed.is_some() && !crate::glm5_graph::capturing();
+                        // #202 CROW_GLM_RT2: x to the CPU lane's host buffer ahead of the publish,
+                        // so the host has it once it saw the router's flag
+                        if t == 1 && crate::glm5_moe::lane::X_EARLY.load(std::sync::atomic::Ordering::Relaxed) && !crate::glm5_graph::capturing() {
+                            p.lane_x_early(self.collapsed);
+                        }
                         crate::glm5_graph::seam_end(lw.layer, p.ids, t * self.moe.topk)?;
                         let ids = match self.routed.as_mut().filter(|_| overlap) {
                             Some(r) => {
