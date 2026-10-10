@@ -266,10 +266,16 @@ impl SplitCost {
 /// tzc)`), up to `maxcpu`; the other pinned ids are read zero-copy by the GPU, so both lanes
 /// finish as close together as the per-expert steps allow. Returns the CPU ids, planning order.
 pub fn plan_split(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)]) -> Vec<u32> {
+    split_ram(cost, gpu_hits, ram, !ram.is_empty()).0
+}
+
+/// [`plan_split`]'s loop over the RAM picks: the CPU ids and the lanes' times `(cpu, gpu)` after
+/// it; `lane` = the CPU lane has work at all (its fixed cost `ca` charged)
+fn split_ram(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)], lane: bool) -> (Vec<u32>, f64, f64) {
     let mut order = ram.to_vec();
     order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut g = cost.g0 + cost.thit * gpu_hits as f64;
-    let mut c = if ram.is_empty() { 0.0 } else { cost.ca };
+    let mut c = if lane { cost.ca } else { 0.0 };
     let mut cpu = Vec::new();
     for &(e, _) in &order {
         let (ce, ge) = (c + cost.cb, g + cost.tzc);
@@ -280,7 +286,49 @@ pub fn plan_split(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)]) -> Vec<
             g = ge;
         }
     }
+    (cpu, c, g)
+}
+
+/// #202: the drive model of the split's picks still landing (the template's serial `nvlat` /
+/// `nvdeep`, sybil-solutions/glm53-flash-offload 6769b27 nv2_host.cpp `start_read`): a fixed
+/// latency in ms (the template's) and the drive's rate in GB/s (`bench_pool_on_container`, pool
+/// 16 x 1 MiB, one fetch of 8 outstanding, 10.89 GB/s, 2026-10-10)
+pub const NV_LAT_MS: f64 = 0.12;
+pub const NV_GBPS: f64 = 10.89;
+
+/// The split under the controller with picks still landing (the template's `plan_and_reply`
+/// with `GLM53_NV_NVCPU`, its default with the CPU lane on, nv2_host.cpp#L462-L470): the
+/// resident RAM picks as [`plan_split`], then the picks whose NVMe read is in flight (`nv`:
+/// expert, expected arrival in ms from now) by arrival: one goes to the CPU when, waiting for
+/// its arrival, that does not raise `max(cpu, gpu)` above the GPU reading it zero-copy once
+/// landed (`max(max(c, a) + cb, g) <= max(c, max(g, a) + tzc)`), up to `maxcpu`.
+pub fn plan_split_nv(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)], nv: &[(u32, f64)]) -> Vec<u32> {
+    let (mut cpu, mut c, mut g) = split_ram(cost, gpu_hits, ram, !ram.is_empty() || !nv.is_empty());
+    let mut order = nv.to_vec();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    for &(e, a) in &order {
+        let a = a.max(0.0);
+        let (ce, ge) = (c.max(a) + cost.cb, g.max(a) + cost.tzc);
+        if cpu.len() < cost.maxcpu && ce.max(g) <= c.max(ge) {
+            c = ce;
+            cpu.push(e);
+        } else {
+            g = ge;
+        }
+    }
     cpu
+}
+
+/// a pinned pick as the CPU lane under the controller sees it
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PinState {
+    /// its record is in its slot: the lane reads it at once
+    Resident,
+    /// its NVMe read is in flight, expected in this many ms (the split decides, [`plan_split_nv`])
+    Landing(f64),
+    /// a copy still writes its slot (a write-back): the GPU reads it (the template's VRAM-ring
+    /// backed keys go to the GPU lane)
+    Busy,
 }
 
 // ---------------------------------------------------------------- #149 path B: the stager switch
@@ -2157,6 +2205,12 @@ impl<'a, M: Mover + Rebase<'a>> ChunkMover<'a, '_, M> {
             unsafe { cuda::stream_wait_event(s, e) };
         }
     }
+    /// `CROW_GLM_CONTROLLER` with the CPU lane: the events of the write-backs still landing in
+    /// pinned slot `q` (the lane's worker polls them; the controller does not wait)
+    fn wb_events(&mut self, q: u32) -> Vec<sys::CUevent> {
+        let rs = self.pending(q);
+        rs.into_iter().map(|r| self.ring.as_ref().expect("pending entries come from the ring").wb[r]).collect()
+    }
     /// the host reads pinned slot `q` (the CPU lane): every write-back into it landed
     fn wait_host(&mut self, q: u32) {
         for r in self.pending(q) {
@@ -2837,23 +2891,28 @@ unsafe fn guess_into_ram(
             continue;
         }
         let Some(q) = d.a.prefetch_admit(ln, e, st.seq) else { continue };
-        // a write-back still landing in the slot goes first (as `ChunkMover::nvme`)
-        if let Some(WbRing { book, wb, .. }) = d.ring.as_mut() {
-            for r in book.pending(q, &mut |r| event_done(wb[r])) {
-                cuda::ck(sys::cuEventSynchronize(wb[r]));
-            }
-        }
+        // a write-back still landing in the slot goes first (as `ChunkMover::nvme`): the read is
+        // submitted once its events completed ([`Deferred`]), the controller does not wait
+        let wb: Vec<u64> = match d.ring.as_mut() {
+            Some(WbRing { book, wb, .. }) => book.pending(q, &mut |r| event_done(wb[r])).into_iter().map(|r| wb[r] as u64).collect(),
+            None => Vec::new(),
+        };
         let dst = RecordDst { gu: (pinned[q as usize / ppl].host as *mut u8).add((q as usize % ppl) * rb as usize), dn: std::ptr::null_mut() };
         let rec = records[ln][e as usize];
         let bytes = rec.parts(&dst).iter().map(|p| p.1.len as u64).sum::<u64>();
         let flag = crate::nvme_source::Landed { flag: (st.landed.host as *mut u64).add(ln * experts + e as usize), value: st.seq };
         // SAFETY: the slot is the arena's for this read (in flight: never a victim, never
         // admitted, never read before its flag); the flag is this key's word, written only by it
-        match src.fetch_prio(&[(rec, dst)], Some(&[flag]), crate::nvme_source::ReadPriority::Demand) {
-            Ok(t) => st.flying.push((t, q)),
-            Err(err) => {
-                d.a.landed(q);
-                return Err(format!("{}: layer {} expert {e}: {err}", glm5_flags::ENV_PREFETCH, first_moe + ln));
+        if !wb.is_empty() {
+            st.stats.wb_deferred += 1;
+            st.defer.submit(DeferJob { events: wb.into_iter().map(|e| (e, false)).collect(), jobs: vec![(rec, dst)], landed: vec![flag], prio: crate::nvme_source::ReadPriority::Demand, slot: Some(q), src });
+        } else {
+            match src.fetch_prio(&[(rec, dst)], Some(&[flag]), crate::nvme_source::ReadPriority::Demand) {
+                Ok(t) => st.flying.push((t, q)),
+                Err(err) => {
+                    d.a.landed(q);
+                    return Err(format!("{}: layer {} expert {e}: {err}", glm5_flags::ENV_PREFETCH, first_moe + ln));
+                }
             }
         }
         pf.stats.issued += 1;
@@ -3240,7 +3299,7 @@ impl ExpertTiers {
     ///
     /// # Safety
     /// As [`ExpertTiers::table_for`].
-    unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<(Dev, u64)>) -> Result<(Dev, Served), String> {
+    unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<CtlReply>) -> Result<(Dev, Served), String> {
         if let Some(e) = self.arena.as_mut().and_then(|d| d.refill_err.take()) {
             return Err(e);
         }
@@ -3258,6 +3317,9 @@ impl ExpertTiers {
         let d = self.arena.as_mut().expect("table_global without the global arena");
         let admit = arena_admits(sel.len(), false, d.cfg.admit_max);
         d.a.set_pin_stay(self.pinned_use.stay);
+        // CROW_GLM_CONTROLLER with the CPU lane: the lane's worker waits per expert, not this thread
+        let ctl_lane = reply.is_some() && self.dev_lane.is_some();
+        let mut waits = LaneWaits::default();
         let served = match self.stager.as_mut() {
             None => {
                 let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[l] };
@@ -3304,6 +3366,9 @@ impl ExpertTiers {
                     read_pinned: Vec::new(),
                     pending: &mut st.pending,
                     stats: &mut st.stats,
+                    defer: &mut st.defer,
+                    landed: Vec::new(),
+                    d2h: Vec::new(),
                 };
                 let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut() };
                 // #203: with the stager the guesses go into the arena's pinned tier (below), not
@@ -3311,12 +3376,23 @@ impl ExpertTiers {
                 let served = serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?;
                 m.settle_locs(&served.locs);
                 if self.pinned_use.cpu_lane {
-                    for &(_, loc) in &served.locs {
+                    for &(e, loc) in &served.locs {
                         if let Loc::Pinned(q) = loc {
-                            m.wait_host(q);
+                            if ctl_lane {
+                                let ev = m.wb_events(q);
+                                if !ev.is_empty() {
+                                    waits.wb.push((e, ev));
+                                }
+                            } else {
+                                m.wait_host(q);
+                            }
                         }
                     }
                 }
+                waits.landed = std::mem::take(&mut m.inner.landed);
+                waits.d2h = std::mem::take(&mut m.inner.d2h);
+                waits.row = m.inner.landed_host;
+                (waits.seq, waits.in_flight, waits.rb) = (m.inner.seq, self.src.records_in_flight(), rb);
                 drop(m);
                 // #202 D1 / #209 D3: the next layer's guess read right behind this layer's demand
                 // (the pool's demand queue), before the answer
@@ -3353,10 +3429,11 @@ impl ExpertTiers {
                     t
                 }
             };
-            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize))
+            let state = |e: u32, rec: *const u8| if ctl_lane { waits.state(e, rec) } else { PinState::Resident };
+            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state)
         };
         match staged {
-            Some((trow, stream, event)) => self.finish_staged(l, lane, served.locs.len(), trow, stream, event, reply)?,
+            Some((trow, stream, event)) => self.finish_staged(l, sel, lane, waits, trow, stream, event, reply)?,
             None => {
                 let post = lane.map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None });
                 crate::glm5_moe::lane::post(post);
@@ -5362,6 +5439,12 @@ pub struct ExpertTiers {
     lane_geo: MoeGeo,
     /// `CROW_GLM_CONTROLLER` with the CPU lane: the lane's device side (lane and stager on)
     dev_lane: Option<glm5_flags::DevLane>,
+    /// `CROW_GLM_CONTROLLER`: the controller's and the CPU lane's clocks, and when the
+    /// controller thread saw the request it is serving (`None` outside a controller job)
+    ctl_clock: std::sync::Arc<glm5_flags::CtlClock>,
+    ctl_seen: Option<std::time::Instant>,
+    /// the serving request's plan and reply spans (from `ctl_seen`), set by `finish_staged`
+    ctl_spans: (std::time::Duration, std::time::Duration),
     /// `CROW_GLM_CPU_LANE=split` as read at construction: the cost model of [`plan_split`]
     /// (`None` = `1` or off: the lane, if on, takes every pinned id)
     pub split: Option<SplitCost>,
@@ -5619,6 +5702,9 @@ impl ExpertTiers {
             lane_clock: Default::default(),
             lane_geo: *moe,
             dev_lane: None,
+            ctl_clock: Default::default(),
+            ctl_seen: None,
+            ctl_spans: Default::default(),
             split: lane_split(std::env::var(CPU_LANE_ENV).ok().as_deref()).then(|| SplitCost::for_threads(lane_threads)),
             heat: vec![0; nl * g.experts],
             stager: None,
@@ -5711,7 +5797,7 @@ impl ExpertTiers {
         // CROW_GLM_MAX_BATCH: a batched step's rows too (one pool run per row)
         let host = self.pinned.get(l).map_or(std::ptr::null(), |p| p.host as *const u8);
         let post = self
-            .lane_plan(l, sel, &mut served, &|e| table[e as usize], &|q| host.add(q as usize * rb as usize))
+            .lane_plan(l, sel, &mut served, &|e| table[e as usize], &|q| host.add(q as usize * rb as usize), &|_, _| PinState::Resident)
             .map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None });
         crate::glm5_moe::lane::post(post);
         self.count_heat(l, sel);
@@ -5851,6 +5937,12 @@ impl ExpertTiers {
         self.lane_clock.clone()
     }
 
+    /// `CROW_GLM_CONTROLLER`: the controller's and the CPU lane's clocks since construction,
+    /// shared (a report reads them while `generate` holds the tiers)
+    pub fn ctl_clock(&self) -> std::sync::Arc<glm5_flags::CtlClock> {
+        self.ctl_clock.clone()
+    }
+
     /// #187 (`glm5_run --cold`): empty the cache again, as after [`ExpertTiers::new`] (see
     /// [`reset_cache`]). The arenas stay allocated; no allocation, no GPU call. `nvme_reads`,
     /// `nvme_bytes` and `moves` keep counting; the cache's own counters restart at 0.
@@ -5870,13 +5962,14 @@ impl ExpertTiers {
     /// No launch reading the store is pending.
     pub unsafe fn free(&mut self) {
         cuda::sync();
+        // the CPU lane's worker first: it may still poll the arena's and the stager's events
+        if let Some(mut d) = self.dev_lane.take() {
+            d.free();
+        }
         let _ = self.drain_flying();
         self.free_arena();
         if let Some(mut st) = self.stager.take() {
             st.free();
-        }
-        if let Some(mut d) = self.dev_lane.take() {
-            d.free();
         }
         if let Some(mut pf) = self.prefetch.take() {
             let _ = pf.free(&self.src);
@@ -5927,13 +6020,108 @@ const WAIT_GEQ: u32 = 0;
 /// staging slots, the landing buffer, the layer's VRAM / pinned slots, its device table and its
 /// pinned table row are free to be rewritten. The one exception is inside a call: an NVMe read
 /// straight into a pinned slot that this call's phase A still copies from (the slot of an expert
-/// promoted to VRAM): the host synchronizes the stager stream first (`gate_syncs`). Under LRU that
+/// promoted to VRAM): that read is handed to [`Deferred`], which submits it once an event behind
+/// the copies completed, so the host does not wait (`gate_syncs` counts them). Under LRU that
 /// needs an NVMe miss that loses VRAM to another pick of the same call, i.e. more picks than VRAM
 /// slots (the synthetic V 3 / top-8 test: 15 of 50 calls); with the plan's 46 VRAM slots an older
 /// victim always exists (derived, not measured).
+/// #202: NVMe reads that may start only once a copy still reading or writing their pinned
+/// destination completed (the stager's gate: a phase-A copy reads the slot; a guessed read: a
+/// write-back still lands in it). The controller thread does not wait for that copy: a thread of
+/// its own waits for the events (`cuEventSynchronize`), then submits the read with its landed
+/// flags; the stream waits on those flags as for any read, so nothing reads the record earlier.
+/// The tickets come back to the stager (`pending`, or `flying` for a guessed record's slot) at
+/// its next call; a failed submission raises the read's flags (the stream goes on) and its error
+/// reaches the stager's next settle.
+struct Deferred {
+    tx: Option<std::sync::mpsc::Sender<DeferJob>>,
+    rx: std::sync::mpsc::Receiver<(Result<crate::nvme_source::Ticket, String>, Option<u32>)>,
+    th: Option<std::thread::JoinHandle<()>>,
+    /// submitted reads whose ticket did not come back yet: without and with a slot
+    out_pending: usize,
+    out_flying: usize,
+}
+
+/// one deferred read: wait for `events` (`own`: created for it, destroyed after), then submit
+struct DeferJob {
+    events: Vec<(u64, bool)>,
+    jobs: Vec<(ExpertRecord, RecordDst)>,
+    landed: Vec<crate::nvme_source::Landed>,
+    prio: crate::nvme_source::ReadPriority,
+    slot: Option<u32>,
+    src: *const NvmeSource,
+}
+// SAFETY: the destinations, flags and the source outlive the job (the stager drains every
+// deferred read before its arena, its flags or the source go: `Stager::drain_deferred`)
+unsafe impl Send for DeferJob {}
+
+impl Deferred {
+    /// # Safety
+    /// A CUDA context is current and outlives the thread.
+    unsafe fn new() -> Deferred {
+        let mut ctx: sys::CUcontext = std::ptr::null_mut();
+        cuda::ck(sys::cuCtxGetCurrent(&mut ctx));
+        let ctx = glm5_flags::SendPtr(ctx as *mut u8);
+        let (tx, jobs) = std::sync::mpsc::channel::<DeferJob>();
+        let (done, rx) = std::sync::mpsc::channel();
+        let th = std::thread::Builder::new()
+            .name("glm5-nvme-deferred".into())
+            .spawn(move || {
+                let c = ctx;
+                // SAFETY: the creator's context, alive while the stager runs
+                unsafe { cuda::ck(sys::cuCtxSetCurrent(c.0 as sys::CUcontext)) };
+                while let Ok(j) = jobs.recv() {
+                    // SAFETY: see `DeferJob`
+                    let r = unsafe {
+                        for &(e, own) in &j.events {
+                            cuda::ck(sys::cuEventSynchronize(e as sys::CUevent));
+                            if own {
+                                cuda::event_destroy(e as sys::CUevent);
+                            }
+                        }
+                        let r = (*j.src).fetch_prio(&j.jobs, Some(&j.landed), j.prio);
+                        if r.is_err() {
+                            // no read will raise them: the stream must not wait for it
+                            for f in &j.landed {
+                                std::ptr::write_volatile(f.flag, f.value);
+                            }
+                        }
+                        r
+                    };
+                    if done.send((r, j.slot)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("glm5 stager: spawning the deferred-read thread");
+        Deferred { tx: Some(tx), rx, th: Some(th), out_pending: 0, out_flying: 0 }
+    }
+
+    fn submit(&mut self, j: DeferJob) {
+        if j.slot.is_some() {
+            self.out_flying += 1;
+        } else {
+            self.out_pending += 1;
+        }
+        self.tx.as_ref().expect("glm5 stager: the deferred-read thread is gone").send(j).expect("glm5 stager: the deferred-read thread is gone");
+    }
+
+    fn join(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.th.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 struct Stager {
     stream: sys::CUstream,
     event: sys::CUevent,
+    /// #202: reads submitted once a copy on their destination completed
+    defer: Deferred,
+    /// a deferred read failed: its error (for the next settle) and its guessed slot (for harvest)
+    defer_err: Option<String>,
+    defer_failed: Vec<u32>,
     /// `stage_cap` records: the NVMe landing of the decode staging slots
     landing: Pinned,
     /// `[MoE layers][experts]` u64: the host side of every layer's record table
@@ -5957,8 +6145,12 @@ pub struct StagerStats {
     pub calls: u64,
     /// NVMe records read with a landed flag (the stager stream waits on each)
     pub landed_reads: u64,
-    /// host syncs of the stager stream before an NVMe read into a pinned slot phase A still reads
+    /// NVMe reads into a pinned slot phase A still reads, deferred until those copies ran (#202:
+    /// formerly a host sync of the stager stream each)
     pub gate_syncs: u64,
+    /// #202: guessed reads deferred until a write-back still landing in their slot completed
+    /// (formerly a host wait for its event)
+    pub wb_deferred: u64,
     /// #202: calls answered (the reply or the compute stream's event queued) and the NVMe
     /// records in flight at each answer, summed (`inflight_at_answer / answers` = records in
     /// flight per layer)
@@ -5985,6 +6177,9 @@ impl Stager {
         let st = Stager {
             stream: cuda::stream_create_non_blocking(),
             event: cuda::event_create(),
+            defer: Deferred::new(),
+            defer_err: None,
+            defer_failed: Vec::new(),
             landing: Pinned::alloc(stage_cap * rb as usize),
             tables: Pinned::alloc(words),
             landed: Pinned::alloc(words),
@@ -6003,10 +6198,61 @@ impl Stager {
         (self.landing.bytes + self.tables.bytes + self.landed.bytes) as u64
     }
 
+    /// #202: the deferred reads' tickets that came back (`block`: until every one of `pending`'s
+    /// kind came, and with `all` every guessed one too) into `pending` / `flying`
+    fn collect_deferred(&mut self, block: bool, all: bool) {
+        loop {
+            let want = block && (self.defer.out_pending > 0 || (all && self.defer.out_flying > 0));
+            let got = if want {
+                match self.defer.rx.recv() {
+                    Ok(x) => x,
+                    Err(_) => {
+                        self.defer.out_pending = 0;
+                        self.defer.out_flying = 0;
+                        self.defer_err.get_or_insert(format!("{STAGER_ENV}: the deferred-read thread is gone"));
+                        return;
+                    }
+                }
+            } else {
+                match self.defer.rx.try_recv() {
+                    Ok(x) => x,
+                    Err(_) => return,
+                }
+            };
+            match got {
+                (r, Some(q)) => {
+                    self.defer.out_flying -= 1;
+                    match r {
+                        Ok(t) => self.flying.push((t, q)),
+                        Err(e) => {
+                            self.defer_failed.push(q);
+                            self.defer_err.get_or_insert(format!("{}: a read of a guessed record: {e}", glm5_flags::ENV_PREFETCH));
+                        }
+                    }
+                }
+                (r, None) => {
+                    self.defer.out_pending -= 1;
+                    match r {
+                        Ok(t) => self.pending.push(t),
+                        Err(e) => {
+                            self.defer_err.get_or_insert(format!("{STAGER_ENV}: a deferred NVMe read: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// #203: the guessed reads that have landed, without blocking: their slots marked landed in
     /// the arena (`None`: no arena); the first failed read by name
     fn harvest(&mut self, mut a: Option<&mut GlobalArena>) -> Result<(), String> {
+        self.collect_deferred(false, false);
         let mut err = None;
+        for q in self.defer_failed.drain(..) {
+            if let Some(a) = a.as_deref_mut() {
+                a.landed(q);
+            }
+        }
         self.flying.retain_mut(|(t, q)| match t.try_done() {
             None => true,
             Some(r) => {
@@ -6024,7 +6270,13 @@ impl Stager {
 
     /// #203: every guessed read waited for (blocking), its slot marked landed
     fn drain_flying(&mut self, src: &NvmeSource, mut a: Option<&mut GlobalArena>) -> Result<(), String> {
-        let mut err = None;
+        self.collect_deferred(true, true);
+        let mut err = self.defer_err.take();
+        for q in self.defer_failed.drain(..) {
+            if let Some(a) = a.as_deref_mut() {
+                a.landed(q);
+            }
+        }
         for (t, q) in self.flying.drain(..) {
             if let Err(e) = src.wait(t) {
                 err.get_or_insert(format!("{}: a read of a guessed record: {e}", glm5_flags::ENV_PREFETCH));
@@ -6038,7 +6290,10 @@ impl Stager {
 
     /// every pending read's report; the first error by name
     fn settle(&mut self, src: &NvmeSource) -> Result<(), String> {
-        let mut err = None;
+        // a deferred gate read was submitted once the earlier call's copies ran, before its
+        // stream waited on its flags: by the next call it has long been submitted
+        self.collect_deferred(true, false);
+        let mut err = self.defer_err.take();
         for t in self.pending.drain(..) {
             if let Err(e) = src.wait(t) {
                 err.get_or_insert(format!("{STAGER_ENV}: an NVMe read of an earlier call: {e}"));
@@ -6051,8 +6306,11 @@ impl Stager {
     /// A CUDA context is current; nothing on the compute stream waits on this stager any more.
     unsafe fn free(&mut self) {
         cuda::stream_sync(self.stream);
+        self.collect_deferred(true, true);
+        self.defer.join();
         // the reads are done (the stager waited on their flags); dropping a ticket drains it
         self.pending.clear();
+        self.flying.clear();
         cuda::event_destroy(self.event);
         cuda::stream_destroy(self.stream);
         self.landing.free();
@@ -6079,6 +6337,105 @@ struct StagerMover<'a> {
     read_pinned: Vec<u32>,
     pending: &'a mut Vec<crate::nvme_source::Ticket>,
     stats: &'a mut StagerStats,
+    /// the gate's reads go through it (no host sync)
+    defer: &'a mut Deferred,
+    /// `CROW_GLM_CONTROLLER` with the CPU lane ([`LaneWaits`]): (expert, landed value) of every
+    /// read this call issued or joined, and the host addresses of pinned records its stream writes
+    landed: Vec<(u32, u64)>,
+    d2h: Vec<usize>,
+}
+
+/// `CROW_GLM_CONTROLLER`: the reply of a controlled call: the mapped reply word, the request's
+/// number, its routing weights (pick order; the CPU lane weights its experts with them)
+#[derive(Clone, Copy, Debug)]
+struct CtlReply<'a> {
+    word: Dev,
+    q: u64,
+    wts: &'a [f32],
+}
+
+/// `CROW_GLM_CONTROLLER` with the CPU lane: what this call's CPU experts wait for before the
+/// lane reads their pinned records (instead of the controller waiting for the stager's event)
+#[derive(Debug)]
+struct LaneWaits {
+    /// (expert, landed value) of every NVMe read this call issued or joined (flag word: `row[e]`)
+    landed: Vec<(u32, u64)>,
+    /// (expert, events) of the write-backs still landing in its pinned slot (global arena ring)
+    wb: Vec<(u32, Vec<sys::CUevent>)>,
+    /// host addresses of pinned records this call's stager stream writes (D2H)
+    d2h: Vec<usize>,
+    /// this layer's row of the stager's landed flags (host)
+    row: *const u64,
+    /// the call's sequence number (its own reads land at it; a joined read at an earlier one)
+    seq: u64,
+    /// NVMe records in flight right after the call's reads were issued
+    in_flight: u64,
+    /// the record bytes (the drive model's service time per record)
+    rb: u64,
+}
+
+impl Default for LaneWaits {
+    fn default() -> LaneWaits {
+        LaneWaits { landed: Vec::new(), wb: Vec::new(), d2h: Vec::new(), row: std::ptr::null(), seq: 0, in_flight: 0, rb: 0 }
+    }
+}
+
+impl LaneWaits {
+    /// the pinned pick `e` (record at host address `rec`) for the lane's split: busy while a copy
+    /// writes it, landing while a read of it is in flight (its expected arrival: [`NV_LAT_MS`] +
+    /// one record's service at [`NV_GBPS`] per record ahead of it and its own; joined reads were
+    /// issued before every read of this call, which queue behind what was already in flight),
+    /// else resident
+    fn state(&self, e: u32, rec: *const u8) -> PinState {
+        if self.wb.iter().any(|x| x.0 == e) || self.d2h.contains(&(rec as usize)) {
+            return PinState::Busy;
+        }
+        let per = self.rb as f64 / (NV_GBPS * 1e9) * 1e3;
+        let own = self.landed.iter().filter(|x| x.1 == self.seq).count() as u64;
+        let ahead = self.in_flight.saturating_sub(own);
+        let (mut joined, mut issued) = (0u64, 0u64);
+        let mut at: Option<f64> = None;
+        for &(x, v) in &self.landed {
+            let p = if v == self.seq {
+                issued += 1;
+                ahead + issued
+            } else {
+                joined += 1;
+                joined
+            };
+            if x == e {
+                // a read whose flag is already up has landed
+                // SAFETY: `row` is the layer's live landed row whenever a read was recorded
+                if unsafe { std::ptr::read_volatile(self.row.add(e as usize)) } < v {
+                    at = Some(at.unwrap_or(0.0).max(NV_LAT_MS + p as f64 * per));
+                }
+            }
+        }
+        at.map_or(PinState::Resident, PinState::Landing)
+    }
+}
+
+/// The CPU experts of one controlled call (`combos` in pick order of `sel`, one row) with their
+/// routing weights and what each waits for: the highest landed value of its reads, its
+/// write-backs' events, and `stager` (the stager's event behind the moves) when the stager stream
+/// writes its record.
+fn lane_picks(sel: &[i32], wts: &[f32], combos: &[crate::glm5_moe::lane::Combo], w: &LaneWaits, stager: Option<sys::CUevent>) -> Vec<glm5_flags::LanePick> {
+    combos
+        .iter()
+        .enumerate()
+        .filter_map(|(c, x)| {
+            let crate::glm5_moe::lane::Combo::Cpu(rec) = *x else { return None };
+            let e = sel[c] as u32;
+            let landed = w.landed.iter().filter(|x| x.0 == e).map(|x| x.1).max();
+            let mut events: Vec<u64> = w.wb.iter().filter(|x| x.0 == e).flat_map(|x| x.1.iter().map(|&v| v as u64)).collect();
+            if let Some(ev) = stager.filter(|_| w.d2h.contains(&(rec as usize))) {
+                events.push(ev as u64);
+            }
+            // SAFETY: `row` is the layer's live landed row whenever a read was recorded
+            let flag = landed.map(|v| (unsafe { w.row.add(e as usize) }, v));
+            Some(glm5_flags::LanePick { rec, w: wts.get(c).copied().unwrap_or(0.0), ready: glm5_flags::Ready { flag, events } })
+        })
+        .collect()
 }
 
 impl Mover for StagerMover<'_> {
@@ -6087,12 +6444,14 @@ impl Mover for StagerMover<'_> {
     fn join(&mut self, e: u32, landed: u64) {
         unsafe { cuda::ck(sys::cuStreamWaitValue64_v2(self.s, self.landed_dev + e as u64 * 8, landed, WAIT_GEQ)) };
         self.stats.joins += 1;
+        self.landed.push((e, landed));
     }
     fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
-        // a reader writes a pinned slot from the host: not while a queued copy still reads it
-        if jobs.iter().any(|(_, d)| matches!(d, Dst::Pinned(q) if self.read_pinned.contains(q))) {
-            unsafe { cuda::stream_sync(self.s) };
-            self.read_pinned.clear();
+        // a reader writes a pinned slot from the host: not while a queued copy still reads it;
+        // the read starts once an event behind those copies completed ([`Deferred`])
+        let gate = jobs.iter().any(|(_, d)| matches!(d, Dst::Pinned(q) if self.read_pinned.contains(q)));
+        // (`read_pinned` stays: a later read into one of those slots is deferred behind them too)
+        if gate {
             self.stats.gate_syncs += 1;
         }
         let rb = self.rb as usize;
@@ -6113,10 +6472,20 @@ impl Mover for StagerMover<'_> {
         // SAFETY: the destinations are the stager's pinned landing and this layer's pinned arena,
         // `rb` bytes each, read only by stager copies queued behind the flags below; the flags
         // are this layer's row, each written by one read per call
-        let t = unsafe { self.src.fetch_landed(&v, &landed) }?;
-        self.pending.push(t);
+        if gate {
+            let ev = unsafe { cuda::event_create() };
+            unsafe {
+                cuda::event_record(ev, self.s);
+                cuda::stream_query(self.s);
+            }
+            self.defer.submit(DeferJob { events: vec![(ev as u64, true)], jobs: v, landed, prio: crate::nvme_source::ReadPriority::Demand, slot: None, src: self.src });
+        } else {
+            let t = unsafe { self.src.fetch_landed(&v, &landed) }?;
+            self.pending.push(t);
+        }
         for &(e, _) in jobs {
             unsafe { cuda::ck(sys::cuStreamWaitValue64_v2(self.s, self.landed_dev + e as u64 * 8, self.seq, WAIT_GEQ)) };
+            self.landed.push((e, self.seq));
         }
         self.stats.landed_reads += jobs.len() as u64;
         Ok(bytes)
@@ -6138,7 +6507,9 @@ impl Mover for StagerMover<'_> {
     fn barrier(&mut self) {}
     fn vram_to_pinned(&mut self, v: u32, q: u32) {
         let p = self.pinned.expect("a pinned destination without a pinned arena");
-        unsafe { cuda::ck(sys::cuMemcpyDtoHAsync_v2((p.host as *mut u8).add(q as usize * self.rb as usize) as *mut _, self.vram + v as u64 * self.rb, self.rb as usize, self.s)) };
+        let dst = unsafe { (p.host as *mut u8).add(q as usize * self.rb as usize) };
+        unsafe { cuda::ck(sys::cuMemcpyDtoHAsync_v2(dst as *mut _, self.vram + v as u64 * self.rb, self.rb as usize, self.s)) };
+        self.d2h.push(dst as usize);
     }
     fn stage_to_vram(&mut self, s: u32, v: u32) {
         unsafe { cuda::ck(sys::cuMemcpyDtoDAsync_v2(self.vram + v as u64 * self.rb, self.stage + s as u64 * self.rb, self.rb as usize, self.s)) };
@@ -6161,6 +6532,9 @@ impl ExpertTiers {
             }
             (false, true) => {
                 cuda::sync();
+                if let Some(d) = self.dev_lane.as_ref() {
+                    d.idle();
+                }
                 let r = self.settle().and(self.drain_flying());
                 if let Some(mut st) = self.stager.take() {
                     st.free();
@@ -6181,7 +6555,7 @@ impl ExpertTiers {
     unsafe fn sync_dev_lane(&mut self) {
         let want = self.pinned_use.cpu_lane && self.stager.is_some();
         match (want, self.dev_lane.is_some()) {
-            (true, false) => self.dev_lane = Some(glm5_flags::DevLane::new(self.topk, self.lane_geo.hidden, self.rb)),
+            (true, false) => self.dev_lane = Some(glm5_flags::DevLane::new(self.lane_geo.hidden, self.lane_geo, self.lane_clock.clone(), self.ctl_clock.clone())),
             (false, true) => {
                 cuda::sync();
                 if let Some(mut d) = self.dev_lane.take() {
@@ -6217,21 +6591,29 @@ impl ExpertTiers {
     /// `q`): which pinned ids the CPU computes (every one; `split`: those `plan_split` gives it,
     /// from the layer's heat) and the combos. `None` with the lane off, more rows than a batched
     /// step holds, or no pinned pick; the counters move the CPU's ids from zero-copy to the lane.
-    fn lane_plan(&self, l: usize, sel: &[i32], served: &mut Served, table: &dyn Fn(u32) -> u64, host: &dyn Fn(u32) -> *const u8) -> Option<(Vec<crate::glm5_moe::lane::Combo>, Vec<u32>)> {
+    ///
+    /// `state` sorts the pinned picks under the controller ([`PinState`]): the lane takes resident
+    /// ones (`1`: all of them; `split`: as planned), a pick still landing only when
+    /// [`plan_split_nv`] gives it to the CPU (never under `1`), a busy one never; so the lane waits
+    /// for a landing only where the split planned that wait. Without the controller every pick is
+    /// resident to it (the host lane waits for the stager's event).
+    fn lane_plan(&self, l: usize, sel: &[i32], served: &mut Served, table: &dyn Fn(u32) -> u64, host: &dyn Fn(u32) -> *const u8, state: &dyn Fn(u32, *const u8) -> PinState) -> Option<(Vec<crate::glm5_moe::lane::Combo>, Vec<u32>)> {
         let k = self.topk;
         if !self.pinned_use.cpu_lane || sel.is_empty() || sel.len() % k != 0 || sel.len() / k > MAX_BATCH || served.moves.zero_copy == 0 {
             return None;
         }
         let e = self.cache.experts;
         let heat = &self.heat[l * e..(l + 1) * e];
-        let pinned: Vec<u32> = served.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).map(|x| x.0).collect();
+        let pinned: Vec<(u32, PinState)> = served.locs.iter().filter_map(|x| if let Loc::Pinned(q) = x.1 { Some((x.0, state(x.0, host(q)))) } else { None }).collect();
+        let resident: Vec<u32> = pinned.iter().filter(|x| x.1 == PinState::Resident).map(|x| x.0).collect();
         let cpu = match self.split {
             Some(cost) => {
                 let hits = served.locs.len() - pinned.len();
-                let ram: Vec<(u32, u32)> = pinned.iter().map(|&x| (x, heat[x as usize])).collect();
-                plan_split(&cost, hits, &ram)
+                let ram: Vec<(u32, u32)> = resident.iter().map(|&x| (x, heat[x as usize])).collect();
+                let nv: Vec<(u32, f64)> = pinned.iter().filter_map(|x| if let PinState::Landing(a) = x.1 { Some((x.0, a)) } else { None }).collect();
+                plan_split_nv(&cost, hits, &ram, &nv)
             }
-            None => pinned,
+            None => resident,
         };
         let (combos, n) = lane_combos_where(sel, &served.locs, |e, _| table(e), |q| host(q), |e| cpu.contains(&e));
         let nd = cpu.len() as u64;
@@ -6292,16 +6674,28 @@ impl ExpertTiers {
     /// # Safety
     /// As [`ExpertTiers::table_for`]; the device published this call's request (so every earlier
     /// call's experts ran); `reply` is a mapped u64 the device waits on.
-    pub unsafe fn table_reply(&mut self, layer: usize, sel: &[i32], reply: Dev, q: u64) -> Result<(), String> {
+    pub unsafe fn table_reply(&mut self, layer: usize, sel: &[i32], wts: &[f32], reply: Dev, q: u64) -> Result<(), String> {
+        let seen = std::time::Instant::now();
+        self.ctl_seen = Some(seen);
+        let r = self.table_reply_seen(layer, sel, wts, reply, q);
+        self.ctl_seen = None;
+        let (plan, rep) = std::mem::take(&mut self.ctl_spans);
+        if r.is_ok() {
+            self.ctl_clock.served(plan, rep, seen.elapsed());
+        }
+        r
+    }
+
+    unsafe fn table_reply_seen(&mut self, layer: usize, sel: &[i32], wts: &[f32], reply: Dev, q: u64) -> Result<(), String> {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         if self.stager.is_none() {
             return Err(format!("{}=1 needs {STAGER_ENV}=1", glm5_flags::ENV_CONTROLLER));
         }
         let ids = distinct_ids(sel, self.cache.experts)?;
         if self.arena.is_some() {
-            return self.table_global(l, sel, &ids, Some((reply, q))).map(|_| ());
+            return self.table_global(l, sel, &ids, Some(CtlReply { word: reply, q, wts })).map(|_| ());
         }
-        self.table_staged(l, sel, &ids, Some((reply, q))).map(|_| ())
+        self.table_staged(l, sel, &ids, Some(CtlReply { word: reply, q, wts })).map(|_| ())
     }
 
     /// `CROW_GLM_CONTROLLER`: wait for the stager stream (after a failure in a controller job)
@@ -6339,10 +6733,10 @@ impl ExpertTiers {
     /// The tail of a stager call (per-layer and global): the record table (its pinned row `trow`)
     /// up on the stager stream behind the moves, then either the compute stream's event wait and
     /// the CPU lane's post (`ready` = the stager's event), or, under the controller, the reply
-    /// word behind the batch and the CPU lane served here on the controller thread
-    /// ([`glm5_flags::DevLane::serve`]: the CPU's table entries point at its zeroed record, its
-    /// rows are computed once the stager's moves are done, the lane flag goes to the request's
-    /// number, also with no CPU combo).
+    /// word behind the batch and the CPU lane handed to its own thread, the controller waiting for
+    /// nothing ([`glm5_flags::DevLane::submit`]: the CPU's table entries point at its zeroed
+    /// record; each CPU expert waits there for what `waits` names for it, its record's landing;
+    /// the lane flag goes to the request's number, also with no CPU combo).
     ///
     /// # Safety
     /// As [`ExpertTiers::table_staged`]; `trow` is layer `l`'s pinned table row.
@@ -6350,14 +6744,16 @@ impl ExpertTiers {
     unsafe fn finish_staged(
         &mut self,
         l: usize,
+        sel: &[i32],
         lane: Option<(Vec<crate::glm5_moe::lane::Combo>, Vec<u32>)>,
-        _served: usize,
+        waits: LaneWaits,
         trow: *mut u64,
         stream: sys::CUstream,
         event: sys::CUevent,
-        reply: Option<(Dev, u64)>,
+        reply: Option<CtlReply>,
     ) -> Result<(), String> {
         let experts = self.cache.experts;
+        let plan_at = self.ctl_seen.map(|t| t.elapsed());
         let dev_lane = reply.is_some() && self.dev_lane.is_some();
         if dev_lane {
             if let Some((_, cpu)) = lane.as_ref() {
@@ -6383,21 +6779,25 @@ impl ExpertTiers {
             }
             // CROW_GLM_CONTROLLER: the reply word behind the batch; the compute stream's device
             // wait for it was queued long before
-            Some((w, q)) => {
-                cuda::ck(sys::cuStreamWriteValue64_v2(stream, w, q, 0));
+            Some(CtlReply { word, q, wts }) => {
+                // a CPU expert whose pinned record this call's stager stream writes (D2H) waits
+                // for the stream's event behind the moves (no flag of its own)
+                let d2h_cpu = lane.as_ref().is_some_and(|(combos, _)| combos.iter().any(|x| matches!(*x, crate::glm5_moe::lane::Combo::Cpu(r) if waits.d2h.contains(&(r as usize)))));
+                if dev_lane && d2h_cpu {
+                    cuda::event_record(event, stream);
+                }
+                cuda::ck(sys::cuStreamWriteValue64_v2(stream, word, q, 0));
                 cuda::stream_query(stream);
+                if let (Some(t), Some(p)) = (self.ctl_seen, plan_at) {
+                    self.ctl_spans = (p, t.elapsed());
+                }
                 crate::glm5_moe::lane::post(None);
                 if dev_lane {
-                    let cpu: Vec<(usize, *const u8)> = match lane.as_ref() {
-                        Some((combos, _)) => {
-                            // the CPU reads its records once the moves that put them there ran
-                            cuda::event_record(event, stream);
-                            cuda::ck(sys::cuEventSynchronize(event));
-                            combos.iter().enumerate().filter_map(|(c, x)| if let crate::glm5_moe::lane::Combo::Cpu(r) = *x { Some((c, r)) } else { None }).collect()
-                        }
+                    let picks = match lane.as_ref() {
+                        Some((combos, _)) => lane_picks(sel, wts, combos, &waits, d2h_cpu.then_some(event)),
                         None => Vec::new(),
                     };
-                    self.dev_lane.as_ref().expect("dev lane").serve(q, &cpu, &self.lane_geo, &self.lane_clock);
+                    self.dev_lane.as_ref().expect("dev lane").submit(q, picks);
                 }
             }
         }
@@ -6411,7 +6811,7 @@ impl ExpertTiers {
     ///
     /// # Safety
     /// As [`ExpertTiers::table_for`]; the host has seen this layer's router finish (its flag).
-    unsafe fn table_staged(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<(Dev, u64)>) -> Result<(Dev, Served), String> {
+    unsafe fn table_staged(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<CtlReply>) -> Result<(Dev, Served), String> {
         let rb = self.rb;
         let experts = self.cache.experts;
         let st = self.stager.as_mut().expect("table_staged without the stager");
@@ -6434,10 +6834,22 @@ impl ExpertTiers {
             read_pinned: Vec::new(),
             pending: &mut st.pending,
             stats: &mut st.stats,
+            defer: &mut st.defer,
+            landed: Vec::new(),
+            d2h: Vec::new(),
         };
         let mut served = match self.prefetch.as_mut() {
             Some(pf) => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut glm5_flags::PrefetchMover::new(&mut m, pf, &self.src, l, self.stage, Some(st.stream)))?,
             None => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut m)?,
+        };
+        let waits = LaneWaits {
+            landed: std::mem::take(&mut m.landed),
+            wb: Vec::new(),
+            d2h: std::mem::take(&mut m.d2h),
+            row: m.landed_host,
+            seq: m.seq,
+            in_flight: self.src.records_in_flight(),
+            rb,
         };
         let (stream, event, trow) = (st.stream, st.event, (st.tables.host as *mut u64).add(row));
         // the table into this layer's pinned row (its last upload ran before this layer's
@@ -6455,9 +6867,11 @@ impl ExpertTiers {
         let pin_host = self.pinned.get(l).map_or(std::ptr::null(), |p| p.host as *const u8);
         let lane = {
             let tv: Vec<u64> = host.to_vec();
-            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| pin_host.add(q as usize * rb as usize))
+            let ctl_lane = reply.is_some() && self.dev_lane.is_some();
+            let state = |e: u32, rec: *const u8| if ctl_lane { waits.state(e, rec) } else { PinState::Resident };
+            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| pin_host.add(q as usize * rb as usize), &state)
         };
-        self.finish_staged(l, lane, served.locs.len(), trow, stream, event, reply)?;
+        self.finish_staged(l, sel, lane, waits, trow, stream, event, reply)?;
         self.count_heat(l, sel);
         if let Some(pf) = self.prefetch.as_mut() {
             let cache = &self.cache;
@@ -8185,7 +8599,7 @@ fn ctl_job(t: &mut ExpertTiers, mut rd: glm5_flags::RingReader, n: usize, score:
         // SAFETY: the host side of the protocol: the main thread does not touch the store while
         // a job runs; the device published this layer's request after the experts of its
         // previous call ran (see `Stager`)
-        if let Err(e) = unsafe { t.table_reply(rq.layer, &rq.ids, rd.reply_dev, rq.seq) } {
+        if let Err(e) = unsafe { t.table_reply(rq.layer, &rq.ids, &rq.wts, rd.reply_dev, rq.seq) } {
             unsafe { t.stager_idle() };
             rd.release_all();
             t.dev_lane_release();
@@ -10016,6 +10430,18 @@ mod split_tests {
         assert_eq!(plan_split(&c, 6, &[]), Vec::<u32>::new());
         // a CPU much faster than PCIe takes every pinned id, coldest first
         assert_eq!(plan_split(&SplitCost { cb: 0.01, ..c }, 0, &ram), vec![2, 7, 9, 5, 11]);
+        // #202 the template's nvcpu rule: no pick landing = plan_split; a landing pick goes to the
+        // CPU only when its wait does not raise the layer's max (CPU 0.05 + 0.3 vs GPU 0.1 + 0.25
+        // at arrival 0: CPU, the next GPU; arrival 10 ms: max(10.3, 0.1) > max(0.05, 10.25): GPU);
+        // considered by arrival
+        assert_eq!(plan_split_nv(&c, 0, &ram, &[]), plan_split(&c, 0, &ram));
+        assert_eq!(plan_split_nv(&c, 0, &[], &[(4, 10.0)]), Vec::<u32>::new());
+        assert_eq!(plan_split_nv(&c, 0, &[], &[(4, 0.0), (6, 0.0)]), vec![4]);
+        assert_eq!(plan_split_nv(&c, 0, &[], &[(8, 2.0), (3, 0.0)]), vec![3]);
+        assert_eq!(plan_split_nv(&SplitCost { maxcpu: 0, ..c }, 0, &[], &[(3, 0.0)]), Vec::<u32>::new());
+        // behind the resident ones (CPU 0.65, GPU 0.85): a pick landing at 0.4 ms waits nothing
+        // past the CPU's work and goes there (0.95 <= max(0.65, 1.1))
+        assert_eq!(plan_split_nv(&c, 0, &ram, &[(13, 0.4)]), vec![2, 5, 13]);
         // a CPU much slower takes none
         assert_eq!(plan_split(&SplitCost { cb: 5.0, ..c }, 0, &ram), Vec::<u32>::new());
     }
@@ -10850,6 +11276,259 @@ mod nvme_par_tests {
                 let got = std::slice::from_raw_parts(host.add((a - base) as usize), t.rb as usize).to_vec();
                 assert!(got == record_bytes(&t, 1, e as u32), "expert {e}: the table's slot does not hold the record");
             }
+            t.free();
+        }
+    }
+
+    /// #202 D-A: under the controller with the CPU lane, `table_reply` plans, starts the NVMe
+    /// reads and queues the reply without waiting for any landing (the former controller waited
+    /// for the stager's event, i.e. for every read of the call, then computed the CPU's experts
+    /// itself); the CPU lane runs on its own thread and takes, under `CROW_GLM_CPU_LANE=1`, only
+    /// resident pinned picks (a pick still landing goes to the GPU, which reads it zero-copy once
+    /// the stager stream saw it land), so it never waits for a landing. Every expert pinned (V 0
+    /// + P 16), the slow pool (1 worker, 4 KiB pieces). Call 1: 8 misses read into pinned slots:
+    /// the call returns while they are in flight, the lane computes nothing, its flag comes while
+    /// they are still in flight, the reply once they landed. Call 2: 4 resident + 4 misses: the lane
+    /// computes the 4 resident ones in one pool run without waiting, its flag again before the
+    /// misses land, and its one row = sum of w x FFN(record, x) of those 4 on the host within 1e-5
+    /// of its largest value (#202 D-C); the misses' table entries are their pinned slots.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib nvme_par_tests -- --ignored --nocapture --test-threads 1"]
+    fn glm5_nvme_par_gpu_the_controller_replies_while_the_reads_and_the_cpu_lane_run() {
+        let g = geo8();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let cnq = Cnq::open_checked(&s.path).unwrap();
+        let h = g.hidden;
+        let wts: Vec<f32> = (0..g.topk).map(|c| 0.05 + 0.03 * c as f32).collect();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut t = {
+                let _env = Env::set(&[
+                    ("CROW_GLM_ARENA", "global".to_string()),
+                    ("CROW_GLM_ARENA_VRING", "0".to_string()),
+                    ("CROW_NVME_POOL", "1".to_string()),
+                    ("CROW_NVME_POOL_THREADS", "1".to_string()),
+                    ("CROW_NVME_POOL_PIECE_KB", "4".to_string()),
+                    ("CROW_GLM_CPU_LANE", "1".to_string()),
+                    ("CROW_PINNED_ALLOC", "host".to_string()),
+                ]);
+                let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 0, pinned: 16 }, 1, g.topk).unwrap();
+                t.set_stager(true).unwrap();
+                t
+            };
+            let first = t.first_moe;
+            let mut reply = Pinned::alloc(4096);
+            std::ptr::write_bytes(reply.host as *mut u8, 0, 8);
+            let dl = t.dev_lane().expect("the lane's device side with lane + stager");
+            let me = std::thread::current().id();
+            for (q, sel) in [(1u64, (0..8).collect::<Vec<i32>>()), (2, vec![0, 1, 2, 3, 8, 9, 10, 11])] {
+                let mut rng = 0x202a_u64 + q;
+                let x: Vec<f32> = (0..h)
+                    .map(|_| {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                    })
+                    .collect();
+                std::ptr::copy_nonoverlapping(x.as_ptr(), dl.x_host as *mut f32, h);
+                let lane0 = t.cpu_lane_clock().read();
+                let c0 = t.ctl_clock().read();
+                let t0 = std::time::Instant::now();
+                t.table_reply(first, &sel, &wts, reply.dev, q).unwrap();
+                let took = t0.elapsed();
+                let flying = t.nvme_io().1;
+                let lane = t.dev_lane.as_ref().unwrap();
+                let flag_at_return = lane.flag_now();
+                eprintln!("glm5 ctl lane call {q}: table_reply {took:?}, records in flight at its return {flying}, lane flag {flag_at_return}");
+                assert!(flying > 0, "call {q}: the controller returned after every read had landed: it waited for the landing");
+                let tw = std::time::Instant::now();
+                while lane.flag_now() < q {
+                    assert!(tw.elapsed().as_secs() < 30, "call {q}: lane flag {} after 30 s", lane.flag_now());
+                    std::thread::yield_now();
+                }
+                let flying_at_flag = t.nvme_io().1;
+                while std::ptr::read_volatile(reply.host as *const u64) < q {
+                    assert!(tw.elapsed().as_secs() < 30, "call {q}: reply {} after 30 s", std::ptr::read_volatile(reply.host as *const u64));
+                    std::thread::yield_now();
+                }
+                assert!(lane.thread_id().is_some_and(|w| w != me), "call {q}: the CPU lane ran on the controller's thread");
+                let (lane1, c1) = (t.cpu_lane_clock().read(), t.ctl_clock().read().since(&c0));
+                let (experts, runs) = (lane1.1 - lane0.1, lane1.2 - lane0.2);
+                eprintln!("glm5 ctl lane call {q}: CPU experts {experts} in {runs} pool runs, waited {} ns for landings, records in flight at the lane flag {flying_at_flag}", c1.cpu_wait_land_ns);
+                let resident = if q == 1 { 0 } else { 4 };
+                assert_eq!(experts, resident as u64, "call {q}: the lane took picks still landing");
+                assert_eq!(c1.cpu_wait_land_ns, 0, "call {q}: the lane waited for a landing");
+                assert!(flying_at_flag > 0, "call {q}: the lane flag came only after the reads landed");
+                if q == 2 {
+                    assert_eq!(runs, 1, "call 2: the resident records in one pool run");
+                    let table = cuda::dtoh_u64(t.tables[0], g.experts);
+                    let dummy = lane.dummy;
+                    assert!(sel[..4].iter().all(|&e| table[e as usize] == dummy) && sel[4..].iter().all(|&e| table[e as usize] != dummy && table[e as usize] != 0), "call 2: the table's CPU entries");
+                }
+                // the reference: the CPU's picks (the resident ones, pick order), weighted, in f64
+                let mut want = vec![0f64; h];
+                for (c, &e) in sel.iter().enumerate().take(resident) {
+                    let rec = record_bytes(&t, 0, e as u32);
+                    let ex = crate::cpu_mul1::Mul1Expert::from_record(&rec, h, moe.expert_inter, moe.bitrate).unwrap();
+                    let mut y = vec![0f32; h];
+                    let lim = moe.swiglu_limit;
+                    crate::cpu_mul1::experts_ffn(std::slice::from_ref(&ex), &x, &mut y, &move |a, b| crate::glm5_moe::swiglu_clamp(a, b, lim), 8, crate::cpu_mul1::Path::Auto);
+                    for (a, v) in want.iter_mut().zip(&y) {
+                        *a += wts[c] as f64 * *v as f64;
+                    }
+                }
+                let got = lane.row();
+                let scale = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+                let err = got.iter().zip(&want).fold(0f64, |m, (a, b)| m.max((*a as f64 - b).abs()));
+                eprintln!("glm5 ctl lane call {q}: row max abs error {err:.3e} at max |y| {scale:.3e}");
+                assert!(err <= 1e-5 * scale.max(f64::MIN_POSITIVE) && (resident == 0 || scale > 0.0), "call {q}: the lane's row is off by {err} at max {scale}");
+            }
+            let c = t.ctl_clock().read();
+            eprintln!("glm5 ctl lane: {} requests, serve {:.1} us per layer, CPU busy {:.1} us waiting {:.1} us per layer", c.requests, c.per_layer_us(c.serve_ns), c.per_layer_us(c.cpu_busy_ns), c.per_layer_us(c.cpu_wait_land_ns));
+            cuda::sync();
+            t.settle().unwrap();
+            reply.free();
+            t.free();
+        }
+    }
+
+    /// #202: a deferred read waits for its event, not its submitter. A stream held on a host word,
+    /// an event behind the hold, one 1 MiB read deferred behind that event: `submit` returns at
+    /// once; 200 ms later the read has not started (its landed flag is down, no ticket back);
+    /// released, the ticket comes back into `flying` with its slot, the flag is up and the bytes
+    /// are the file's.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib nvme_par_tests -- --ignored --nocapture --test-threads 1"]
+    fn glm5_nvme_par_gpu_a_deferred_read_waits_for_its_event_not_its_submitter() {
+        use crate::geo::ExpertCodec;
+        use crate::nvme_source::{ColdSource, ExpertRecord, Landed, NvmeConfig, PoolAsk, PoolConfig, RecordLayout, Span};
+        const LEN: usize = 1 << 20;
+        let dir = std::env::temp_dir().join(format!("crow-defer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("raw.bin");
+        let bytes: Vec<u8> = (0..LEN).map(|i| (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut cfg = NvmeConfig::new(&path);
+        cfg.pool = PoolAsk::On(PoolConfig { threads: 4, piece: 256 << 10 });
+        let src = NvmeSource::open(&cfg).unwrap();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut st = Stager::new(1, 16, 1, LEN as u64).unwrap();
+            let mut hold = Pinned::alloc(4096);
+            let mut dst = Pinned::alloc(LEN);
+            let (hw, fw) = (hold.host as *mut u64, (hold.host as *mut u64).add(8));
+            std::ptr::write_volatile(hw, 0);
+            std::ptr::write_volatile(fw, 0);
+            let s = cuda::stream_create_non_blocking();
+            cuda::ck(sys::cuStreamWaitValue64_v2(s, hold.dev, 1, WAIT_GEQ));
+            let ev = cuda::event_create();
+            cuda::event_record(ev, s);
+            cuda::stream_query(s);
+            let rec = ExpertRecord { layer: 0, id: 0, gu: Span { off: 0, len: LEN }, dn: Span { off: 0, len: 0 }, codec: ExpertCodec::Mul1, layout: RecordLayout::OneUnit };
+            let t0 = std::time::Instant::now();
+            st.defer.submit(DeferJob {
+                events: vec![(ev as u64, false)],
+                jobs: vec![(rec, RecordDst { gu: dst.host as *mut u8, dn: std::ptr::null_mut() })],
+                landed: vec![Landed { flag: fw, value: 7 }],
+                prio: crate::nvme_source::ReadPriority::Demand,
+                slot: Some(3),
+                src: &src,
+            });
+            let took = t0.elapsed();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            st.collect_deferred(false, false);
+            let (flag_held, back_held) = (std::ptr::read_volatile(fw), st.flying.len());
+            std::ptr::write_volatile(hw, 1);
+            st.collect_deferred(true, true);
+            assert_eq!(st.flying.len(), 1, "the ticket came back into flying");
+            let (t, q) = st.flying.pop().unwrap();
+            src.wait(t).unwrap();
+            eprintln!("glm5 deferred read: submit {took:?}; held 200 ms: flag {flag_held}, tickets back {back_held}; released: flag {}", std::ptr::read_volatile(fw));
+            assert!(took.as_millis() < 20, "submit waited ({took:?})");
+            assert_eq!((flag_held, back_held), (0, 0), "the read started before its event");
+            assert_eq!((q, std::ptr::read_volatile(fw)), (3, 7));
+            assert!(std::slice::from_raw_parts(dst.host as *const u8, LEN) == &bytes[..], "the record's bytes");
+            cuda::stream_sync(s);
+            cuda::event_destroy(ev);
+            cuda::stream_destroy(s);
+            st.free();
+            hold.free();
+            dst.free();
+        }
+        drop(src);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #202: the stager's gate (an NVMe read into a pinned slot a queued phase-A copy of the same
+    /// call still reads) no longer synchronizes the stager stream on the host. Per-layer store,
+    /// V 3 + P 4, the stager on, 40 calls of 8 random picks (seeded); before each call the stager
+    /// stream is held on a host word released 300 ms later by another thread. Every call, gated
+    /// or not, returns well before the release (the former host sync waited for it); the calls
+    /// gated at least once; the device's table entries hold the container's records.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib nvme_par_tests -- --ignored --nocapture --test-threads 1"]
+    fn glm5_nvme_par_gpu_the_stager_gate_does_not_wait_on_the_host() {
+        let g = geo8();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let cnq = Cnq::open_checked(&s.path).unwrap();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut t = {
+                let _env = Env::set(&[]);
+                let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+                t.set_stager(true).unwrap();
+                t
+            };
+            let first = t.first_moe;
+            let mut hold = Pinned::alloc(4096);
+            let hw = glm5_flags::SendPtr(hold.host as *mut u64);
+            let mut rng = 0x2020_u64;
+            let (mut gated, mut slowest) = (0u64, std::time::Duration::ZERO);
+            for call in 0..40 {
+                let mut sel: Vec<i32> = Vec::new();
+                while sel.len() < g.topk {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let e = ((rng >> 33) % g.experts as u64) as i32;
+                    if !sel.contains(&e) {
+                        sel.push(e);
+                    }
+                }
+                std::ptr::write_volatile(hw.0, 0);
+                let st = t.stager.as_ref().unwrap().stream;
+                cuda::ck(sys::cuStreamWaitValue64_v2(st, hold.dev, 1, WAIT_GEQ));
+                cuda::stream_query(st);
+                let hp = glm5_flags::SendPtr(hw.0);
+                let rel = std::thread::spawn(move || {
+                    let hp = hp;
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    // SAFETY: the live mapped word
+                    unsafe { std::ptr::write_volatile(hp.0, 1) };
+                });
+                let g0 = t.stager_stats().unwrap().gate_syncs;
+                let t0 = std::time::Instant::now();
+                let (table, served) = t.table_for(first, &sel).unwrap();
+                let took = t0.elapsed();
+                let gate = t.stager_stats().unwrap().gate_syncs - g0;
+                gated += gate;
+                slowest = slowest.max(took);
+                rel.join().unwrap();
+                cuda::sync();
+                t.settle().unwrap();
+                assert!(took.as_millis() < 150, "call {call}: table_for took {took:?} with the stager stream held (gate {gate}): the host waited for the stream");
+                let addrs = cuda::dtoh_u64(table, g.experts);
+                for &(e, _) in &served.locs {
+                    let a = addrs[e as usize];
+                    let want = record_bytes(&t, 0, e);
+                    let got = cuda::dtoh_t::<u8>(a, t.rb as usize);
+                    assert!(got == want, "call {call}: expert {e}: the table's record is not the container's");
+                }
+            }
+            eprintln!("glm5 stager gate: 40 calls, {gated} gated reads deferred, slowest call {slowest:?} with the stream held 300 ms");
+            assert!(gated > 0, "no call gated: the test means nothing");
+            hold.free();
             t.free();
         }
     }
