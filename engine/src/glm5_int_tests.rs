@@ -47,6 +47,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_MAX_BATCH",
     "CROW_GLM_LANES2",
     "CROW_GLM_RT2",
+    "CROW_GLM_RT2_TABLE_SM",
     "CROW_GLM_ATTN2",
 ];
 
@@ -785,7 +786,9 @@ fn glm5_int_gpu_lanes2_is_the_measurement_arm_within_the_accuracy_bar() {
 /// arm's ids and logits bit for bit (the same experts on the GPU, the same combine sum); with the
 /// lane the same ids and a logit cosine >= 0.9999 per generated row (RT2's lane leaves a pick still
 /// landing or written back to the GPU, so the CPU set may differ). Every RT2 arm ran its decode
-/// layers through `experts_rt2`.
+/// layers through `experts_rt2`. #202 `CROW_GLM_RT2_TABLE_SM=1` (the tables through the SMs, not
+/// the copy engine): without the lane the RT2 arm's ids and logits bit for bit, with the lane the
+/// arm's ids within the same bar.
 #[test]
 #[ignore = "needs the GPU (about 12 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
 fn glm5_int_gpu_rt2_is_the_arm_without_the_controller_within_the_accuracy_bar() {
@@ -817,13 +820,15 @@ fn glm5_int_gpu_rt2_is_the_arm_without_the_controller_within_the_accuracy_bar() 
     let calls = || crate::glm5_moe::lane::RT2_CALLS.load(std::sync::atomic::Ordering::Relaxed);
     for (what, sizes) in [("V3 P4", TierSizes { vram: 3, pinned: 4 }), ("V0 P16", TierSizes { vram: 0, pinned: 16 })] {
         let c0 = calls();
-        let outs = run_loaded_arms(&[("arm no lane", base.clone()), ("arm no lane rt2", plus(&base, &[("CROW_GLM_RT2", "1")]))], &prompt, n, sizes);
+        let sm = [("CROW_GLM_RT2", "1"), ("CROW_GLM_RT2_TABLE_SM", "1")];
+        let outs = run_loaded_arms(&[("arm no lane", base.clone()), ("arm no lane rt2", plus(&base, &[("CROW_GLM_RT2", "1")])), ("arm no lane rt2 sm", plus(&base, &sm))], &prompt, n, sizes);
         let c1 = calls();
-        eprintln!("glm5 int rt2 {what} no lane: NVMe reads arm {} rt2 {}, RT2 calls {}", outs[0].nvme_reads, outs[1].nvme_reads, c1 - c0);
-        assert_same(&["arm no lane", "arm no lane rt2"], &outs);
+        eprintln!("glm5 int rt2 {what} no lane: NVMe reads arm {} rt2 {} rt2 sm {}, RT2 calls {}", outs[0].nvme_reads, outs[1].nvme_reads, outs[2].nvme_reads, c1 - c0);
+        assert_same(&["arm no lane", "arm no lane rt2", "arm no lane rt2 sm"], &outs);
         assert_eq!(outs[0].nvme_reads, outs[1].nvme_reads, "{what}: RT2 moves no record differently");
+        assert_eq!(outs[0].nvme_reads, outs[2].nvme_reads, "{what}: RT2 with the SM tables moves no record differently");
         assert!(c1 > c0, "{what}: no decode layer ran through experts_rt2");
-        let outs = run_loaded_arms(&[("arm", lane.clone()), ("arm rt2", plus(&lane, &[("CROW_GLM_RT2", "1")]))], &prompt, n, sizes);
+        let outs = run_loaded_arms(&[("arm", lane.clone()), ("arm rt2", plus(&lane, &[("CROW_GLM_RT2", "1")])), ("arm rt2 sm", plus(&lane, &sm))], &prompt, n, sizes);
         let c2 = calls();
         eprintln!(
             "glm5 int rt2 {what} lane split: NVMe reads arm {} rt2 {}, CPU experts arm {} rt2 {}, RT2 calls {}",
@@ -834,6 +839,7 @@ fn glm5_int_gpu_rt2_is_the_arm_without_the_controller_within_the_accuracy_bar() 
             c2 - c1
         );
         assert_g3(&format!("rt2 {what} lane split vs arm"), &outs[1], &outs[0]);
+        assert_g3(&format!("rt2 sm {what} lane split vs arm"), &outs[2], &outs[0]);
         assert!(c2 > c1, "{what}: no decode layer ran through experts_rt2");
         if sizes.vram == 0 {
             assert!(outs[1].lane_experts > 0, "{what}: the lane ran under RT2");

@@ -15,6 +15,8 @@
 //   glm5_swiglu_clamp     h = silu(min(g, L)) * clamp(u, -L, L), silu(v) = v / (1 + exp(-v))
 //   glm5_moe_combine      y[t] = (sum_k w[t][k] * ye[t * K + k]) + ys[t], k in pick order
 //   glm5_moe_combine_rows the same, each row through a pointer (#202 CROW_GLM_RT2)
+//   glm5_moe_tables_in    dst[i] = src[i], i < 2 * K: RT2's slot / row tables from mapped host memory
+//                         into VRAM on the SMs (#202 CROW_GLM_RT2_TABLE_SM)
 //
 // Every rounded add and multiply outside expf is an __fadd_rn / __fmul_rn / __fdiv_rn intrinsic,
 // which NVRTC never contracts into an fma (-fmad=true is its default), so the f32 order is the
@@ -151,6 +153,19 @@ extern "C" __global__ void glm5_moe_combine_rows(const unsigned long long* __res
         acc = __fadd_rn(acc, __fmul_rn(w[(size_t)t * K + k], r[j]));
     }
     y[(size_t)t * H + j] = __fadd_rn(acc, ys[(size_t)t * H + j]);
+}
+
+// #202 CROW_GLM_RT2_TABLE_SM: the [2 * K] u64 slot and row tables of GpuMoePlan::experts_rt2,
+// written by the host into a mapped pinned buffer (src, its device pointer), copied into the
+// device table (dst) by the SMs instead of a cuMemcpyHtoDAsync: no copy-engine command, so the
+// early pass that follows on the compute stream does not queue behind the stager's landings and
+// write-backs on the copy engine. Volatile loads: the host rewrites these words between calls, so
+// no cache may serve a former call's value (each word is read once per launch anyway).
+// prm = {K, H}. grid (1), block 32 (2 * K <= 2 * GLM5_MAXK = 32; the loop covers any block).
+extern "C" __global__ void glm5_moe_tables_in(const volatile unsigned long long* src, unsigned long long* __restrict__ dst,
+                                              const int* __restrict__ prm) {
+    const int n = 2 * prm[0];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
 // ---------------- crow-nest #191: the glm5_next dense NVFP4 GEMV ----------------
