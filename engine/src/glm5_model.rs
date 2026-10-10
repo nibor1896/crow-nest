@@ -946,7 +946,10 @@ impl Glm5Pass {
                     }
                     KdaProj::O => fp4_gemv_of(kn, ints, &a.o, xi, yo, tt, None, t),
                 };
-                if decode {
+                if decode && glm5_mhc::attn_fuse() {
+                    // #202 A (CROW_GLM_ATTN_FUSE): the same row in 6 launches instead of 12, bit-identical
+                    glm5_kda::step_fused_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, self.sub, &mut proj);
+                } else if decode {
                     glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, self.sub, &mut proj);
                 } else {
                     glm5_kda::prompt_rows_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
@@ -1121,7 +1124,12 @@ impl Glm5Pass {
             cuda::sync();
             tp.attn.out.extend(cuda::dtoh(self.sub, t * h));
         }
-        self.mhc.expand(&kn.mhc, x, self.sub, x, t);
+        // #202 A (CROW_GLM_ATTN_FUSE, with the fused site): this expand runs inside the FFN site's
+        // coeffs_norm launch below (untapped only: `fuse` is off with taps)
+        let fold = fuse && glm5_mhc::attn_fuse() && self.mhc.expand_fits();
+        if !fold {
+            self.mhc.expand(&kn.mhc, x, self.sub, x, t);
+        }
         if let Some(tp) = taps.as_deref_mut() {
             cuda::sync();
             tp.attn.expanded.extend(cuda::dtoh(x, t * HC * h));
@@ -1131,7 +1139,13 @@ impl Glm5Pass {
             }
         }
         // FFN site
-        if fuse { self.mhc.coeffs_norm(&kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t) } else { self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t) }
+        if fold {
+            self.mhc.expand_coeffs_norm(&kn.mhc, &lw.ffn_hc, x, self.sub, lw.post_norm, self.collapsed, t);
+        } else if fuse {
+            self.mhc.coeffs_norm(&kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t)
+        } else {
+            self.mhc.coeffs(&kn.mhc, &lw.ffn_hc, x, self.collapsed, t)
+        }
         if let Some(tp) = taps.as_deref_mut() {
             self.tap_coeffs(&mut tp.ffn, t);
         }

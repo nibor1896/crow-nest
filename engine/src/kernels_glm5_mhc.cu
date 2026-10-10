@@ -388,3 +388,149 @@ extern "C" __global__ void glm5_mhc_mix_norm(const float* __restrict__ x, const 
                                              const float* __restrict__ nw) {
     mhc_mix_site<true>(x, fn, base, scale, logits, pre, post, comb, collapsed, done, prm, nw);
 }
+
+// #202 A (CROW_GLM_ATTN_FUSE): glm5_mhc_expand of the site before (its post / comb still in the
+// plan, the sublayer output y) folded into glm5_mhc_mix_norm of the next site: one launch where the
+// layer queued two (the attention site's expand, the FFN site's mix_norm). grid (24, T), block 256,
+// H / 256 one of 1, 2, 4, 8, 16 (MHC_EXP_Q). Every block first runs glm5_mhc_expand's
+// statements for its thread's columns d = threadIdx.x + 256 q of row t (the coefficients copied to
+// shared memory first) into registers xe[i][q] = X'[i][d], then mhc_mix_site's chains (NORM) over
+// those values in the record's k order (k = i H + d ascending per thread, the order of its strided
+// loops), so every logit, coefficient, collapse and norm value has the bits of expand + mix_norm.
+// The last block of the row (every other block of the row has read x and the old post / comb by
+// then: each counts after its loops) writes X' over x (in place, as the expand did), then runs
+// mhc_mix_site's tail, which writes the new site's coefficients and reads X' back for the collapse
+// (the block's own stores, ordered by the barrier). x is not restrict here: this kernel writes it.
+// Q = H / 256 is a template parameter (1, 2, 4, 8 or 16): with a run-time Q the register array's
+// guarded loops ran 2.5 times slower (RTX 5090, h 4096: 37.5 us against 16.1 us per launch).
+#define MHC_EXP_Q 16
+
+template <int Q>
+__device__ __forceinline__ void mhc_expand_mix_norm_q(float* x, const float* __restrict__ y,
+                                                      const unsigned short* __restrict__ fn, const float* __restrict__ base,
+                                                      const float* __restrict__ scale, float* logits, float* pre, float* post,
+                                                      float* comb, float* collapsed, unsigned int* done,
+                                                      const int* __restrict__ prm, const float* __restrict__ nw) {
+    __shared__ float sh_red[MHC_THREADS / 32];
+    __shared__ float sh_part[MHC_THREADS / 32];
+    __shared__ float sh_m[MHC_MIX];
+    __shared__ float sh_pre[MHC_HC];
+    __shared__ float sh_pre1[MHC_HC];
+    __shared__ float sh_ep[MHC_HC];
+    __shared__ float sh_ec[MHC_HC * MHC_HC];
+    __shared__ int sh_last;
+    const int H = prm[0];
+    const int n = MHC_HC * H;
+    const int m = blockIdx.x;
+    const int t = blockIdx.y;
+    float* xr = x + (size_t)t * n;
+
+    // 0. glm5_mhc_expand of row t (the previous site's post / comb), this thread's columns
+    if (threadIdx.x < MHC_HC) sh_ep[threadIdx.x] = post[t * MHC_HC + threadIdx.x];
+    if (threadIdx.x < MHC_HC * MHC_HC) sh_ec[threadIdx.x] = comb[(size_t)t * MHC_HC * MHC_HC + threadIdx.x];
+    __syncthreads();
+    float xe[MHC_HC][Q];
+#pragma unroll
+    for (int q = 0; q < Q; q++) {
+        if (q < Q) {
+            const int d = threadIdx.x + MHC_THREADS * q;
+            float r[MHC_HC];
+#pragma unroll
+            for (int j = 0; j < MHC_HC; j++) r[j] = xr[j * H + d];
+            const float yv = y[(size_t)t * H + d];
+#pragma unroll
+            for (int i = 0; i < MHC_HC; i++) {
+                float v = __fmul_rn(sh_ec[i], r[0]);
+#pragma unroll
+                for (int j = 1; j < MHC_HC; j++) v = __fadd_rn(v, __fmul_rn(sh_ec[j * MHC_HC + i], r[j]));
+                xe[i][q] = __fadd_rn(__fmul_rn(sh_ep[i], yv), v);
+            }
+        }
+    }
+
+    // 1. the record's unweighted RMSNorm factor over X'
+    float ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < MHC_HC; i++)
+#pragma unroll
+        for (int q = 0; q < Q; q++)
+            if (q < Q) ss = fmaf(xe[i][q], xe[i][q], ss);
+    ss = mhc_block_sum(ss, sh_red);
+    const float r = __frsqrt_rn(__fadd_rn(__fdiv_rn(ss, (float)n), MHC_RMS_EPS));
+
+    // 2. row m of m = fn . (r X')
+    const unsigned short* fm = fn + (size_t)m * n;
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < MHC_HC; i++)
+#pragma unroll
+        for (int q = 0; q < Q; q++)
+            if (q < Q) {
+                const float xn = __fmul_rn(xe[i][q], r);
+                acc = fmaf(mhc_bf16(fm[i * H + threadIdx.x + MHC_THREADS * q]), xn, acc);
+            }
+    float v = acc;
+    for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if ((threadIdx.x & 31) == 0) sh_part[threadIdx.x >> 5] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < MHC_THREADS / 32; i++) s = __fadd_rn(s, sh_part[i]);
+        logits[(size_t)t * MHC_MIX + m] = s;
+        __threadfence();
+        const unsigned int prev = atomicAdd(&done[t], 1u);
+        sh_last = prev == MHC_MIX - 1;
+        if (sh_last) done[t] = 0u;  // every other block of the row has counted
+    }
+    __syncthreads();
+    if (!sh_last) return;  // block-uniform
+
+    // the expand's output: X' over x (every block of the row has read x)
+#pragma unroll
+    for (int i = 0; i < MHC_HC; i++)
+#pragma unroll
+        for (int q = 0; q < Q; q++)
+            if (q < Q) xr[i * H + threadIdx.x + MHC_THREADS * q] = xe[i][q];
+
+    // 3.-5. and 9. (mhc_mix_site's tail with NORM), the last block of row t only
+    __threadfence();
+    if (threadIdx.x < MHC_MIX) sh_m[threadIdx.x] = __ldcg(logits + (size_t)t * MHC_MIX + threadIdx.x);
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        mhc_coeff_tail_warp(sh_m, base, scale, sh_pre, pre, post, comb, t, true);
+    } else {
+        const int u = threadIdx.x - 32;
+        if (u < MHC_HC) sh_pre1[u] = __fadd_rn(mhc_sigmoid(__fadd_rn(__fmul_rn(sh_m[u], scale[0]), base[u])), MHC_HC_EPS);
+        asm volatile("bar.sync 1, %0;" ::"r"(MHC_THREADS - 32));
+        const float p0 = sh_pre1[0], p1 = sh_pre1[1], p2 = sh_pre1[2], p3 = sh_pre1[3];
+        for (int d = u; d < H; d += MHC_THREADS - 32) {
+            float c = __fmul_rn(p0, xr[d]);
+            c = __fadd_rn(c, __fmul_rn(p1, xr[H + d]));
+            c = __fadd_rn(c, __fmul_rn(p2, xr[2 * H + d]));
+            c = __fadd_rn(c, __fmul_rn(p3, xr[3 * H + d]));
+            collapsed[(size_t)t * H + d] = c;
+        }
+    }
+    // gm_rmsnorm over collapsed [t] (mhc_mix_site's NORM part)
+    __syncthreads();
+    __shared__ float red[32];
+    float* xp = collapsed + (size_t)t * H;
+    const long long hn = H;
+    float sq = 0.0f;
+    for (long long i = threadIdx.x; i < hn; i += blockDim.x) sq += xp[i] * xp[i];
+    float rn = rsqrtf(mhc_gm_block_sum(sq, red) / (float)hn + MHC_RMS_EPS);
+    for (long long i = threadIdx.x; i < hn; i += blockDim.x) xp[i] = nw[i] * (xp[i] * rn);
+}
+
+extern "C" __global__ void glm5_mhc_expand_mix_norm(float* x, const float* __restrict__ y,
+                                                    const unsigned short* __restrict__ fn, const float* __restrict__ base,
+                                                    const float* __restrict__ scale, float* logits, float* pre, float* post,
+                                                    float* comb, float* collapsed, unsigned int* done,
+                                                    const int* __restrict__ prm, const float* __restrict__ nw) {
+    switch (prm[0] / MHC_THREADS) {
+#define MHC_EXP_ARM(Q)     case Q: mhc_expand_mix_norm_q<Q>(x, y, fn, base, scale, logits, pre, post, comb, collapsed, done, prm, nw); break;
+        MHC_EXP_ARM(1) MHC_EXP_ARM(2) MHC_EXP_ARM(4) MHC_EXP_ARM(8) MHC_EXP_ARM(MHC_EXP_Q)
+#undef MHC_EXP_ARM
+        default: __trap();
+    }
+}

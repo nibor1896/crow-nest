@@ -210,6 +210,73 @@ __device__ __forceinline__ void mul1_lane_lo(int lo[8], int lane, int bits, int 
 // mul1_tile_fma per tile, kb ascending, then mul1_store_part), so the bits are the same.
 // p: [0] k, [1] n, [2] S, [3] tr_off, [4] n32 (u32 words per tile), [5] bits, [6] half, [7] T.
 // xh: [E][T][k]; part: [E][S][T][n] (raw y' partials, one per k-split)
+// #202 F: the body of mul1_gemv (below, kept as it was so its code does not move) for slot e
+// (row e of xh and part), k-split sp, the trellis at tbase, statement for statement: the GEMV of
+// mul1_gemv_gu and mul1_gemv_o, so their f32 order is mul1_gemv's.
+__device__ __forceinline__ void mul1_gemv_body(const unsigned long long tbase, const float* __restrict__ xh, float* __restrict__ part,
+                                               const int k, const int n, const int S, const int n32, const int bits, const int half,
+                                               const int T, const int e, const int sp) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S;
+    const int nb0 = blockIdx.x * 8, nb = nb0 + warp;
+    const int kb0 = sp * tps, rows = tps * 16;
+    __shared__ float xs[MUL1_MAXT * MUL1_XROWS];
+    __shared__ __align__(16) unsigned int ring[2][MUL1_U * 8 * MUL1_N32MAX];
+    mul1_stage_x(xs, xh, e, T, k, kb0, rows);
+    const int run4 = 2 * n32;          // 16-byte pieces of one tile row's run (8 n32 words)
+    const int stage4 = MUL1_U * run4;  // pieces per stage, <= MUL1_PIECES * 256
+    const bool vec = (tbase & 15ull) == 0;
+    uint4 rg[MUL1_PIECES];
+    int lo[8];
+    mul1_lane_lo(lo, lane, bits, half, n32);
+    float acc0[MUL1_MAXT], acc1[MUL1_MAXT];
+    #pragma unroll
+    for (int t = 0; t < MUL1_MAXT; t++) {
+        acc0[t] = 0.0f;
+        acc1[t] = 0.0f;
+    }
+    const int rbase = 2 * (lane & 3);
+    for (int kt = 0, buf = 0; kt < tps + MUL1_U; kt += MUL1_U, buf ^= 1) {
+        // issue the loads of the stage at tile row kt (if any) into registers
+        if (kt < tps) {
+            #pragma unroll
+            for (int q = 0; q < MUL1_PIECES; q++) {
+                const int i = threadIdx.x + q * 256;
+                const int u = i / run4, c = i - u * run4;
+                if (i < stage4 && kt + u < tps) {
+                    const size_t w0 = ((size_t)(kb0 + kt + u) * tiles_n + nb0) * n32 + 4 * c;
+                    if (vec) {
+                        rg[q] = ((const uint4*)tbase)[w0 >> 2];
+                    } else {
+                        const unsigned int* s = (const unsigned int*)tbase + w0;
+                        rg[q] = make_uint4(s[0], s[1], s[2], s[3]);
+                    }
+                }
+            }
+        }
+        // compute the previous stage (rows kt - MUL1_U ..) from the other ring slot
+        if (kt > 0) {
+            const int kp = kt - MUL1_U;
+            #pragma unroll
+            for (int u = 0; u < MUL1_U; u++) {
+                if (kp + u < tps)
+                    mul1_tile_fma(ring[buf ^ 1] + u * (8 * MUL1_N32MAX) + warp * n32, lo, n32, xs, rows, (kp + u) * 16 + rbase, T, acc0, acc1);
+            }
+        }
+        // the stage at kt into its ring slot
+        if (kt < tps) {
+            #pragma unroll
+            for (int q = 0; q < MUL1_PIECES; q++) {
+                const int i = threadIdx.x + q * 256;
+                const int u = i / run4, c = i - u * run4;
+                if (i < stage4 && kt + u < tps) ((uint4*)ring[buf])[u * (2 * MUL1_N32MAX) + c] = rg[q];
+            }
+        }
+        __syncthreads();
+    }
+    mul1_store_part(part, acc0, acc1, e, S, sp, T, n, nb, lane);
+}
+
 extern "C" __global__ void __launch_bounds__(256) mul1_gemv(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh,
                                                             float* __restrict__ part, const int* __restrict__ p) {
     const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6], T = p[7];
@@ -276,6 +343,137 @@ extern "C" __global__ void __launch_bounds__(256) mul1_gemv(const unsigned long 
         __syncthreads();
     }
     mul1_store_part(part, acc0, acc1, e, S, sp, T, n, nb, lane);
+}
+
+// ---------------- #202 F (CROW_GLM_MUL1_FUSE): the decode FFN of a slot set in three launches ----------------
+// The unfused FFN of GemvPlan::run_slots x 3 + glm5_swiglu_clamp is ten launches: had_in, gemv,
+// had_out per projection and the activation. Fused, with the same operations in the same order on
+// every value, so every output bit is the same:
+//   mul1_had_in2  mul1_had_in of gate and of up (the same x, each its own suh) in one launch
+//   mul1_gemv_gu  mul1_gemv of gate and of up in one launch (blockIdx.z = matrix * E + slot); the
+//                 LAST of the 2 S blocks of one (slot, 128 outputs) to finish - a per-(slot, block)
+//                 counter, reset by that block (the glm5_mhc_mix pattern) - sums the k-split
+//                 partials of both (mul1_out_block, partials read back through L2 with __ldcg), so
+//                 g and u are mul1_had_out's; then h = glm5_swiglu_clamp(g, u) (mul1_clamp_swiglu,
+//                 the kernels_glm5_moe.cu expression) and xh_d = mul1_had_in of h with the down
+//                 suh: the act launch and the down had_in folded in. g, u and h are stored as before.
+//   mul1_gemv_o   mul1_gemv of down; the last of the S blocks of one (slot, 128 outputs) runs
+//                 mul1_had_out into y.
+// A null record (a spare late slot) returns at once in every block, so its counters stay 0 and
+// nothing of its rows is written, as in the unfused kernels (its h row is not written either).
+
+// glm5_swiglu_clamp's expression (defined with the prefill kernels below)
+__device__ __forceinline__ float mul1_clamp_swiglu(float gv, float uv, float L);
+
+// mul1_out_block with the partials read through L2 (another block of this launch wrote them)
+__device__ __forceinline__ void mul1_out_block_cg(float v[4], const float* part, const unsigned short* __restrict__ svh,
+                                                  int e, int S, int T, int t, int n, int blk, int lane) {
+    int c0 = blk * 128 + 4 * lane;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float s = __ldcg(part + (((size_t)e * S + 0) * T + t) * n + c0 + j);
+        for (int sp = 1; sp < S; sp++) s = __fadd_rn(s, __ldcg(part + (((size_t)e * S + sp) * T + t) * n + c0 + j));
+        v[j] = s;
+    }
+    mul1_fwht128(v, lane);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = __fmul_rn(__fmul_rn(v[j], 0.0078125f), mul1_h2f(svh[c0 + j]));
+}
+
+// true (block-uniform) in the last of `total` blocks that count on cnt[idx]; that block resets the
+// counter, so the next launch finds 0. Every thread publishes its partials before the count.
+__device__ __forceinline__ bool mul1_last_block(unsigned int* cnt, int idx, unsigned int total) {
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int prev = atomicAdd(cnt + idx, 1u);
+        last = prev == total - 1u;
+        if (last) cnt[idx] = 0u;
+    }
+    __syncthreads();
+    if (last) __threadfence();
+    return last != 0;
+}
+
+// grid (k/128, T, 2E), block 32. p: [0] k, [1] T, [2] suh_off gate, [3] suh_off up.
+// x: [E][T][k]; xh_g, xh_u: [E][T][k]. z < E: gate of slot z, else up of slot z - E.
+extern "C" __global__ void mul1_had_in2(const unsigned long long* __restrict__ ptrs, const float* __restrict__ x,
+                                        float* __restrict__ xh_g, float* __restrict__ xh_u, const int* __restrict__ p) {
+    const int k = p[0], T = p[1];
+    const int E = gridDim.z >> 1, m = blockIdx.z >= E, e = blockIdx.z - m * E;
+    const int t = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
+    if (ptrs[e] == 0ull) return;
+    const unsigned short* suh = (const unsigned short*)(ptrs[e] + (unsigned long long)p[2 + m]);
+    const size_t row = ((size_t)e * T + t) * k;
+    const int c0 = blk * 128 + 4 * lane;
+    float v[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = x[row + c0 + j];
+    mul1_in_block(v, suh, c0, lane);
+    float* xh = m ? xh_u : xh_g;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) xh[row + c0 + j] = v[j];
+}
+
+// grid (n/128, S, 2E), block 256; n = inter. p: [0] k, [1] n, [2] S, [3] tr_off gate, [4] tr_off up,
+// [5] n32, [6] bits, [7] half, [8] T, [9] svh_off gate, [10] svh_off up, [11] suh_off down,
+// [12] swiglu limit (f32 bits). xh_g, xh_u: [E][T][k]; part_g, part_u: [E][S][T][n];
+// cnt: [E][n/128] u32, zero between launches; g, u, h, xh_d: [E][T][n].
+extern "C" __global__ void __launch_bounds__(256) mul1_gemv_gu(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh_g,
+                                                               const float* __restrict__ xh_u, float* part_g, float* part_u,
+                                                               unsigned int* cnt, float* __restrict__ g_out, float* __restrict__ u_out,
+                                                               float* __restrict__ h_out, float* __restrict__ xh_d, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[5], bits = p[6], half = p[7], T = p[8];
+    const int E = gridDim.z >> 1, m = blockIdx.z >= E, e = blockIdx.z - m * E, sp = blockIdx.y;
+    const unsigned long long base = ptrs[e];
+    if (base == 0ull) return;
+    mul1_gemv_body(base + (unsigned long long)p[3 + m], m ? xh_u : xh_g, m ? part_u : part_g, k, n, S, n32, bits, half, T, e, sp);
+    if (!mul1_last_block(cnt, e * gridDim.x + blockIdx.x, 2u * S)) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, blk = blockIdx.x;
+    const float L = __int_as_float(p[12]);
+    const unsigned short* svh_g = (const unsigned short*)(base + (unsigned long long)p[9]);
+    const unsigned short* svh_u = (const unsigned short*)(base + (unsigned long long)p[10]);
+    const unsigned short* suh_d = (const unsigned short*)(base + (unsigned long long)p[11]);
+    for (int t = warp; t < T; t += 8) {
+        float g[4], u[4], v[4];
+        mul1_out_block_cg(g, part_g, svh_g, e, S, T, t, n, blk, lane);
+        mul1_out_block_cg(u, part_u, svh_u, e, S, T, t, n, blk, lane);
+        const size_t o = ((size_t)e * T + t) * n + blk * 128 + 4 * lane;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            g_out[o + j] = g[j];
+            u_out[o + j] = u[j];
+            v[j] = mul1_clamp_swiglu(g[j], u[j], L);
+            h_out[o + j] = v[j];
+        }
+        mul1_in_block(v, suh_d, blk * 128 + 4 * lane, lane);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) xh_d[o + j] = v[j];
+    }
+}
+
+// grid (n/128, S, E), block 256. p: [0] k, [1] n, [2] S, [3] tr_off, [4] n32, [5] bits, [6] half,
+// [7] T, [8] svh_off. xh: [E][T][k]; part: [E][S][T][n]; cnt: [E][n/128] u32, zero between
+// launches; y: [E][T][n].
+extern "C" __global__ void __launch_bounds__(256) mul1_gemv_o(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh,
+                                                              float* part, unsigned int* cnt, float* __restrict__ y,
+                                                              const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6], T = p[7];
+    const int e = blockIdx.z, sp = blockIdx.y;
+    const unsigned long long base = ptrs[e];
+    if (base == 0ull) return;
+    mul1_gemv_body(base + (unsigned long long)p[3], xh, part, k, n, S, n32, bits, half, T, e, sp);
+    if (!mul1_last_block(cnt, e * gridDim.x + blockIdx.x, (unsigned int)S)) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, blk = blockIdx.x;
+    const unsigned short* svh = (const unsigned short*)(base + (unsigned long long)p[8]);
+    for (int t = warp; t < T; t += 8) {
+        float v[4];
+        mul1_out_block_cg(v, part, svh, e, S, T, t, n, blk, lane);
+        const size_t o = ((size_t)e * T + t) * n + blk * 128 + 4 * lane;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) y[o + j] = v[j];
+    }
 }
 
 // #187 (CROW_GLM_GEMV2=1): the T = 1 GEMV for decode. Grid, block, k-split and the f32 order
