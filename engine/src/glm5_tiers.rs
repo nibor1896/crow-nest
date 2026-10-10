@@ -224,17 +224,19 @@ pub struct SplitCost {
 
 impl SplitCost {
     /// RTX 5090 (PCIe 5.0 x16), Core Ultra 9 285K, 2 x 32 GB DDR5-5600, by the lane's thread
-    /// count: `glm5_tiers_gpu_split_cost_bench` (2026-10-10), the real lane over 24 (VRAM, CPU)
-    /// splits of one synthetic GLM layer at 8, 12, 16 and 20 threads, records rotated beyond the
-    /// L3 and the GPU's L2; CPU and GPU zero-copy share the DRAM, so the fit takes `tzc` and `cb`
-    /// under each other's load (`thit` 0.0148 from the solo VRAM run). Best split per V 0 / 2 /
-    /// 4 / 6, ms: 8 threads 1.626 / 1.335 / 1.098 / 0.717, 12 1.675 / 1.349 / 1.022 / 0.630,
-    /// 16 1.535 / 1.226 / 0.913 / 0.614, 20 1.503 / 1.261 / 0.841 / 0.572 (all-GPU V 0 2.08-2.47).
+    /// count: `glm5_tiers_gpu_split_cost_bench` (2026-10-10, recalibrated for the #200 int16
+    /// CPU arm), the real lane over 24 (VRAM, CPU) splits of one synthetic GLM layer at 8, 12,
+    /// 16 and 20 threads, records rotated beyond the L3 and the GPU's L2; CPU and GPU zero-copy
+    /// share the DRAM, so the fit takes `tzc` and `cb` under each other's load (`thit` 0.0144
+    /// from the solo VRAM run). Best split per V 0 / 2 / 4 / 6, ms: 8 threads 1.207 / 0.911 /
+    /// 0.703 / 0.454, 12 1.250 / 0.929 / 0.714 / 0.459, 16 1.199 / 0.940 / 0.698 / 0.456, 20
+    /// 1.159 / 0.961 / 0.687 / 0.456 (all-GPU 1.86 / 1.50 / 1.08 / 0.64). Before #200 (exact CPU
+    /// arm) `cb` was 0.402 / 0.346 / 0.285 / 0.248 ms.
     pub const RTX5090_285K_BY_THREADS: [(usize, SplitCost); 4] = [
-        (8, SplitCost { g0: 0.040, thit: 0.0148, tzc: 0.2441, ca: 0.140, cb: 0.4017, maxcpu: 32 }),
-        (12, SplitCost { g0: 0.050, thit: 0.0148, tzc: 0.2589, ca: 0.110, cb: 0.3459, maxcpu: 32 }),
-        (16, SplitCost { g0: 0.220, thit: 0.0148, tzc: 0.2737, ca: 0.360, cb: 0.2849, maxcpu: 32 }),
-        (20, SplitCost { g0: 0.290, thit: 0.0148, tzc: 0.2367, ca: 0.350, cb: 0.2481, maxcpu: 32 }),
+        (8, SplitCost { g0: 0.330, thit: 0.0144, tzc: 0.2222, ca: 0.260, cb: 0.2283, maxcpu: 32 }),
+        (12, SplitCost { g0: 0.120, thit: 0.0144, tzc: 0.2165, ca: 0.090, cb: 0.1910, maxcpu: 32 }),
+        (16, SplitCost { g0: 0.270, thit: 0.0144, tzc: 0.2165, ca: 0.290, cb: 0.1656, maxcpu: 32 }),
+        (20, SplitCost { g0: 0.120, thit: 0.0144, tzc: 0.2165, ca: 0.150, cb: 0.1509, maxcpu: 32 }),
     ];
 
     /// the model at [`SPLIT_LANE_THREADS`], the split's default
@@ -9113,12 +9115,15 @@ mod split_tests {
         assert_eq!(plan_split(&SplitCost { cb: 5.0, ..c }, 0, &ram), Vec::<u32>::new());
     }
 
-    /// The calibrated models plan the splits the bench measured best (confirmation run
-    /// 2026-10-10, CPU ids for V 0 / 2 / 4 / 6 of 8 picks): 8 threads 3 / 2 / 1 / 1, 12 threads
-    /// 3 / 2 / 2 / 1, 16 and 20 threads 4 / 3 / 2 / 1; the split's default is the 20-thread model.
+    /// The calibrated models (#200 int16 CPU arm) plan these splits (CPU ids for V 0 / 2 / 4 / 6
+    /// of 8 picks): 8 and 12 threads 4 / 3 / 2 / 1, 16 threads 5 / 3 / 2 / 1, 20 threads 5 / 4 /
+    /// 3 / 1. The bench's measured best (calibration run, confirmation run 2026-10-10): 20 threads
+    /// 5 / 4 / 3 / 1 in both runs; 12 threads 4 / 3 / 3 / 1 and 4 / 3 / 2 / 1; 8 threads 4 / 3 /
+    /// 2 / 1 and 3 / 3 / 2 / 1; 16 threads 5 / 3 / 3 / 1 and 5 / 4 / 3 / 1 (each miss within 7 %
+    /// of the best split's time). The split's default is the 20-thread model.
     #[test]
     fn the_calibrated_cost_model_plans_the_measured_best_splits() {
-        let want = [(8usize, [3usize, 2, 1, 1]), (12, [3, 2, 2, 1]), (16, [4, 3, 2, 1]), (20, [4, 3, 2, 1])];
+        let want = [(8usize, [4usize, 3, 2, 1]), (12, [4, 3, 2, 1]), (16, [5, 3, 2, 1]), (20, [5, 4, 3, 1])];
         for (threads, best) in want {
             let c = SplitCost::for_threads(threads);
             for (hits, nc) in [0usize, 2, 4, 6].into_iter().zip(best) {
