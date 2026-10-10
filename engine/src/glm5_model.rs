@@ -1184,7 +1184,12 @@ impl Glm5Pass {
                                 p.shared_early(&self.kn.k, &self.kn.moe, w, self.collapsed);
                             }
                             c.wait_reply();
-                            p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                            if c.early {
+                                // #202: the reply came at once; each late expert waits for its own landing
+                                c.experts_early(p, &self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                            } else {
+                                p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                            }
                             // the CPU lane: its one summed row added behind the combine (the GPU
                             // computed the CPU's combos from a zeroed record: they added 0)
                             if let Some(dl) = lane.as_ref() {
