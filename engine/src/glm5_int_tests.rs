@@ -297,13 +297,17 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
             if *borrow {
                 let (live, all, v) = tiers.elastic_live().unwrap();
                 assert!(all >= 2 && live == all && v == 3, "{name}: the elastic part at construction ({live} of {all} chunks)");
-                // the prompt alone: scratch back, chunks handed back; then one decode row
+                // the prompt alone: chunks handed back for it, scratch back after it, and the
+                // elastic part grown back on the host thread at its end (`decode_ready`)
+                let e0 = tiers.arena_elastic_stats().unwrap();
                 let id = run.prefill(&mut cnq, &mut tiers, &prompt, 0, &mut |_| {}).unwrap();
+                let e1 = tiers.arena_elastic_stats().unwrap();
                 assert_eq!(run.rows_held(), 1, "{name}: the prompt's scratch went back");
-                assert_eq!(tiers.elastic_live().unwrap().0, 0, "{name}: the prompt handed the elastic chunks back");
+                assert!(e1.enter > e0.enter && e1.exit > e0.exit, "{name}: the prompt handed the elastic chunks back and they grew back ({e0:?} -> {e1:?})");
+                assert_eq!(tiers.elastic_live().unwrap().0, all, "{name}: every elastic chunk live after the prompt");
                 run.row(&mut cnq, &mut tiers, id, prompt.len(), true).unwrap();
-                assert_eq!(tiers.elastic_live().unwrap().0, all, "{name}: the decode row grew the elastic part back");
-                eprintln!("glm5 int borrow: elastic {all} chunks x {v} slots handed back for the prompt, grown back at the first decode row");
+                assert_eq!(tiers.elastic_live().unwrap().0, all, "{name}: every elastic chunk live in decode");
+                eprintln!("glm5 int borrow: elastic {all} chunks x {v} slots handed back for the prompt and grown back after it ({e0:?} -> {e1:?})");
                 tiers.reset_cache().unwrap();
                 for k in run.kda_states() {
                     k.reset();
