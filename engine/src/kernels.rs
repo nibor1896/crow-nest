@@ -6210,11 +6210,27 @@ pub mod mul1 {
     use cudarc::driver::sys::{CUdeviceptr, CUfunction};
 
     /// every entry of `MUL1_SRC`
-    pub const NAMES: &[&str] = &["mul1_had_in", "mul1_gemv", "mul1_gemv_warp", "mul1_had_out", "mul1_act_had_in", "mul1_decode_states", "mul1_gemm_grp", "mul1_tc_in", "mul1_tc_recon", "mul1_tc_out", "mul1_gemm_tc"];
+    pub const NAMES: &[&str] = &["mul1_had_in", "mul1_gemv", "mul1_gemv_warp", "mul1_had_out", "mul1_act_had_in", "mul1_decode_states", "mul1_gemm_grp", "mul1_tc_in", "mul1_tc_recon", "mul1_tc_out", "mul1_gemm_tc", "mul1_gemv2"];
     /// tokens per slot (`MUL1_MAXT`)
     pub const MAXT: usize = 8;
     /// activation rows one k-split stages in shared memory (`MUL1_XROWS`)
     pub const XROWS: usize = 512;
+    /// #187: shared words of one `mul1_gemv2` buffer (`MUL1_G2_WORDS`): tiles and activations
+    pub const G2_WORDS: usize = 3840;
+
+    /// #187: `CROW_GLM_GEMV2=1` runs the T = 1 GEMVs of new plans on `mul1_gemv2` (same bits as
+    /// `mul1_gemv`); unset or anything else: `mul1_gemv` (the path of record)
+    pub fn gemv2_from_env() -> bool {
+        matches!(std::env::var("CROW_GLM_GEMV2").ok().as_deref(), Some("1"))
+    }
+
+    /// #187: `mul1_gemv2` takes this GEMV shape at `tokens` rows: T = 1 and one block's k-split
+    /// (tps = k / 16 / S tile rows x 8 tiles of n32 + 4 words, then tps * 16 activations) within
+    /// `G2_WORDS` (GLM K = 3: gate and up 3840, down 1920)
+    pub fn gemv2_fits(spec: &MatSpec, tokens: usize) -> bool {
+        let tps = spec.k / 16 / ksplit(spec.k);
+        tokens == 1 && spec.bits <= 8 && !(spec.bits == 8 && spec.half) && tps * (8 * (spec.n32() + 4) + 16) <= G2_WORDS
+    }
 
     /// The k-split S of a GEMV with input width `k`: the largest power of two <= 16 that divides
     /// the `k / 16` tile rows (k is a multiple of 128, so S >= 8).
@@ -6279,6 +6295,7 @@ pub mod mul1 {
         gemv: CUfunction,
         gemv_block: CUfunction,
         gemv_warp: CUfunction,
+        gemv2: CUfunction,
         had_out: CUfunction,
         act: CUfunction,
         pub decode_states: CUfunction,
@@ -6294,6 +6311,7 @@ pub mod mul1 {
                 gemv: module.get("mul1_gemv"),
                 gemv_block: module.get("mul1_gemv"),
                 gemv_warp: module.get("mul1_gemv_warp"),
+                gemv2: module.get("mul1_gemv2"),
                 had_out: module.get("mul1_had_out"),
                 act: module.get("mul1_act_had_in"),
                 decode_states: module.get("mul1_decode_states"),
@@ -6307,6 +6325,13 @@ pub mod mul1 {
         pub fn use_warp_gemv(&mut self, on: bool) {
             self.gemv = if on { self.gemv_warp } else { self.gemv_block };
         }
+
+        /// #187: queue the GEMV of `slots` slots over grid (n / 128, S, slots): `mul1_gemv2` when
+        /// the plan takes it and the reference arm (`use_warp_gemv`) is off, else the current `gemv`
+        unsafe fn launch_gemv_on(&self, v2: bool, n: usize, s: usize, slots: usize, args: &[u64]) {
+            let f = if v2 && self.gemv == self.gemv_block { self.gemv2 } else { self.gemv };
+            launch_v(f, (n / 128) as u32, s as u32, slots as u32, 256, args);
+        }
     }
 
     fn i32s(v: &[usize]) -> Vec<i32> {
@@ -6319,6 +6344,9 @@ pub mod mul1 {
         pub slots: usize,
         pub tokens: usize,
         pub s: usize,
+        /// #187: the GEMV runs on `mul1_gemv2` (`CROW_GLM_GEMV2=1` and `gemv2_fits` at `new`;
+        /// the tests and the bench set it directly)
+        pub gemv2: bool,
         prm_in: CUdeviceptr,
         prm_gemv: CUdeviceptr,
         prm_out: CUdeviceptr,
@@ -6341,6 +6369,7 @@ pub mod mul1 {
                 slots,
                 tokens,
                 s,
+                gemv2: gemv2_from_env() && gemv2_fits(&spec, tokens),
                 prm_in: cuda::to_i32_dev(&i32s(&[k, t, spec.suh_off])),
                 prm_gemv: cuda::to_i32_dev(&i32s(&[k, n, s, spec.tr_off, spec.n32(), spec.bits as usize, spec.half as usize, t])),
                 prm_out: cuda::to_i32_dev(&i32s(&[n, s, t, spec.svh_off])),
@@ -6353,8 +6382,9 @@ pub mod mul1 {
             launch_v(kn.had_in, (self.spec.k / 128) as u32, self.tokens as u32, self.slots as u32, 32, &[ptrs, x, self.xh, self.prm_in]);
         }
 
-        unsafe fn launch_gemv(&self, kn: &Kernels, ptrs: CUdeviceptr) {
-            launch_v(kn.gemv, (self.spec.n / 128) as u32, self.s as u32, self.slots as u32, 256, &[ptrs, self.xh, self.part, self.prm_gemv]);
+        pub(crate) unsafe fn launch_gemv(&self, kn: &Kernels, ptrs: CUdeviceptr) {
+            assert!(!self.gemv2 || gemv2_fits(&self.spec, self.tokens), "mul1: gemv2 on a shape it does not take");
+            kn.launch_gemv_on(self.gemv2, self.spec.n, self.s, self.slots, &[ptrs, self.xh, self.part, self.prm_gemv]);
         }
 
         unsafe fn launch_out(&self, kn: &Kernels, ptrs: CUdeviceptr, y: CUdeviceptr) {
@@ -6381,7 +6411,7 @@ pub mod mul1 {
             assert!((1..=self.slots).contains(&n), "mul1: {n} of {} slots", self.slots);
             let (kc, nc, t) = ((self.spec.k / 128) as u32, (self.spec.n / 128) as u32, self.tokens as u32);
             launch_v(kn.had_in, kc, t, n as u32, 32, &[ptrs, x, self.xh, self.prm_in]);
-            launch_v(kn.gemv, nc, self.s as u32, n as u32, 256, &[ptrs, self.xh, self.part, self.prm_gemv]);
+            kn.launch_gemv_on(self.gemv2, self.spec.n, self.s, n, &[ptrs, self.xh, self.part, self.prm_gemv]);
             launch_v(kn.had_out, nc, t, n as u32, 32, &[ptrs, self.part, y, self.prm_out]);
         }
 
@@ -7145,6 +7175,189 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
                 fp.free();
             }
             drop_lanes(l);
+        }
+    }
+
+    /// #187: `mul1_gemv2` (the T = 1 decode GEMV, `CROW_GLM_GEMV2=1`) gives the bits of
+    /// `mul1_gemv` for every bitrate whose k-split fits (the 7 cases plus synthetic K = 1, 1.5,
+    /// 2.5, 5, 8), gate / up / down, two slots, from VRAM, from pinned RAM and from a trellis base
+    /// that is not 16-byte aligned; and the FFN of a GLM expert (8 slots, VRAM).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu -- --ignored --nocapture --test-threads 1"]
+    fn mul1_gpu_gemv2_equals_gemv_bits() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let mut rng = Rng(0x6E2);
+            let mut all = cases();
+            for (i, k) in [1.0, 1.5, 2.5, 5.0, 8.0].into_iter().enumerate() {
+                all.push(Case {
+                    name: format!("synth K = {k}"),
+                    source: format!("synth:{}", 50 + i),
+                    bitrate: cpu_mul1::Bitrate::from_k(k).unwrap(),
+                    hidden: 512,
+                    inter: 256,
+                    want: [String::new(), String::new(), String::new()],
+                });
+            }
+            let (mut checked, mut skipped) = (0, 0);
+            for c in &all {
+                let rec = record(c);
+                let l = lanes(&[&rec, &rec]);
+                let mut shifted = vec![0u8; 4];
+                shifted.extend_from_slice(&rec);
+                let mut vs = cuda::upload_dev(&shifted);
+                let mut ptr_s = cuda::to_u64_dev(&[vs + 4, vs + 4]);
+                let sp = spec_of(c);
+                for (name, spec) in [("gate", sp[0]), ("up", sp[1]), ("down", sp[2])] {
+                    if !mul1::gemv2_fits(&spec, 1) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let x = xs(2 * spec.k, &mut rng);
+                    let mut plan = GemvPlan::new(spec, 2, 1);
+                    let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(2 * spec.n * 4));
+                    for (lane, ptrs) in [("VRAM", l.ptr_v), ("pinned", l.ptr_p), ("VRAM + 4 B", ptr_s)] {
+                        let mut out = |v2: bool| {
+                            plan.gemv2 = v2;
+                            cuda::ck(cudarc::driver::sys::cuMemsetD8_v2(yd, 0xAB, 2 * spec.n * 4));
+                            cuda::ck(cudarc::driver::sys::cuMemsetD8_v2(plan.part, 0xAB, 2 * plan.s * spec.n * 4));
+                            plan.run(&kn, ptrs, xd, yd);
+                            cuda::sync();
+                            bits(&cuda::dtoh(yd, 2 * spec.n))
+                        };
+                        let want = out(false);
+                        assert_eq!(out(true), want, "{} {name} {lane}: mul1_gemv2 != mul1_gemv", c.name);
+                        checked += 1;
+                    }
+                    cuda::free_dev(&mut xd);
+                    cuda::free_dev(&mut yd);
+                    plan.free();
+                }
+                cuda::free_dev(&mut vs);
+                cuda::free_dev(&mut ptr_s);
+                drop_lanes(l);
+            }
+            let c = &glm_cases()[0];
+            let rec = record(c);
+            let refs: Vec<&[u8]> = (0..8).map(|_| rec.as_slice()).collect();
+            let l = lanes(&refs);
+            let x = xs(8 * c.hidden, &mut rng);
+            let mut plan = FfnPlan::new(c.hidden, c.inter, c.bitrate.bits, c.bitrate.half, 8, 1);
+            assert!(mul1::gemv2_fits(&plan.gate.spec, 1) && mul1::gemv2_fits(&plan.down.spec, 1), "GLM K = 3 shapes take gemv2");
+            let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(8 * c.hidden * 4));
+            let mut ys = Vec::new();
+            for v2 in [false, true] {
+                for g in [&mut plan.gate, &mut plan.up, &mut plan.down] {
+                    g.gemv2 = v2;
+                }
+                plan.run(&kn, l.ptr_v, xd, yd);
+                cuda::sync();
+                ys.push(bits(&cuda::dtoh(yd, 8 * c.hidden)));
+            }
+            assert_eq!(ys[0], ys[1], "GLM FFN, 8 slots: gemv2 != gemv");
+            eprintln!("mul1_gemv2 == mul1_gemv bit for bit: {checked} GEMV cases ({skipped} shapes beyond G2_WORDS) + 1 GLM FFN x 8 slots");
+            cuda::free_dev(&mut xd);
+            cuda::free_dev(&mut yd);
+            plan.free();
+            drop_lanes(l);
+        }
+    }
+
+    /// #187 bench: T = 1 from VRAM (and 8 slots from pinned RAM, 16 records), GLM K = 3 records, `mul1_gemv` (old) vs `mul1_gemv2` (new) as
+    /// alternating arms. 48 distinct records (the 48 gate trellises 151 MB: more than the 96 MB
+    /// L2), rotated. Rows: the gate GEMV kernel alone (one launch over `slots` experts) and the
+    /// whole FFN (7 launches), for 1 expert and a group of 8 per launch; GB/s of trellis (gate)
+    /// or record (FFN) bytes; one warm-up round per arm, then 5 timed rounds per arm of 64
+    /// launches back to back with one sync; median, min, max.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib mul1_gpu_gemv2_bench -- --ignored --nocapture"]
+    fn mul1_gpu_gemv2_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Kernels::new();
+            let c = &glm_cases()[0];
+            let base = record(c);
+            let tb = cpu_mul1::Mul1Matrix::trellis_bytes(c.hidden, c.inter, c.bitrate);
+            const NREC: usize = 48;
+            let mut all = Vec::with_capacity(NREC * base.len());
+            for i in 0..NREC as u32 {
+                let mut r = base.clone();
+                r[..3 * tb].iter_mut().for_each(|b| *b = b.rotate_left(i % 8) ^ (i as u8).wrapping_mul(37));
+                all.extend_from_slice(&r);
+            }
+            let rb = base.len() as u64;
+            let mut vram = cuda::upload_dev(&all);
+            // the first 16 records again in pinned host memory (zero-copy UVA), 152 MB
+            const NPIN: usize = 16;
+            let mut pinned = cuda::Pinned::alloc_cold(NPIN * base.len());
+            pinned.write_bytes(0, &all[..NPIN * base.len()]);
+            drop(all);
+            let pv: Vec<u64> = (0..2 * NREC as u64).map(|i| vram + (i % NREC as u64) * rb).collect();
+            let mut ptr_v = cuda::to_u64_dev(&pv);
+            let pp: Vec<u64> = (0..2 * NPIN as u64).map(|i| pinned.dev + (i % NPIN as u64) * rb).collect();
+            let mut ptr_p = cuda::to_u64_dev(&pp);
+            let rec_bytes = (3 * tb + 6 * (c.hidden + c.inter)) as f64;
+            eprintln!("mul1 gemv2 bench: K = 3, T 1, VRAM, gate trellis {tb} B, record {rec_bytes} B, {NREC} records rotated");
+            for name in ["mul1_gemv", "mul1_gemv2"] {
+                use cudarc::driver::sys;
+                let f = kn.module.get(name);
+                let (mut regs, mut blocks) = (0i32, 0i32);
+                cuda::ck(sys::cuFuncGetAttribute(&mut regs, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS, f));
+                cuda::ck(sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut blocks, f, 256, 0));
+                eprintln!("  {name}: {regs} registers, {blocks} blocks of 256 per SM");
+            }
+            for (lane, slots, nrec, ptr_l) in [("VRAM", 1usize, NREC, ptr_v), ("VRAM", 8, NREC, ptr_v), ("pinned", 8, NPIN, ptr_p)] {
+                let x = xs(slots * c.hidden, &mut Rng(7));
+                let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(slots * c.hidden * 4));
+                let mut gp = GemvPlan::new(spec_of(c)[0], slots, 1);
+                let mut fp = FfnPlan::new(c.hidden, c.inter, c.bitrate.bits, c.bitrate.half, slots, 1);
+                gp.run(&kn, ptr_l, xd, yd);
+                for (what, bytes) in [("gemv gate", tb as f64), ("ffn", rec_bytes)] {
+                    let bytes = bytes * slots as f64;
+                    let mut gbs = [Vec::new(), Vec::new()];
+                    for round in 0..12 {
+                        let v2 = round % 2 == 1;
+                        gp.gemv2 = v2;
+                        for g in [&mut fp.gate, &mut fp.up, &mut fp.down] {
+                            g.gemv2 = v2;
+                        }
+                        cuda::sync();
+                        let t0 = std::time::Instant::now();
+                        for call in 0..64usize {
+                            let pe = ptr_l + 8 * ((call * slots) % nrec) as u64;
+                            if what == "ffn" {
+                                fp.run(&kn, pe, xd, yd);
+                            } else {
+                                gp.launch_gemv(&kn, pe);
+                            }
+                        }
+                        cuda::sync();
+                        let s = t0.elapsed().as_secs_f64();
+                        if round > 1 {
+                            gbs[round % 2].push(64.0 * bytes / s / 1e9);
+                        }
+                    }
+                    for (arm, g) in ["mul1_gemv (old)", "mul1_gemv2 (new)"].iter().zip(gbs.iter_mut()) {
+                        g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        eprintln!(
+                            "  {lane:6} {what:9} {slots} expert(s) {arm:16}: median {:.1} GB/s (min {:.1}, max {:.1}), {:.1} us per launch group",
+                            g[2],
+                            g[0],
+                            g[4],
+                            bytes / (g[2] * 1e9) * 1e6
+                        );
+                    }
+                }
+                cuda::free_dev(&mut xd);
+                cuda::free_dev(&mut yd);
+                gp.free();
+                fp.free();
+            }
+            cuda::free_dev(&mut vram);
+            cuda::free_dev(&mut ptr_v);
+            cuda::free_dev(&mut ptr_p);
+            pinned.free();
         }
     }
 }
