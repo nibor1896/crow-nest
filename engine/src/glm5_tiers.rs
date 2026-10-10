@@ -2995,11 +2995,14 @@ struct ArenaDev {
     /// #195 S: a refill's error on the host thread ([`ExpertTiers::decode_ready`]), returned by the
     /// next decode call
     refill_err: Option<String>,
+    /// #202: the device-memory release epoch ([`cuda::mem_release_epoch`]) of the last
+    /// [`ExpertTiers::elastic_exit`] that left a chunk down (`None` after one that left none)
+    exit_refused: Option<u64>,
 }
 
 impl ArenaDev {
     fn new(a: GlobalArena, cfg: ArenaConfig) -> ArenaDev {
-        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default(), refill_err: None }
+        ArenaDev { a, cfg, chunks: Vec::new(), base_chunks: 0, ring: None, stage: None, elastic: ElasticStats::default(), refill_err: None, exit_refused: None }
     }
 
     fn reset(&mut self) {
@@ -3385,16 +3388,33 @@ impl ExpertTiers {
             return;
         }
         let cb = vpl as u64 * rb;
+        // #202: no device memory released by this process since the last try left chunks down:
+        // the free VRAM can only have shrunk, so every chunk is refused again (counted as before)
+        // without a `cuMemGetInfo` per chunk and decode row
+        let epoch = cuda::mem_release_epoch();
+        if d.exit_refused == Some(epoch) {
+            d.elastic.realloc_fail += down.len() as u64;
+            d.elastic.exit += 1;
+            return;
+        }
+        // a chunk the free VRAM refused: the next ones see the same free VRAM (nothing allocated
+        // in between) and are refused without reading it again
+        let mut fits = true;
+        let mut refused = false;
         for c in down {
-            let ok = cuda::free_vram_bytes() >= cb + ARENA_RESERVE_BYTES;
-            match ok.then(|| cuda::try_alloc_zeroed("glm5 elastic VRAM expert slots", cb as usize)) {
+            fits = fits && cuda::free_vram_bytes() >= cb + ARENA_RESERVE_BYTES;
+            match fits.then(|| cuda::try_alloc_zeroed("glm5 elastic VRAM expert slots", cb as usize)) {
                 Some(Ok(p)) => {
                     d.chunks[c] = p;
                     d.a.enable(c * vpl..(c + 1) * vpl);
                 }
-                _ => d.elastic.realloc_fail += 1,
+                _ => {
+                    d.elastic.realloc_fail += 1;
+                    refused = true;
+                }
             }
         }
+        d.exit_refused = refused.then_some(epoch);
         d.elastic.exit += 1;
     }
 
@@ -8101,7 +8121,7 @@ impl ExpertTiers {
                 let st = self.stager.as_mut().expect("an early call without the stager");
                 if st.dummy == 0 {
                     st.dummy = cuda::alloc_named("glm5 controller late stand-in record", rb as usize);
-                    cuda::ck(sys::cuMemsetD8_v2(st.dummy, 0, rb as usize));
+                    cuda::memset_zero_sync(st.dummy, rb as usize);
                 }
                 let over = items.len() > glm5_flags::late_slots(self.lanes2, self.topk);
                 for it in &items {

@@ -23,6 +23,65 @@ pub fn cur_stream() -> CUstream {
     CUR_STREAM.load(Ordering::Relaxed) as CUstream
 }
 
+// ---- #202: device-memory driver calls, counted ----------------------------
+// The engine's device allocations, frees, synchronous memsets and free-VRAM reads go through this
+// module; each bumps its counter (a relaxed atomic add). `MEM_RELEASES` counts every release of
+// device memory by this process (cuMemFree, a VMM unmap, a module unload): while it stands still,
+// the free VRAM this process sees can only have shrunk.
+static MEM_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static MEM_FREES: AtomicU64 = AtomicU64::new(0);
+static MEM_MEMSETS: AtomicU64 = AtomicU64::new(0);
+static MEM_INFOS: AtomicU64 = AtomicU64::new(0);
+static MEM_RELEASES: AtomicU64 = AtomicU64::new(0);
+
+/// #202: the device-memory driver calls of this process so far (see [`mem_api_counts`])
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemApiCounts {
+    /// `cuMemAlloc_v2` (and VMM allocations)
+    pub allocs: u64,
+    /// `cuMemFree_v2` (and VMM frees)
+    pub frees: u64,
+    /// synchronous `cuMemsetD8_v2` on the legacy stream
+    pub memsets: u64,
+    /// `cuMemGetInfo_v2`
+    pub infos: u64,
+}
+
+impl MemApiCounts {
+    /// the calls made since `earlier`
+    pub fn since(&self, earlier: &MemApiCounts) -> MemApiCounts {
+        MemApiCounts { allocs: self.allocs - earlier.allocs, frees: self.frees - earlier.frees, memsets: self.memsets - earlier.memsets, infos: self.infos - earlier.infos }
+    }
+}
+
+pub fn mem_api_counts() -> MemApiCounts {
+    MemApiCounts {
+        allocs: MEM_ALLOCS.load(Ordering::Relaxed),
+        frees: MEM_FREES.load(Ordering::Relaxed),
+        memsets: MEM_MEMSETS.load(Ordering::Relaxed),
+        infos: MEM_INFOS.load(Ordering::Relaxed),
+    }
+}
+
+/// #202: bumped by every release of device memory by this process; equal values bracket a
+/// stretch in which this process freed no device memory
+pub fn mem_release_epoch() -> u64 {
+    MEM_RELEASES.load(Ordering::Relaxed)
+}
+
+fn mem_released() {
+    MEM_RELEASES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// synchronous `cuMemsetD8_v2` of `bytes` zero bytes at `d` (legacy stream), counted (#202)
+///
+/// # Safety
+/// A CUDA context is current; `d` holds `bytes` bytes.
+pub unsafe fn memset_zero_sync(d: CUdeviceptr, bytes: usize) {
+    MEM_MEMSETS.fetch_add(1, Ordering::Relaxed);
+    ck(sys::cuMemsetD8_v2(d, 0, bytes));
+}
+
 // cudarc 0.19.9 binds the graph entry points only for CUDA 11.4-11.8 - on
 // cuda-13030 we load them directly out of the driver library (same loader
 // pattern as the 32-bit memops were handled with in p9).
@@ -338,6 +397,7 @@ impl Drop for RequestScope {
 pub unsafe fn try_alloc_zeroed(what: &str, bytes: usize) -> Result<CUdeviceptr, AllocFailed> {
     assert!(bytes > 0, "alloc of 0 bytes ({what})");
     let mut d: CUdeviceptr = 0;
+    MEM_ALLOCS.fetch_add(1, Ordering::Relaxed);
     let r = sys::cuMemAlloc_v2(&mut d, bytes);
     if r != CUresult::CUDA_SUCCESS {
         return Err(AllocFailed {
@@ -347,7 +407,7 @@ pub unsafe fn try_alloc_zeroed(what: &str, bytes: usize) -> Result<CUdeviceptr, 
             result: format!("{r:?}"),
         });
     }
-    ck(sys::cuMemsetD8_v2(d, 0, bytes));
+    memset_zero_sync(d, bytes);
     live_allocs().lock().unwrap().insert(d, bytes);
     Ok(d)
 }
@@ -412,6 +472,7 @@ pub unsafe fn drop_dbg(tag: &str) {
 pub unsafe fn vram_info() -> (u64, u64) {
     let mut free: usize = 0;
     let mut total: usize = 0;
+    MEM_INFOS.fetch_add(1, Ordering::Relaxed);
     ck(sys::cuMemGetInfo_v2(&mut free, &mut total));
     (free as u64, total as u64)
 }
@@ -428,6 +489,7 @@ impl Module {
     pub unsafe fn unload(&mut self) {
         if !self.0.is_null() {
             ck(sys::cuModuleUnload(self.0));
+            mem_released();
             self.0 = std::ptr::null_mut();
         }
     }
@@ -478,12 +540,16 @@ pub unsafe fn alloc_zeroed(bytes: usize) -> CUdeviceptr {
 pub unsafe fn free_dev(d: &mut CUdeviceptr) {
     // #117: a lendable (VMM) allocation is torn down as one, never cuMemFree'd
     if *d != 0 && free_lendable(*d) {
+        MEM_FREES.fetch_add(1, Ordering::Relaxed);
+        mem_released();
         live_allocs().lock().unwrap().remove(d);
         *d = 0;
         return;
     }
     if *d != 0 {
+        MEM_FREES.fetch_add(1, Ordering::Relaxed);
         ck_call("cuMemFree_v2", sys::cuMemFree_v2(*d));
+        mem_released();
         live_allocs().lock().unwrap().remove(&(*d as u64));
         *d = 0;
     }
@@ -1477,7 +1543,8 @@ pub unsafe fn try_alloc_lendable(what: &str, bytes: usize) -> Result<CUdeviceptr
             return Err(fail(r));
         }
     };
-    ck(sys::cuMemsetD8_v2(va, 0, size));
+    MEM_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    memset_zero_sync(va, size);
     live_allocs().lock().unwrap().insert(va, size);
     lendables().lock().unwrap().push(Lendable { va, size, what: what.to_string(), handle: Some(h) });
     Ok(va)
@@ -1551,6 +1618,7 @@ pub unsafe fn lend_release(target: u64) -> LendOutcome {
         let h = l.handle.take().unwrap();
         ck_call("cuMemUnmap", sys::cuMemUnmap(l.va as CUdeviceptr, l.size));
         ck_call("cuMemRelease", sys::cuMemRelease(h));
+        mem_released();
         out.regions += 1;
         out.bytes += l.size as u64;
         out.what.push(format!("{} {:.1} MiB", l.what, l.size as f64 / (1u64 << 20) as f64));
@@ -1575,7 +1643,7 @@ pub unsafe fn lend_remap() -> Result<LendOutcome, AllocFailed> {
         match vmm_map(l.va, l.size) {
             Ok(h) => {
                 l.handle = Some(h);
-                ck(sys::cuMemsetD8_v2(l.va as CUdeviceptr, 0, l.size));
+                memset_zero_sync(l.va as CUdeviceptr, l.size);
                 out.regions += 1;
                 out.bytes += l.size as u64;
                 out.what.push(l.what.clone());
