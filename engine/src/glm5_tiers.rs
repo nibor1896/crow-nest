@@ -10554,8 +10554,7 @@ impl Glm5Run {
         for (r0, t) in prompt_calls(n, self.prompt_chunk) {
             let t0 = std::time::Instant::now();
             let base = RowBase::of(tiers);
-            let e = gm::embed_rows(cnq, &g, &ids[r0..r0 + t]);
-            cuda::to_f32_into(self.x, &gm::trunk_input(&e, h, g.hc_streams));
+            crate::glm5_embed::trunk_into(self.pass.kn.embed.as_ref(), cnq, &g, &ids[r0..r0 + t], self.x);
             self.layers_chunk(tiers, pos0 + r0, t)?;
             rows(self, cnq, r0, t)?;
             if r0 + t == n {
