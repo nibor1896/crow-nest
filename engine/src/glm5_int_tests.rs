@@ -24,6 +24,8 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_ARENA_STAGE_GB",
     "CROW_GLM_ARENA_STAGE_MIN",
     "CROW_GLM_STAGE_OVERLAP",
+    "CROW_GLM_PREFILL_NVPF",
+    "CROW_GLM_PREFILL_NVPF_MIN_ROWS",
     "CROW_GLM_CPU_LANE",
     "CROW_GLM_LANE_THREADS",
     "CROW_GLM_PINNED",
@@ -331,7 +333,25 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
     let n = 6;
     let sizes = TierSizes { vram: 3, pinned: 4 };
     let elastic = format!("{}", 4.0 * 3.0 * REC as f64 / (1u64 << 30) as f64);
-    let arms: [(&str, Vec<(&str, String)>, bool); 5] = [
+    // #196 NVPF: the overlap path with the stage engine's ring reading the next layers ahead
+    // (staging on for its engine, never staging a call: the minimum is above every call's picks)
+    let stage = format!("{}", g.experts as f64 * REC as f64 / (1u64 << 30) as f64);
+    let nvpf = |elastic: Option<&String>| -> Vec<(&str, String)> {
+        let mut v = vec![
+            ("CROW_CHUNK", "4".to_string()),
+            ("CROW_GLM_ARENA", "global".into()),
+            ("CROW_GLM_STAGE_OVERLAP", "1".into()),
+            ("CROW_GLM_ARENA_STAGE_GB", stage.clone()),
+            ("CROW_GLM_ARENA_STAGE_MIN", "1000000".into()),
+            ("CROW_GLM_PREFILL_NVPF", "1".into()),
+            ("CROW_GLM_PREFILL_NVPF_MIN_ROWS", "1".into()),
+        ];
+        if let Some(e) = elastic {
+            v.push(("CROW_GLM_ARENA_ELASTIC_GB", e.clone()));
+        }
+        v
+    };
+    let arms: [(&str, Vec<(&str, String)>, bool); 7] = [
         ("chunk 4", vec![("CROW_CHUNK", "4".into())], false),
         ("chunk 4 global", vec![("CROW_CHUNK", "4".into()), ("CROW_GLM_ARENA", "global".into())], false),
         ("chunk 4 global elastic", vec![("CROW_CHUNK", "4".into()), ("CROW_GLM_ARENA", "global".into()), ("CROW_GLM_ARENA_ELASTIC_GB", elastic.clone())], true),
@@ -342,6 +362,8 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
             vec![("CROW_CHUNK", "4".into()), ("CROW_GLM_ARENA", "global".into()), ("CROW_GLM_ARENA_ELASTIC_GB", elastic.clone()), ("CROW_GLM_STAGE_OVERLAP", "1".into())],
             true,
         ),
+        ("chunk 4 global overlap nvpf", nvpf(None), false),
+        ("chunk 4 global elastic overlap nvpf", nvpf(Some(&elastic)), true),
     ];
     let mut outs: Vec<Generated> = Vec::new();
     unsafe {
@@ -376,6 +398,11 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
             }
             let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
             eprintln!("glm5 int {name}: ids {:?}, NVMe reads {}", gen.ids, tiers.nvme_reads);
+            if name.ends_with("nvpf") {
+                let st = tiers.arena_stage_stats().unwrap().0;
+                eprintln!("glm5 int {name}: {st:?}");
+                assert!(st.nvpf_calls > 0 && st.nvpf_copied > 0 && st.calls == 0, "{name}: the prompt calls ran on the read-ahead plan ({st:?})");
+            }
             assert_eq!(run.rows_held(), if *borrow { 1 } else { 4 }, "{name}: rows held after the run");
             tiers.free();
             run.free();
