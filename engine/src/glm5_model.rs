@@ -322,6 +322,8 @@ pub struct Glm5Kernels {
     pub mhc: glm5_mhc::Kernels,
     pub moe: kernels::glm5_moe::Kernels,
     pub mul1: mul1::Kernels,
+    /// #186 `CROW_GLM_EMBED_GATHER=1`: the prompt calls' device gather (`glm5_embed`); `None` off
+    pub embed: Option<crate::glm5_embed::Gather>,
 }
 
 impl Glm5Kernels {
@@ -333,7 +335,7 @@ impl Glm5Kernels {
         // a second handle to the same module: `main` owns it
         let kda = KdaKernels::with_base(g, cuda::Module(main.0));
         let mla = MlaKernels::new(MlaDims::of(g), main.get("qsa_select_fast"));
-        Glm5Kernels { k, kda, mla, mhc: glm5_mhc::Kernels::new(), moe: kernels::glm5_moe::Kernels::new(), mul1: mul1::Kernels::new(), main }
+        Glm5Kernels { k, kda, mla, mhc: glm5_mhc::Kernels::new(), moe: kernels::glm5_moe::Kernels::new(), mul1: mul1::Kernels::new(), embed: crate::glm5_embed::Gather::from_env(), main }
     }
 }
 
