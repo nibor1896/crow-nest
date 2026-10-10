@@ -132,6 +132,35 @@ pub(crate) fn run_arms_sized(arms: &[Arm], n: usize, sizes: TierSizes) -> Vec<Ou
     outs
 }
 
+/// G3 on the logits of one generated position: cosine, KL(p || q) of the softmaxes, top-1 agreement
+pub(crate) fn g3(p: &[f32], q: &[f32]) -> (f64, f64, bool) {
+    let dot: f64 = p.iter().zip(q).map(|(a, b)| *a as f64 * *b as f64).sum();
+    let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+    let sm = |v: &[f32]| {
+        let m = v.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b)) as f64;
+        let e: Vec<f64> = v.iter().map(|a| (*a as f64 - m).exp()).collect();
+        let z: f64 = e.iter().sum();
+        e.into_iter().map(|x| x / z).collect::<Vec<f64>>()
+    };
+    let (a, b) = (sm(p), sm(q));
+    let kl = a.iter().zip(&b).filter(|(x, _)| **x > 0.0).map(|(x, y)| x * (x / y.max(1e-300)).ln()).sum();
+    let arg = |v: &[f32]| v.iter().enumerate().fold(0, |m, (i, x)| if *x > v[m] { i } else { m });
+    (dot / (n(p) * n(q)), kl, arg(p) == arg(q))
+}
+
+/// robin 2026-10-10: an arm whose placement differs (the RAM-tier prefetch, #203) is held to
+/// accuracy, not bits: the reference's ids, and per generated position logits cosine >= 0.9999
+/// (G3's bound), KL and top-1 reported
+pub(crate) fn assert_g3(name: &str, o: &Out, base: &Out) {
+    assert_eq!(o.gen.ids, base.gen.ids, "{name}: ids");
+    let r: Vec<(f64, f64, bool)> = o.gen.logits.iter().zip(&base.gen.logits).map(|(p, q)| g3(q, p)).collect();
+    let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
+    let kl = r.iter().map(|x| x.1).fold(0.0, f64::max);
+    let top1 = r.iter().filter(|x| x.2).count();
+    eprintln!("glm5 int G3 {name}: logits cosine min {cos:.7}, KL max {kl:.3e}, top-1 {top1}/{}, bits differ {:?}", r.len(), bit_diff(&o.gen.logits, &base.gen.logits));
+    assert!(cos >= 0.9999, "{name}: logits cosine {cos} under G3's 0.9999");
+}
+
 /// every arm gives the first arm's ids and logits bit for bit
 pub(crate) fn assert_bit_identical(arms: &[Arm], outs: &[Out]) {
     for (a, o) in arms.iter().zip(outs) {
@@ -144,9 +173,12 @@ pub(crate) fn assert_bit_identical(arms: &[Arm], outs: &[Out]) {
 /// Merge fix of glm-router-prefetch into the global arena: the controller's `table_reply`, the
 /// prefetch store and its hint read go through the global arena (`table_global`) when
 /// `CROW_GLM_ARENA=global`, not through the per-layer cache the arena does not use. Every arm
-/// gives the switch-off ids and logits bit for bit, and every global arm the NVMe reads of the
-/// global arm without switches (the same arena moves; the per-layer cache reads 236, the arena
-/// 376 on this model, so an arm that bypassed the arena shows here).
+/// gives the switch-off ids and logits bit for bit (the MUL1 kernels read VRAM and pinned
+/// records alike), every global arm without the stager's prefetch the NVMe reads of the global
+/// arm without switches (the same arena moves; the per-layer cache reads 236, the arena 376 on
+/// this model, so an arm that bypassed the arena shows here). #203: with the stager the guesses
+/// go into the arena's pinned tier, so a guessed expert is a pinned hit at its layer: those arms
+/// read fewer demand records from the NVMe than the global arm.
 #[test]
 #[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
 fn glm5_int_gpu_the_global_arena_serves_the_controller_and_the_prefetch() {
@@ -164,7 +196,11 @@ fn glm5_int_gpu_the_global_arena_serves_the_controller_and_the_prefetch() {
     assert_bit_identical(&arms, &outs);
     assert_ne!(outs[0].nvme_reads, outs[1].nvme_reads, "the arena must move differently from the per-layer cache for the check to mean something");
     for (a, o) in arms.iter().zip(&outs).skip(2) {
-        assert_eq!(o.nvme_reads, outs[1].nvme_reads, "{}: NVMe reads of the global arena", a.name);
+        if a.stager && a.sw.prefetch {
+            assert!(o.nvme_reads < outs[1].nvme_reads, "{}: {} demand NVMe reads, the global arm {}: the guesses did not become pinned hits", a.name, o.nvme_reads, outs[1].nvme_reads);
+        } else {
+            assert_eq!(o.nvme_reads, outs[1].nvme_reads, "{}: NVMe reads of the global arena", a.name);
+        }
     }
 }
 
@@ -417,7 +453,14 @@ fn glm5_int_gpu_the_cpu_lane_runs_with_the_arena_the_stager_and_the_controller()
             eprintln!("glm5 int lane split V3 P4 {what} {}: CPU experts {}, ids {:?}", a.name, o.lane_experts, o.gen.ids);
         }
         assert!(outs[0].lane_experts > 0, "{what}: the CPU lane computed nothing");
-        assert_bit_identical(&arms, &outs);
+        // #203: on the global arena the guesses become pinned hits, so the split hands the CPU
+        // other experts (other bits by design, #188): held to G3 there
+        if what == "global" {
+            assert_bit_identical(&arms[..2], &outs[..2]);
+            assert_g3("lane split V3 P4 global ctl+la+prefetch+overlap", &outs[2], &outs[0]);
+        } else {
+            assert_bit_identical(&arms, &outs);
+        }
     }
 }
 
@@ -534,5 +577,108 @@ fn glm5_int_gpu_the_full_template_arm_is_the_default_path() {
     assert!(outs.iter().all(|o| o.lane_experts > 0), "the lane ran in every arm");
     assert_same(&["lane split V0 P16", "full with the lane, without the chunk V0 P16"], &outs[..2]);
     assert_same(&["lane split chunk 12 V0 P16", "full V0 P16"], &outs[2..]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #202 / #203 / #209, the synthetic counters: the template arm (global arena, write-back ring,
+/// NVMe piece pool of 8 workers, flags + stager + controller + LA + prefetch on the side stream +
+/// shared overlap) and flags + stager + prefetch without the controller, 5-id prompt + 10 ids,
+/// V 3 + P 4 per layer. Per row: NVMe records read from the drive (demand and prefetch), records
+/// in flight when a layer is answered, the prefetch's issued / used / wasted / joins. A
+/// measurement: it prints; it holds the counters consistent and each arm to G3 against the
+/// default path (the joins' device waits: a kernel that read a pinned slot before its record
+/// landed would show here).
+#[test]
+#[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_nvme_overlap_counters() {
+    let g = geo8();
+    let s = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&s.path).unwrap();
+    let prompt = [3i64, 17, 101, 999, 5];
+    let n = 10;
+    let ctl = Switches { flags: true, controller: true, la: true, prefetch: true, pf_side: true, overlap: true, ..Switches::default() };
+    let fsp = Switches { flags: true, prefetch: true, ..Switches::default() };
+    let env: &[(&str, &str)] = &[("CROW_GLM_ARENA", "global"), ("CROW_GLM_ARENA_VRING", "2"), ("CROW_NVME_POOL", "1"), ("CROW_NVME_POOL_THREADS", "8")];
+    let arms = [arm("default", &[], Switches::default(), false), arm("template ctl", env, ctl, true), arm("flags+stager+prefetch", env, fsp, true)];
+    let mut outs: Vec<Out> = Vec::new();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+        for a in &arms {
+            let _env = Env::set(&a.env);
+            run.set_switches(&mut cnq, a.sw);
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+            tiers.set_stager(a.stager).unwrap();
+            tiers.set_prefetch(a.sw.prefetch);
+            let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
+            let rows = (prompt.len() + n - 1) as f64;
+            let (drive, left) = tiers.nvme_io();
+            let Some(st) = tiers.stager_stats() else {
+                outs.push(Out { gen, nvme_reads: tiers.nvme_reads, lane_experts: 0 });
+                tiers.free();
+                continue;
+            };
+            let pf = tiers.prefetch_stats().unwrap();
+            eprintln!(
+                "glm5 int counters {}: ids {:?}; per row: demand NVMe reads {:.2}, drive records {:.2}; records in flight per answered layer {:.3} ({} answers); prefetch issued {} used {} wasted {} joins {}; in flight at the end {left}",
+                a.name,
+                gen.ids,
+                tiers.nvme_reads as f64 / rows,
+                drive as f64 / rows,
+                st.inflight_at_answer as f64 / st.answers.max(1) as f64,
+                st.answers,
+                pf.issued,
+                pf.used,
+                pf.wasted,
+                pf.joins
+            );
+            assert!(st.answers > 0 && drive >= pf.issued, "{}: the counters", a.name);
+            outs.push(Out { gen, nvme_reads: tiers.nvme_reads, lane_experts: 0 });
+            tiers.free();
+        }
+        run.free();
+    }
+    for (a, o) in arms.iter().zip(&outs).skip(1) {
+        assert_g3(a.name, o, &outs[0]);
+    }
+}
+
+/// #202 D4: the prefetch store never waits for its own reads. A half of 8 store records of
+/// 1 MiB read through one pool worker in 4 KiB pieces, then the next guess of the same parity:
+/// its `issue` returns while those reads still run (the slots still in flight are skipped, not
+/// waited for), and `forget` then drains them.
+#[test]
+#[ignore = "needs the GPU (pinned store): cargo test --release --lib glm5_int_gpu -- --ignored --test-threads 1"]
+fn glm5_int_gpu_the_prefetch_store_does_not_wait_for_its_reads() {
+    use crate::geo::ExpertCodec;
+    use crate::nvme_source::{ExpertRecord, NvmeConfig, NvmeSource, PoolAsk, PoolConfig, RecordLayout, Span};
+    const LEN: usize = 16 << 20;
+    let dir = std::env::temp_dir().join(format!("crow-int-retire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("raw.bin");
+    std::fs::write(&path, vec![7u8; LEN]).unwrap();
+    let rec = |id: u32, off: u64| ExpertRecord { layer: 0, id, gu: Span { off, len: 1 << 20 }, dn: Span { off: 0, len: 0 }, codec: ExpertCodec::Mul1, layout: RecordLayout::OneUnit };
+    let recs: Vec<ExpertRecord> = (0..16).map(|k| rec(k, (k as u64) << 20)).collect();
+    let mut cfg = NvmeConfig::new(&path);
+    cfg.pool = PoolAsk::On(PoolConfig { threads: 1, piece: 4096 });
+    let src = NvmeSource::open(&cfg).unwrap();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        let mut pf = crate::glm5_flags::Prefetch::new(8, 1 << 20);
+        assert_eq!(pf.issue(&src, &recs, 0, &[], &(0..8).collect::<Vec<u32>>()).unwrap(), 8);
+        let t0 = std::time::Instant::now();
+        let n = pf.issue(&src, &recs, 2, &[], &(8..16).collect::<Vec<u32>>()).unwrap();
+        let dt = t0.elapsed();
+        let first_left = !pf.landed_value(7);
+        eprintln!("glm5 int store: the second issue took {dt:?}, issued {n}, the first half's last read still running {first_left}");
+        assert_eq!(n, 0, "the second issue rewrote slots whose reads it had waited for (issued {n})");
+        assert!(first_left, "the first half's reads landed before the second issue returned");
+        pf.forget(&src).unwrap();
+        assert!(pf.landed_value(7), "forget drains the reads");
+        pf.free(&src).unwrap();
+    }
+    drop(src);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -383,31 +383,65 @@ pub struct FetchReport {
 /// the readers are done, because they write into the caller's buffers until then.
 pub struct Ticket {
     parts: Vec<mpsc::Receiver<Result<FetchReport, String>>>,
+    /// the reports of the parts already taken ([`Ticket::try_done`])
+    sum: FetchReport,
+    err: Option<String>,
 }
 
 impl Ticket {
+    fn new(parts: Vec<mpsc::Receiver<Result<FetchReport, String>>>) -> Ticket {
+        Ticket { parts, sum: FetchReport::default(), err: None }
+    }
+
+    fn take(&mut self, r: Result<Result<FetchReport, String>, ()>) {
+        match r {
+            Ok(Ok(r)) => {
+                self.sum.records += r.records;
+                self.sum.bytes += r.bytes;
+                self.sum.clamped += r.clamped;
+            }
+            Ok(Err(e)) => {
+                self.err.get_or_insert(e);
+            }
+            Err(()) => {
+                self.err.get_or_insert("an NVMe reader thread died".to_string());
+            }
+        }
+    }
+
+    fn result(&mut self) -> Result<FetchReport, String> {
+        match self.err.take() {
+            Some(e) => Err(e),
+            None => Ok(std::mem::take(&mut self.sum)),
+        }
+    }
+
     fn drain(&mut self) -> Result<FetchReport, String> {
-        let mut sum = FetchReport::default();
-        let mut err = None;
-        for rx in self.parts.drain(..) {
-            match rx.recv() {
-                Ok(Ok(r)) => {
-                    sum.records += r.records;
-                    sum.bytes += r.bytes;
-                    sum.clamped += r.clamped;
+        for rx in std::mem::take(&mut self.parts) {
+            self.take(rx.recv().map_err(|_| ()));
+        }
+        self.result()
+    }
+
+    /// Without blocking: the fetch's report once every part of it is done (every record read,
+    /// sanitized and its landed flag raised), `None` while a part still runs. After `Some` the
+    /// ticket is spent (dropping it no longer waits).
+    pub fn try_done(&mut self) -> Option<Result<FetchReport, String>> {
+        let mut i = 0;
+        while i < self.parts.len() {
+            match self.parts[i].try_recv() {
+                Ok(r) => {
+                    self.take(Ok(r));
+                    self.parts.swap_remove(i);
                 }
-                Ok(Err(e)) => {
-                    err.get_or_insert(e);
-                }
-                Err(_) => {
-                    err.get_or_insert("an NVMe reader thread died".to_string());
+                Err(mpsc::TryRecvError::Empty) => i += 1,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.take(Err(()));
+                    self.parts.swap_remove(i);
                 }
             }
         }
-        match err {
-            Some(e) => Err(e),
-            None => Ok(sum),
-        }
+        self.parts.is_empty().then(|| self.result())
     }
 }
 
@@ -613,12 +647,26 @@ struct Batch {
     reply: mpsc::Sender<Result<FetchReport, String>>,
 }
 
+/// The records a source was asked to read and those not landed yet (#202: records in flight)
+#[derive(Debug, Default)]
+struct IoCount {
+    submitted: AtomicU64,
+    in_flight: AtomicU64,
+}
+
+impl IoCount {
+    fn landed(&self, n: usize) {
+        self.in_flight.fetch_sub(n as u64, Ordering::AcqRel);
+    }
+}
+
 /// The NVMe backend: `readers` threads, one container handle each, or the piece pool.
 pub struct NvmeSource {
     tx: Vec<mpsc::Sender<Batch>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     backend: NvmeBackend,
     pool: Option<Pool>,
+    io: Arc<IoCount>,
 }
 
 impl NvmeSource {
@@ -641,15 +689,18 @@ impl NvmeSource {
                     "NVMe tier: {POOL_ENV}=1 with {BACKEND_ENV}=ioring refused: the piece pool reads with one synchronous unbuffered handle per worker, not a ring (leave {BACKEND_ENV} unset)"
                 ));
             }
-            let p = Pool::open(&cfg.path, pc, cfg.affinity.as_deref())?;
-            return Ok(NvmeSource { tx: Vec::new(), threads: Vec::new(), backend, pool: Some(p) });
+            let io = Arc::new(IoCount::default());
+            let p = Pool::open(&cfg.path, pc, cfg.affinity.as_deref(), io.clone())?;
+            return Ok(NvmeSource { tx: Vec::new(), threads: Vec::new(), backend, pool: Some(p), io });
         }
         if cfg.readers == 0 || cfg.readers > MAX_IN_FLIGHT {
             return Err(format!("NVMe tier: readers {} outside 1..={MAX_IN_FLIGHT}", cfg.readers));
         }
         let mut tx = Vec::new();
         let mut threads = Vec::new();
+        let io = Arc::new(IoCount::default());
         for i in 0..cfg.readers {
+            let count = io.clone();
             let cpu = cfg.affinity.as_ref().map(|a| a[i % a.len()]);
             let mut reader = Reader::open(&cfg.path, backend)?;
             let (btx, brx) = mpsc::channel::<Batch>();
@@ -669,6 +720,7 @@ impl NvmeSource {
                         // SAFETY: `fetch_landed`'s contract: every flag is a live u64 until the
                         // ticket is waited on, which cannot happen before the reply below
                         unsafe { raise_landed(&b.jobs) };
+                        count.landed(b.jobs.len());
                         let _ = b.reply.send(r);
                     }
                 })
@@ -681,7 +733,18 @@ impl NvmeSource {
             tx.push(btx);
             threads.push(h);
         }
-        Ok(NvmeSource { tx, threads, backend, pool: None })
+        Ok(NvmeSource { tx, threads, backend, pool: None, io })
+    }
+
+    /// #202: records asked for since the source opened (every fetch, demand and prefetch)
+    pub fn records_submitted(&self) -> u64 {
+        self.io.submitted.load(Ordering::Acquire)
+    }
+
+    /// #202: records asked for whose landed point (bytes in, sanitized, flag raised) has not
+    /// come yet
+    pub fn records_in_flight(&self) -> u64 {
+        self.io.in_flight.load(Ordering::Acquire)
     }
 
     /// threads that issue reads: the readers, or the pool's workers
@@ -780,6 +843,8 @@ impl NvmeSource {
                 return Err(format!("NVMe tier refused: {why}"));
             }
         }
+        self.io.submitted.fetch_add(jobs.len() as u64, Ordering::AcqRel);
+        self.io.in_flight.fetch_add(jobs.len() as u64, Ordering::AcqRel);
         if let Some(p) = &self.pool {
             return Ok(p.submit(jobs, landed, prio));
         }
@@ -795,7 +860,7 @@ impl NvmeSource {
             self.tx[i].send(Batch { jobs, reply }).map_err(|_| format!("NVMe tier: reader {i} is gone"))?;
             parts.push(rx);
         }
-        Ok(Ticket { parts })
+        Ok(Ticket::new(parts))
     }
 }
 
@@ -811,6 +876,7 @@ impl ColdSource for NvmeSource {
 
 /// One fetch of the pool: its records left, the sum of their reports, the ticket's sender.
 struct PoolFetch {
+    io: Arc<IoCount>,
     left: AtomicUsize,
     sum: Mutex<(FetchReport, Option<String>)>,
     reply: Mutex<Option<mpsc::Sender<Result<FetchReport, String>>>>,
@@ -853,19 +919,20 @@ struct PoolShared {
 /// The piece pool: `threads` workers, one unbuffered handle each.
 struct Pool {
     cfg: PoolConfig,
+    io: Arc<IoCount>,
     shared: Arc<PoolShared>,
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Pool {
-    fn open(path: &Path, cfg: PoolConfig, affinity: Option<&[usize]>) -> Result<Pool, String> {
+    fn open(path: &Path, cfg: PoolConfig, affinity: Option<&[usize]>, io: Arc<IoCount>) -> Result<Pool, String> {
         if let Some(why) = cfg.refusal() {
             return Err(why);
         }
         let shared = Arc::new(PoolShared { q: Mutex::new(PoolQueues::default()), cv: Condvar::new() });
         // built up in place: a failure below drops it, which closes the queue and joins the
         // workers already started
-        let mut pool = Pool { cfg, shared, workers: Vec::with_capacity(cfg.threads) };
+        let mut pool = Pool { cfg, io, shared, workers: Vec::with_capacity(cfg.threads) };
         for i in 0..cfg.threads {
             let file = open_unbuffered_sync(path)?;
             let cpu = affinity.map(|a| a[i % a.len()]);
@@ -898,10 +965,10 @@ impl Pool {
     /// record order, under one lock. The jobs are checked already.
     fn submit(&self, jobs: &[(ExpertRecord, RecordDst)], landed: Option<&[Landed]>, prio: ReadPriority) -> Ticket {
         if jobs.is_empty() {
-            return Ticket { parts: Vec::new() };
+            return Ticket::new(Vec::new());
         }
         let (reply, rx) = mpsc::channel();
-        let fetch = Arc::new(PoolFetch { left: AtomicUsize::new(jobs.len()), sum: Mutex::new(Default::default()), reply: Mutex::new(Some(reply)) });
+        let fetch = Arc::new(PoolFetch { io: self.io.clone(), left: AtomicUsize::new(jobs.len()), sum: Mutex::new(Default::default()), reply: Mutex::new(Some(reply)) });
         let piece = self.cfg.piece;
         let mut pieces = Vec::new();
         for (k, (rec, dst)) in jobs.iter().enumerate() {
@@ -927,7 +994,7 @@ impl Pool {
             dq.extend(pieces);
         }
         self.shared.cv.notify_all();
-        Ticket { parts: vec![rx] }
+        Ticket::new(vec![rx])
     }
 }
 
@@ -1042,6 +1109,7 @@ fn finish_record(r: &PoolRecord) {
     // SAFETY: `fetch_landed`'s contract, the flag lives until the ticket is waited on
     unsafe { raise_landed(jobs) };
     let f = &r.fetch;
+    f.io.landed(1);
     {
         let mut s = f.sum.lock().unwrap();
         s.0.records += 1;

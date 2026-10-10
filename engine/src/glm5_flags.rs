@@ -705,6 +705,11 @@ pub struct PrefetchStats {
     pub used: u64,
     /// store records dropped unused (their slot was needed again, or the store was emptied)
     pub wasted: u64,
+    /// #203: demands for a record whose read was still in flight (they joined it)
+    pub joins: u64,
+    /// the used records the call's NVMe read count still holds (the store: every used record,
+    /// staged as an NVMe read; the RAM tier: none, a used record is a pinned hit)
+    pub covered: u64,
 }
 
 impl PrefetchStats {
@@ -717,6 +722,8 @@ impl PrefetchStats {
             bytes: self.bytes - o.bytes,
             used: self.used - o.used,
             wasted: self.wasted - o.wasted,
+            joins: self.joins - o.joins,
+            covered: self.covered - o.covered,
         }
     }
 
@@ -727,6 +734,8 @@ impl PrefetchStats {
         self.bytes += o.bytes;
         self.used += o.used;
         self.wasted += o.wasted;
+        self.joins += o.joins;
+        self.covered += o.covered;
     }
 }
 
@@ -737,7 +746,8 @@ impl PrefetchStats {
 /// its last reader is the staging copy of `table_for` of m - 2, queued before m - 2's experts;
 /// the host is in `table_for` of m - 1 only after m - 1's router flag, so (in-order compute
 /// stream, the stager's event before those experts) that copy has run. A read still in flight in
-/// the half (a guess never used) is waited for before its slot is rewritten.
+/// the half (a guess never used) is not waited for (#202 D4): its slot stays out of use until the
+/// read completes (polled without blocking), so the controller never blocks on the store.
 pub struct Prefetch {
     buf: Pinned,
     flags: Pinned,
@@ -788,7 +798,7 @@ impl Prefetch {
         self.shared.clone()
     }
 
-    fn publish_stats(&self) {
+    pub fn publish_stats(&self) {
         if let Ok(mut g) = self.shared.lock() {
             *g = self.stats;
         }
@@ -809,8 +819,32 @@ impl Prefetch {
         unsafe { (self.buf.host as *mut u8).add(i * self.rb as usize) }
     }
 
-    /// drop slot `i`: its read reports (waits if it still runs), an unused record counts as wasted
-    fn retire(&mut self, src: &crate::nvme_source::NvmeSource, i: usize) -> Result<(), String> {
+    /// Drop slot `i` without blocking (an unused record counts as wasted): a finished read
+    /// reports; one still running keeps its ticket, and the slot stays out of use until
+    /// [`Prefetch::poll`] sees it done.
+    fn retire(&mut self, i: usize) -> Result<(), String> {
+        if self.key[i].is_some() && !self.used[i] {
+            self.stats.wasted += 1;
+        }
+        self.key[i] = None;
+        self.used[i] = false;
+        self.poll(i)
+    }
+
+    /// slot `i`'s read, if it finished, reports and frees the ticket (never blocks)
+    fn poll(&mut self, i: usize) -> Result<(), String> {
+        let r = match self.ticket[i].as_mut().and_then(|t| t.try_done()) {
+            Some(r) => {
+                self.ticket[i] = None;
+                r.map(|_| ())
+            }
+            None => Ok(()),
+        };
+        r.map_err(|e| format!("{ENV_PREFETCH}: a prefetch read: {e}"))
+    }
+
+    /// drop slot `i`, waiting for its read (emptying the store)
+    fn retire_wait(&mut self, src: &crate::nvme_source::NvmeSource, i: usize) -> Result<(), String> {
         use crate::nvme_source::ColdSource;
         let r = self.ticket[i].take().map_or(Ok(()), |t| src.wait(t).map(|_| ()));
         if self.key[i].is_some() && !self.used[i] {
@@ -830,17 +864,16 @@ impl Prefetch {
         let half = (l % 2) * self.k..(l % 2 + 1) * self.k;
         let mut err = Ok(());
         for i in half.clone() {
-            if !matches!(self.key[i], Some((kl, ke)) if kl == l && keep.contains(&ke)) {
-                let r = self.retire(src, i);
-                if err.is_ok() {
-                    err = r;
-                }
+            let r = if matches!(self.key[i], Some((kl, ke)) if kl == l && keep.contains(&ke)) { Ok(()) } else { self.retire(i) };
+            if err.is_ok() {
+                err = r;
             }
         }
         err?;
         let mut n = 0;
         for &e in want {
-            let Some(i) = half.clone().find(|&i| self.key[i].is_none()) else { break };
+            // a free slot: no record and no read still running into it
+            let Some(i) = half.clone().find(|&i| self.key[i].is_none() && self.ticket[i].is_none()) else { break };
             let dst = crate::nvme_source::RecordDst { gu: self.host(i), dn: std::ptr::null_mut() };
             let rec = recs[e as usize];
             let bytes = rec.parts(&dst).iter().map(|p| p.1.len as u64).sum::<u64>();
@@ -870,7 +903,7 @@ impl Prefetch {
     pub fn forget(&mut self, src: &crate::nvme_source::NvmeSource) -> Result<(), String> {
         let mut err = Ok(());
         for i in 0..self.key.len() {
-            let r = self.retire(src, i);
+            let r = self.retire_wait(src, i);
             if err.is_ok() {
                 err = r;
             }
@@ -971,6 +1004,9 @@ impl<'a> PrefetchMover<'a> {
 }
 
 impl crate::glm5_tiers::Mover for PrefetchMover<'_> {
+    fn join(&mut self, e: u32, landed: u64) {
+        self.inner.join(e, landed)
+    }
     fn nvme(&mut self, jobs: &[(u32, crate::glm5_tiers::Dst)]) -> Result<u64, String> {
         use crate::glm5_tiers::Dst;
         let mut rest = Vec::with_capacity(jobs.len());
@@ -991,6 +1027,7 @@ impl crate::glm5_tiers::Mover for PrefetchMover<'_> {
                     if !self.pf.used[i] {
                         self.pf.used[i] = true;
                         self.pf.stats.used += 1;
+                        self.pf.stats.covered += 1;
                     }
                     bytes += self.pf.bytes[i];
                     self.redirect.push((s, i));
