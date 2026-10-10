@@ -1,0 +1,38 @@
+{
+ "busy_ms": {
+  "mHC/norm": 1.4045393937007875,
+  "attn KDA": 3.4054893228346454,
+  "dense FFN (l0-2)": 0.27125755118110234,
+  "attn MLA": 1.9304125590551182,
+  "router": 0.6330635433070866,
+  "shared expert": 0.9710807952755905,
+  "moe gather/combine": 0.28221496062992124,
+  "routed early (VRAM+zero-copy)": 27.742017999999998,
+  "routed late (staged)": 4.35700348031496,
+  "head": 0.8891903070866142,
+  "router side guess (s13)": 0.506214125984252
+ },
+ "idle_ms": {
+  "host: token turnaround (argmax readback -> next launch)": 0.42033,
+  "latency: launch/queue (kernel launched before the GPU ran dry)": 8.125774047244095,
+  "host: launch-bound (kernel launched after the GPU ran dry)": 1.2325086692913387,
+  "copy: s7 in-stream (x D2H, table H2D, token I/O)": 0.07468256692913386,
+  "latency: copy/event -> kernel start": 0.36445955118110235,
+  "latency: copy queue": 0.7390353385826772,
+  "host: routing step (flag -> plan -> launch)": 1.606009251968504,
+  "copy: stager H2D landing->stage (s16)": 2.1466980393700785,
+  "copy: stager D2D / table (s16)": 0.17182559842519685,
+  "copy: write-back D2H VRAM->pinned (s14)": 0.22322260629921262,
+  "NVMe landing (late pass waits on the stager event)": 23.838785393700785,
+  "queue: write-back D2H VRAM->pinned (s14)": 0.5545281653543307,
+  "NVMe landing via copy queue (s7 copy behind the stager's landed-flag wait)": 4.336826393700788,
+  "host: CPU lane (combine waits for the lane rows)": 1.8167912755905513,
+  "queue: stager H2D landing->stage (s16)": 0.30471320472440944,
+  "queue: stager D2D / table (s16)": 0.026458629921259844,
+  "router: publish waits for the side guess (s13)": 0.007704401574803149
+ },
+ "ms_per_token": 88.37376833070866,
+ "tokens": 127,
+ "early_slots_per_token": 182.3464566929134,
+ "late_slots_per_token": 28.291338582677167
+}

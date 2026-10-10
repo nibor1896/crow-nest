@@ -1,0 +1,39 @@
+window 11.223 s, 127 tokens, 88.37 ms/token; busy 42.39 + idle 45.99 = 88.38
+GPU busy (ms/token):
+  routed early (VRAM+zero-copy)                                  27.74
+  routed late (staged)                                            4.36
+  attn KDA                                                        3.41
+  attn MLA                                                        1.93
+  mHC/norm                                                        1.40
+  shared expert                                                   0.97
+  head                                                            0.89
+  router                                                          0.63
+  router side guess (s13)                                         0.51
+  moe gather/combine                                              0.28
+  dense FFN (l0-2)                                                0.27
+GPU idle (ms/token):
+  NVMe landing (late pass waits on the stager event)             23.84
+  latency: launch/queue (kernel launched before the GPU ran dry)    8.13
+  NVMe landing via copy queue (s7 copy behind the stager's landed-flag wait)    4.34
+  copy: stager H2D landing->stage (s16)                           2.15
+  host: CPU lane (combine waits for the lane rows)                1.82
+  host: routing step (flag -> plan -> launch)                     1.61
+  host: launch-bound (kernel launched after the GPU ran dry)      1.23
+  latency: copy queue                                             0.74
+  queue: write-back D2H VRAM->pinned (s14)                        0.55
+  host: token turnaround (argmax readback -> next launch)         0.42
+  latency: copy/event -> kernel start                             0.36
+  queue: stager H2D landing->stage (s16)                          0.30
+  copy: write-back D2H VRAM->pinned (s14)                         0.22
+  copy: stager D2D / table (s16)                                  0.17
+  copy: s7 in-stream (x D2H, table H2D, token I/O)                0.07
+  queue: stager D2D / table (s16)                                 0.03
+  router: publish waits for the side guess (s13)                  0.01
+MoE sublayers 42.0/token; GPU routed slots per token: early 182.3, late 28.3; with a stager wait 42.0/token
+routed mul1_gemv: VRAM-equivalent 3.74 + zero-copy excess 27.05 (under the lane 18.81, without 8.24) + had/act 1.31 ms/token
+zero-copy 0.833 GB/token (decode.json) / 27.05 ms = 30.8 GB/s effective
+  early gemv calls under the lane: 71.3/token, mean slots 4.33, zero-copy excess 221.0 us/call
+  early gemv calls without the lane: 17.8/token, mean slots 4.26, zero-copy excess 95.8 us/call
+  -> zero-copy is 2.31x slower while the lane runs
+CPU lane: 26.19 ms/token, 125.4 experts/token, 45.4 GB/s; lane longer than the GPU's routed work: 1.82 ms/token as measured, 21.16 if the GPU had no zero-copy
+host-served expert bytes/token: lane 1.19 GB + zero-copy 0.83 GB

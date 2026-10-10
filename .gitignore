@@ -73,6 +73,10 @@ decode_out/quality-probe/*/*
 !decode_out/quality-probe/*/records.jsonl
 !decode_out/quality-probe/*/run.json
 !decode_out/quality-probe/*/summary.md
+# Nsight Systems reports and their SQLite exports beside the GLM profiles stay local (24 files,
+# 491 MB on 2026-10-10); the stats CSVs, JSON, budgets and analysis scripts beside them are committed
+runs/**/*.nsys-rep
+runs/**/*.sqlite
 oracle/golden/
 oracle/routing-selections.npz
 *.log

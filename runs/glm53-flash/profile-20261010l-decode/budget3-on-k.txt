@@ -1,0 +1,188 @@
+window 9.705 s, 127 tokens, 76.42 ms/token; busy 34.54 + idle 41.89 = 76.43
+GPU busy (ms/token):
+  routed early (VRAM+zero-copy)                                  17.37
+  routed late (staged)                                            6.92
+  attn KDA                                                        3.36
+  attn MLA                                                        1.92
+  mHC/norm                                                        1.40
+  shared expert                                                   0.96
+  head                                                            0.84
+  router                                                          0.64
+  router side guess (s13)                                         0.50
+  dense FFN (l0-2)                                                0.27
+  moe gather/combine                                              0.24
+  moe other                                                       0.13
+GPU idle (ms/token):
+  NVMe landing (late pass waits on the stager event)             23.16
+  latency: launch/queue (kernel launched before the GPU ran dry)    8.93
+  host: CPU lane (combine waits for the lane rows)                2.51
+  host: routing step (flag -> plan -> launch)                     1.84
+  copy: write-back D2H VRAM->pinned (s14)                         1.30
+  host: launch-bound (kernel launched after the GPU ran dry)      0.98
+  copy: stager H2D landing->stage (s16)                           0.90
+  host: token turnaround (argmax readback -> next launch)         0.84
+  latency: copy queue                                             0.68
+  NVMe landing via copy queue (s7 copy behind the stager's landed-flag wait)    0.31
+  latency: copy/event -> kernel start                             0.17
+  copy: stager D2D / table (s16)                                  0.14
+  copy: s7 in-stream (x D2H, table H2D, token I/O)                0.06
+  queue: write-back D2H VRAM->pinned (s14)                        0.05
+  router: publish waits for the side guess (s13)                  0.02
+MoE sublayers 42.0/token; GPU routed slots per token: early 224.2, late 42.5; with a stager wait 42.0/token
+routed mul1_gemv: VRAM-equivalent 4.66 + zero-copy excess 17.93 (under the lane 9.39, without 8.54) + had/act 1.70 ms/token
+zero-copy 0.601 GB/token (decode.json) / 17.93 ms = 33.5 GB/s effective
+  early gemv calls under the lane: 55.3/token, mean slots 5.15, zero-copy excess 131.7 us/call
+  early gemv calls without the lane: 34.8/token, mean slots 5.74, zero-copy excess 30.6 us/call
+  -> zero-copy is 4.31x slower while the lane runs
+CPU lane: 17.47 ms/token, 69.3 experts/token, 37.6 GB/s; lane longer than the GPU's routed work: 2.33 ms/token as measured, 11.62 if the GPU had no zero-copy
+host-served expert bytes/token: lane 0.66 GB + zero-copy 0.60 GB
+
+====================================================================================================
+latency: launch/queue 8.93 = queued not started (>= 5 us) 5.49 + back-to-back (< 5 us) 3.44 ms/token
+    s7 kernel: launched, no wait, GPU idle (queued not started)                   4.13 ms/token (259.7/token,   15.9 us each)
+    s13 kernel waits on an s7 event (cross-stream event -> start)                 1.28 ms/token ( 32.4/token,   39.4 us each)
+    s13 glm5_router_sig_topk: launched, no wait, GPU idle (queued not started)    0.05 ms/token (  1.6/token,   30.8 us each)
+    s13 glm5_pred_tag: launched, no wait, GPU idle (queued not started)           0.03 ms/token (  1.1/token,   24.5 us each)
+    back-to-back gaps: 1586/token
+kernels per token: s7 1885, s13 123; cuLaunchKernel 2008/token
+
+joined MoE sublayers: 5334 of 5334; negative zero-copy counts (join mismatch): 0
+per token: VRAM 185.8, pinned 138.2 (lane 69.3 + zero-copy 68.9), NVMe 12.0; early slots 224.2, late 42.5
+
+-- zero-copy cost per expert (early GEMV excess over the all-VRAM model; fused: gemv_gu + gemv_o):
+  no lane in the layer     412 layers: excess =    2.6 +    1.2 us x zc  | median by zc 0:2us(n178), 1:3us(n157), 2:2us(n53), 3:1us(n15), 4:3us(n6)
+  lane in the layer       4922 layers: excess =   73.8 +  144.2 us x zc  | median by zc 0:2us(n526), 1:239us(n1827), 2:349us(n1490), 3:545us(n794), 4:569us(n224), 5:568us(n52), 6:538us(n9)
+-- CPU lane time per layer (start-in-GPU query -> busy query before the combine launch):
+  no zero-copy             526 layers: lane =  125.6 +  125.6 us x experts | median by count 1:221us(n526)
+  with zero-copy          4396 layers: lane =  110.2 +  192.5 us x experts | median by count 1:270us(n1880), 2:450us(n1418), 3:639us(n845), 4:844us(n243), 5:1008us(n10)
+  all                     4922 layers: lane =   95.4 +  197.7 us x experts | median by count 1:261us(n2406), 2:450us(n1418), 3:639us(n845), 4:844us(n243), 5:1008us(n10)
+-- MoE span (gather start -> combine end), layers without an NVMe demand read or stager H2D:
+  3488 layers (27.5/token), mean span 829 us
+  span = 63 + 23.5 x VRAM + 528.1 x zero-copy + -47.7 x lane (us), R2 0.412
+  early GPU ends 462 us after the gather, the lane 549 us; lane last in 53 % of layers
+  layers with lane AND zero-copy: 22.2/token, host-served bytes / (first start -> last end) = 55.3 GB/s
+  zero-copy only: 1.0/token, 3111.8 GB/s over the zero-copy excess
+  lane only: 3.2/token, 39.2 GB/s over the lane time
+
+-- NVMe: stager-stream waits (cuStreamWaitValue64 on s16) -> the s16 op behind it
+  25.6 waits/token; issue -> s16 op start: p10 469 p50 1681 p90 4012 us, mean 2040 us
+  bins (us): <100: 2%, <500: 11%, <1000: 21%, <1500: 44%, <2000: 60%, <3000: 79%, <5000: 95%
+-- per layer by NVMe demand reads n (plain-log counts): GPU idle between gather and combine, span
+  n=0: 31.72 layers/token, span    933 us, routed GPU busy   513 us, late wait present 100 %
+  n=1:  8.83 layers/token, span   2343 us, routed GPU busy   741 us, late wait present 100 %
+  n=2:  1.24 layers/token, span   3876 us, routed GPU busy   985 us, late wait present 100 %
+  n=3:  0.17 layers/token, span   5390 us, routed GPU busy  1184 us, late wait present 100 %
+  n=4:  0.03 layers/token, span   6259 us, routed GPU busy  1492 us, late wait present 100 %
+  span = 931 + 1431 us x n  (every MoE layer)
+
+-- critical path per token (s7 timeline cut at the MoE layers' marks, ms/token):
+  attention, mHC, dense, head, turnaround (previous combine end -> router start)    12.62
+  router (router start -> topk end)                                                  0.66
+  side-guess join (topk end -> publish start)                                        3.21
+  routing step (publish start -> gather start; shared expert runs here)              3.65
+  MoE span (gather start -> combine end)                                            56.29
+  tail (last combine end -> window end)                                              0.01
+  sum                                                                               76.42  (window 76.42)
+
+-- clean layers (no demand read, no stager wait value, no late slot): zero-copy = early - VRAM, lane = 8 - early
+  14.6 layers/token; mean VRAM 5.18, zero-copy 0.94, lane 1.88; span 590 us
+  early GPU end (after gather start) = 42 + 8.9 x VRAM + 279.1 x zero-copy + 51.9 x lane experts (us)
+  lane end (after gather start)      = 101 + 211.7 x lane experts + 12.9 x zero-copy (us)
+  -> one expert: zero-copy 279 us on the GPU (+13 us on the lane), lane 212 us (+52 us on the GPU)
+  (lane, zero-copy): n/token, GPU end / lane end / span us
+    (1, 1):  3.5    397 /   332 /   411
+    (1, 0):  3.2    173 /   301 /   331
+    (2, 1):  3.1    437 /   509 /   546
+    (3, 1):  2.2    455 /   676 /   717
+    (3, 2):  1.3    816 /   700 /   835
+    (4, 2):  0.6    896 /   890 /   965
+    (4, 3):  0.3   1120 /   920 /  1126
+    (0, 0):  0.3    190 /  -336 /   194
+    (5, 3):  0.1   1199 /  1089 /  1216
+  span - max(GPU end, lane end) = 32 us (combine launch + run)
+  split simulation, sum of max(GPU, lane) over clean layers, ms/token: now 7.86, best split per layer 7.84, all zero-copy 12.75, all lane 10.16
+  per clean layer: now 539 us, best 538 us -> over 42 layers 0.05 ms/token
+  host-served bytes per clean layer 26.7 MB; at the measured 47.8 GB/s (bytes / max end)
+
+====================================================================================================
+-- host-bound GPU idle by the kernel that waited (ms/token):
+  CPU lane (combine waits for the lane rows)                                         2.51
+  routing step (flag -> plan -> stager API -> tables_in/early pass launch)           2.01
+  token turnaround (argmax readback -> next launch)                                  0.84
+  launch-bound before mul1_had_in                                                    0.13
+  launch-bound before glm5_mhc_expand                                                0.11
+  launch-bound before glm5_publish_pred                                              0.11
+  launch-bound before glm5_gemv_fp4                                                  0.10
+  launch-bound before mul1_gemv                                                      0.10
+  launch-bound before glm5_mhc_mix_norm                                              0.09
+  launch-bound before gemv_bf16_b                                                    0.08
+  launch-bound before gemv_bf16_w                                                    0.01
+  launch-bound before rmsnorm_gated                                                  0.01
+  sum                                                                                6.17
+
+-- critical path per token on s7, additive (ms/token), 42.0 MoE layers/token:
+  attention, mHC, dense, head, turnaround (previous combine end -> router start)                        12.62
+  router (router start -> topk end)                                                                      0.66
+  topk end -> early pass start (gather, publish, shared expert; host flag -> plan -> stager API)         7.62
+  early pass (VRAM + zero-copy experts, under the lane)                                                 18.85
+  early end -> late start (stager event: NVMe landing, promotion copies)                                25.40
+  late pass (landed / staged / written-back experts)                                                     8.11
+  late end -> combine end (lane rows, combine)                                                           3.17
+  tail of the window (last combine end -> window end)                                                    0.01
+  sum                                                                                                   76.42  (window 76.42)
+  lane end after the late end: 2.14 ms/token of the tail
+
+-- stager batch per layer (host API between topk launch and tables_in launch), per token:
+  wait values 25.6, 9.47 MB H2D 17.4, D2D 34.8, D2H 17.4; demand reads (rows) 12.0
+  class                                                         layers/tok  wait ms/tok  late ms/tok  span us  wait us  late slots
+  a demand read (n >= 1)                                            10.28       17.80        3.89     2596     1731    1.85
+  no demand read, waits on a guessed read in flight (join)           8.41        6.94        3.26     1678      825    1.60
+  no NVMe wait, promotion H2D in the batch                           7.96        0.66        0.96      845       83    1.27
+  nothing staged (table only)                                       15.35        0.00        0.00      571        0    0.00
+  span (gather start -> combine end) = 208 + 1469 x demand + 979 x joined guess (waits beyond demand) + 79 x H2D + 79 x D2H + 64 x zero-copy + 127 x lane + 4 x VRAM (us), R2 0.740
+  short form: span = 598 + 1448 x demand + 1015 x joined guess (us)  (round k: 597 + 1,447 x demand + 1,015 x join)
+  per token: demand 12.0, joined waits 13.6, H2D 17.4, D2H 17.4 -> base 25.10 + demand 17.39 + joins 13.80 ms
+
+-- NVMe: per wait value, host issue -> the next s16 op start (landed), by layer class:
+  layers with a demand read     15.3/token: p10  1199 p50  2217 p90  4716 mean  2490 us  (one 9.47 MB record at the drive's 8.14 GB/s QD1: 1,164 us)
+  join-only layers              10.3/token: p10   237 p50  1062 p90  3027 mean  1376 us  (one 9.47 MB record at the drive's 8.14 GB/s QD1: 1,164 us)
+  drive: 46.7 records read/token (issued minus dropped) x 1.164 ms = 54.3 ms busy per 76.4 ms token (71 %); demand 12.0, guesses 34.6 (used 16.0, wasted 18.6, dropped before the drive 0.0), joins 13.6
+  demand overtakes 0.000/token, promoted 0.00/token
+
+-- per layer by demand reads n: mean us of each critical-path part (pre | router | topk->early | early | wait | late | tail)
+  n=0: 31.72/token    262 |   16 |  178 |   446 |   239 |  133 |   96   late slots 0.74, waits 0.33, H2D 0.43
+  n=1:  8.83/token    394 |   15 |  191 |   460 |  1516 |  337 |   13   late slots 1.70, waits 1.33, H2D 0.39
+  n=2:  1.24/token    470 |   16 |  195 |   458 |  2817 |  580 |    6   late slots 2.58, waits 2.27, H2D 0.31
+  n=3:  0.17/token    993 |   14 |  182 |   372 |  4136 |  861 |    5   late slots 3.48, waits 3.24, H2D 0.24
+
+-- GPU busy and idle inside each critical-path part (ms/token); idle by the analysis.py class of its gap
+  pre       span  12.62 = busy   7.81 + idle  4.81 (queued/launch latency 3.52, host 1.26, s13 event / queue 0.04)
+  router    span   0.66 = busy   0.55 + idle  0.11 (queued/launch latency 0.10, s13 event / queue 0.01, host 0.01)
+  to_early  span   7.62 = busy   1.72 + idle  5.90 (host 2.29, queued/launch latency 2.13, s13 event / queue 1.48)
+  early     span  18.85 = busy  17.37 + idle  1.48 (queued/launch latency 1.38, host 0.10)
+  wait      span  25.40 = busy   0.00 + idle 25.40 (stager event 25.40, host 0.00)
+  late      span   8.11 = busy   6.92 + idle  1.19 (queued/launch latency 1.19, host 0.00)
+  tail      span   3.17 = busy   0.18 + idle  2.99 (host 2.51, queued/launch latency 0.35, stager event 0.13)
+
+-- s7 kernels launched before the GPU ran dry that still started >= 5 us after it ran dry, by kernel (top 12):
+  glm5_mhc_expand               1.08 ms/token    28.9/token   37.3 us each
+  mul1_had_out                  0.57 ms/token    54.2/token   10.5 us each
+  mul1_gemv                     0.45 ms/token    47.0/token    9.6 us each
+  mul1_had_in                   0.40 ms/token    43.0/token    9.3 us each
+  glm5_moe_combine_rows         0.30 ms/token     7.8/token   39.1 us each
+  glm5_moe_gather               0.25 ms/token    10.8/token   23.2 us each
+  glm5_mhc_mix_norm             0.22 ms/token     6.7/token   32.3 us each
+  glm5_swiglu_clamp             0.15 ms/token    14.9/token    9.7 us each
+  gemv_bf16_w                   0.12 ms/token     8.3/token   14.5 us each
+  glm5_gemv_fp4                 0.11 ms/token     5.8/token   18.3 us each
+  glm5_moe_tables_in            0.09 ms/token    10.6/token    8.1 us each
+  gm_idx_store                  0.08 ms/token     1.8/token   42.7 us each
+
+-- host routing step per layer (us, mean / p50): GPU topk end -> host's first API after it -> first stager API -> tables_in launch end -> tables_in GPU start
+  topk end -> first host API after it (flag seen + plan)          83.5 /    77.9
+  -> first stager API                                              9.5 /     0.0
+  first stager API -> tables_in launch end                        70.2 /    60.5
+  -> tables_in GPU start                                           8.7 /     1.6
+  stager API time inside                                          44.0 /    34.5
+  stager API calls (count)                                         6.9 /     4.0
+  topk end -> tables_in start (total)                            172.0 /   148.4
