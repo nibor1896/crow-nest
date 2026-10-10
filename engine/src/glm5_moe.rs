@@ -857,6 +857,83 @@ pub const GROUP_XROWS: usize = 256;
 /// the grouped GEMM's entry in `kernels::MUL1_SRC`
 pub const GROUP_ENTRY: &str = "mul1_gemm_grp";
 
+/// #186: the rows of one expert (in one `experts_items` range) from which `CROW_GLM_MOE_TC=1`
+/// runs it as FP16 reconstruction + tensor-core GEMM instead of `mul1_gemm_grp` (exllamav3
+/// `exl3.py` 151539c7 L137-144: FP16 reconstruction + hgemm above 144 rows)
+pub const TC_MIN_ROWS: usize = 144;
+/// #186: the most rows of one tensor-core chunk (the scratch's `xh` / `part` / `g` / `u` rows)
+pub const TC_CHUNK_ROWS: usize = 1024;
+
+/// #186: `CROW_GLM_MOE_TC` (`1` or `tc` on; unset / anything else off, the default)
+pub fn moe_tc_from_env() -> bool {
+    matches!(std::env::var("CROW_GLM_MOE_TC").ok().as_deref(), Some("1") | Some("tc"))
+}
+
+/// #186: the device bytes of the tensor-core expert scratch of a plan of `tokens` rows ([`MoeTc`]):
+/// `xh` and `part` `[rows][max(H, I)]` f32, gate / up `[rows][I]` f32 (rows = min(tokens,
+/// [`TC_CHUNK_ROWS`])), the three FP16 matrices of one expert; 0 below [`TC_MIN_ROWS`] tokens
+pub fn moe_tc_bytes(hidden: usize, inter: usize, tokens: usize) -> u64 {
+    if tokens < TC_MIN_ROWS {
+        return 0;
+    }
+    carve(&moe_tc_parts(hidden, inter, tokens.min(TC_CHUNK_ROWS))).1 as u64
+}
+
+fn moe_tc_parts(hidden: usize, inter: usize, rows: usize) -> [usize; 7] {
+    let m = hidden.max(inter);
+    let w = hidden * inter * 2;
+    [rows * m * 4, rows * m * 4, rows * inter * 4, rows * inter * 4, w, w, w]
+}
+
+/// #186: the tensor-core expert path of a [`GpuMoeGroupedPlan`] (`CROW_GLM_MOE_TC=1`): one
+/// expert's gate, up and down reconstructed to FP16 `[n][k]` (`mul1_tc_recon`, the codec's FP16
+/// values), then per chunk of rows `mul1_tc_in` (x * suh, FWHT), `mul1_gemm_tc` (FP16 MMA, FP32
+/// accumulate), `mul1_tc_out` (FWHT, / 128, * svh); down reads the clamped SwiGLU of the chunk's
+/// gate / up rows and writes `ye`. Not bit-identical to `mul1_gemm_grp`.
+pub struct MoeTc {
+    region: CUdeviceptr,
+    rows: usize,
+    xh: CUdeviceptr,
+    part: CUdeviceptr,
+    g: CUdeviceptr,
+    u: CUdeviceptr,
+    w: [CUdeviceptr; 3],
+    f_in: u64,
+    f_recon: u64,
+    f_out: u64,
+    f_gemm: u64,
+}
+
+impl MoeTc {
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn new(hidden: usize, inter: usize, tokens: usize, mk: &mul1::Kernels) -> MoeTc {
+        let rows = tokens.clamp(1, TC_CHUNK_ROWS);
+        let (off, bytes) = carve(&moe_tc_parts(hidden, inter, rows));
+        let region = cuda::alloc_named("glm5 MoE tensor-core expert scratch", bytes);
+        let at = |n: usize| region + off[n] as u64;
+        MoeTc {
+            region,
+            rows,
+            xh: at(0),
+            part: at(1),
+            g: at(2),
+            u: at(3),
+            w: [at(4), at(5), at(6)],
+            f_in: mk.module.get("mul1_tc_in") as u64,
+            f_recon: mk.module.get("mul1_tc_recon") as u64,
+            f_out: mk.module.get("mul1_tc_out") as u64,
+            f_gemm: mk.module.get("mul1_gemm_tc") as u64,
+        }
+    }
+
+    /// # Safety
+    /// No launch on the scratch is pending.
+    pub unsafe fn free(&mut self) {
+        cuda::free_dev(&mut self.region);
+    }
+}
+
 /// The expert-major schedule of one prompt call, the prefill of 0xSero's glm53-flash-offload
 /// (exllamav3's grouped MoE): every selected expert is fetched once for the call and applied to
 /// all rows routed to it. Built on the host from the call's `[t][topk]` router ids (the routing
@@ -1024,6 +1101,10 @@ pub struct GpuMoeGroupedPlan {
     item_rows: std::cell::RefCell<Vec<usize>>,
     /// `mul1_gemm_grp` (`CUfunction` as an integer, as `LaneBuf::ev`)
     grp: u64,
+    /// #186: the uploaded schedule's work items (host copy, for the tensor-core experts)
+    item_work: std::cell::RefCell<Vec<[i32; 3]>>,
+    /// #186: the tensor-core expert path (`CROW_GLM_MOE_TC=1` and at least `TC_MIN_ROWS` tokens)
+    tc: Option<MoeTc>,
 }
 
 impl GpuMoeGroupedPlan {
@@ -1094,6 +1175,25 @@ impl GpuMoeGroupedPlan {
             piece,
             item_rows: std::cell::RefCell::new(Vec::new()),
             grp: mk.module.get(GROUP_ENTRY) as u64,
+            item_work: std::cell::RefCell::new(Vec::new()),
+            tc: if moe_tc_from_env() && tokens >= TC_MIN_ROWS { Some(MoeTc::new(h, i, tokens, mk)) } else { None },
+        }
+    }
+
+    /// #186: switch the tensor-core expert path on or off (the A/B arm of the tests and the
+    /// micro-bench; `CROW_GLM_MOE_TC` picks it at construction)
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch of this plan is pending.
+    pub unsafe fn set_tc(&mut self, on: bool, mk: &mul1::Kernels) {
+        match (on, self.tc.is_some()) {
+            (true, false) => self.tc = Some(MoeTc::new(self.geo.hidden, self.geo.expert_inter, self.tokens, mk)),
+            (false, true) => {
+                if let Some(mut t) = self.tc.take() {
+                    t.free();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1123,6 +1223,7 @@ impl GpuMoeGroupedPlan {
         let flat: Vec<i32> = s.work.iter().flatten().copied().collect();
         cuda::to_i32_into(self.work, &flat);
         *self.item_rows.borrow_mut() = s.work.iter().map(|w| w[2] as usize).collect();
+        *self.item_work.borrow_mut() = s.work.clone();
     }
 
     /// queue the routed experts of work items `items` of the uploaded schedule through `table`:
@@ -1133,6 +1234,59 @@ impl GpuMoeGroupedPlan {
     /// `table` points every expert of these items at a readable record until the launches
     /// finished; `x` holds the call's rows.
     pub unsafe fn experts_items(&self, table: CUdeviceptr, x: CUdeviceptr, items: std::ops::Range<usize>) {
+        let Some(tc) = &self.tc else {
+            return self.experts_items_grp(table, x, items);
+        };
+        // #186: an expert of at least TC_MIN_ROWS rows in the range takes the tensor cores, the
+        // items between such experts mul1_gemm_grp as before
+        let work = self.item_work.borrow();
+        assert!(items.end <= work.len(), "glm5_moe: items {items:?} of a schedule of {}", work.len());
+        let (mut a, mut from) = (items.start, items.start);
+        while a < items.end {
+            let e = work[a][0];
+            let (mut b, mut rows) = (a, 0usize);
+            while b < items.end && work[b][0] == e {
+                rows += work[b][2] as usize;
+                b += 1;
+            }
+            if rows >= TC_MIN_ROWS {
+                self.experts_items_grp(table, x, from..a);
+                self.expert_tc(tc, table, x, e as u64, work[a][1] as usize, rows);
+                from = b;
+            }
+            a = b;
+        }
+        self.experts_items_grp(table, x, from..items.end);
+    }
+
+    /// #186: the `rows` list entries from `f` of expert `e` on the tensor cores into `ye` ([`MoeTc`])
+    unsafe fn expert_tc(&self, tc: &MoeTc, table: CUdeviceptr, x: CUdeviceptr, e: u64, f: usize, rows: usize) {
+        use cudarc::driver::sys::CUfunction;
+        let (h, i, k) = (self.geo.hidden, self.geo.expert_inter, self.geo.topk);
+        let [sg, su, sd] = self.geo.record_specs();
+        let u = |v: usize| v as u64;
+        let (fi, fr, fo, fg) = (tc.f_in as CUfunction, tc.f_recon as CUfunction, tc.f_out as CUfunction, tc.f_gemm as CUfunction);
+        for (m, s) in [sg, su, sd].iter().enumerate() {
+            launch_v(fr, (s.n / 128) as u32, (s.k / 16) as u32, 1, 256, &[table, tc.w[m], e, u(s.k), u(s.n), u(s.n32()), s.bits as u64, s.half as u64, u(s.tr_off)]);
+        }
+        let mut r0 = 0;
+        while r0 < rows {
+            let (r, f0) = (tc.rows.min(rows - r0), u(f + r0));
+            let tb = r.div_ceil(128) as u32;
+            for (m, s, dst) in [(0usize, sg, tc.g), (1, su, tc.u)] {
+                launch_v(fi, (h / 128) as u32, r as u32, 1, 32, &[table, self.list, x, x, tc.xh, e, f0, u(h), u(k), 0, u(s.suh_off), 0]);
+                launch_v(fg, (i / 128) as u32, tb, 1, 256, &[tc.w[m], tc.xh, tc.part, u(h), u(i), u(r)]);
+                launch_v(fo, (i / 128) as u32, r as u32, 1, 32, &[table, self.list, tc.part, dst, e, f0, u(i), u(s.svh_off), 0]);
+            }
+            launch_v(fi, (i / 128) as u32, r as u32, 1, 32, &[table, self.list, tc.g, tc.u, tc.xh, e, f0, u(i), 1, 1, u(sd.suh_off), self.geo.swiglu_limit.to_bits() as u64]);
+            launch_v(fg, (h / 128) as u32, tb, 1, 256, &[tc.w[2], tc.xh, tc.part, u(i), u(h), u(r)]);
+            launch_v(fo, (h / 128) as u32, r as u32, 1, 32, &[table, self.list, tc.part, self.ye, e, f0, u(h), u(sd.svh_off), 1]);
+            r0 += r;
+        }
+    }
+
+    /// the `mul1_gemm_grp` path of [`GpuMoeGroupedPlan::experts_items`] (the default)
+    unsafe fn experts_items_grp(&self, table: CUdeviceptr, x: CUdeviceptr, items: std::ops::Range<usize>) {
         if items.is_empty() {
             return;
         }
@@ -1202,6 +1356,9 @@ impl GpuMoeGroupedPlan {
         (self.ge, self.ue, self.ye, self.ys) = (0, 0, 0, 0);
         self.shared.free();
         self.dense.free();
+        if let Some(mut t) = self.tc.take() {
+            t.free();
+        }
     }
 }
 
@@ -2409,6 +2566,145 @@ mod tests {
                 cuda::free_dev(d);
             }
             pinned.free();
+        }
+    }
+
+    /// #186 `CROW_GLM_MOE_TC`: the tensor-core expert path (`MoeTc`: FP16 reconstruction +
+    /// `mul1_gemm_tc`) against `mul1_gemm_grp`, synthetic GLM layer, 6 distinct 3-bit records
+    /// (expert x reads record x % 6). t = 300 rows, every row picks expert 0 (300 rows: the
+    /// tensor cores) and 7 distinct others (a few rows each: `mul1_gemm_grp` in both arms). Every
+    /// `ye` row of expert 0 has cosine >= 0.9999 to the default path's, every other row is bit for
+    /// bit the default path's; the same through a pinned (zero-copy) table.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM): cargo test --release --lib glm5_moe_gpu_tc -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_tc_experts_match_the_grouped_kernel() {
+        const NR: usize = 6;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mk = mul1::Kernels::new();
+            let g = geo();
+            let (h, k, e) = (g.hidden, g.topk, g.experts);
+            let recs: Vec<u8> = (0..NR as u32).flat_map(record).collect();
+            let rb = cpu_mul1::GLM_RECORD_BYTES_K3 as u64;
+            let mut vram = cuda::upload_dev(&recs);
+            let mut pinned = cuda::Pinned::alloc_cold(recs.len());
+            pinned.write_bytes(0, &recs);
+            let table = |base: u64| -> Vec<u64> { (0..e).map(|x| base + rb * (x % NR) as u64).collect() };
+            let (mut tv, mut tp) = (cuda::to_u64_dev(&table(vram)), cuda::to_u64_dev(&table(pinned.dev)));
+            let t = 300usize;
+            let mut rng = Rng(186);
+            let x: Vec<f32> = (0..t * h).map(|_| rng.f(X_AMP)).collect();
+            let mut ids = Vec::with_capacity(t * k);
+            for r in 0..t {
+                ids.push(0i32);
+                let mut picked = vec![0i32];
+                while picked.len() < k {
+                    let c = 1 + ((r * 7919 + picked.len() * 104_729 + (rng.f(1.0).to_bits() as usize)) % (e - 1)) as i32;
+                    if !picked.contains(&c) {
+                        picked.push(c);
+                    }
+                }
+                ids.extend_from_slice(&picked[1..]);
+            }
+            let sch = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+            let mut xd = cuda::to_f32_dev(&x);
+            let mut a = GpuMoeGroupedPlan::new(&g, t, &mk);
+            a.set_tc(false, &mk);
+            let mut b = GpuMoeGroupedPlan::new(&g, t, &mk);
+            b.set_tc(true, &mk);
+            for (name, tab) in [("vram", tv), ("pinned", tp)] {
+                a.upload(&sch);
+                b.upload(&sch);
+                a.experts_items(tab, xd, 0..sch.work.len());
+                b.experts_items(tab, xd, 0..sch.work.len());
+                cuda::sync();
+                let (ya, yb) = (cuda::dtoh(a.ye, t * k * h), cuda::dtoh(b.ye, t * k * h));
+                let (mut worst, mut n_tc) = (1f64, 0usize);
+                let (mut all_a, mut all_b) = (Vec::new(), Vec::new());
+                for c in 0..t * k {
+                    let (ra, rb) = (&ya[c * h..(c + 1) * h], &yb[c * h..(c + 1) * h]);
+                    if ids[c] == 0 {
+                        let cs = cosine(ra, rb);
+                        worst = worst.min(cs);
+                        n_tc += 1;
+                        all_a.extend_from_slice(ra);
+                        all_b.extend_from_slice(rb);
+                    } else {
+                        assert!(ra.iter().zip(rb).all(|(p, q)| p.to_bits() == q.to_bits()), "{name}: ye of combo {c} (expert {}, grouped path) differs", ids[c]);
+                    }
+                }
+                let whole = cosine(&all_a, &all_b);
+                eprintln!("glm5_moe tc {name}: expert 0, {n_tc} rows on the tensor cores: worst row cosine {worst:.8}, all rows {whole:.8}; the other experts' rows bit-identical");
+                assert_eq!(n_tc, t);
+                assert!(worst >= 0.9999, "{name}: worst row cosine {worst} < 0.9999");
+            }
+            a.free();
+            b.free();
+            for d in [&mut xd, &mut vram, &mut tv, &mut tp] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
+    }
+
+    /// #186 micro-bench: one expert (gate, up, down; synthetic 3-bit record in VRAM) at 2048 rows
+    /// (top-1, every row on expert 0): `mul1_gemm_grp` (the default) against the tensor-core path
+    /// (`CROW_GLM_MOE_TC`: reconstruction + `mul1_gemm_tc`), median of 9 calls after 2 warm-up
+    /// calls, host wall around a stream sync; the cosine of the two outputs.
+    #[test]
+    #[ignore = "bench, needs the GPU (about 1 GB VRAM): cargo test --release --lib glm5_moe_gpu_tc_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_tc_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mk = mul1::Kernels::new();
+            let g = MoeGeo { topk: 1, ..geo() };
+            let (h, i, e) = (g.hidden, g.expert_inter, g.experts);
+            let rec = record(3);
+            let mut one = cuda::upload_dev(&rec);
+            let mut tv = cuda::to_u64_dev(&vec![one; e]);
+            for t in [144usize, 256, 512, 2048] {
+                let mut rng = Rng(t as u64);
+                let x: Vec<f32> = (0..t * h).map(|_| rng.f(X_AMP)).collect();
+                let mut xd = cuda::to_f32_dev(&x);
+                let sch = ExpertMajor::new(&vec![0i32; t], 1, e, GROUP_ROWS).unwrap();
+                let mut p = GpuMoeGroupedPlan::new(&g, t, &mk);
+                let mut med = |p: &GpuMoeGroupedPlan| -> f64 {
+                    p.upload(&sch);
+                    let mut v = Vec::new();
+                    for n in 0..11 {
+                        let t0 = std::time::Instant::now();
+                        p.experts_items(tv, xd, 0..sch.work.len());
+                        cuda::sync();
+                        if n >= 2 {
+                            v.push(t0.elapsed().as_secs_f64());
+                        }
+                    }
+                    v.sort_by(|a, b| a.total_cmp(b));
+                    v[v.len() / 2]
+                };
+                p.set_tc(false, &mk);
+                let old = med(&p);
+                let ya = cuda::dtoh(p.ye, t * h);
+                p.set_tc(true, &mk);
+                let new = med(&p);
+                let yb = cuda::dtoh(p.ye, t * h);
+                let cs = cosine(&ya, &yb);
+                let flop = 2.0 * t as f64 * 3.0 * (h * i) as f64;
+                eprintln!(
+                    "glm5_moe tc bench: one expert, {t} rows: mul1_gemm_grp {:.3} ms ({:.1} TFLOPS), tensor cores {:.3} ms ({:.1} TFLOPS), {:.1}x; cosine {cs:.8}",
+                    old * 1e3,
+                    flop / old / 1e12,
+                    new * 1e3,
+                    flop / new / 1e12,
+                    old / new
+                );
+                assert!(cs >= 0.9999, "{t} rows: cosine {cs}");
+                p.free();
+                cuda::free_dev(&mut xd);
+            }
+            for d in [&mut one, &mut tv] {
+                cuda::free_dev(d);
+            }
         }
     }
 
