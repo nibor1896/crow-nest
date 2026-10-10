@@ -382,7 +382,8 @@ impl Rows for Glm5Device {
         self.run.settle_ahead(&mut self.tiers)
     }
     fn counters(&self) -> ([u64; 3], u64) {
-        let a = self.tiers.cache.counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
+        // the tier each access was served from on either path (the global arena keeps its own)
+        let a = self.tiers.tier_counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
         (a, self.tiers.nvme_bytes)
     }
     fn slots(&self) -> usize {
