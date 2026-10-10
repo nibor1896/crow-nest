@@ -28,6 +28,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_STAGE_OVERLAP",
     "CROW_GLM_PREFILL_NVPF",
     "CROW_GLM_PREFILL_NVPF_MIN_ROWS",
+    "CROW_GLM_PREFILL_NVPF_EARLY",
     "CROW_GLM_CPU_LANE",
     "CROW_GLM_LANE_THREADS",
     "CROW_GLM_PINNED",
@@ -357,7 +358,13 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
         }
         v
     };
-    let arms: [(&str, Vec<(&str, String)>, bool); 7] = [
+    // #196 NVPF early: the plan from each prompt call's embedding on, every NVMe-tier expert
+    let early = |elastic: Option<&String>| -> Vec<(&str, String)> {
+        let mut v = nvpf(elastic);
+        v.push(("CROW_GLM_PREFILL_NVPF_EARLY", "1".into()));
+        v
+    };
+    let arms: [(&str, Vec<(&str, String)>, bool); 9] = [
         ("chunk 4", vec![("CROW_CHUNK", "4".into())], false),
         ("chunk 4 global", vec![("CROW_CHUNK", "4".into()), ("CROW_GLM_ARENA", "global".into())], false),
         ("chunk 4 global elastic", vec![("CROW_CHUNK", "4".into()), ("CROW_GLM_ARENA", "global".into()), ("CROW_GLM_ARENA_ELASTIC_GB", elastic.clone())], true),
@@ -370,6 +377,8 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
         ),
         ("chunk 4 global overlap nvpf", nvpf(None), false),
         ("chunk 4 global elastic overlap nvpf", nvpf(Some(&elastic)), true),
+        ("chunk 4 global overlap nvpf early", early(None), false),
+        ("chunk 4 global elastic overlap nvpf early", early(Some(&elastic)), true),
     ];
     let mut outs: Vec<Generated> = Vec::new();
     unsafe {
@@ -404,10 +413,17 @@ fn glm5_int_gpu_the_prompt_borrows_its_scratch_from_the_elastic_arena() {
             }
             let gen = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
             eprintln!("glm5 int {name}: ids {:?}, NVMe reads {}", gen.ids, tiers.nvme_reads);
-            if name.ends_with("nvpf") {
+            if name.ends_with("nvpf") || name.ends_with("nvpf early") {
                 let st = tiers.arena_stage_stats().unwrap().0;
                 eprintln!("glm5 int {name}: {st:?}");
                 assert!(st.nvpf_calls > 0 && st.nvpf_copied > 0 && st.calls == 0, "{name}: the prompt calls ran on the read-ahead plan ({st:?})");
+                if name.ends_with("early") {
+                    // one plan per prompt call, opened at its embedding and kept by its MoE layers;
+                    // the expert-major calls read nothing on the host path
+                    assert_eq!(st.nvpf_host, 0, "{name}: every NVMe record out of the ring ({st:?})");
+                    let prefills = 1 + u64::from(*borrow);
+                    assert_eq!(st.nvpf_plans, prefills * prompt.len().div_ceil(4) as u64, "{name}: one plan per prompt call ({st:?})");
+                }
             }
             assert_eq!(run.rows_held(), if *borrow { 1 } else { 4 }, "{name}: rows held after the run");
             tiers.free();
