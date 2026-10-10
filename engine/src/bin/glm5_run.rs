@@ -288,17 +288,29 @@ fn counters_json(p: &Phase, rb: u64) -> Value {
     })
 }
 
-/// `CROW_GLM_PREFETCH`: the store's counters of a phase. A staged NVMe record the store held
-/// (`used`) was read before its layer asked; the demand misses it did not cover are the phase's
-/// NVMe reads minus those.
+/// `CROW_GLM_PREFETCH`: the prefetch's counters of a phase. A guessed record a demand used was
+/// read before its layer asked; the store's used records are still counted as the call's NVMe
+/// reads (`covered`), the RAM tier's are pinned hits (#203), so the demand misses it did not
+/// cover are the phase's NVMe reads minus the covered ones. `joins`: demands on a guessed read
+/// still in flight.
 fn prefetch_json(p: &Phase, t: f64) -> Value {
     let f = p.pf.unwrap_or_default();
-    let uncovered = p.nvme_reads.saturating_sub(f.used);
+    let uncovered = p.nvme_reads.saturating_sub(f.covered);
     json!({
         "mode": if p.pf.is_some() { "next-layer" } else { "none" },
-        "hints": f.hints, "resident": f.resident, "issued": f.issued, "issued_bytes": f.bytes, "used": f.used, "wasted": f.wasted,
+        "hints": f.hints, "resident": f.resident, "issued": f.issued, "issued_bytes": f.bytes, "used": f.used, "wasted": f.wasted, "joins": f.joins, "covered": f.covered,
+        "issued_per_token": f.issued as f64 / t, "used_per_token": f.used as f64 / t, "wasted_per_token": f.wasted as f64 / t, "joins_per_token": f.joins as f64 / t,
         "demand_misses_uncovered": uncovered, "demand_misses_uncovered_per_token": uncovered as f64 / t,
     })
+}
+
+/// #209: the readers line: with the piece pool on (`CROW_NVME_POOL=1`) its workers read, not the
+/// `--readers` handles
+fn nvme_readers_label(readers: usize, pool: Option<crow_nest_engine::nvme_source::PoolConfig>) -> String {
+    match pool {
+        Some(c) => format!("NVMe piece pool {} threads x {} KiB (CROW_NVME_POOL=1; --readers {readers} unused)", c.threads, c.piece / 1024),
+        None => format!("NVMe readers {readers}"),
+    }
 }
 
 /// #192: the speculative decode's counters of one rep, per decode token (`tokens` = the ids the
@@ -379,7 +391,7 @@ fn counters_line(p: &Phase, rb: u64) -> String {
     let f = |k: &str| c[k].as_f64().unwrap_or(0.0);
     let h = |k: &str| 100.0 * c["hit_rate"][k].as_f64().unwrap_or(0.0);
     format!(
-        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch none (issued 0, used 0, wasted 0, demand misses uncovered {:.2}), CPU lane {:.2} experts {:.4} s",
+        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch {} (issued {:.2}, used {:.2}, wasted {:.2}, joins {:.2}, demand misses uncovered {:.2}), CPU lane {:.2} experts {:.4} s",
         f("visits_per_token"),
         h("vram"),
         h("pinned"),
@@ -393,6 +405,11 @@ fn counters_line(p: &Phase, rb: u64) -> String {
         f("d2h_gb_per_token"),
         f("promotions_per_token"),
         f("evictions_per_token"),
+        c["prefetch"]["mode"].as_str().unwrap_or("none"),
+        c["prefetch"]["issued_per_token"].as_f64().unwrap_or(0.0),
+        c["prefetch"]["used_per_token"].as_f64().unwrap_or(0.0),
+        c["prefetch"]["wasted_per_token"].as_f64().unwrap_or(0.0),
+        c["prefetch"]["joins_per_token"].as_f64().unwrap_or(0.0),
         c["prefetch"]["demand_misses_uncovered_per_token"].as_f64().unwrap_or(0.0),
         f("cpu_lane_per_token"),
         f("cpu_lane_s_per_token")
@@ -545,6 +562,12 @@ fn run(args: &[String]) -> Result<(), String> {
     let num = |n: &str| -> Result<Option<usize>, String> { flag(n)?.map(|v| v.parse::<usize>().map_err(|_| format!("{n} {v:?} is not a whole number"))).transpose() };
     let n = num("-n")?.unwrap_or(16);
     let readers = num("--readers")?.unwrap_or(1);
+    // #209: the piece pool the tier store's source opens with (it replaces the readers)
+    let pool = {
+        use crow_nest_engine::nvme_source as ns;
+        let env = |k: &str| std::env::var(k).ok();
+        ns::resolve_pool(ns::PoolAsk::Env, env(ns::POOL_ENV).as_deref(), env(ns::POOL_THREADS_ENV).as_deref(), env(ns::POOL_PIECE_KB_ENV).as_deref())?
+    };
     let reps = num("--reps")?.unwrap_or(1);
     if reps == 0 {
         return Err("--reps 0: nothing to run".into());
@@ -625,7 +648,7 @@ fn run(args: &[String]) -> Result<(), String> {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let moe_layers = gt::moe_layers(&o.g);
         println!(
-            "[glm5_run] #159 plan at free VRAM {:.2} GiB, context {context}, pinned budget {:.2} GiB: per MoE layer VRAM {} / pinned {} / NVMe {}; running VRAM {} / pinned {} / NVMe {} x {} MoE layers, NVMe readers {readers}",
+            "[glm5_run] #159 plan at free VRAM {:.2} GiB, context {context}, pinned budget {:.2} GiB: per MoE layer VRAM {} / pinned {} / NVMe {}; running VRAM {} / pinned {} / NVMe {} x {} MoE layers, {}",
             gib(free),
             gib(budget),
             plan.hot,
@@ -634,7 +657,8 @@ fn run(args: &[String]) -> Result<(), String> {
             sizes.vram,
             sizes.pinned,
             o.g.experts - sizes.vram - sizes.pinned,
-            moe_layers
+            moe_layers,
+            nvme_readers_label(readers, pool)
         );
         if chunk > 1 {
             println!(
@@ -686,7 +710,7 @@ fn run(args: &[String]) -> Result<(), String> {
             "prompt": { "source": source, "base_ids": base.len(), "ids": prompt.len(), "prompt_tokens_flag": prompt_tokens },
             "generate": n, "reps": reps, "cold": cold, "stop_eos": stop_eos, "random_ids_seed": random_seed, "context": context,
             "tiers": { "plan": { "vram": plan.hot, "pinned": plan.pinned, "nvme": plan.nvme }, "vram_slots": sizes.vram, "pinned_slots": sizes.pinned,
-                       "nvme": o.g.experts - sizes.vram - sizes.pinned, "moe_layers": moe_layers, "first_moe_layer": first_moe, "readers": readers,
+                       "nvme": o.g.experts - sizes.vram - sizes.pinned, "moe_layers": moe_layers, "first_moe_layer": first_moe, "readers": readers, "nvme_pool": pool.map(|c| json!({ "threads": c.threads, "piece_bytes": c.piece })),
                        "policy": format!("{:?}", tiers.cache.policy), "pinned_use": format!("{:?}", tiers.pinned_use), "arena": format!("{:?}", tiers.arena_kind()), "arena_config": tiers.arena_config().map(|c| format!("{c:?}")), "staging_slots": tiers.stage_cap, "pinned_budget_bytes": budget, "free_vram_at_plan_bytes": free,
                        "prefill_staging_slots": tiers.prefill_cap() },
             "prompt_chunk": { "chunk": run.prompt_chunk(), "calls": gt::prompt_calls(prompt.len(), run.prompt_chunk()).iter().map(|c| c.1).collect::<Vec<_>>(), "plan_chunk_scratch_bytes": input.chunk_scratch_bytes },
@@ -915,7 +939,7 @@ mod tests {
                     at,
                     lane_s: 0.0,
                     // the store on in decode rows only: 1 record used of 2 read per row
-                    pf: (!prompt).then_some(PrefetchStats { hints: 1, issued: 2, bytes: 200, used: 1, wasted: 1, ..PrefetchStats::default() }),
+                    pf: (!prompt).then_some(PrefetchStats { hints: 1, issued: 2, bytes: 200, used: 1, wasted: 1, covered: 1, ..PrefetchStats::default() }),
                 }
             })
             .collect()
@@ -963,6 +987,18 @@ mod tests {
         assert_eq!(l[1]["nvme_reads_per_token"], 1.0);
         assert!(layers_line(&dec, 3).starts_with("NVMe reads/tok min l3 1.00 median 1.00 max l3 1.00"), "{}", layers_line(&dec, 3));
         assert!(counters_line(&pre, 1_000_000_000).starts_with("visits 16.0, hits vram 25.0 % pinned 25.0 % nvme 50.0 %, r 8.00 NVMe reads"), "{}", counters_line(&pre, 1_000_000_000));
+        // #209: the line prints the prefetch's mode and counters per token, not a fixed "none"
+        assert!(counters_line(&pre, 1).contains("prefetch none (issued 0.00, used 0.00, wasted 0.00, joins 0.00, demand misses uncovered 8.00)"), "{}", counters_line(&pre, 1));
+        assert!(counters_line(&dec, 1).contains("prefetch next-layer (issued 2.00, used 1.00, wasted 1.00, joins 0.00, demand misses uncovered 1.00)"), "{}", counters_line(&dec, 1));
+        assert_eq!(d["prefetch"]["joins"], 0);
+    }
+
+    /// #209: under CROW_NVME_POOL=1 the readers are the pool's workers, not `--readers`
+    #[test]
+    fn the_readers_line_names_the_pool_when_it_is_on() {
+        use crow_nest_engine::nvme_source::PoolConfig;
+        assert_eq!(nvme_readers_label(1, None), "NVMe readers 1");
+        assert_eq!(nvme_readers_label(1, Some(PoolConfig { threads: 48, piece: 1 << 20 })), "NVMe piece pool 48 threads x 1024 KiB (CROW_NVME_POOL=1; --readers 1 unused)");
     }
 
     /// `-n 1`: the only id comes from the last prompt row; the decode phase is empty, not NaN
