@@ -7264,7 +7264,7 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
         }
     }
 
-    /// #187 bench: T = 1 from VRAM, GLM K = 3 records, `mul1_gemv` (old) vs `mul1_gemv2` (new) as
+    /// #187 bench: T = 1 from VRAM (and 8 slots from pinned RAM, 16 records), GLM K = 3 records, `mul1_gemv` (old) vs `mul1_gemv2` (new) as
     /// alternating arms. 48 distinct records (the 48 gate trellises 151 MB: more than the 96 MB
     /// L2), rotated. Rows: the gate GEMV kernel alone (one launch over `slots` experts) and the
     /// whole FFN (7 launches), for 1 expert and a group of 8 per launch; GB/s of trellis (gate)
@@ -7288,9 +7288,15 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
             }
             let rb = base.len() as u64;
             let mut vram = cuda::upload_dev(&all);
+            // the first 16 records again in pinned host memory (zero-copy UVA), 152 MB
+            const NPIN: usize = 16;
+            let mut pinned = cuda::Pinned::alloc_cold(NPIN * base.len());
+            pinned.write_bytes(0, &all[..NPIN * base.len()]);
             drop(all);
             let pv: Vec<u64> = (0..2 * NREC as u64).map(|i| vram + (i % NREC as u64) * rb).collect();
             let mut ptr_v = cuda::to_u64_dev(&pv);
+            let pp: Vec<u64> = (0..2 * NPIN as u64).map(|i| pinned.dev + (i % NPIN as u64) * rb).collect();
+            let mut ptr_p = cuda::to_u64_dev(&pp);
             let rec_bytes = (3 * tb + 6 * (c.hidden + c.inter)) as f64;
             eprintln!("mul1 gemv2 bench: K = 3, T 1, VRAM, gate trellis {tb} B, record {rec_bytes} B, {NREC} records rotated");
             for name in ["mul1_gemv", "mul1_gemv2"] {
@@ -7301,12 +7307,12 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
                 cuda::ck(sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut blocks, f, 256, 0));
                 eprintln!("  {name}: {regs} registers, {blocks} blocks of 256 per SM");
             }
-            for slots in [1usize, 8] {
+            for (lane, slots, nrec, ptr_l) in [("VRAM", 1usize, NREC, ptr_v), ("VRAM", 8, NREC, ptr_v), ("pinned", 8, NPIN, ptr_p)] {
                 let x = xs(slots * c.hidden, &mut Rng(7));
                 let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(slots * c.hidden * 4));
                 let mut gp = GemvPlan::new(spec_of(c)[0], slots, 1);
                 let mut fp = FfnPlan::new(c.hidden, c.inter, c.bitrate.bits, c.bitrate.half, slots, 1);
-                gp.run(&kn, ptr_v, xd, yd);
+                gp.run(&kn, ptr_l, xd, yd);
                 for (what, bytes) in [("gemv gate", tb as f64), ("ffn", rec_bytes)] {
                     let bytes = bytes * slots as f64;
                     let mut gbs = [Vec::new(), Vec::new()];
@@ -7319,7 +7325,7 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
                         cuda::sync();
                         let t0 = std::time::Instant::now();
                         for call in 0..64usize {
-                            let pe = ptr_v + 8 * ((call * slots) % NREC) as u64;
+                            let pe = ptr_l + 8 * ((call * slots) % nrec) as u64;
                             if what == "ffn" {
                                 fp.run(&kn, pe, xd, yd);
                             } else {
@@ -7335,7 +7341,7 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
                     for (arm, g) in ["mul1_gemv (old)", "mul1_gemv2 (new)"].iter().zip(gbs.iter_mut()) {
                         g.sort_by(|a, b| a.partial_cmp(b).unwrap());
                         eprintln!(
-                            "  {what:9} {slots} expert(s) {arm:16}: median {:.1} GB/s (min {:.1}, max {:.1}), {:.1} us per launch group",
+                            "  {lane:6} {what:9} {slots} expert(s) {arm:16}: median {:.1} GB/s (min {:.1}, max {:.1}), {:.1} us per launch group",
                             g[2],
                             g[0],
                             g[4],
@@ -7350,6 +7356,8 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
             }
             cuda::free_dev(&mut vram);
             cuda::free_dev(&mut ptr_v);
+            cuda::free_dev(&mut ptr_p);
+            pinned.free();
         }
     }
 }
