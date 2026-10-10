@@ -115,6 +115,8 @@ extern "C" __global__ void mul1_had_in(const unsigned long long* __restrict__ pt
                                        float* __restrict__ xh, const int* __restrict__ p) {
     const int k = p[0], T = p[1];
     const int e = blockIdx.z, t = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
     const unsigned short* suh = (const unsigned short*)(ptrs[e] + (unsigned long long)p[2]);
     const size_t row = ((size_t)e * T + t) * k;
     const int c0 = blk * 128 + 4 * lane;
@@ -212,6 +214,8 @@ extern "C" __global__ void __launch_bounds__(256) mul1_gemv(const unsigned long 
                                                             float* __restrict__ part, const int* __restrict__ p) {
     const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6], T = p[7];
     const int e = blockIdx.z, sp = blockIdx.y;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
     const unsigned long long tbase = ptrs[e] + (unsigned long long)p[3];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int tiles_n = n >> 4, tps = (k >> 4) / S;
@@ -352,6 +356,8 @@ extern "C" __global__ void __launch_bounds__(256, 6) mul1_gemv2(const unsigned l
                                                                 float* __restrict__ part, const int* __restrict__ p) {
     const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6];
     const int e = blockIdx.z, sp = blockIdx.y;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
     const unsigned long long tbase = ptrs[e] + (unsigned long long)p[3];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int tiles_n = n >> 4, tps = (k >> 4) / S;
@@ -420,6 +426,8 @@ extern "C" __global__ void mul1_gemv_warp(const unsigned long long* __restrict__
                                           float* __restrict__ part, const int* __restrict__ p) {
     const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6], T = p[7];
     const int e = blockIdx.z, sp = blockIdx.y;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
     const unsigned int* tr = (const unsigned int*)(ptrs[e] + (unsigned long long)p[3]);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int tiles_n = n >> 4, tps = (k >> 4) / S;
@@ -464,6 +472,8 @@ extern "C" __global__ void mul1_had_out(const unsigned long long* __restrict__ p
                                         float* __restrict__ y, const int* __restrict__ p) {
     const int n = p[0], S = p[1], T = p[2];
     const int e = blockIdx.z, t = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
     const unsigned short* svh = (const unsigned short*)(ptrs[e] + (unsigned long long)p[3]);
     float v[4];
     mul1_out_block(v, part, svh, e, S, T, t, n, blk, lane);

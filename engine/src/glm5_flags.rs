@@ -93,6 +93,38 @@ pub const ENV_PREFETCH_SIDE: &str = "CROW_GLM_PREFETCH_SIDE";
 pub const ENV_SHARED_OVERLAP: &str = "CROW_GLM_SHARED_OVERLAP";
 pub const ENV_CONTROLLER: &str = "CROW_GLM_CONTROLLER";
 pub const ENV_LA: &str = "CROW_GLM_LA";
+/// #202 lanes: `1` lets the GPU experts, the CPU lane and the NVMe reads of a controlled decode
+/// layer run side by side (see [`lanes2_on`]); unset or anything else keeps the former path
+pub const ENV_LANES2: &str = "CROW_GLM_LANES2";
+
+/// `CROW_GLM_LANES2=1` (the repo's `CROW_*` rule: only `1` turns it on). Under the controller's
+/// early reply: the CPU lane takes only resident records (a record still landing goes to the
+/// GPU's late pass, so the lane never waits for a landing or a write-back); the late pass holds
+/// top-k slots ([`late_slots`]) and its spare slots read nothing (a null record: the expert
+/// kernels return at once), so no layer waits for all its landings before its experts and a
+/// layer without late experts pays no late GEMV; the device waits for the stager's moves word only
+/// when the call queued a copy the experts read (else the moves are no wait of the experts at
+/// all: the early experts read the mapped table row); the next layer's guessed reads go to the
+/// NVMe pool's `Prefetch` queue (at most [`LANES2_PREFETCH_WORKERS`] workers on it) and a guessed
+/// read the layer then needs moves to the `Demand` queue.
+pub fn lanes2_on() -> bool {
+    std::env::var(ENV_LANES2).ok().as_deref() == Some("1")
+}
+
+/// #202 lanes: workers of the NVMe piece pool that may read `Prefetch` pieces at once under
+/// `CROW_GLM_LANES2` (the others stay free for a layer's demand reads;
+/// `nvme_source::tests::bench_lanes_pool_under_spin`, 2026-10-10: demand 2 x 9.47 MB p50 2.48
+/// ms at 4 of 16 against 2.85 ms uncapped)
+pub const LANES2_PREFETCH_WORKERS: usize = 4;
+
+/// the late pass's slots: [`LATE_SLOTS`], or top-k `k` under `CROW_GLM_LANES2`
+pub fn late_slots(lanes2: bool, k: usize) -> usize {
+    if lanes2 {
+        k
+    } else {
+        LATE_SLOTS
+    }
+}
 
 /// how long the host spins for a router's ids before it gives up by name (a layer's router is
 /// well under a second; the WDDM TDR is 2 s)
@@ -325,7 +357,8 @@ extern "C" __global__ void glm5_ctl_wait(const unsigned long long* ctr, volatile
     __threadfence_system();
 }}
 // #202 early reply: the late ring entry of request q ({late_w} u64): [0] q, [1] mode (1: the moves
-// word before the experts, 2: every late item waited before the experts), [2] items, [3] a VRAM
+// word before the experts, 2: every late item waited before the experts, 4: the spare late slots
+// read a null record), [2] items, [3] a VRAM
 // record the spare late slots read, [4] the moves word's address, [5] its value; from [8] four
 // words per item: expert, record address, wait word address, wait value
 __device__ bool glm5_late_spin(const volatile unsigned long long* w, unsigned long long v, unsigned long long q, volatile unsigned long long* err, long long timeout_ns)
@@ -367,7 +400,9 @@ extern "C" __global__ void glm5_ctl_late(const unsigned long long* ctr, const un
     const unsigned long long q = *ctr;
     const volatile unsigned long long* en = (const volatile unsigned long long*) (late + (q % {ring}) * {late_w});
     const bool mine = en[0] == q;
-    const unsigned long long spare = (mine && en[3]) ? en[3] : ptrs1[0];
+    // mode 4 (CROW_GLM_LANES2): a spare slot reads nothing (a null record, the expert kernels
+    // return at once)
+    const unsigned long long spare = (mine && (en[1] & 4)) ? 0ull : (mine && en[3]) ? en[3] : ptrs1[0];
     int j = 0;
     if (mine && !(en[1] & 2)) {{
         const unsigned long long n = en[2];
@@ -1355,6 +1390,9 @@ pub struct Ctl {
     pre: CUfunction,
     late_k: CUfunction,
     scatter: CUfunction,
+    /// #202 lanes ([`ENV_LANES2`], read at `new`): the late pass's slots ([`late_slots`]); the
+    /// controller job writes its entries to match ([`Ctl::set_lanes2`])
+    pub late_slots: usize,
 }
 
 /// `CROW_GLM_CONTROLLER` with `CROW_GLM_PREFETCH`: the guesses as the controller saw them
@@ -1564,6 +1602,7 @@ impl Ctl {
         let late = Pinned::alloc(CTL_RING * LATE_WORDS * 8);
         std::ptr::write_bytes(late.host as *mut u8, 0, late.bytes);
         Ctl {
+            late_slots: late_slots(lanes2_on(), k),
             early: std::env::var(ENV_CTL_LATE_REPLY).ok().as_deref() != Some("1"),
             late,
             pre: kn.ctl_pre,
@@ -1679,10 +1718,10 @@ impl Ctl {
 
     /// #202 early reply: the experts of the last published request's layer behind
     /// [`Ctl::wait_reply`] (the table `table` read where the controller wrote it): `glm5_ctl_pre`
-    /// (the moves word; with more late experts than [`LATE_SLOTS`] every late one), the experts
+    /// (the moves word; with more late experts than the late slots every late one), the experts
     /// (a late one reads a zeroed VRAM record there), the shared one, then the late pass:
     /// `glm5_ctl_late` waits for each late expert's own word and puts it into a late slot, the
-    /// expert GEMVs over [`LATE_SLOTS`] slots, `glm5_ctl_scatter` over their combos' rows, the
+    /// expert GEMVs over the late slots ([`Ctl::late_slots`]), `glm5_ctl_scatter` over their combos' rows, the
     /// combine. One row (`t = 1`).
     ///
     /// # Safety
@@ -1722,7 +1761,7 @@ impl Ctl {
     ) {
         let err = self.reply.dev + 8;
         launch_v(self.pre, 1, 1, 1, 1, &[self.ctr, self.late.dev, err, CTL_WAIT_NS]);
-        let (ctr, late, k, fill, scatter) = (self.ctr, self.late.dev, self.k, self.late_k, self.scatter);
+        let (ctr, late, k, fill, scatter, slots) = (self.ctr, self.late.dev, self.k, self.late_k, self.scatter, self.late_slots);
         let h = p.geo.hidden;
         p.experts_late(
             kn,
@@ -1732,16 +1771,22 @@ impl Ctl {
             table,
             x,
             y,
-            LATE_SLOTS,
+            slots,
             &mut |ids, ptrs1, ptrs2, idx| {
                 if let Some(m) = mark {
                     cuda::event_record(m, cuda::cur_stream());
                 }
-                launch_v(fill, 1, 1, 1, 1, &[ctr, late, ids, k as u64, ptrs1, ptrs2, idx, LATE_SLOTS as u64, err, CTL_WAIT_NS])
+                launch_v(fill, 1, 1, 1, 1, &[ctr, late, ids, k as u64, ptrs1, ptrs2, idx, slots as u64, err, CTL_WAIT_NS])
             },
-            &mut |ye, ye2, idx| launch_v(scatter, h.div_ceil(256).min(64) as u32, LATE_SLOTS as u32, 1, 256, &[ye, ye2, idx]),
+            &mut |ye, ye2, idx| launch_v(scatter, h.div_ceil(256).min(64) as u32, slots as u32, 1, 256, &[ye, ye2, idx]),
         );
         cuda::stream_query(cuda::cur_stream());
+    }
+
+    /// #202 lanes: the late pass of [`late_slots`] (`CROW_GLM_LANES2` on or off); the tiers
+    /// serving this controller must be set alike (`ExpertTiers::set_lanes2`)
+    pub fn set_lanes2(&mut self, on: bool) {
+        self.late_slots = late_slots(on, self.k);
     }
 
     /// no request was handed to a job yet (a controller made by the last `set_switches`)

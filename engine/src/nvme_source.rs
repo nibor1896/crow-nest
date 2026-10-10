@@ -764,6 +764,38 @@ impl NvmeSource {
     pub fn backend(&self) -> NvmeBackend {
         self.backend
     }
+
+    /// #202 lanes (`CROW_GLM_LANES2`): at most `lo_max` of the piece pool's workers read
+    /// `Prefetch` pieces at once, the others stay free for `Demand` (`usize::MAX`, the default:
+    /// every worker). A no-op on the per-reader backends.
+    pub fn set_lanes(&self, lo_max: usize) {
+        if let Some(p) = &self.pool {
+            let g = p.shared.q.lock().unwrap();
+            p.shared.lo_max.store(lo_max.max(1), Ordering::Relaxed);
+            drop(g);
+            p.shared.cv.notify_all();
+        }
+    }
+
+    /// #202 lanes: the record whose landed flag is `flag` is needed now: its `Prefetch` pieces
+    /// still queued move to the back of the `Demand` queue (in their order). Returns the pieces
+    /// moved (0 on the per-reader backends, or when none is queued).
+    pub fn promote(&self, flag: *const u64) -> usize {
+        let Some(p) = &self.pool else { return 0 };
+        let mut q = p.shared.q.lock().unwrap();
+        let mine = |x: &Piece| x.rec.job.landed.is_some_and(|l| std::ptr::eq(l.flag as *const u64, flag));
+        if !q.lo.iter().any(mine) {
+            return 0;
+        }
+        let lo = std::mem::take(&mut q.lo);
+        let (up, keep): (VecDeque<Piece>, VecDeque<Piece>) = lo.into_iter().partition(mine);
+        let n = up.len();
+        q.lo = keep;
+        q.hi.extend(up);
+        drop(q);
+        p.shared.cv.notify_all();
+        n
+    }
 }
 
 impl Drop for NvmeSource {
@@ -909,11 +941,16 @@ struct PoolQueues {
     hi: VecDeque<Piece>,
     lo: VecDeque<Piece>,
     closed: bool,
+    /// #202 lanes: `Prefetch` pieces being read now
+    lo_running: usize,
 }
 
 struct PoolShared {
     q: Mutex<PoolQueues>,
     cv: Condvar,
+    /// #202 lanes ([`NvmeSource::set_lanes`]): at most this many workers read `Prefetch` pieces
+    /// at once, so a `Demand` piece finds a free worker at once (default: every worker)
+    lo_max: std::sync::atomic::AtomicUsize,
 }
 
 /// The piece pool: `threads` workers, one unbuffered handle each.
@@ -929,7 +966,7 @@ impl Pool {
         if let Some(why) = cfg.refusal() {
             return Err(why);
         }
-        let shared = Arc::new(PoolShared { q: Mutex::new(PoolQueues::default()), cv: Condvar::new() });
+        let shared = Arc::new(PoolShared { q: Mutex::new(PoolQueues::default()), cv: Condvar::new(), lo_max: std::sync::atomic::AtomicUsize::new(usize::MAX) });
         // built up in place: a failure below drops it, which closes the queue and joins the
         // workers already started
         let mut pool = Pool { cfg, io, shared, workers: Vec::with_capacity(cfg.threads) };
@@ -1009,20 +1046,24 @@ impl Drop for Pool {
     }
 }
 
-/// A worker: the high queue's front whenever there is one, else the low queue's; one read at a
-/// time; the worker that finishes a record's last piece finishes the record.
+/// A worker: the high queue's front whenever there is one, else the low queue's (#202 lanes: only
+/// while fewer than `lo_max` workers read low pieces); one read at a time; the worker that
+/// finishes a record's last piece finishes the record.
 fn pool_worker(file: &std::fs::File, sh: &PoolShared) {
     loop {
-        let p = {
+        let (p, low) = {
             let mut q = sh.q.lock().unwrap();
             loop {
                 if let Some(p) = q.hi.pop_front() {
-                    break p;
+                    break (p, false);
                 }
-                if let Some(p) = q.lo.pop_front() {
-                    break p;
+                if q.lo_running < sh.lo_max.load(Ordering::Relaxed) {
+                    if let Some(p) = q.lo.pop_front() {
+                        q.lo_running += 1;
+                        break (p, true);
+                    }
                 }
-                if q.closed {
+                if q.closed && q.lo.is_empty() {
                     return;
                 }
                 q = sh.cv.wait(q).unwrap();
@@ -1034,6 +1075,14 @@ fn pool_worker(file: &std::fs::File, sh: &PoolShared) {
             }
             Err(e) => {
                 p.rec.err.lock().unwrap().get_or_insert(e);
+            }
+        }
+        if low {
+            let mut q = sh.q.lock().unwrap();
+            q.lo_running -= 1;
+            if !q.lo.is_empty() {
+                drop(q);
+                sh.cv.notify_one();
             }
         }
         // AcqRel: the last decrement sees every other worker's bytes of this record
@@ -2187,6 +2236,132 @@ mod tests {
             src.wait(tp).unwrap();
             assert_eq!(last == 0, overtakes, "{prio:?}: the last prefetch record had {}landed when the 8 KiB read completed", if last == 0 { "not " } else { "" });
         }
+    }
+
+    /// #202 lanes: `lo_max` caps the workers on low pieces: two workers, cap 1, a long prefetch
+    /// queued first; a demand read queued behind it starts on the second worker at once (its
+    /// flag rises while prefetch records are still queued), and every byte is right
+    #[test]
+    fn lanes_cap_keeps_a_worker_free_for_demand() {
+        const LEN: usize = 16 << 20;
+        let (f, want) = pool_raw_file("lanes", LEN);
+        let src = NvmeSource::open(&pool_cfg(&f.path, 2, 4096)).unwrap();
+        src.set_lanes(1);
+        let pf: Vec<ExpertRecord> = (0..8).map(|k| pool_rec(k, (k as u64) << 20, 1 << 20)).collect();
+        let pf_bufs: Vec<Aligned> = pf.iter().map(|_| Aligned::new(1 << 20)).collect();
+        let pf_jobs: Vec<(ExpertRecord, RecordDst)> = pf.iter().zip(&pf_bufs).map(|(r, b)| (*r, RecordDst { gu: b.p, dn: std::ptr::null_mut() })).collect();
+        let flags: Vec<u64> = vec![0; 8];
+        let landed: Vec<Landed> = (0..8).map(|k| Landed { flag: &flags[k] as *const u64 as *mut u64, value: 1 }).collect();
+        let tp = unsafe { src.fetch_prio(&pf_jobs, Some(&landed), ReadPriority::Prefetch) }.unwrap();
+        let b = Aligned::new(1 << 20);
+        let d = pool_rec(99, 12 << 20, 1 << 20);
+        let td = unsafe { src.fetch_prio(&[(d, RecordDst { gu: b.p, dn: std::ptr::null_mut() })], None, ReadPriority::Demand) }.unwrap();
+        src.wait(td).unwrap();
+        let last = unsafe { std::ptr::read_volatile(&flags[7]) };
+        assert!(b.bytes() == &want[12 << 20..13 << 20]);
+        src.wait(tp).unwrap();
+        for (k, buf) in pf_bufs.iter().enumerate() {
+            assert!(buf.bytes() == &want[k << 20..(k + 1) << 20], "prefetch record {k}");
+        }
+        assert_eq!(last, 0, "the demand read waited for the whole prefetch");
+        src.set_lanes(usize::MAX);
+    }
+
+    /// #202 lanes: `promote` moves a queued prefetch record's pieces into the demand queue: one
+    /// worker, 8 prefetch records of 1 MiB in 4 KiB pieces; promoting the last one lands it while
+    /// the 7th has not landed; the bytes of all are right and a second promote moves nothing
+    #[test]
+    fn lanes_promote_moves_a_joined_prefetch_record_up() {
+        const LEN: usize = 16 << 20;
+        let (f, want) = pool_raw_file("promote", LEN);
+        let src = NvmeSource::open(&pool_cfg(&f.path, 1, 4096)).unwrap();
+        let pf: Vec<ExpertRecord> = (0..8).map(|k| pool_rec(k, (k as u64) << 20, 1 << 20)).collect();
+        let pf_bufs: Vec<Aligned> = pf.iter().map(|_| Aligned::new(1 << 20)).collect();
+        let pf_jobs: Vec<(ExpertRecord, RecordDst)> = pf.iter().zip(&pf_bufs).map(|(r, b)| (*r, RecordDst { gu: b.p, dn: std::ptr::null_mut() })).collect();
+        let flags: Vec<u64> = vec![0; 8];
+        let landed: Vec<Landed> = (0..8).map(|k| Landed { flag: &flags[k] as *const u64 as *mut u64, value: 1 }).collect();
+        let tp = unsafe { src.fetch_prio(&pf_jobs, Some(&landed), ReadPriority::Prefetch) }.unwrap();
+        assert!(src.promote(&flags[7]) > 0, "nothing of record 7 was queued");
+        let t0 = std::time::Instant::now();
+        while unsafe { std::ptr::read_volatile(&flags[7]) } == 0 {
+            assert!(t0.elapsed().as_secs() < 30);
+            std::hint::spin_loop();
+        }
+        let six = unsafe { std::ptr::read_volatile(&flags[6]) };
+        src.wait(tp).unwrap();
+        for (k, buf) in pf_bufs.iter().enumerate() {
+            assert!(buf.bytes() == &want[k << 20..(k + 1) << 20], "record {k}");
+        }
+        assert_eq!(six, 0, "record 6 landed before the promoted record 7");
+        assert_eq!(src.promote(&flags[7]), 0);
+    }
+
+    /// #202 lanes bench (about a minute, writes and removes a 768 MiB temp file on the temp
+    /// drive): latency of a demand fetch of 2 records of 9.47 MB every 4 ms under a prefetch
+    /// load (1 record per 4 ms, `Prefetch`), pool 16 x 1 MiB, with the CPU idle, with
+    /// `CROW_LANES_BENCH_SPIN` (default 24) threads spinning (the CPU lane's pool and the
+    /// controller's waits), and spinning with the prefetch cap of [`NvmeSource::set_lanes`].
+    /// `cargo test --release --lib nvme_source::tests::bench_lanes -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_lanes_pool_under_spin() {
+        const REC: usize = 9_474_048;
+        const RECS: usize = 80;
+        let rec_al = REC.div_ceil(4096) * 4096;
+        let (f, _) = pool_raw_file("lanes-bench", RECS * rec_al);
+        let spin_n: usize = std::env::var("CROW_LANES_BENCH_SPIN").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+        let src = NvmeSource::open(&pool_cfg(&f.path, 16, 1 << 20)).unwrap();
+        let recs: Vec<ExpertRecord> = (0..RECS).map(|k| pool_rec(k as u32, (k * rec_al) as u64, REC)).collect();
+        let bufs: Vec<Aligned> = (0..8).map(|_| Aligned::new(REC)).collect();
+        let pct = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 2], v[(v.len() * 9 / 10).min(v.len() - 1)], v[v.len() - 1])
+        };
+        for (what, spin, cap) in [("warm-up", false, usize::MAX), ("idle", false, usize::MAX), ("spin", true, usize::MAX), ("spin+cap8", true, 8), ("spin+cap4", true, 4)] {
+            src.set_lanes(cap);
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let mut lat = Vec::new();
+            let t_all = std::time::Instant::now();
+            let mut bytes = 0u64;
+            std::thread::scope(|sc| {
+                if spin {
+                    for _ in 0..spin_n {
+                        sc.spawn(|| {
+                            let mut x = 1u64;
+                            while !stop.load(Ordering::Relaxed) {
+                                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                                std::hint::spin_loop();
+                            }
+                            std::hint::black_box(x);
+                        });
+                    }
+                }
+                let mut pf: VecDeque<Ticket> = VecDeque::new();
+                let mut c = 0usize;
+                for i in 0..120 {
+                    std::thread::sleep(std::time::Duration::from_millis(4));
+                    if pf.len() == 4 {
+                        bytes += src.wait(pf.pop_front().unwrap()).unwrap().bytes;
+                    }
+                    let j = (recs[c % RECS], RecordDst { gu: bufs[2 + i % 4].p, dn: std::ptr::null_mut() });
+                    c += 7;
+                    pf.push_back(unsafe { src.fetch_prio(&[j], None, ReadPriority::Prefetch) }.unwrap());
+                    let jobs: Vec<(ExpertRecord, RecordDst)> = (0..2).map(|k| (recs[(c + k * 13) % RECS], RecordDst { gu: bufs[k].p, dn: std::ptr::null_mut() })).collect();
+                    c += 3;
+                    let t0 = std::time::Instant::now();
+                    let t = unsafe { src.fetch_prio(&jobs, None, ReadPriority::Demand) }.unwrap();
+                    bytes += src.wait(t).unwrap().bytes;
+                    lat.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                while let Some(t) = pf.pop_front() {
+                    bytes += src.wait(t).unwrap().bytes;
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            let (p50, p90, max) = pct(&mut lat);
+            eprintln!("lanes bench {what} ({spin_n} spinners, prefetch cap {cap}): demand 2 x 9.47 MB p50 {p50:.2} ms, p90 {p90:.2} ms, max {max:.2} ms; {:.2} GB/s overall", bytes as f64 / t_all.elapsed().as_secs_f64() / 1e9);
+        }
+        src.set_lanes(usize::MAX);
     }
 
     /// a plain file of xorshift bytes (the backend tests' `raw_file`, on every platform)
