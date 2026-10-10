@@ -407,7 +407,7 @@ fn glm5_int_decode_hot_set_with_the_borrowed_prompt_scratch() {
 /// Cross-wiring 2: the CPU lane (`1` and `split`) with the global arena, the stager, the
 /// controller and its lookahead. The lane's CPU combos have other bits than the GPU's, so a
 /// comparison holds when the same experts go to the CPU: with every expert in pinned (V 0 + P 16
-/// of 16 per layer) `1` gives every pick to the CPU on every path, and `split` plans from the same
+/// of 16 per layer) `1` gives every pick to the CPU on every path (under the controller every resident one, #202), and `split` plans from the same
 /// heat on every path (every call counts it). Every arm without the controller gives the bits of
 /// the synchronous per-layer lane of its mode, and the CPU computed experts in every arm. Then
 /// V 3 + P 4: the controller (with LA and the prefetch) against flags + stager with the lane on,
@@ -443,7 +443,9 @@ fn glm5_int_gpu_the_cpu_lane_runs_with_the_arena_the_stager_and_the_controller()
             assert_g3(&format!("lane {mode} {}", a.name), o, &outs[0]);
         }
         if mode == "1" {
-            assert!(outs.iter().all(|o| o.lane_experts == outs[0].lane_experts), "every pick on the CPU on every path");
+            assert!(outs[..4].iter().all(|o| o.lane_experts == outs[0].lane_experts), "every pick on the CPU on every path without the controller");
+            // #202: under the controller a pick still landing from the NVMe goes to the GPU
+            assert!(outs[4..].iter().all(|o| o.lane_experts < outs[0].lane_experts), "the controller's lane took picks still landing");
         }
     }
     // mixed tiers: the controller with the lane against flags + stager with the lane

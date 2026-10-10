@@ -264,10 +264,16 @@ impl SplitCost {
 /// tzc)`), up to `maxcpu`; the other pinned ids are read zero-copy by the GPU, so both lanes
 /// finish as close together as the per-expert steps allow. Returns the CPU ids, planning order.
 pub fn plan_split(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)]) -> Vec<u32> {
+    split_ram(cost, gpu_hits, ram, !ram.is_empty()).0
+}
+
+/// [`plan_split`]'s loop over the RAM picks: the CPU ids and the lanes' times `(cpu, gpu)` after
+/// it; `lane` = the CPU lane has work at all (its fixed cost `ca` charged)
+fn split_ram(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)], lane: bool) -> (Vec<u32>, f64, f64) {
     let mut order = ram.to_vec();
     order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut g = cost.g0 + cost.thit * gpu_hits as f64;
-    let mut c = if ram.is_empty() { 0.0 } else { cost.ca };
+    let mut c = if lane { cost.ca } else { 0.0 };
     let mut cpu = Vec::new();
     for &(e, _) in &order {
         let (ce, ge) = (c + cost.cb, g + cost.tzc);
@@ -278,7 +284,49 @@ pub fn plan_split(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)]) -> Vec<
             g = ge;
         }
     }
+    (cpu, c, g)
+}
+
+/// #202: the drive model of the split's picks still landing (the template's serial `nvlat` /
+/// `nvdeep`, sybil-solutions/glm53-flash-offload 6769b27 nv2_host.cpp `start_read`): a fixed
+/// latency in ms (the template's) and the drive's rate in GB/s (`bench_pool_on_container`, pool
+/// 16 x 1 MiB, one fetch of 8 outstanding, 10.89 GB/s, 2026-10-10)
+pub const NV_LAT_MS: f64 = 0.12;
+pub const NV_GBPS: f64 = 10.89;
+
+/// The split under the controller with picks still landing (the template's `plan_and_reply`
+/// with `GLM53_NV_NVCPU`, its default with the CPU lane on, nv2_host.cpp#L462-L470): the
+/// resident RAM picks as [`plan_split`], then the picks whose NVMe read is in flight (`nv`:
+/// expert, expected arrival in ms from now) by arrival: one goes to the CPU when, waiting for
+/// its arrival, that does not raise `max(cpu, gpu)` above the GPU reading it zero-copy once
+/// landed (`max(max(c, a) + cb, g) <= max(c, max(g, a) + tzc)`), up to `maxcpu`.
+pub fn plan_split_nv(cost: &SplitCost, gpu_hits: usize, ram: &[(u32, u32)], nv: &[(u32, f64)]) -> Vec<u32> {
+    let (mut cpu, mut c, mut g) = split_ram(cost, gpu_hits, ram, !ram.is_empty() || !nv.is_empty());
+    let mut order = nv.to_vec();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    for &(e, a) in &order {
+        let a = a.max(0.0);
+        let (ce, ge) = (c.max(a) + cost.cb, g.max(a) + cost.tzc);
+        if cpu.len() < cost.maxcpu && ce.max(g) <= c.max(ge) {
+            c = ce;
+            cpu.push(e);
+        } else {
+            g = ge;
+        }
+    }
     cpu
+}
+
+/// a pinned pick as the CPU lane under the controller sees it
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PinState {
+    /// its record is in its slot: the lane reads it at once
+    Resident,
+    /// its NVMe read is in flight, expected in this many ms (the split decides, [`plan_split_nv`])
+    Landing(f64),
+    /// a copy still writes its slot (a write-back): the GPU reads it (the template's VRAM-ring
+    /// backed keys go to the GPU lane)
+    Busy,
 }
 
 // ---------------------------------------------------------------- #149 path B: the stager switch
@@ -3028,6 +3076,7 @@ impl ExpertTiers {
                 waits.landed = std::mem::take(&mut m.inner.landed);
                 waits.d2h = std::mem::take(&mut m.inner.d2h);
                 waits.row = m.inner.landed_host;
+                (waits.seq, waits.in_flight, waits.rb) = (m.inner.seq, self.src.records_in_flight(), rb);
                 drop(m);
                 // #202 D1 / #209 D3: the next layer's guess read right behind this layer's demand
                 // (the pool's demand queue), before the answer
@@ -3064,7 +3113,8 @@ impl ExpertTiers {
                     t
                 }
             };
-            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize))
+            let state = |e: u32, rec: *const u8| if ctl_lane { waits.state(e, rec) } else { PinState::Resident };
+            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state)
         };
         match staged {
             Some((trow, stream, event)) => self.finish_staged(l, sel, lane, waits, trow, stream, event, reply)?,
@@ -4847,7 +4897,7 @@ impl ExpertTiers {
         // CROW_GLM_MAX_BATCH: a batched step's rows too (one pool run per row)
         let host = self.pinned.get(l).map_or(std::ptr::null(), |p| p.host as *const u8);
         let post = self
-            .lane_plan(l, sel, &mut served, &|e| table[e as usize], &|q| host.add(q as usize * rb as usize))
+            .lane_plan(l, sel, &mut served, &|e| table[e as usize], &|q| host.add(q as usize * rb as usize), &|_, _| PinState::Resident)
             .map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None });
         crate::glm5_moe::lane::post(post);
         self.count_heat(l, sel);
@@ -5238,11 +5288,52 @@ struct LaneWaits {
     d2h: Vec<usize>,
     /// this layer's row of the stager's landed flags (host)
     row: *const u64,
+    /// the call's sequence number (its own reads land at it; a joined read at an earlier one)
+    seq: u64,
+    /// NVMe records in flight right after the call's reads were issued
+    in_flight: u64,
+    /// the record bytes (the drive model's service time per record)
+    rb: u64,
 }
 
 impl Default for LaneWaits {
     fn default() -> LaneWaits {
-        LaneWaits { landed: Vec::new(), wb: Vec::new(), d2h: Vec::new(), row: std::ptr::null() }
+        LaneWaits { landed: Vec::new(), wb: Vec::new(), d2h: Vec::new(), row: std::ptr::null(), seq: 0, in_flight: 0, rb: 0 }
+    }
+}
+
+impl LaneWaits {
+    /// the pinned pick `e` (record at host address `rec`) for the lane's split: busy while a copy
+    /// writes it, landing while a read of it is in flight (its expected arrival: [`NV_LAT_MS`] +
+    /// one record's service at [`NV_GBPS`] per record ahead of it and its own; joined reads were
+    /// issued before every read of this call, which queue behind what was already in flight),
+    /// else resident
+    fn state(&self, e: u32, rec: *const u8) -> PinState {
+        if self.wb.iter().any(|x| x.0 == e) || self.d2h.contains(&(rec as usize)) {
+            return PinState::Busy;
+        }
+        let per = self.rb as f64 / (NV_GBPS * 1e9) * 1e3;
+        let own = self.landed.iter().filter(|x| x.1 == self.seq).count() as u64;
+        let ahead = self.in_flight.saturating_sub(own);
+        let (mut joined, mut issued) = (0u64, 0u64);
+        let mut at: Option<f64> = None;
+        for &(x, v) in &self.landed {
+            let p = if v == self.seq {
+                issued += 1;
+                ahead + issued
+            } else {
+                joined += 1;
+                joined
+            };
+            if x == e {
+                // a read whose flag is already up has landed
+                // SAFETY: `row` is the layer's live landed row whenever a read was recorded
+                if unsafe { std::ptr::read_volatile(self.row.add(e as usize)) } < v {
+                    at = Some(at.unwrap_or(0.0).max(NV_LAT_MS + p as f64 * per));
+                }
+            }
+        }
+        at.map_or(PinState::Resident, PinState::Landing)
     }
 }
 
@@ -5412,21 +5503,29 @@ impl ExpertTiers {
     /// `q`): which pinned ids the CPU computes (every one; `split`: those `plan_split` gives it,
     /// from the layer's heat) and the combos. `None` with the lane off, more rows than a batched
     /// step holds, or no pinned pick; the counters move the CPU's ids from zero-copy to the lane.
-    fn lane_plan(&self, l: usize, sel: &[i32], served: &mut Served, table: &dyn Fn(u32) -> u64, host: &dyn Fn(u32) -> *const u8) -> Option<(Vec<crate::glm5_moe::lane::Combo>, Vec<u32>)> {
+    ///
+    /// `state` sorts the pinned picks under the controller ([`PinState`]): the lane takes resident
+    /// ones (`1`: all of them; `split`: as planned), a pick still landing only when
+    /// [`plan_split_nv`] gives it to the CPU (never under `1`), a busy one never; so the lane waits
+    /// for a landing only where the split planned that wait. Without the controller every pick is
+    /// resident to it (the host lane waits for the stager's event).
+    fn lane_plan(&self, l: usize, sel: &[i32], served: &mut Served, table: &dyn Fn(u32) -> u64, host: &dyn Fn(u32) -> *const u8, state: &dyn Fn(u32, *const u8) -> PinState) -> Option<(Vec<crate::glm5_moe::lane::Combo>, Vec<u32>)> {
         let k = self.topk;
         if !self.pinned_use.cpu_lane || sel.is_empty() || sel.len() % k != 0 || sel.len() / k > MAX_BATCH || served.moves.zero_copy == 0 {
             return None;
         }
         let e = self.cache.experts;
         let heat = &self.heat[l * e..(l + 1) * e];
-        let pinned: Vec<u32> = served.locs.iter().filter(|x| matches!(x.1, Loc::Pinned(_))).map(|x| x.0).collect();
+        let pinned: Vec<(u32, PinState)> = served.locs.iter().filter_map(|x| if let Loc::Pinned(q) = x.1 { Some((x.0, state(x.0, host(q)))) } else { None }).collect();
+        let resident: Vec<u32> = pinned.iter().filter(|x| x.1 == PinState::Resident).map(|x| x.0).collect();
         let cpu = match self.split {
             Some(cost) => {
                 let hits = served.locs.len() - pinned.len();
-                let ram: Vec<(u32, u32)> = pinned.iter().map(|&x| (x, heat[x as usize])).collect();
-                plan_split(&cost, hits, &ram)
+                let ram: Vec<(u32, u32)> = resident.iter().map(|&x| (x, heat[x as usize])).collect();
+                let nv: Vec<(u32, f64)> = pinned.iter().filter_map(|x| if let PinState::Landing(a) = x.1 { Some((x.0, a)) } else { None }).collect();
+                plan_split_nv(&cost, hits, &ram, &nv)
             }
-            None => pinned,
+            None => resident,
         };
         let (combos, n) = lane_combos_where(sel, &served.locs, |e, _| table(e), |q| host(q), |e| cpu.contains(&e));
         let nd = cpu.len() as u64;
@@ -5654,7 +5753,15 @@ impl ExpertTiers {
             Some(pf) => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut glm5_flags::PrefetchMover::new(&mut m, pf, &self.src, l, self.stage, Some(st.stream)))?,
             None => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut m)?,
         };
-        let waits = LaneWaits { landed: std::mem::take(&mut m.landed), wb: Vec::new(), d2h: std::mem::take(&mut m.d2h), row: m.landed_host };
+        let waits = LaneWaits {
+            landed: std::mem::take(&mut m.landed),
+            wb: Vec::new(),
+            d2h: std::mem::take(&mut m.d2h),
+            row: m.landed_host,
+            seq: m.seq,
+            in_flight: self.src.records_in_flight(),
+            rb,
+        };
         let (stream, event, trow) = (st.stream, st.event, (st.tables.host as *mut u64).add(row));
         // the table into this layer's pinned row (its last upload ran before this layer's
         // previous experts), then up on the stager behind the moves
@@ -5671,7 +5778,9 @@ impl ExpertTiers {
         let pin_host = self.pinned.get(l).map_or(std::ptr::null(), |p| p.host as *const u8);
         let lane = {
             let tv: Vec<u64> = host.to_vec();
-            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| pin_host.add(q as usize * rb as usize))
+            let ctl_lane = reply.is_some() && self.dev_lane.is_some();
+            let state = |e: u32, rec: *const u8| if ctl_lane { waits.state(e, rec) } else { PinState::Resident };
+            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| pin_host.add(q as usize * rb as usize), &state)
         };
         self.finish_staged(l, sel, lane, waits, trow, stream, event, reply)?;
         self.count_heat(l, sel);
@@ -9230,6 +9339,18 @@ mod split_tests {
         assert_eq!(plan_split(&c, 6, &[]), Vec::<u32>::new());
         // a CPU much faster than PCIe takes every pinned id, coldest first
         assert_eq!(plan_split(&SplitCost { cb: 0.01, ..c }, 0, &ram), vec![2, 7, 9, 5, 11]);
+        // #202 the template's nvcpu rule: no pick landing = plan_split; a landing pick goes to the
+        // CPU only when its wait does not raise the layer's max (CPU 0.05 + 0.3 vs GPU 0.1 + 0.25
+        // at arrival 0: CPU, the next GPU; arrival 10 ms: max(10.3, 0.1) > max(0.05, 10.25): GPU);
+        // considered by arrival
+        assert_eq!(plan_split_nv(&c, 0, &ram, &[]), plan_split(&c, 0, &ram));
+        assert_eq!(plan_split_nv(&c, 0, &[], &[(4, 10.0)]), Vec::<u32>::new());
+        assert_eq!(plan_split_nv(&c, 0, &[], &[(4, 0.0), (6, 0.0)]), vec![4]);
+        assert_eq!(plan_split_nv(&c, 0, &[], &[(8, 2.0), (3, 0.0)]), vec![3]);
+        assert_eq!(plan_split_nv(&SplitCost { maxcpu: 0, ..c }, 0, &[], &[(3, 0.0)]), Vec::<u32>::new());
+        // behind the resident ones (CPU 0.65, GPU 0.85): a pick landing at 0.4 ms waits nothing
+        // past the CPU's work and goes there (0.95 <= max(0.65, 1.1))
+        assert_eq!(plan_split_nv(&c, 0, &ram, &[(13, 0.4)]), vec![2, 5, 13]);
         // a CPU much slower takes none
         assert_eq!(plan_split(&SplitCost { cb: 5.0, ..c }, 0, &ram), Vec::<u32>::new());
     }
@@ -10068,13 +10189,15 @@ mod nvme_par_tests {
     /// #202 D-A: under the controller with the CPU lane, `table_reply` plans, starts the NVMe
     /// reads and queues the reply without waiting for any landing (the former controller waited
     /// for the stager's event, i.e. for every read of the call, then computed the CPU's experts
-    /// itself); the CPU lane runs on its own thread and waits per expert for its record. Every
-    /// expert pinned (V 0 + P 16, `CROW_GLM_CPU_LANE=1`: every pick on the CPU), the slow pool
-    /// (1 worker, 4 KiB pieces). Call 1: 8 misses, read into pinned slots: the call returns
-    /// while they are in flight and the lane flag is still down; the lane flag and the reply come
-    /// once they landed. Call 2: 4 resident + 4 misses: the lane computes the resident ones first
-    /// (two pool runs). Both rows: the lane's one row = sum of w x FFN(record, x) on the host
-    /// within 1e-5 of its largest value (#202 D-C).
+    /// itself); the CPU lane runs on its own thread and takes, under `CROW_GLM_CPU_LANE=1`, only
+    /// resident pinned picks (a pick still landing goes to the GPU, which reads it zero-copy once
+    /// the stager stream saw it land), so it never waits for a landing. Every expert pinned (V 0
+    /// + P 16), the slow pool (1 worker, 4 KiB pieces). Call 1: 8 misses read into pinned slots:
+    /// the call returns while they are in flight, the lane computes nothing, its flag comes while
+    /// they are still in flight, the reply once they landed. Call 2: 4 resident + 4 misses: the lane
+    /// computes the 4 resident ones in one pool run without waiting, its flag again before the
+    /// misses land, and its one row = sum of w x FFN(record, x) of those 4 on the host within 1e-5
+    /// of its largest value (#202 D-C); the misses' table entries are their pinned slots.
     #[test]
     #[ignore = "needs the GPU (about 1 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib nvme_par_tests -- --ignored --nocapture --test-threads 1"]
     fn glm5_nvme_par_gpu_the_controller_replies_while_the_reads_and_the_cpu_lane_run() {
@@ -10115,7 +10238,8 @@ mod nvme_par_tests {
                     })
                     .collect();
                 std::ptr::copy_nonoverlapping(x.as_ptr(), dl.x_host as *mut f32, h);
-                let runs0 = t.cpu_lane_clock().read().2;
+                let lane0 = t.cpu_lane_clock().read();
+                let c0 = t.ctl_clock().read();
                 let t0 = std::time::Instant::now();
                 t.table_reply(first, &sel, &wts, reply.dev, q).unwrap();
                 let took = t0.elapsed();
@@ -10124,20 +10248,33 @@ mod nvme_par_tests {
                 let flag_at_return = lane.flag_now();
                 eprintln!("glm5 ctl lane call {q}: table_reply {took:?}, records in flight at its return {flying}, lane flag {flag_at_return}");
                 assert!(flying > 0, "call {q}: the controller returned after every read had landed: it waited for the landing");
-                assert!(flag_at_return < q, "call {q}: the lane flag was up before the call's records landed");
                 let tw = std::time::Instant::now();
-                while lane.flag_now() < q || std::ptr::read_volatile(reply.host as *const u64) < q {
-                    assert!(tw.elapsed().as_secs() < 30, "call {q}: lane flag {} reply {} after 30 s", lane.flag_now(), std::ptr::read_volatile(reply.host as *const u64));
+                while lane.flag_now() < q {
+                    assert!(tw.elapsed().as_secs() < 30, "call {q}: lane flag {} after 30 s", lane.flag_now());
+                    std::thread::yield_now();
+                }
+                let flying_at_flag = t.nvme_io().1;
+                while std::ptr::read_volatile(reply.host as *const u64) < q {
+                    assert!(tw.elapsed().as_secs() < 30, "call {q}: reply {} after 30 s", std::ptr::read_volatile(reply.host as *const u64));
                     std::thread::yield_now();
                 }
                 assert!(lane.thread_id().is_some_and(|w| w != me), "call {q}: the CPU lane ran on the controller's thread");
-                let runs = t.cpu_lane_clock().read().2 - runs0;
+                let (lane1, c1) = (t.cpu_lane_clock().read(), t.ctl_clock().read().since(&c0));
+                let (experts, runs) = (lane1.1 - lane0.1, lane1.2 - lane0.2);
+                eprintln!("glm5 ctl lane call {q}: CPU experts {experts} in {runs} pool runs, waited {} ns for landings, records in flight at the lane flag {flying_at_flag}", c1.cpu_wait_land_ns);
+                let resident = if q == 1 { 0 } else { 4 };
+                assert_eq!(experts, resident as u64, "call {q}: the lane took picks still landing");
+                assert_eq!(c1.cpu_wait_land_ns, 0, "call {q}: the lane waited for a landing");
+                assert!(flying_at_flag > 0, "call {q}: the lane flag came only after the reads landed");
                 if q == 2 {
-                    assert!(runs >= 2, "call 2: the resident records were not computed before the missing ones landed ({runs} pool run)");
+                    assert_eq!(runs, 1, "call 2: the resident records in one pool run");
+                    let table = cuda::dtoh_u64(t.tables[0], g.experts);
+                    let dummy = lane.dummy;
+                    assert!(sel[..4].iter().all(|&e| table[e as usize] == dummy) && sel[4..].iter().all(|&e| table[e as usize] != dummy && table[e as usize] != 0), "call 2: the table's CPU entries");
                 }
-                // the reference: every pick on the CPU, weighted, summed in f64
+                // the reference: the CPU's picks (the resident ones, pick order), weighted, in f64
                 let mut want = vec![0f64; h];
-                for (c, &e) in sel.iter().enumerate() {
+                for (c, &e) in sel.iter().enumerate().take(resident) {
                     let rec = record_bytes(&t, 0, e as u32);
                     let ex = crate::cpu_mul1::Mul1Expert::from_record(&rec, h, moe.expert_inter, moe.bitrate).unwrap();
                     let mut y = vec![0f32; h];
@@ -10150,8 +10287,8 @@ mod nvme_par_tests {
                 let got = lane.row();
                 let scale = want.iter().fold(0f64, |m, v| m.max(v.abs()));
                 let err = got.iter().zip(&want).fold(0f64, |m, (a, b)| m.max((*a as f64 - b).abs()));
-                eprintln!("glm5 ctl lane call {q}: {runs} pool runs, row max abs error {err:.3e} at max |y| {scale:.3e}");
-                assert!(scale > 0.0 && err <= 1e-5 * scale, "call {q}: the lane's row is off by {err} at max {scale}");
+                eprintln!("glm5 ctl lane call {q}: row max abs error {err:.3e} at max |y| {scale:.3e}");
+                assert!(err <= 1e-5 * scale.max(f64::MIN_POSITIVE) && (resident == 0 || scale > 0.0), "call {q}: the lane's row is off by {err} at max {scale}");
             }
             let c = t.ctl_clock().read();
             eprintln!("glm5 ctl lane: {} requests, serve {:.1} us per layer, CPU busy {:.1} us waiting {:.1} us per layer", c.requests, c.per_layer_us(c.serve_ns), c.per_layer_us(c.cpu_busy_ns), c.per_layer_us(c.cpu_wait_land_ns));
