@@ -924,9 +924,29 @@ pub const TC_MIN_ROWS: usize = 144;
 /// #186: the most rows of one tensor-core chunk (the scratch's `xh` / `part` / `g` / `u` rows)
 pub const TC_CHUNK_ROWS: usize = 1024;
 
-/// #186: `CROW_GLM_MOE_TC` (`1` or `tc` on; unset / anything else off, the default)
+/// #186: `CROW_GLM_MOE_TC`: `1` or `tc` the per-expert tensor-core path ([`MoeTc`]), `2` the
+/// grouped one ([`MoeTc2`]); unset / anything else 0, off (the default)
+pub fn moe_tc_mode_from_env() -> u8 {
+    match std::env::var("CROW_GLM_MOE_TC").ok().as_deref() {
+        Some("1") | Some("tc") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// #186: `CROW_GLM_MOE_TC` is on (mode 1 or 2, [`moe_tc_mode_from_env`])
 pub fn moe_tc_from_env() -> bool {
-    matches!(std::env::var("CROW_GLM_MOE_TC").ok().as_deref(), Some("1") | Some("tc"))
+    moe_tc_mode_from_env() != 0
+}
+
+/// #186: the tensor-core expert scratch of `mode` ([`moe_tc_mode_from_env`]) of a plan of `tokens`
+/// rows: [`moe_tc_bytes`] for 1, [`moe_tc2_bytes`] of [`Tc2Cfg::default_for`] for 2, else 0
+pub fn moe_tc_mode_bytes(mode: u8, hidden: usize, inter: usize, experts: usize, topk: usize, tokens: usize) -> u64 {
+    match mode {
+        1 => moe_tc_bytes(hidden, inter, tokens),
+        2 => moe_tc2_bytes(hidden, inter, experts, topk, tokens, &Tc2Cfg::default_for(tokens)),
+        _ => 0,
+    }
 }
 
 /// #186: the device bytes of the tensor-core expert scratch of a plan of `tokens` rows ([`MoeTc`]):
@@ -991,6 +1011,272 @@ impl MoeTc {
     /// No launch on the scratch is pending.
     pub unsafe fn free(&mut self) {
         cuda::free_dev(&mut self.region);
+    }
+}
+
+/// #186 `CROW_GLM_MOE_TC=2`: an expert with at least this many rows in an `experts_items` range
+/// takes the grouped tensor-core pass ([`MoeTc2`]), fewer `mul1_gemm_grp` (micro-bench
+/// `glm5_moe_gpu_tc2_bench`, one GLM layer at 8192 rows: 1, 16 and 32 within 1 %, 64 +8 %,
+/// 144 +76 %)
+pub const TC2_MIN_ROWS: usize = 16;
+/// #186: the most packed rows of one grouped batch at the default (raised to the plan's tokens:
+/// one expert never has more), 32 KiB of scratch per row at GLM-5.3-Flash shapes (micro-bench:
+/// 16384 rows 1.5 % faster than 8192 for twice the scratch; 32768 slower)
+pub const TC2_ROWS: usize = 8192;
+
+/// #186: the knobs of [`MoeTc2`] (`CROW_GLM_MOE_TC=2`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tc2Cfg {
+    /// decode the weights inside the GEMM (`mul1_tc2_gemm*f`, no weight scratch) instead of
+    /// `mul1_tc2_recon` into FP16 weight slots
+    pub fused: bool,
+    /// the most experts of one batch; without `fused` also the FP16 weight slots (two matrices
+    /// of `H * I * 2` bytes each, 32 MiB per slot at GLM shapes)
+    pub slots: usize,
+    /// the most packed rows of one batch (raised to the plan's tokens)
+    pub rows: usize,
+    /// row tile of the grouped GEMM, 64 or 128
+    pub bm: usize,
+    /// an expert takes the tensor cores from this many rows in a range
+    pub min_rows: usize,
+}
+
+impl Tc2Cfg {
+    /// the default of a plan of `tokens` rows: fused decode, 128-row tiles, batches of up to
+    /// [`TC2_ROWS`] rows (micro-bench `glm5_moe_gpu_tc2_bench`)
+    pub fn default_for(tokens: usize) -> Tc2Cfg {
+        Tc2Cfg { fused: true, slots: usize::MAX, rows: TC2_ROWS.max(tokens), bm: 128, min_rows: TC2_MIN_ROWS }
+    }
+
+    /// `rows` raised to `tokens`
+    fn rows_for(&self, tokens: usize) -> usize {
+        self.rows.max(tokens)
+    }
+}
+
+fn moe_tc2_parts(hidden: usize, inter: usize, experts: usize, topk: usize, tokens: usize, cfg: &Tc2Cfg) -> [usize; 12] {
+    let (c, r) = (tokens * topk, cfg.rows_for(tokens));
+    let work = grouped_work_cap(experts, topk, tokens);
+    [
+        if cfg.fused { 0 } else { cfg.slots * 2 * hidden * inter * 2 },
+        r * hidden.max(inter) * 2,
+        r * hidden * 2,
+        r * inter * 4,
+        r * inter * 4,
+        c * 4,
+        c * 4,
+        experts * 4,
+        (experts + 1) * 4,
+        (experts + 1) * 4,
+        work * 12,
+        c * 4,
+    ]
+}
+
+/// #186: the device bytes of [`MoeTc2`] of `cfg` for a plan of `tokens` rows: without `fused` the
+/// FP16 weights of `slots` experts (two matrices at a time: gate and up, then down); per batch
+/// row `xg` FP16 `[max(H, I)]` (also the down input), `xu` FP16 `[H]`, `g` / `u` f32 `[I]` (32 KiB
+/// per row at GLM shapes); the schedule (combo lists, offsets, the `mul1_gemm_grp` items of the
+/// small experts); 0 below [`TC2_MIN_ROWS`] tokens
+pub fn moe_tc2_bytes(hidden: usize, inter: usize, experts: usize, topk: usize, tokens: usize, cfg: &Tc2Cfg) -> u64 {
+    if tokens < cfg.min_rows.max(1) {
+        return 0;
+    }
+    carve(&moe_tc2_parts(hidden, inter, experts, topk, tokens, cfg)).1 as u64
+}
+
+/// #186: the host side of one schedule on [`MoeTc2`] ([`Tc2Sched::new`]): which experts take the
+/// grouped tensor-core pass, the `mul1_gemm_grp` items of the others, and the device arrays
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tc2Sched {
+    /// per big expert (at least the minimum rows, schedule order): the expert id
+    pub big_e: Vec<i32>,
+    /// per big expert: its first packed row in `list_big` (len big + 1)
+    pub row_off: Vec<i32>,
+    /// per big expert: its first row tile of `bm` rows (len big + 1)
+    pub mt_pre: Vec<i32>,
+    /// the big experts' combos, packed in schedule order
+    pub list_big: Vec<i32>,
+    /// per packed row: its expert id
+    pub row_e: Vec<i32>,
+    /// the small experts' combos, packed in schedule order
+    pub list2: Vec<i32>,
+    /// the small experts' work items `[expert, first entry of list2, rows]`
+    pub work2: Vec<[i32; 3]>,
+    /// the rows of every item of `work2`
+    pub rows2: Vec<usize>,
+    /// per item index i of the schedule (len items + 1): small items before i
+    pub small_pre: Vec<usize>,
+    /// per item index i (len items + 1): big experts whose first item is before i
+    pub big_pre: Vec<usize>,
+    /// per item index: the item belongs to a big expert and is not its first
+    inner_big: Vec<bool>,
+}
+
+impl Tc2Sched {
+    /// the split of a schedule's `work` items over `list` (an [`ExpertMajor`]'s): experts of at
+    /// least `min_rows` rows big, row tiles of `bm` rows
+    pub fn new(work: &[[i32; 3]], list: &[i32], min_rows: usize, bm: usize) -> Tc2Sched {
+        let mut s = Tc2Sched { row_off: vec![0], mt_pre: vec![0], ..Default::default() };
+        let n = work.len();
+        let mut a = 0;
+        while a < n {
+            let e = work[a][0];
+            let (mut b, mut rows) = (a, 0usize);
+            while b < n && work[b][0] == e {
+                rows += work[b][2] as usize;
+                b += 1;
+            }
+            let big = rows >= min_rows;
+            for (i, it) in work.iter().enumerate().take(b).skip(a) {
+                s.small_pre.push(s.work2.len());
+                s.big_pre.push(s.big_e.len());
+                s.inner_big.push(big && i > a);
+                let (f, r) = (it[1] as usize, it[2] as usize);
+                if big {
+                    s.list_big.extend_from_slice(&list[f..f + r]);
+                    s.row_e.extend(std::iter::repeat_n(e, r));
+                } else {
+                    s.work2.push([e, s.list2.len() as i32, r as i32]);
+                    s.rows2.push(r);
+                    s.list2.extend_from_slice(&list[f..f + r]);
+                }
+            }
+            if big {
+                s.big_e.push(e);
+                s.row_off.push(s.list_big.len() as i32);
+                s.mt_pre.push(s.mt_pre.last().unwrap() + rows.div_ceil(bm) as i32);
+            }
+            a = b;
+        }
+        s.small_pre.push(s.work2.len());
+        s.big_pre.push(s.big_e.len());
+        s
+    }
+
+    /// the `work2` items and the big experts of the schedule's items `items`; refused by name for
+    /// a range that splits a big expert
+    pub fn split(&self, items: std::ops::Range<usize>) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        assert!(items.end < self.small_pre.len(), "glm5_moe: items {items:?} of a schedule of {}", self.small_pre.len() - 1);
+        for i in [items.start, items.end] {
+            assert!(!self.inner_big.get(i).copied().unwrap_or(false), "glm5_moe: items {items:?} split a tensor-core expert at item {i}");
+        }
+        (self.small_pre[items.start]..self.small_pre[items.end], self.big_pre[items.start]..self.big_pre[items.end])
+    }
+}
+
+/// #186 `CROW_GLM_MOE_TC=2`: the grouped tensor-core expert path of a [`GpuMoeGroupedPlan`]. The
+/// experts of an `experts_items` range with at least `min_rows` rows go in batches of up to
+/// `slots` experts, each batch: `mul1_tc2_recon` (gate and up of every expert to FP16),
+/// `mul1_tc2_in` (H (x * suh) of gate and up, FP16), one grouped `mul1_tc2_gemm*` launch for gate
+/// and up (FP32 accumulate, epilogue H / 128 * svh into `g` / `u`), `mul1_tc2_recon` (down),
+/// `mul1_tc2_act` (clamped SwiGLU, H (. * suh), FP16), one grouped GEMM launch for down into `ye`;
+/// the other experts' items run `mul1_gemm_grp` in one call (their rows bit for bit the default
+/// path's). Not bit-identical to `mul1_gemm_grp`.
+pub struct MoeTc2 {
+    region: CUdeviceptr,
+    /// the knobs
+    pub cfg: Tc2Cfg,
+    /// packed rows per batch (`cfg.rows` raised to the plan's tokens)
+    rows: usize,
+    w: CUdeviceptr,
+    xg: CUdeviceptr,
+    xu: CUdeviceptr,
+    g: CUdeviceptr,
+    u: CUdeviceptr,
+    list_big: CUdeviceptr,
+    row_e: CUdeviceptr,
+    big_e: CUdeviceptr,
+    row_off: CUdeviceptr,
+    mt_pre: CUdeviceptr,
+    work2: CUdeviceptr,
+    list2: CUdeviceptr,
+    sch: std::cell::RefCell<Tc2Sched>,
+    f_recon: u64,
+    f_in: u64,
+    f_act: u64,
+    f_gemm64: u64,
+    f_gemm128: u64,
+    f_gemm64f: u64,
+    f_gemm128f: u64,
+}
+
+impl MoeTc2 {
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn new(geo: &MoeGeo, tokens: usize, cfg: Tc2Cfg, mk: &mul1::Kernels) -> MoeTc2 {
+        let (h, i) = (geo.hidden, geo.expert_inter);
+        let rows = cfg.rows_for(tokens);
+        assert!(cfg.slots > 0 && matches!(cfg.bm, 64 | 128), "glm5_moe: grouped tensor-core knobs {cfg:?}");
+        assert!(h % 128 == 0 && i % 128 == 0 && (h / 16) * (i / 16) % 8 == 0 && rows <= 65_535, "glm5_moe: grouped tensor-core shapes H {h} I {i} rows {rows}");
+        let (off, bytes) = carve(&moe_tc2_parts(h, i, geo.experts, geo.topk, tokens, &cfg));
+        let region = cuda::alloc_named("glm5 MoE grouped tensor-core expert scratch", bytes);
+        let at = |n: usize| region + off[n] as u64;
+        MoeTc2 {
+            region,
+            cfg,
+            rows,
+            w: at(0),
+            xg: at(1),
+            xu: at(2),
+            g: at(3),
+            u: at(4),
+            list_big: at(5),
+            row_e: at(6),
+            big_e: at(7),
+            row_off: at(8),
+            mt_pre: at(9),
+            work2: at(10),
+            list2: at(11),
+            sch: std::cell::RefCell::new(Tc2Sched::default()),
+            f_recon: mk.module.get("mul1_tc2_recon") as u64,
+            f_in: mk.module.get("mul1_tc2_in") as u64,
+            f_act: mk.module.get("mul1_tc2_act") as u64,
+            f_gemm64: mk.module.get("mul1_tc2_gemm64") as u64,
+            f_gemm128: mk.module.get("mul1_tc2_gemm128") as u64,
+            f_gemm64f: mk.module.get("mul1_tc2_gemm64f") as u64,
+            f_gemm128f: mk.module.get("mul1_tc2_gemm128f") as u64,
+        }
+    }
+
+    /// the split of an uploaded schedule to the device (blocking copies)
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the schedule arrays is pending.
+    unsafe fn upload(&self, work: &[[i32; 3]], list: &[i32]) {
+        let s = Tc2Sched::new(work, list, self.cfg.min_rows.max(1), self.cfg.bm);
+        for (d, v) in [(self.list_big, &s.list_big), (self.row_e, &s.row_e), (self.big_e, &s.big_e), (self.row_off, &s.row_off), (self.mt_pre, &s.mt_pre), (self.list2, &s.list2)] {
+            if !v.is_empty() {
+                cuda::to_i32_into(d, v);
+            }
+        }
+        if !s.work2.is_empty() {
+            cuda::to_i32_into(self.work2, &s.work2.iter().flatten().copied().collect::<Vec<_>>());
+        }
+        *self.sch.borrow_mut() = s;
+    }
+
+    /// # Safety
+    /// No launch on the scratch is pending.
+    pub unsafe fn free(&mut self) {
+        cuda::free_dev(&mut self.region);
+    }
+}
+
+/// #186: the tensor-core expert path of a [`GpuMoeGroupedPlan`] (`CROW_GLM_MOE_TC`)
+enum Tc {
+    /// mode 1: per expert ([`MoeTc`])
+    Per(MoeTc),
+    /// mode 2: grouped ([`MoeTc2`])
+    Grouped(MoeTc2),
+}
+
+impl Tc {
+    unsafe fn free(&mut self) {
+        match self {
+            Tc::Per(t) => t.free(),
+            Tc::Grouped(t) => t.free(),
+        }
     }
 }
 
@@ -1163,8 +1449,9 @@ pub struct GpuMoeGroupedPlan {
     grp: u64,
     /// #186: the uploaded schedule's work items (host copy, for the tensor-core experts)
     item_work: std::cell::RefCell<Vec<[i32; 3]>>,
-    /// #186: the tensor-core expert path (`CROW_GLM_MOE_TC=1` and at least `TC_MIN_ROWS` tokens)
-    tc: Option<MoeTc>,
+    /// #186: the tensor-core expert path (`CROW_GLM_MOE_TC=1` and at least `TC_MIN_ROWS` tokens,
+    /// or `CROW_GLM_MOE_TC=2` and at least `TC2_MIN_ROWS`)
+    tc: Option<Tc>,
 }
 
 impl GpuMoeGroupedPlan {
@@ -1236,7 +1523,11 @@ impl GpuMoeGroupedPlan {
             item_rows: std::cell::RefCell::new(Vec::new()),
             grp: mk.module.get(GROUP_ENTRY) as u64,
             item_work: std::cell::RefCell::new(Vec::new()),
-            tc: if moe_tc_from_env() && tokens >= TC_MIN_ROWS { Some(MoeTc::new(h, i, tokens, mk)) } else { None },
+            tc: match moe_tc_mode_from_env() {
+                1 if tokens >= TC_MIN_ROWS => Some(Tc::Per(MoeTc::new(h, i, tokens, mk))),
+                2 if tokens >= TC2_MIN_ROWS => Some(Tc::Grouped(MoeTc2::new(geo, tokens, Tc2Cfg::default_for(tokens), mk))),
+                _ => None,
+            },
         }
     }
 
@@ -1246,15 +1537,43 @@ impl GpuMoeGroupedPlan {
     /// # Safety
     /// A CUDA context is current; no launch of this plan is pending.
     pub unsafe fn set_tc(&mut self, on: bool, mk: &mul1::Kernels) {
-        match (on, self.tc.is_some()) {
-            (true, false) => self.tc = Some(MoeTc::new(self.geo.hidden, self.geo.expert_inter, self.tokens, mk)),
-            (false, true) => {
-                if let Some(mut t) = self.tc.take() {
-                    t.free();
-                }
-            }
-            _ => {}
+        self.set_tc_mode(if on { 1 } else { 0 }, mk);
+    }
+
+    /// #186: switch to tensor-core mode `mode` (0 off, 1 per expert, 2 grouped with
+    /// [`Tc2Cfg::default_for`]; `CROW_GLM_MOE_TC` picks it at construction). Upload the schedule
+    /// after a switch.
+    ///
+    /// # Safety
+    /// As [`GpuMoeGroupedPlan::set_tc`].
+    pub unsafe fn set_tc_mode(&mut self, mode: u8, mk: &mul1::Kernels) {
+        if mode == 2 {
+            return self.set_tc2(Tc2Cfg::default_for(self.tokens), mk);
         }
+        if matches!((&self.tc, mode), (None, 0) | (Some(Tc::Per(_)), 1)) {
+            return;
+        }
+        if let Some(mut t) = self.tc.take() {
+            t.free();
+        }
+        if mode == 1 {
+            self.tc = Some(Tc::Per(MoeTc::new(self.geo.hidden, self.geo.expert_inter, self.tokens, mk)));
+        }
+    }
+
+    /// #186: the grouped tensor-core path (mode 2) with the knobs `cfg` (rebuilt when they
+    /// differ); upload the schedule after a switch
+    ///
+    /// # Safety
+    /// As [`GpuMoeGroupedPlan::set_tc`].
+    pub unsafe fn set_tc2(&mut self, cfg: Tc2Cfg, mk: &mul1::Kernels) {
+        if matches!(&self.tc, Some(Tc::Grouped(t)) if t.cfg == cfg) {
+            return;
+        }
+        if let Some(mut t) = self.tc.take() {
+            t.free();
+        }
+        self.tc = Some(Tc::Grouped(MoeTc2::new(&self.geo, self.tokens, cfg, mk)));
     }
 
     /// #196: the most combos of one gate / up piece
@@ -1284,6 +1603,9 @@ impl GpuMoeGroupedPlan {
         cuda::to_i32_into(self.work, &flat);
         *self.item_rows.borrow_mut() = s.work.iter().map(|w| w[2] as usize).collect();
         *self.item_work.borrow_mut() = s.work.clone();
+        if let Some(Tc::Grouped(t)) = &self.tc {
+            t.upload(&s.work, &s.list);
+        }
     }
 
     /// queue the routed experts of work items `items` of the uploaded schedule through `table`:
@@ -1294,8 +1616,10 @@ impl GpuMoeGroupedPlan {
     /// `table` points every expert of these items at a readable record until the launches
     /// finished; `x` holds the call's rows.
     pub unsafe fn experts_items(&self, table: CUdeviceptr, x: CUdeviceptr, items: std::ops::Range<usize>) {
-        let Some(tc) = &self.tc else {
-            return self.experts_items_grp(table, x, items);
+        let tc = match &self.tc {
+            None => return self.experts_items_grp(table, x, items),
+            Some(Tc::Grouped(t)) => return self.experts_items_tc2(t, table, x, items),
+            Some(Tc::Per(t)) => t,
         };
         // #186: an expert of at least TC_MIN_ROWS rows in the range takes the tensor cores, the
         // items between such experts mul1_gemm_grp as before
@@ -1347,11 +1671,17 @@ impl GpuMoeGroupedPlan {
 
     /// the `mul1_gemm_grp` path of [`GpuMoeGroupedPlan::experts_items`] (the default)
     unsafe fn experts_items_grp(&self, table: CUdeviceptr, x: CUdeviceptr, items: std::ops::Range<usize>) {
+        let rows = self.item_rows.borrow();
+        assert!(items.end <= self.work_cap && items.end <= rows.len(), "glm5_moe: items {items:?} of a schedule of {}", rows.len());
+        self.grp_on(table, x, self.work, self.list, &rows, items);
+    }
+
+    /// the `mul1_gemm_grp` launches of items `items` of the work items at `work` (device,
+    /// `[expert, first entry of list, rows]`) over the combo list `list`, `rows` their row counts
+    unsafe fn grp_on(&self, table: CUdeviceptr, x: CUdeviceptr, work: CUdeviceptr, list: CUdeviceptr, rows: &[usize], items: std::ops::Range<usize>) {
         if items.is_empty() {
             return;
         }
-        let rows = self.item_rows.borrow();
-        assert!(items.end <= self.work_cap && items.end <= rows.len(), "glm5_moe: items {items:?} of a schedule of {}", rows.len());
         let (h, i) = (self.geo.hidden, self.geo.expert_inter);
         let f = self.grp as cudarc::driver::sys::CUfunction;
         let mut a = items.start;
@@ -1362,11 +1692,64 @@ impl GpuMoeGroupedPlan {
                 b += 1;
             }
             assert!(b > a, "glm5_moe: a work item of {} rows in pieces of {}", rows[a], self.piece);
-            let (work, w) = (self.work + (a * 12) as u64, (b - a) as u32);
-            launch_v(f, (i / 128) as u32, w, 2, 256, &[table, work, self.list, x, x, self.ge, self.ue, self.prm_gu]);
-            launch_v(f, (h / 128) as u32, w, 1, 256, &[table, work, self.list, self.ge, self.ue, self.ye, self.ye, self.prm_d]);
+            let (wk, w) = (work + (a * 12) as u64, (b - a) as u32);
+            launch_v(f, (i / 128) as u32, w, 2, 256, &[table, wk, list, x, x, self.ge, self.ue, self.prm_gu]);
+            launch_v(f, (h / 128) as u32, w, 1, 256, &[table, wk, list, self.ge, self.ue, self.ye, self.ye, self.prm_d]);
             a = b;
         }
+    }
+
+    /// #186 `CROW_GLM_MOE_TC=2`: the items `items` on [`MoeTc2`]: the small experts' items in one
+    /// `mul1_gemm_grp` call, the big experts in batches of up to `slots` experts
+    unsafe fn experts_items_tc2(&self, tc: &MoeTc2, table: CUdeviceptr, x: CUdeviceptr, items: std::ops::Range<usize>) {
+        let s = tc.sch.borrow();
+        let (small, big) = s.split(items);
+        self.grp_on(table, x, tc.work2, tc.list2, &s.rows2, small);
+        let mut j = big.start;
+        while j < big.end {
+            let mut j1 = j + 1;
+            while j1 < big.end && j1 - j < tc.cfg.slots && (s.row_off[j1 + 1] - s.row_off[j]) as usize <= tc.rows {
+                j1 += 1;
+            }
+            assert!((s.row_off[j1] - s.row_off[j]) as usize <= tc.rows, "glm5_moe: an expert of {} rows in a scratch of {}", s.row_off[j1] - s.row_off[j], tc.rows);
+            self.tc2_batch(tc, &s, table, x, j..j1);
+            j = j1;
+        }
+    }
+
+    /// #186: one batch of big experts `js` (indices into the [`Tc2Sched`]) on [`MoeTc2`]
+    unsafe fn tc2_batch(&self, tc: &MoeTc2, s: &Tc2Sched, table: CUdeviceptr, x: CUdeviceptr, js: std::ops::Range<usize>) {
+        use cudarc::driver::sys::CUfunction;
+        let (h, i, k) = (self.geo.hidden, self.geo.expert_inter, self.geo.topk);
+        let [sg, su, sd] = self.geo.record_specs();
+        let u = |v: usize| v as u64;
+        let (b0, nexp) = (js.start, js.len());
+        let pbase = s.row_off[b0] as usize;
+        let rows = s.row_off[js.end] as usize - pbase;
+        let mtiles = (s.mt_pre[js.end] - s.mt_pre[b0]) as usize;
+        let mat = h * i * 2;
+        let slot = 2 * mat;
+        let tiles = (h / 16) * (i / 16);
+        let recon = |m0: usize, mats: u32| {
+            launch_v(tc.f_recon as CUfunction, (tiles / 8) as u32, mats, nexp as u32, 256, &[table, tc.big_e, tc.w, u(b0), u(sg.n32()), sg.bits as u64, sg.half as u64, u(m0), u(sg.tr_off), u(su.tr_off), u(sd.tr_off), u(slot), u(mat)]);
+        };
+        let gemm = match (tc.cfg.bm, tc.cfg.fused) {
+            (128, false) => tc.f_gemm128,
+            (128, true) => tc.f_gemm128f,
+            (_, false) => tc.f_gemm64,
+            (_, true) => tc.f_gemm64f,
+        } as CUfunction;
+        let dec = [u(sg.n32()), sg.bits as u64, sg.half as u64];
+        if !tc.cfg.fused {
+            recon(0, 2);
+        }
+        launch_v(tc.f_in as CUfunction, h.div_ceil(1024) as u32, rows as u32, 2, 256, &[table, tc.list_big, tc.row_e, x, tc.xg, tc.xu, u(pbase), u(h), u(k), u(sg.suh_off), u(su.suh_off)]);
+        launch_v(gemm, (mtiles * (i / 128) * 2) as u32, 1, 1, 128, &[tc.w, tc.xg, tc.xu, tc.big_e, tc.row_off, tc.mt_pre, tc.list_big, table, tc.g, tc.u, u(b0), u(nexp), u(h), u(i), 2, u(sg.svh_off), u(su.svh_off), 0, u(slot), u(mat), u(sg.tr_off), u(su.tr_off), dec[0], dec[1], dec[2]]);
+        if !tc.cfg.fused {
+            recon(2, 1);
+        }
+        launch_v(tc.f_act as CUfunction, i.div_ceil(1024) as u32, rows as u32, 1, 256, &[table, tc.row_e, tc.g, tc.u, tc.xg, u(pbase), u(i), u(sd.suh_off), self.geo.swiglu_limit.to_bits() as u64]);
+        launch_v(gemm, (mtiles * (h / 128)) as u32, 1, 1, 128, &[tc.w, tc.xg, tc.xg, tc.big_e, tc.row_off, tc.mt_pre, tc.list_big, table, self.ye, self.ye, u(b0), u(nexp), u(i), u(h), 1, u(sd.svh_off), u(sd.svh_off), 1, u(slot), u(mat), u(sd.tr_off), u(sd.tr_off), dec[0], dec[1], dec[2]]);
     }
 
     /// queue the shared expert on the first `t` rows of `x` and the combine into `y`
@@ -2893,6 +3276,317 @@ mod tests {
                 cuda::free_dev(d);
             }
             pinned.free();
+        }
+    }
+
+    // ---------------------------------------------------------------- #186 CROW_GLM_MOE_TC=2
+
+    /// `t` rows of `k` distinct picks over `e` experts with log-normal expert popularity
+    /// (`sigma`): at 8192 rows top-8 over 288, sigma 0.6 puts about 200 experts at 144 rows or
+    /// more, as the profile of one real 8192-token chunk (profile-20261010e: about 196 experts per
+    /// layer at >= 144 rows, mean 227, a few above 1024)
+    fn realistic_ids(t: usize, k: usize, e: usize, sigma: f64, seed: u64) -> Vec<i32> {
+        let mut rng = Rng(seed);
+        let mut unit = || ((rng.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+        let mut cdf = Vec::with_capacity(e);
+        let mut acc = 0.0;
+        for _ in 0..e {
+            let n = (-2.0 * unit().ln()).sqrt() * (std::f64::consts::TAU * unit()).cos();
+            acc += (sigma * n).exp();
+            cdf.push(acc);
+        }
+        let mut ids = Vec::with_capacity(t * k);
+        for _ in 0..t {
+            let mut row: Vec<i32> = Vec::with_capacity(k);
+            while row.len() < k {
+                let u = unit() * acc;
+                let x = cdf.partition_point(|&c| c < u).min(e - 1) as i32;
+                if !row.contains(&x) {
+                    row.push(x);
+                }
+            }
+            ids.extend(row);
+        }
+        ids
+    }
+
+    /// the rows per expert of `ids`: (experts with >= 144 rows, the most rows)
+    fn routing_stats(ids: &[i32], e: usize) -> (usize, usize) {
+        let mut n = vec![0usize; e];
+        for &x in ids {
+            n[x as usize] += 1;
+        }
+        (n.iter().filter(|&&r| r >= 144).count(), *n.iter().max().unwrap())
+    }
+
+    /// #186: the split of a schedule for `CROW_GLM_MOE_TC=2`: every combo once, either in the big
+    /// experts' packed list (experts of at least the minimum rows, whole) or in the small items'
+    /// list, items rebased onto it; row offsets and row-tile prefixes; a range at expert
+    /// boundaries splits into the matching small items and big experts, and a range inside a big
+    /// expert is refused.
+    #[test]
+    fn glm5_moe_tc2_schedule_splits_big_and_small_experts() {
+        let (t, k, e) = (300usize, 8usize, 288usize);
+        let ids = skewed_ids(t, k, e, 3.0, 186);
+        let sch = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+        for (min_rows, bm) in [(1usize, 64usize), (40, 64), (40, 128), (100_000, 64)] {
+            let s = Tc2Sched::new(&sch.work, &sch.list, min_rows, bm);
+            let mut rows = std::collections::BTreeMap::<i32, usize>::new();
+            for &x in &ids {
+                *rows.entry(x).or_default() += 1;
+            }
+            let big: Vec<i32> = rows.iter().filter(|(_, &r)| r >= min_rows).map(|(&x, _)| x).collect();
+            assert_eq!(s.big_e, big, "min {min_rows}: the big experts");
+            let mut all: Vec<i32> = s.list_big.iter().chain(&s.list2).copied().collect();
+            all.sort();
+            assert_eq!(all, (0..(t * k) as i32).collect::<Vec<_>>(), "min {min_rows}: every combo once");
+            for (j, &x) in s.big_e.iter().enumerate() {
+                let (a, b) = (s.row_off[j] as usize, s.row_off[j + 1] as usize);
+                assert_eq!(b - a, rows[&x]);
+                assert!(s.list_big[a..b].iter().all(|&c| ids[c as usize] == x) && s.row_e[a..b].iter().all(|&y| y == x));
+                assert_eq!((s.mt_pre[j + 1] - s.mt_pre[j]) as usize, rows[&x].div_ceil(bm));
+            }
+            let mut f = 0;
+            for (w, &r) in s.work2.iter().zip(&s.rows2) {
+                assert!(rows[&w[0]] < min_rows && w[1] == f && w[2] as usize == r && r <= GROUP_ROWS);
+                assert!(s.list2[f as usize..f as usize + r].iter().all(|&c| ids[c as usize] == w[0]));
+                f += r as i32;
+            }
+            // pseudo-row sub-batches (expert boundaries) cover every small item and big expert once
+            let (mut small, mut bigs) = (0..0, 0..0);
+            let mut r0 = 0;
+            while r0 < sch.pseudo_rows() {
+                let (sm, bg) = s.split(sch.work_of_rows(r0, 3.min(sch.pseudo_rows() - r0)));
+                assert_eq!((sm.start, bg.start), (small.end, bigs.end));
+                (small, bigs) = (small.start..sm.end, bigs.start..bg.end);
+                r0 += 3;
+            }
+            assert_eq!((small, bigs), (0..s.work2.len(), 0..s.big_e.len()));
+            if let Some(j) = (0..sch.work.len()).find(|&i| i > 0 && sch.work[i][0] == sch.work[i - 1][0] && rows[&sch.work[i][0]] >= min_rows) {
+                assert!(std::panic::catch_unwind(|| s.split(j..sch.work.len())).is_err(), "min {min_rows}: a range from item {j} splits a big expert");
+            }
+        }
+    }
+
+    /// #186 `CROW_GLM_MOE_TC=2`: the grouped tensor-core path against `mul1_gemm_grp`, synthetic
+    /// GLM layer (6 distinct 3-bit records, expert x reads record x % 6), 8192 rows, a realistic
+    /// routing (`realistic_ids`). Every `ye` row of an expert on the tensor cores has cosine >=
+    /// 0.9999 to the default path's, every other row is bit for bit the default path's: (a) 64-row
+    /// tiles, 5 slots (many batches), pseudo-row sub-batches through a VRAM table; (b) 128-row
+    /// tiles, 16 slots, the whole range through a pinned (zero-copy) table.
+    #[test]
+    #[ignore = "needs the GPU (about 5 GB VRAM): cargo test --release --lib glm5_moe_gpu_tc2 -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_tc2_experts_match_the_grouped_kernel() {
+        const NR: usize = 6;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mk = mul1::Kernels::new();
+            let g = geo();
+            let (h, k, e) = (g.hidden, g.topk, g.experts);
+            let recs: Vec<u8> = (0..NR as u32).flat_map(record).collect();
+            let rb = cpu_mul1::GLM_RECORD_BYTES_K3 as u64;
+            let mut vram = cuda::upload_dev(&recs);
+            let mut pinned = cuda::Pinned::alloc_cold(recs.len());
+            pinned.write_bytes(0, &recs);
+            let table = |base: u64| -> Vec<u64> { (0..e).map(|x| base + rb * (x % NR) as u64).collect() };
+            let (mut tv, mut tp) = (cuda::to_u64_dev(&table(vram)), cuda::to_u64_dev(&table(pinned.dev)));
+            let t = 8192usize;
+            let ids = realistic_ids(t, k, e, 0.6, 1861);
+            let (n144, most) = routing_stats(&ids, e);
+            let mut rng = Rng(1862);
+            let x: Vec<f32> = (0..t * h).map(|_| rng.f(X_AMP)).collect();
+            let sch = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+            let mut xd = cuda::to_f32_dev(&x);
+            let mut a = GpuMoeGroupedPlan::new(&g, t, &mk);
+            a.set_tc(false, &mk);
+            a.upload(&sch);
+            a.experts_items(tv, xd, 0..sch.work.len());
+            cuda::sync();
+            let ya = cuda::dtoh(a.ye, t * k * h);
+            a.free();
+            let mut b = GpuMoeGroupedPlan::new(&g, t, &mk);
+            for (name, tab, bm, slots, min_rows, sub, fused) in [
+                ("recon, 64-row tiles, 5 slots, >= 144 rows, sub-batches, vram", tv, 64usize, 5usize, 144usize, true, false),
+                ("recon, 128-row tiles, 16 slots, >= 16 rows, pinned", tp, 128, 16, TC2_MIN_ROWS, false, false),
+                ("fused decode, 64-row tiles, 5 slots, >= 144 rows, sub-batches, vram", tv, 64, 5, 144, true, true),
+                ("fused decode (default), pinned", tp, 128, usize::MAX, TC2_MIN_ROWS, false, true),
+            ] {
+                b.set_tc2(Tc2Cfg { fused, slots, rows: TC2_ROWS, bm, min_rows }, &mk);
+                cuda::ck(cudarc::driver::sys::cuMemsetD8_v2(b.ye, 0, t * k * h * 4));
+                b.upload(&sch);
+                if sub {
+                    let mut r0 = 0;
+                    while r0 < sch.pseudo_rows() {
+                        let rows = 5.min(sch.pseudo_rows() - r0);
+                        b.experts_items(tab, xd, sch.work_of_rows(r0, rows));
+                        r0 += rows;
+                    }
+                } else {
+                    b.experts_items(tab, xd, 0..sch.work.len());
+                }
+                cuda::sync();
+                let yb = cuda::dtoh(b.ye, t * k * h);
+                let mut n_rows = vec![0usize; e];
+                for &id in &ids {
+                    n_rows[id as usize] += 1;
+                }
+                let (mut worst, mut n_tc, mut n_grp) = (1f64, 0usize, 0usize);
+                let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+                for c in 0..t * k {
+                    let (ra, rb) = (&ya[c * h..(c + 1) * h], &yb[c * h..(c + 1) * h]);
+                    if n_rows[ids[c] as usize] >= min_rows {
+                        worst = worst.min(cosine(ra, rb));
+                        n_tc += 1;
+                        for (p, q) in ra.iter().zip(rb) {
+                            dot += *p as f64 * *q as f64;
+                            na += *p as f64 * *p as f64;
+                            nb += *q as f64 * *q as f64;
+                        }
+                    } else {
+                        assert!(ra.iter().zip(rb).all(|(p, q)| p.to_bits() == q.to_bits()), "{name}: ye of combo {c} (expert {}, grouped path) differs", ids[c]);
+                        n_grp += 1;
+                    }
+                }
+                let whole = dot / (na.sqrt() * nb.sqrt());
+                eprintln!(
+                    "glm5_moe tc2 {name}: {t} rows, {n144} experts >= 144 rows, at most {most}; {n_tc} combos on the tensor cores: worst row cosine {worst:.8}, all {whole:.8}; {n_grp} combos mul1_gemm_grp bit-identical"
+                );
+                assert!(n_tc > 0 && worst >= 0.9999, "{name}: worst row cosine {worst} < 0.9999");
+            }
+            b.free();
+            for d in [&mut xd, &mut vram, &mut tv, &mut tp] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
+    }
+
+    /// #186 micro-bench: the routed experts of one full GLM MoE layer at 8192 rows (realistic
+    /// routing, `realistic_ids`; one synthetic 3-bit record copied to 288 distinct VRAM slots):
+    /// `mul1_gemm_grp` (TC off), the per-expert tensor-core path (`CROW_GLM_MOE_TC=1`) and the
+    /// grouped one (`=2`) over its knobs (minimum rows, row tile, slots). Median of 5 calls after
+    /// 1 warm-up, host wall around a stream sync; TFLOPS over every routed combo (2 * 8192 * 8 *
+    /// 3 * H * I); the cosine of the grouped default against `mul1_gemm_grp` over every row.
+    #[test]
+    #[ignore = "bench, needs the GPU (about 8 GB VRAM): cargo test --release --lib glm5_moe_gpu_tc2_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_tc2_bench() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mk = mul1::Kernels::new();
+            let g = geo();
+            let (h, i, k, e) = (g.hidden, g.expert_inter, g.topk, g.experts);
+            let rec = record(3);
+            let rb = rec.len();
+            let one = cuda::upload_dev(&rec);
+            let mut arena = cuda::alloc_named("bench records", e * rb);
+            for x in 0..e {
+                cuda::d2d_async(arena + (x * rb) as u64, one, rb);
+            }
+            cuda::sync();
+            let mut one = one;
+            cuda::free_dev(&mut one);
+            let mut tv = cuda::to_u64_dev(&(0..e).map(|x| arena + (x * rb) as u64).collect::<Vec<_>>());
+            let t = 8192usize;
+            let ids = realistic_ids(t, k, e, 0.6, 1863);
+            let (n144, most) = routing_stats(&ids, e);
+            let mut rng = Rng(1864);
+            let x: Vec<f32> = (0..t * h).map(|_| rng.f(X_AMP)).collect();
+            let mut xd = cuda::to_f32_dev(&x);
+            let sch = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+            let flop = 2.0 * (t * k) as f64 * 3.0 * (h * i) as f64;
+            {
+                use cudarc::driver::sys::{cuFuncGetAttribute, CUfunction_attribute as A};
+                for name in ["mul1_tc2_gemm64", "mul1_tc2_gemm128", "mul1_tc2_recon"] {
+                    let f = mk.module.get(name);
+                    let at = |a: A| -> i32 {
+                        let mut v = 0i32;
+                        cuda::ck(cuFuncGetAttribute(&mut v, a, f));
+                        v
+                    };
+                    eprintln!("glm5_moe tc2 bench: {name} {} registers, {} B local (spills), {} B static shared", at(A::CU_FUNC_ATTRIBUTE_NUM_REGS), at(A::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES), at(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES));
+                }
+            }
+            eprintln!("glm5_moe tc2 bench: {t} rows top-{k} over {e} experts: {} experts routed, {n144} with >= 144 rows, at most {most}; {:.2} TFLOP per layer", sch.experts.len(), flop / 1e12);
+            let mut p = GpuMoeGroupedPlan::new(&g, t, &mk);
+            let mut med = |p: &GpuMoeGroupedPlan| -> f64 {
+                p.upload(&sch);
+                let mut v = Vec::new();
+                for n in 0..6 {
+                    let t0 = std::time::Instant::now();
+                    p.experts_items(tv, xd, 0..sch.work.len());
+                    cuda::sync();
+                    if n >= 1 {
+                        v.push(t0.elapsed().as_secs_f64());
+                    }
+                }
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            };
+            let say = |what: &str, s: f64| eprintln!("glm5_moe tc2 bench: {what}: {:.2} ms per layer ({:.1} TFLOPS; x42 layers {:.2} s)", s * 1e3, flop / s / 1e12, s * 42.0);
+            p.set_tc_mode(0, &mk);
+            let t0 = med(&p);
+            say("mul1_gemm_grp (TC off)", t0);
+            let ya = cuda::dtoh(p.ye, t * k * h);
+            p.set_tc_mode(1, &mk);
+            let t1 = med(&p);
+            say("per expert (TC=1)", t1);
+            let dflt = Tc2Cfg::default_for(t);
+            let sweep: Vec<Tc2Cfg> = if std::env::var("CROW_GLM_TC2_SWEEP").is_ok() {
+                let mut v = Vec::new();
+                for fused in [false, true] {
+                    for slots in [8, 32] {
+                        for bm in [64, 128] {
+                            for min_rows in [1, 16, 32, 64, 144] {
+                                v.push(Tc2Cfg { fused, slots, rows: t, bm, min_rows });
+                            }
+                        }
+                    }
+                }
+                for rows in [8192, 16_384, 32_768] {
+                    v.push(Tc2Cfg { rows, ..dflt });
+                }
+                v
+            } else {
+                vec![Tc2Cfg { fused: false, slots: 16, rows: t, bm: 64, min_rows: 32 }, Tc2Cfg { bm: 64, ..dflt }, Tc2Cfg { rows: t, ..dflt }]
+            };
+            let label = |c: &Tc2Cfg| {
+                format!(
+                    "grouped (TC=2) {}, {} experts / {} rows per batch, {}-row tiles, >= {} rows ({} MiB scratch)",
+                    if c.fused { "fused decode" } else { "recon" },
+                    if c.slots == usize::MAX { "all".to_string() } else { c.slots.to_string() },
+                    c.rows_for(t),
+                    c.bm,
+                    c.min_rows,
+                    moe_tc2_bytes(h, i, e, k, t, c) >> 20
+                )
+            };
+            for c in sweep {
+                p.set_tc2(c, &mk);
+                let s = med(&p);
+                say(&label(&c), s);
+            }
+            p.set_tc_mode(2, &mk);
+            let t2 = med(&p);
+            say(&format!("default {}", label(&dflt)), t2);
+            let yb = cuda::dtoh(p.ye, t * k * h);
+            let mut worst = 1f64;
+            for c in 0..t * k {
+                worst = worst.min(cosine(&ya[c * h..(c + 1) * h], &yb[c * h..(c + 1) * h]));
+            }
+            let whole = cosine(&ya, &yb);
+            eprintln!(
+                "glm5_moe tc2 bench: TC=1 {:.2} ms -> TC=2 {:.2} ms per layer ({:.1}x; vs TC off {:.1}x); TC=2 vs mul1_gemm_grp: worst row cosine {worst:.8}, all rows {whole:.8}; scratch {} B",
+                t1 * 1e3,
+                t2 * 1e3,
+                t1 / t2,
+                t0 / t2,
+                moe_tc2_bytes(h, i, e, k, t, &dflt)
+            );
+            assert!(worst >= 0.9999, "worst row cosine {worst}");
+            p.free();
+            for d in [&mut xd, &mut arena, &mut tv] {
+                cuda::free_dev(d);
+            }
         }
     }
 }
