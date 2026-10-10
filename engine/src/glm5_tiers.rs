@@ -1007,6 +1007,12 @@ pub const ARENA_STAGE_ENV: &str = "CROW_GLM_ARENA_STAGE_GB";
 pub const ARENA_STAGE_MIN_ENV: &str = "CROW_GLM_ARENA_STAGE_MIN";
 /// the free VRAM the elastic part leaves (sybil's `GLM53_EC_RESERVE_GB` default 2.5)
 pub const ARENA_RESERVE_BYTES: u64 = 5 << 29;
+/// #188: `1` = the frequency tiers ([`GlobalArena::set_freq`]); `0` (default) = the CLOCK / LRU arena
+pub const ARENA_FREQ_ENV: &str = "CROW_GLM_ARENA_FREQ";
+/// #188 frequency tiers: the scores' half-life in decode tokens (`tools/glm_tier_sim.py arena`, runs/glm53-flash/cache-sim-20261010)
+pub const FREQ_HALFLIFE_TOKENS: f64 = 64.0;
+/// #188 frequency tiers: an expert enters a full VRAM tier only above (1 + margin) x the lowest VRAM score
+pub const FREQ_MARGIN: f64 = 1.0;
 const GIB: f64 = (1u64 << 30) as f64;
 
 /// The switches of the global arena (all read with [`arena_config`]; only under `CROW_GLM_ARENA=global`).
@@ -1019,11 +1025,13 @@ pub struct ArenaConfig {
     pub elastic_bytes: u64,
     pub stage_bytes: u64,
     pub stage_min: usize,
+    /// #188 `CROW_GLM_ARENA_FREQ=1`: the frequency tiers
+    pub freq: bool,
 }
 
 impl Default for ArenaConfig {
     fn default() -> ArenaConfig {
-        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512 }
+        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false }
     }
 }
 
@@ -1071,6 +1079,11 @@ pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig,
     if let Some(n) = int(ARENA_STAGE_MIN_ENV, 1, 1 << 20)? {
         c.stage_min = n;
     }
+    c.freq = match val(ARENA_FREQ_ENV).as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(v) => return Err(format!("{ARENA_FREQ_ENV}={v:?}: accepted 0 (default), 1")),
+    };
     Ok(c)
 }
 
@@ -1239,6 +1252,36 @@ pub struct GlobalArena {
     /// sybil's warm scores per key (`CROW_GLM_ARENA_WARM`, [`GlobalArena::set_scores`]); empty
     /// without a warm file
     score: Vec<f64>,
+    /// #188 `CROW_GLM_ARENA_FREQ=1`: the frequency tiers ([`GlobalArena::set_freq`]); `None` = the
+    /// CLOCK / LRU arena above
+    freq: Option<FreqState>,
+}
+
+/// A lazy min-heap entry of the frequency tiers: (score bits, key). Scores are never negative, so
+/// their bits order as the scores do; an entry is stale once the key left the tier or its score moved.
+type FreqHeap = std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>;
+
+/// #188 the frequency tiers' state: every key's decayed count of its decode routings (a pick adds
+/// `inc`, `inc` grows by `grow` per decode row: a half-life of [`FREQ_HALFLIFE_TOKENS`] rows), and a
+/// lazy min-heap per tier
+#[derive(Clone, Debug)]
+struct FreqState {
+    fscore: Vec<f64>,
+    prior: Vec<f64>,
+    inc: f64,
+    grow: f64,
+    margin: f64,
+    topk: usize,
+    vheap: FreqHeap,
+    rheap: FreqHeap,
+    /// a VRAM slot may be empty (slots added, enabled or disabled since the last look)
+    vfree: bool,
+}
+
+impl FreqState {
+    fn new(keys: usize, halflife: f64, margin: f64, topk: usize) -> FreqState {
+        FreqState { fscore: vec![0.0; keys], prior: vec![0.0; keys], inc: 1.0, grow: 2f64.powf(1.0 / halflife), margin, topk, vheap: FreqHeap::new(), rheap: FreqHeap::new(), vfree: true }
+    }
 }
 
 /// `vpin` of a disabled VRAM slot (the write-back ring, an elastic chunk handed back): never a victim
@@ -1281,16 +1324,18 @@ impl GlobalArena {
             lent: Vec::new(),
             fresh: Vec::new(),
             score: Vec::new(),
+            freq: None,
         })
     }
 
     /// empty again (as [`GlobalArena::new`]); the switches, the warm scores and the disabled slots
-    /// are kept
+    /// are kept; the frequency tiers' scores restart at their prior
     pub fn reset(&mut self) {
         let (stay, noadmit, gen, score) = (self.pin_stay, self.noadmit, self.gen, std::mem::take(&mut self.score));
+        let freq = self.freq.take().map(|f| FreqState { fscore: f.prior.clone(), inc: 1.0, vheap: FreqHeap::new(), rheap: FreqHeap::new(), vfree: true, ..f });
         let off: Vec<bool> = self.vpin.iter().map(|&p| p == DISABLED).collect();
         *self = GlobalArena::new(self.layers, self.experts, self.vowner.len(), self.rowner.len()).expect("the same shape");
-        (self.pin_stay, self.noadmit, self.gen, self.score) = (stay, noadmit, gen + 1, score);
+        (self.pin_stay, self.noadmit, self.gen, self.score, self.freq) = (stay, noadmit, gen + 1, score, freq);
         for (p, off) in self.vpin.iter_mut().zip(off) {
             if off {
                 *p = DISABLED;
@@ -1322,6 +1367,9 @@ impl GlobalArena {
         self.refb.resize(m, false);
         self.vpin.resize(m, 0);
         self.gen += 1;
+        if let Some(f) = self.freq.as_mut() {
+            f.vfree = true;
+        }
     }
 
     /// Disable the VRAM slots `r` (never victims from now on): their experts go to pinned as the
@@ -1361,6 +1409,9 @@ impl GlobalArena {
             self.fresh.push(s as u32);
         }
         self.gen += 1;
+        if let Some(f) = self.freq.as_mut() {
+            f.vfree = true;
+        }
     }
 
     /// sybil's warm scores per MoE layer (as [`GlobalArena::warm_plan`]; a layer without scores
@@ -1370,6 +1421,145 @@ impl GlobalArena {
         for (l, sc) in scores.iter().enumerate().take(self.layers).filter(|(_, s)| s.len() == self.experts) {
             self.score[l * self.experts..(l + 1) * self.experts].copy_from_slice(sc);
         }
+        // #188: the frequency tiers start each expert at half the decayed count its warm rate
+        // (top-k x its share of the layer's scores per decode row) settles at: rate / ln(grow) / 2
+        if let Some(f) = self.freq.as_mut() {
+            let e = self.experts;
+            for (l, sc) in scores.iter().enumerate().take(self.layers).filter(|(_, s)| s.len() == e) {
+                let sum: f64 = sc.iter().sum();
+                if sum > 0.0 {
+                    for (i, &s) in sc.iter().enumerate() {
+                        f.prior[l * e + i] = 0.5 / f.grow.ln() * f.topk as f64 * s.max(0.0) / sum;
+                    }
+                }
+            }
+            f.fscore.copy_from_slice(&f.prior);
+            f.inc = 1.0;
+        }
+        self.freq_rebuild();
+    }
+
+    /// #188 `CROW_GLM_ARENA_FREQ=1`: the frequency tiers from now on. Every expert carries a decayed
+    /// count of its decode routings ([`GlobalArena::freq_count`], half-life `halflife` decode rows;
+    /// [`GlobalArena::set_scores`] starts it at half its warm rate's steady value). The pinned victim
+    /// is the lowest count not routed in the call (not the oldest); a routed expert outside VRAM
+    /// enters VRAM only into an empty slot or when its count is above (1 + `margin`) x the lowest
+    /// VRAM count not routed in the call (that expert written back into pinned); any other NVMe
+    /// miss is read into pinned and served there (zero-copy or the CPU lane). `pin_stay` and
+    /// `noadmit` do not apply. Lossless: only where records lie changes. `topk` = picks per row.
+    pub fn set_freq(&mut self, halflife: f64, margin: f64, topk: usize) {
+        assert!(halflife > 0.0 && margin >= 0.0 && topk > 0, "frequency tiers: half-life {halflife}, margin {margin}, top-k {topk}");
+        self.freq = Some(FreqState::new(self.layers * self.experts, halflife, margin, topk));
+        self.freq_rebuild();
+    }
+
+    /// whether the frequency tiers are on
+    pub fn freq_on(&self) -> bool {
+        self.freq.is_some()
+    }
+
+    /// #188: the decayed count of expert `e` of MoE layer `l` (`None` without the frequency tiers),
+    /// in units of the current increment
+    pub fn freq_score(&self, l: usize, e: u32) -> Option<f64> {
+        self.freq.as_ref().map(|f| f.fscore[l * self.experts + e as usize] / f.inc)
+    }
+
+    /// #188: count one decode call of MoE layer `l` (`sel` = its `[rows][topk]` picks): the first
+    /// MoE layer's call starts `rows` new decode rows (every count decays by 2^(-rows / half-life),
+    /// kept as a growing increment), then each pick adds the increment. A no-op without the
+    /// frequency tiers.
+    pub fn freq_count(&mut self, l: usize, sel: &[i32]) {
+        let e = self.experts;
+        let base = l * e;
+        let Some(f) = self.freq.as_mut() else { return };
+        if l == 0 {
+            let rows = sel.len().div_ceil(f.topk.max(1)).max(1);
+            f.inc *= f.grow.powi(rows as i32);
+        }
+        if f.inc > 1e100 {
+            let inc = f.inc;
+            f.fscore.iter_mut().for_each(|s| *s /= inc);
+            f.inc = 1.0;
+            self.freq_rebuild();
+        }
+        let f = self.freq.as_mut().expect("the frequency tiers");
+        for &id in sel {
+            if (id as usize) < e {
+                f.fscore[base + id as usize] += f.inc;
+            }
+        }
+        for &id in sel {
+            if (id as usize) < e {
+                self.freq_push(base + id as usize);
+            }
+        }
+    }
+
+    /// the heap entry of key `k` in the tier it lies in (none on the NVMe)
+    fn freq_push(&mut self, k: usize) {
+        let place = self.place[k];
+        let (vram, ram) = (self.vowner.len(), self.rowner.len());
+        let Some(f) = self.freq.as_mut() else { return };
+        let ent = std::cmp::Reverse((f.fscore[k].to_bits(), k as u32));
+        let (heap, cap) = match place {
+            Place::Vram(_) => (&mut f.vheap, vram),
+            Place::Ram(_) => (&mut f.rheap, ram),
+            Place::Nvme => return,
+        };
+        heap.push(ent);
+        if heap.len() > 4 * cap + 64 {
+            self.freq_rebuild();
+        }
+    }
+
+    /// both heaps again from the places (stale entries gone)
+    fn freq_rebuild(&mut self) {
+        let Some(f) = self.freq.as_mut() else { return };
+        f.vheap.clear();
+        f.rheap.clear();
+        for (k, p) in self.place.iter().enumerate() {
+            let ent = std::cmp::Reverse((f.fscore[k].to_bits(), k as u32));
+            match p {
+                Place::Vram(_) => f.vheap.push(ent),
+                Place::Ram(_) => f.rheap.push(ent),
+                Place::Nvme => {}
+            }
+        }
+    }
+
+    /// the frequency tiers' lowest live entry of a tier for which `ok(key)` holds (stale entries
+    /// dropped, refused ones kept)
+    fn freq_lowest(&mut self, vram: bool, ok: &dyn Fn(&GlobalArena, usize) -> bool) -> Option<usize> {
+        let mut f = self.freq.take()?;
+        let heap = if vram { &mut f.vheap } else { &mut f.rheap };
+        let (mut held, mut found) = (Vec::new(), None);
+        while let Some(std::cmp::Reverse((bits, k))) = heap.pop() {
+            let ku = k as usize;
+            let live = f.fscore[ku].to_bits() == bits && if vram { matches!(self.place[ku], Place::Vram(_)) } else { matches!(self.place[ku], Place::Ram(_)) };
+            if !live {
+                continue;
+            }
+            held.push(std::cmp::Reverse((bits, k)));
+            if ok(self, ku) {
+                found = Some(ku);
+                break;
+            }
+        }
+        heap.extend(held);
+        self.freq = Some(f);
+        found
+    }
+
+    /// an empty enabled VRAM slot not taken in this call, if the frequency tiers may have one
+    fn freq_free_slot(&mut self) -> Option<usize> {
+        if !self.freq.as_ref().is_some_and(|f| f.vfree) {
+            return None;
+        }
+        let s = (0..self.vowner.len()).find(|&s| self.vowner[s] == NONE && self.vpin[s] != DISABLED && self.vpin[s] != self.epoch);
+        if s.is_none() {
+            self.freq.as_mut().expect("the frequency tiers").vfree = false;
+        }
+        s
     }
 
     /// #195 S: the brought-back VRAM slots ([`GlobalArena::enable`], [`GlobalArena::add_slots`])
@@ -1458,6 +1648,7 @@ impl GlobalArena {
             self.place[k] = Place::Vram(s as u32);
             self.refb[s] = true;
             self.vpin[s] = ep;
+            self.freq_push(k);
         }
         let mut ch: Vec<(u32, Place, Place)> = self.touched.iter().filter(|&&(k, b)| self.place[k as usize] != b).map(|&(k, b)| (k, b, self.place[k as usize])).collect();
         ch.sort_unstable_by_key(|c| c.0);
@@ -1611,12 +1802,23 @@ impl GlobalArena {
         self.rowner[q as usize] = k as u32;
         self.ram_push_newest(q);
         self.place[k] = Place::Ram(q);
+        self.freq_push(k);
         Some(q)
     }
 
     /// the pinned LRU victim: the oldest slot whose expert is not routed in this call and whose
-    /// read has landed
-    fn ram_victim(&self) -> Option<u32> {
+    /// read has landed (#188 frequency tiers: the lowest count instead of the oldest)
+    fn ram_victim(&mut self) -> Option<u32> {
+        if self.freq.is_some() {
+            let k = self.freq_lowest(false, &|a, k| match a.place[k] {
+                Place::Ram(q) => a.prot[k] != a.epoch && a.rflight[q as usize] == 0,
+                _ => false,
+            })?;
+            return match self.place[k] {
+                Place::Ram(q) => Some(q),
+                _ => None,
+            };
+        }
         let mut x = self.oldest;
         while x != NONE && (self.prot[self.rowner[x as usize] as usize] == self.epoch || self.rflight[x as usize] != 0) {
             x = self.next[x as usize];
@@ -1668,6 +1870,7 @@ impl GlobalArena {
         self.rflight[q as usize] = landed;
         self.rpf[q as usize] = true;
         self.stats.pf_admitted += 1;
+        self.freq_push(k);
         Some(q)
     }
 
@@ -1741,18 +1944,28 @@ impl GlobalArena {
                 }
             }
         }
+        let freq = self.freq.is_some();
         if admit && !self.vowner.is_empty() {
             for &k in &misses {
-                if (self.pin_stay && matches!(self.place[k], Place::Ram(_))) || (self.noadmit && self.place[k] == Place::Nvme) {
+                if !freq && ((self.pin_stay && matches!(self.place[k], Place::Ram(_))) || (self.noadmit && self.place[k] == Place::Nvme)) {
                     continue;
                 }
                 // #203: a slot whose read is in flight stays (the call reads it where it lands)
                 if matches!(self.place[k], Place::Ram(q) if self.rflight[q as usize] != 0) {
                     continue;
                 }
-                let Some(s) = self.victim() else {
-                    self.stats.no_victim += 1;
-                    break;
+                // #188 frequency tiers: an empty slot, or the lowest VRAM count when `k` beats it
+                let s = if freq {
+                    match self.freq_slot(k) {
+                        Some(s) => s,
+                        None => continue,
+                    }
+                } else {
+                    let Some(s) = self.victim() else {
+                        self.stats.no_victim += 1;
+                        break;
+                    };
+                    s
                 };
                 let v = self.vowner[s];
                 self.record(k);
@@ -1768,6 +1981,7 @@ impl GlobalArena {
                 self.refb[s] = true;
                 self.vpin[s] = ep;
                 self.stats.admitted += 1;
+                self.freq_push(k);
                 if v != NONE {
                     let v = v as usize;
                     self.record(v);
@@ -1793,6 +2007,29 @@ impl GlobalArena {
         let mut ch: Vec<(u32, Place, Place)> = self.touched.iter().filter(|&&(k, b)| self.place[k as usize] != b).map(|&(k, b)| (k, b, self.place[k as usize])).collect();
         ch.sort_unstable_by_key(|c| c.0);
         ch
+    }
+
+    /// #188 frequency tiers: the VRAM slot routed expert `k` (outside VRAM) enters, or `None` (it
+    /// stays out): an empty enabled slot, else the slot of the lowest VRAM count not routed in this
+    /// call when `k`'s count is above (1 + margin) x that one
+    fn freq_slot(&mut self, k: usize) -> Option<usize> {
+        if let Some(s) = self.freq_free_slot() {
+            return Some(s);
+        }
+        let ep = self.epoch;
+        let v = self.freq_lowest(true, &|a, x| match a.place[x] {
+            Place::Vram(s) => a.vpin[s as usize] != ep && a.vpin[s as usize] != DISABLED,
+            _ => false,
+        })?;
+        let f = self.freq.as_ref()?;
+        if f.fscore[k] > (1.0 + f.margin) * f.fscore[v] {
+            match self.place[v] {
+                Place::Vram(s) => Some(s as usize),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 
     /// the invariants: every expert in at most one slot, the slot owners and the places agree,
@@ -3261,6 +3498,9 @@ impl ExpertTiers {
         d.chunks = if vpl > 0 { self.vram.clone() } else { Vec::new() };
         d.base_chunks = d.chunks.len();
         d.a.set_noadmit(d.cfg.noadmit);
+        if d.cfg.freq {
+            d.a.set_freq(FREQ_HALFLIFE_TOKENS, FREQ_MARGIN, topk);
+        }
         let base = nl * vpl;
         if d.cfg.vring > 0 && base >= 2 * d.cfg.vring && d.a.ram_slots() > 0 {
             let r = base - d.cfg.vring..base;
@@ -3602,6 +3842,8 @@ impl ExpertTiers {
         let d = self.arena.as_mut().expect("table_global without the global arena");
         let admit = arena_admits(sel.len(), false, d.cfg.admit_max);
         d.a.set_pin_stay(self.pinned_use.stay);
+        // #188 CROW_GLM_ARENA_FREQ: the decode call's picks counted before it is placed
+        d.a.freq_count(l, sel);
         // CROW_GLM_CONTROLLER with the CPU lane: the lane's worker waits per expert, not this thread
         let ctl_lane = reply.is_some() && self.dev_lane.is_some();
         // #202 RT2: a one-row call off the controller through the stager splits early / late
@@ -4377,7 +4619,7 @@ mod arena_tests {
         }
         let none = |_: &str| None;
         assert_eq!(arena_config(&none).unwrap(), ArenaConfig::default());
-        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512 });
+        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false });
         let set = |k: &str| match k {
             ARENA_ADMIT_MAX_ENV => Some("16".to_string()),
             ARENA_NOADMIT_ENV => Some("1".to_string()),
@@ -4389,7 +4631,7 @@ mod arena_tests {
             _ => None,
         };
         let c = arena_config(&set).unwrap();
-        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256 });
+        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false });
         for (k, v) in [(ARENA_ADMIT_MAX_ENV, "x"), (ARENA_NOADMIT_ENV, "yes"), (ARENA_VRING_ENV, "-1"), (ARENA_ELASTIC_ENV, "nan"), (ARENA_STAGE_MIN_ENV, "0")] {
             let one = |q: &str| (q == k).then(|| v.to_string());
             assert!(arena_config(&one).unwrap_err().contains(k), "{k}={v}");
@@ -4705,6 +4947,77 @@ mod arena_tests {
             assert_eq!((v, a.stats.admitted), (hits, admitted), "V {cv} P {cp}");
             a.check().unwrap();
         }
+    }
+
+    /// #188 `CROW_GLM_ARENA_FREQ=1` on the shared trace is `tools/glm_tier_sim.py` `FreqTiers`
+    /// (half-life 64, margin 1, no prior): VRAM hits, admissions and write-backs are the sim's
+    #[test]
+    fn freq_tiers_equal_glm_tier_sim_freq() {
+        let tr = trace(600, 42, 288, 8);
+        for (cv, cp, hits, adm, wb) in [(25 * 42, 83 * 42, 71_038u64, 3_347u64, 2_297u64), (46 * 42, 124 * 42, 125_796, 4_449, 2_517), (8 * 42, 20 * 42, 23_245, 1_377, 1_041)] {
+            let mut a = GlobalArena::new(42, 288, cv, cp).unwrap();
+            a.set_freq(FREQ_HALFLIFE_TOKENS, FREQ_MARGIN, 8);
+            for tok in &tr {
+                for (l, ids) in tok.iter().enumerate() {
+                    let sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                    a.freq_count(l, &sel);
+                    a.step(l, ids, arena_admits(ids.len(), false, 64));
+                }
+            }
+            let v: u64 = a.counters().iter().map(|c| c[0]).sum();
+            assert_eq!((v, a.stats.admitted, a.stats.write_backs), (hits, adm, wb), "V {cv} P {cp}");
+            a.check().unwrap();
+        }
+    }
+
+    /// #188 the frequency tiers by hand (1 VRAM and 1 pinned slot, no decay, margin 1): an empty
+    /// VRAM slot takes the first miss; a miss enters a full VRAM tier only above 2 x the lowest VRAM
+    /// count (that expert written back into the slot the promoted one left); otherwise it is read
+    /// into pinned, whose victim is the lowest count, not the oldest. Off, the same calls admit
+    /// every miss; the switch parses and refuses by name.
+    #[test]
+    fn freq_tiers_by_hand_and_the_switch() {
+        fn call(a: &mut GlobalArena, e: u32) -> Vec<(u32, Place, Place)> {
+            a.freq_count(0, &[e as i32]);
+            a.step(0, &[e], true)
+        }
+        let mut a = GlobalArena::new(1, 6, 1, 1).unwrap();
+        a.set_freq(f64::INFINITY, 1.0, 1);
+        assert_eq!(call(&mut a, 0), vec![(0, Place::Nvme, Place::Vram(0))]);
+        assert_eq!(call(&mut a, 1), vec![(1, Place::Nvme, Place::Ram(0))], "1 > 2 x 1 is false");
+        assert!(call(&mut a, 1).is_empty(), "2 > 2 x 1 is false: it stays in pinned");
+        assert_eq!(call(&mut a, 1), vec![(0, Place::Vram(0), Place::Ram(0)), (1, Place::Ram(0), Place::Vram(0))], "3 > 2: promoted");
+        assert_eq!(call(&mut a, 2), vec![(0, Place::Ram(0), Place::Nvme), (2, Place::Nvme, Place::Ram(0))], "the lowest count leaves pinned");
+        assert_eq!((a.stats.admitted, a.stats.write_backs, a.stats.ram_evictions), (2, 1, 1));
+        assert_eq!((a.freq_score(0, 1), a.freq_score(0, 0)), (Some(3.0), Some(1.0)));
+        a.check().unwrap();
+        // a reset keeps the switch and starts the counts again
+        a.reset();
+        assert!(a.freq_on() && a.freq_score(0, 1) == Some(0.0));
+        let mut b = GlobalArena::new(1, 6, 1, 1).unwrap();
+        b.set_pin_stay(true);
+        for e in [0, 1, 1, 1, 2] {
+            b.step(0, &[e], true);
+        }
+        assert_eq!((b.place(0, 2), b.freq_on(), b.freq_score(0, 0)), (Place::Vram(0), false, None), "off: every miss admitted");
+        let get = |v: &'static str| move |k: &str| (k == ARENA_FREQ_ENV).then(|| v.to_string());
+        assert!(arena_config(&get("1")).unwrap().freq);
+        assert!(!arena_config(&get("0")).unwrap().freq);
+        assert!(arena_config(&get("yes")).unwrap_err().contains(ARENA_FREQ_ENV));
+    }
+
+    /// #188 the frequency tiers' prior: half the decayed count each expert's warm rate settles at
+    /// (top-k x its share of the layer's scores / ln(grow) / 2), and the warm plan unchanged
+    #[test]
+    fn freq_tiers_prior_from_the_warm_scores() {
+        let mut a = GlobalArena::new(1, 4, 1, 1).unwrap();
+        a.set_freq(64.0, 1.0, 2);
+        a.set_scores(&[vec![3.0, 1.0, 0.0, 0.0]]);
+        let steady = 1.0 / (2f64.powf(1.0 / 64.0)).ln();
+        assert!((a.freq_score(0, 0).unwrap() - 0.5 * steady * 2.0 * 0.75).abs() < 1e-9);
+        assert!((a.freq_score(0, 1).unwrap() - 0.5 * steady * 2.0 * 0.25).abs() < 1e-9);
+        assert_eq!(a.freq_score(0, 2), Some(0.0));
+        assert_eq!(a.warm_plan(&[vec![3.0, 1.0, 0.0, 0.0]]), (vec![vec![0]], vec![vec![1]]));
     }
 
     #[test]

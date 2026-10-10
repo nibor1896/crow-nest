@@ -265,8 +265,16 @@ fn counters_json(p: &Phase, rb: u64) -> Value {
     let m = p.total_moves();
     let visits = m.visits.max(1) as f64;
     let gb = |records: u64| records as f64 * rb as f64 / 1e9 / t;
+    // #188: the NVMe records per token split into demand (misses no guess covered) and speculative
+    // (guesses issued), and the records copied into VRAM slots (admissions and promotions)
+    let pf = p.pf.unwrap_or_default();
+    let demand = p.nvme_reads.saturating_sub(pf.covered);
     json!({
         "tokens": p.tokens,
+        "nvme_demand_reads_per_token": demand as f64 / t,
+        "nvme_speculative_reads_per_token": pf.issued as f64 / t,
+        "nvme_records_per_token": (demand + pf.issued) as f64 / t,
+        "h2d_promotion_records_per_token": m.stage_to_vram as f64 / t,
         "visits": m.visits, "visits_per_token": m.visits as f64 / t,
         "hits": { "vram": tot[0], "pinned": tot[1], "nvme": tot[2] },
         "hit_rate": { "vram": tot[0] as f64 / visits, "pinned": tot[1] as f64 / visits, "nvme": tot[2] as f64 / visits },
@@ -416,7 +424,7 @@ fn counters_line(p: &Phase, rb: u64) -> String {
     let f = |k: &str| c[k].as_f64().unwrap_or(0.0);
     let h = |k: &str| 100.0 * c["hit_rate"][k].as_f64().unwrap_or(0.0);
     format!(
-        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch {} (issued {:.2}, used {:.2}, wasted {:.2}, joins {:.2}, demand misses uncovered {:.2}), CPU lane {:.2} experts {:.4} s",
+        "visits {:.1}, hits vram {:.1} % pinned {:.1} % nvme {:.1} %, r {:.2} NVMe reads ({:.3} GB), m {:.4}, H2D {:.3} GB, zero-copy {:.3} GB, host DRAM->GPU {:.3} GB, D2H {:.3} GB, promotions {:.2}, evictions {:.2}, prefetch {} (issued {:.2}, used {:.2}, wasted {:.2}, joins {:.2}, demand misses uncovered {:.2}), CPU lane {:.2} experts {:.4} s; NVMe records demand {:.2} + speculative {:.2}, H2D promotion records {:.2}",
         f("visits_per_token"),
         h("vram"),
         h("pinned"),
@@ -437,7 +445,10 @@ fn counters_line(p: &Phase, rb: u64) -> String {
         c["prefetch"]["joins_per_token"].as_f64().unwrap_or(0.0),
         c["prefetch"]["demand_misses_uncovered_per_token"].as_f64().unwrap_or(0.0),
         f("cpu_lane_per_token"),
-        f("cpu_lane_s_per_token")
+        f("cpu_lane_s_per_token"),
+        f("nvme_demand_reads_per_token"),
+        f("nvme_speculative_reads_per_token"),
+        f("h2d_promotion_records_per_token")
     )
 }
 
@@ -1004,6 +1015,9 @@ mod tests {
         assert_eq!(c["zero_copy_gb_per_token"], 4.0);
         assert_eq!(c["host_dram_to_gpu_gb_per_token"], 12.0);
         assert_eq!((c["promotions_per_token"].as_f64(), c["evictions_per_token"].as_f64()), (Some(2.0), Some(2.0)));
+        assert_eq!((c["nvme_demand_reads_per_token"].as_f64(), c["nvme_speculative_reads_per_token"].as_f64(), c["nvme_records_per_token"].as_f64()), (Some(8.0), Some(0.0), Some(8.0)));
+        let into_vram = pre.total_moves().stage_to_vram as f64 / pre.tokens as f64;
+        assert_eq!(c["h2d_promotion_records_per_token"].as_f64(), Some(into_vram));
         assert_eq!((c["prefetch"]["mode"].as_str(), c["prefetch"]["issued"].as_u64(), c["prefetch"]["demand_misses_uncovered"].as_u64()), (Some("none"), Some(0), Some(24)));
         assert_eq!(c["hit_rate"]["nvme"], 0.5);
         let d = counters_json(&dec, 1);

@@ -1742,22 +1742,22 @@ class FreqTiers:
             self.prot[k] = ep
             if count:
                 self.score[k] += self.inc
-        for k in keys:
+        misses = []
+        for k in keys:                            # the engine's order: classify, admit, then land the rest
             if k in self.vset:
                 self._push(self.vheap, self.vset, k)
                 tier.append(VRAM)
                 continue
-            inram = k in self.rset
-            tier.append(PIN if inram else NVME)
-            v, go = None, False
-            if admit and self.nv:
-                if len(self.vset) < self.nv:
-                    go = True
-                else:
+            tier.append(PIN if k in self.rset else NVME)
+            misses.append(k)
+        if admit and self.nv:
+            for k in misses:
+                v = None
+                if len(self.vset) >= self.nv:
                     v = self._low(self.vheap, self.vset)
-                    go = v is not None and self.score[k] > (1.0 + self.margin) * self.score[v]
-            if go:
-                if inram:                         # exclusive: its pinned slot is free for the write-back
+                    if v is None or not self.score[k] > (1.0 + self.margin) * self.score[v]:
+                        continue
+                if k in self.rset:                # exclusive: its pinned slot is free for the write-back
                     self.rset.discard(k)
                     c["promotions"] += 1
                 if v is not None:
@@ -1766,8 +1766,10 @@ class FreqTiers:
                 self.vset.add(k)
                 self._push(self.vheap, self.vset, k)
                 c["h2d"] += 1
+        for k in misses:
+            if k in self.vset:
                 continue
-            if inram:
+            if k in self.rset:
                 self._push(self.rheap, self.rset, k)
             else:
                 self._ram_insert(k)
