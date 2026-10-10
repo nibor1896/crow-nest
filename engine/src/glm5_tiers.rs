@@ -861,6 +861,8 @@ pub fn plan_for_rows(g: &Glm5Geo, context: usize, rows: usize, vram_total: u64, 
     let pinned_budget = if stager { pinned_budget.saturating_sub(stager_pinned_bytes(g.moe_layers(), g.experts, g.topk, record_bytes)) } else { pinned_budget };
     // CROW_GLM_PREFETCH's store and CROW_GLM_LA's host-mapped embedding table, the same way
     let pinned_budget = pinned_budget.saturating_sub(decode_switch_pinned_bytes(g, &Switches::from_env(), record_bytes));
+    // #196: the prefill stage engine's pinned ring (CROW_GLM_ARENA=global with staging)
+    let pinned_budget = pinned_budget.saturating_sub(prefill_ring_pinned_bytes(&env, record_bytes));
     crate::manager::plan_glm5_next_chunk(g, context, vram_total, pinned_budget, crate::geo::GLM5_NEXT_DENSE_BYTES, record_bytes, crate::gen::pf_tg(), crate::gen::pf_async_on(), chunk)
 }
 
@@ -2010,6 +2012,356 @@ pub struct StageStats {
     /// records copied into a buffer from their pinned slot, and read from the NVMe
     pub from_pinned: u64,
     pub from_nvme: u64,
+    /// #196 stage engine: forward plans begun, NVMe records the ring reader read into the pinned
+    /// ring, ring slots it reused (each after the slot's previous H2D was done), the most reads
+    /// it had in flight at once (at most [`PREFILL_RING_QD`]), the ring's slots
+    pub plans: u64,
+    pub ring_reads: u64,
+    pub ring_wraps: u64,
+    pub in_flight_max: u64,
+    pub ring_slots: u64,
+    /// host time staged prompt calls blocked on the NVMe (ending a plan, a synchronous restage)
+    pub host_wait_ns: u64,
+    /// calls restaged synchronously through the pageable landing (a selected id outside the
+    /// layer's plan: more non-VRAM experts than a staging buffer holds)
+    pub sync_restaged: u64,
+}
+
+/// #196: the template's prefill ring (`GLM53_NV_PF_RING` 192 slots, glm53-flash-offload @ 6769b27
+/// docs/how-it-works.md#L346): at most this many pinned ring slots
+pub const PREFILL_RING_MAX: usize = 192;
+/// #196: the template's `GLM53_NV_PF_QD`: NVMe reads of the stage engine in flight at once
+pub const PREFILL_RING_QD: usize = 24;
+
+/// #196: the stage engine's pinned ring slots for staging buffers of `stage_records` records: one
+/// buffer's worth (a whole layer's non-VRAM experts in flight), at most [`PREFILL_RING_MAX`]
+pub fn prefill_ring_slots(stage_records: usize) -> usize {
+    stage_records.clamp(1, PREFILL_RING_MAX)
+}
+
+/// #196: the pinned bytes of the stage engine (ring slots plus two flag words per slot, rounded up
+/// to 4096 B) under the arena switches `get` reads; 0 without `CROW_GLM_ARENA=global` and
+/// `CROW_GLM_ARENA_STAGE_GB`. [`plan_for_rows`] takes it off the pinned budget.
+pub fn prefill_ring_pinned_bytes(get: &dyn Fn(&str) -> Option<String>, record_bytes: u64) -> u64 {
+    if record_bytes == 0 || arena_kind(get(ARENA_ENV).as_deref()) != Ok(ArenaKind::Global) {
+        return 0;
+    }
+    match arena_config(get) {
+        Ok(c) if c.stage_bytes > 0 => {
+            let r = prefill_ring_slots((c.stage_bytes / record_bytes) as usize);
+            r as u64 * record_bytes + (2 * r * 8).next_multiple_of(4096) as u64
+        }
+        _ => 0,
+    }
+}
+
+/// #196: where a planned record of a staged forward comes from
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageSrc {
+    /// its pinned slot (kept for the forward: a prompt call admits nothing)
+    Ram(u32),
+    /// the `g`-th NVMe read of the plan (the ring reader's FIFO order)
+    Nvme(usize),
+}
+
+/// #196: the template's `stage_begin` plan of one staged forward from MoE layer `l0`: per layer
+/// every non-VRAM expert in id order, at most `nst` (the records a staging buffer holds), and the
+/// NVMe reads in layer order
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagePlan {
+    pub l0: usize,
+    pub layers: Vec<Vec<(u32, StageSrc)>>,
+    /// (MoE layer, expert) of NVMe read `g`
+    pub nv: Vec<(usize, u32)>,
+    /// the placement generation the plan was taken at
+    pub gen: u64,
+}
+
+/// #196: plan the forward from MoE layer `l0` to `nl` over `experts` experts per layer
+pub fn stage_plan(place: &dyn Fn(usize, u32) -> Place, l0: usize, nl: usize, experts: usize, nst: usize, gen: u64) -> StagePlan {
+    let mut nv = Vec::new();
+    let layers = (l0..nl)
+        .map(|l| {
+            let row: Vec<(u32, Place)> = (0..experts as u32).map(|e| (e, place(l, e))).filter(|(_, p)| !matches!(p, Place::Vram(_))).take(nst).collect();
+            row.into_iter()
+                .map(|(e, p)| match p {
+                    Place::Ram(q) => (e, StageSrc::Ram(q)),
+                    _ => {
+                        nv.push((l, e));
+                        (e, StageSrc::Nvme(nv.len() - 1))
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    StagePlan { l0, layers, nv, gen }
+}
+
+/// the ring reader's shared state with the host thread
+struct RingShared {
+    /// submit only the plan's reads below this index (`usize::MAX` = all; set when the plan ends)
+    stop: std::sync::atomic::AtomicUsize,
+    /// the reader's first read error, taken by the host's next staged call
+    err: std::sync::Mutex<Option<String>>,
+}
+
+impl RingShared {
+    fn fail(&self, e: String) {
+        self.err.lock().unwrap().get_or_insert(e);
+    }
+}
+
+/// what the ring reader did for one plan
+#[derive(Default)]
+struct RingReport {
+    submitted: usize,
+    wraps: u64,
+    in_flight_max: u64,
+    err: Option<String>,
+}
+
+/// the ring reader's inputs (raw addresses: the ring, the flags and the source outlive the
+/// thread, which [`StageEngine::finish`] or its drop joins)
+struct RingJob {
+    recs: Vec<ExpertRecord>,
+    base: u64,
+    slots: usize,
+    qd: usize,
+    rb: usize,
+    ring: usize,
+    flags: usize,
+    src: usize,
+    sh: std::sync::Arc<RingShared>,
+}
+
+/// the ring reader shares the store's NVMe source with the host thread
+#[allow(dead_code)]
+fn nvme_source_is_sync() {
+    fn sync<T: Sync>() {}
+    sync::<NvmeSource>();
+}
+
+/// The template's `st_reader`: read the plan's NVMe records in FIFO order into ring slot
+/// `(base + g) % slots`, at most `qd` in flight. Each read raises the slot's landed flag (word
+/// `r`) to `base + g + 1`, which the copy stream waits on before the H2D (`cuStreamWaitValue64`),
+/// so the host thread never waits; the copy stream raises the slot's done flag (word
+/// `slots + r`) to the same value after the H2D (`cuStreamWriteValue64`), and a slot is read into
+/// again only once the done flag of its previous read is up. Both flags are monotonic sequences.
+fn ring_reader(j: RingJob) -> RingReport {
+    use std::sync::atomic::{fence, Ordering};
+    let mut rep = RingReport::default();
+    // SAFETY: the creator's source, alive until this thread is joined
+    let src = unsafe { &*(j.src as *const NvmeSource) };
+    let word = |i: usize| (j.flags + i * 8) as *mut u64;
+    let read = |i: usize| {
+        let v = unsafe { std::ptr::read_volatile(word(i)) };
+        fence(Ordering::Acquire);
+        v
+    };
+    let mut tickets: std::collections::VecDeque<(usize, u64, crate::nvme_source::Ticket)> = std::collections::VecDeque::new();
+    // an error reaches the host at its next staged call and at the plan's end
+    let fail = |e: String, rep: &mut RingReport| {
+        let msg = format!("{ARENA_STAGE_ENV}: a stage-engine NVMe read: {e}");
+        j.sh.fail(msg.clone());
+        rep.err.get_or_insert(msg);
+    };
+    let settle = |t: crate::nvme_source::Ticket, rep: &mut RingReport| {
+        if let Err(e) = src.wait(t) {
+            fail(e, rep);
+        }
+    };
+    let slots = j.slots as u64;
+    'plan: for (g, rec) in j.recs.iter().enumerate() {
+        let seq = j.base + g as u64;
+        let r = (seq % slots) as usize;
+        if j.sh.stop.load(Ordering::Acquire) <= g {
+            break;
+        }
+        if seq >= slots {
+            // the slot's previous read: its H2D done before this read overwrites the slot
+            let mut spins = 0u32;
+            let mut waited = false;
+            while read(j.slots + r) < seq - slots + 1 {
+                if j.sh.stop.load(Ordering::Acquire) <= g {
+                    break 'plan;
+                }
+                waited = true;
+                spins += 1;
+                if spins < 256 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            }
+            rep.wraps += u64::from(waited);
+        }
+        while let Some(&(fr, fv, _)) = tickets.front() {
+            if read(fr) < fv {
+                break;
+            }
+            let (_, _, t) = tickets.pop_front().unwrap();
+            settle(t, &mut rep);
+        }
+        if tickets.len() >= j.qd {
+            let (_, _, t) = tickets.pop_front().unwrap();
+            settle(t, &mut rep);
+        }
+        let dst = RecordDst { gu: (j.ring + r * j.rb) as *mut u8, dn: std::ptr::null_mut() };
+        let landed = crate::nvme_source::Landed { flag: word(r), value: seq + 1 };
+        match unsafe { src.fetch_landed(&[(*rec, dst)], &[landed]) } {
+            Ok(t) => tickets.push_back((r, seq + 1, t)),
+            Err(e) => {
+                fail(e, &mut rep);
+                // the copy stream waits on this flag: raise it (the error ends the prompt call)
+                fence(Ordering::SeqCst);
+                unsafe { std::ptr::write_volatile(word(r), seq + 1) };
+            }
+        }
+        rep.submitted = g + 1;
+        rep.in_flight_max = rep.in_flight_max.max(tickets.len() as u64);
+    }
+    for (_, _, t) in tickets.drain(..) {
+        settle(t, &mut rep);
+    }
+    rep
+}
+
+/// #196: the template's prefill stage engine (glm53-flash-offload @ 6769b27
+/// kernels/nv2/nv2_host.cpp#L734-L852): a pinned FIFO ring the ring reader fills with a forward
+/// plan's NVMe records several layers ahead, a landed and a done flag per slot (host-mapped
+/// words). The host thread enqueues each layer's H2D on the staging copy stream between a device
+/// wait on the landed flag and a device write of the done flag.
+struct StageEngine {
+    ring: Pinned,
+    /// `[landed; slots]` then `[done; slots]` u64
+    flags: Pinned,
+    slots: usize,
+    qd: usize,
+    sh: std::sync::Arc<RingShared>,
+    th: Option<std::thread::JoinHandle<RingReport>>,
+    plan: Option<StagePlan>,
+    /// the next MoE layer of the plan to enqueue, and the plan's reads enqueued so far
+    cursor: usize,
+    enqueued: usize,
+    /// the ring sequence of the plan's read 0 (sequences never restart: the flags are monotonic)
+    base: u64,
+}
+
+impl StageEngine {
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn new(slots: usize, qd: usize, rb: u64) -> StageEngine {
+        let flags = Pinned::alloc((2 * slots * 8).next_multiple_of(4096));
+        std::ptr::write_bytes(flags.host as *mut u8, 0, flags.bytes);
+        StageEngine {
+            ring: Pinned::alloc(slots * rb as usize),
+            flags,
+            slots,
+            qd,
+            sh: std::sync::Arc::new(RingShared { stop: std::sync::atomic::AtomicUsize::new(usize::MAX), err: std::sync::Mutex::new(None) }),
+            th: None,
+            plan: None,
+            cursor: 0,
+            enqueued: 0,
+            base: 0,
+        }
+    }
+
+    fn pinned_bytes(&self) -> u64 {
+        (self.ring.bytes + self.flags.bytes) as u64
+    }
+
+    /// the device address of ring slot `r`'s landed flag and of its done flag
+    fn flag_dev(&self, r: usize) -> (u64, u64) {
+        (self.flags.dev + r as u64 * 8, self.flags.dev + (self.slots + r) as u64 * 8)
+    }
+
+    /// enqueue on `s` the H2D of plan read `g` out of its ring slot into `dst` (`None` = the read
+    /// is consumed, not copied): wait for its landed flag, copy, raise its done flag
+    ///
+    /// # Safety
+    /// A CUDA context is current; `dst` holds a record.
+    unsafe fn enqueue(&self, g: usize, dst: Option<Dev>, rb: u64, s: sys::CUstream) {
+        let seq = self.base + g as u64;
+        let r = (seq % self.slots as u64) as usize;
+        let (landed, done) = self.flag_dev(r);
+        cuda::ck(sys::cuStreamWaitValue64_v2(s, landed, seq + 1, WAIT_GEQ));
+        if let Some(d) = dst {
+            cuda::ck(sys::cuMemcpyHtoDAsync_v2(d, (self.ring.host as *const u8).add(r * rb as usize) as *const _, rb as usize, s));
+        }
+        cuda::ck(sys::cuStreamWriteValue64_v2(s, done, seq + 1, 0));
+    }
+
+    /// begin `plan`: start the ring reader on its NVMe records
+    ///
+    /// # Safety
+    /// No plan is open; `src` outlives the reader ([`StageEngine::finish`]).
+    unsafe fn begin(&mut self, plan: StagePlan, records: &[Vec<ExpertRecord>], src: &NvmeSource, rb: u64) {
+        debug_assert!(self.plan.is_none() && self.th.is_none());
+        self.sh.stop.store(usize::MAX, std::sync::atomic::Ordering::Release);
+        let job = RingJob {
+            recs: plan.nv.iter().map(|&(l, e)| records[l][e as usize]).collect(),
+            base: self.base,
+            slots: self.slots,
+            qd: self.qd,
+            rb: rb as usize,
+            ring: self.ring.host as usize,
+            flags: self.flags.host as usize,
+            src: src as *const NvmeSource as usize,
+            sh: self.sh.clone(),
+        };
+        self.th = Some(std::thread::Builder::new().name("glm5-stage-ring".into()).spawn(move || ring_reader(job)).expect("the stage ring reader thread"));
+        self.cursor = plan.l0;
+        self.enqueued = 0;
+        self.plan = Some(plan);
+    }
+
+    /// End the open plan: the reader stops after the reads already enqueued and is joined; every
+    /// read it submitted beyond them is consumed on `stream` (waited for, its done flag raised),
+    /// so the next plan's reads wait for nothing that will not come.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn finish(&mut self, stream: sys::CUstream, rb: u64) -> RingReport {
+        let Some(plan) = self.plan.take() else { return RingReport::default() };
+        self.sh.stop.store(self.enqueued, std::sync::atomic::Ordering::Release);
+        let rep = match self.th.take().map(|t| t.join()) {
+            Some(Ok(r)) => r,
+            _ => {
+                // the reader died: raise every landed flag past what the copy stream may wait for
+                for r in 0..self.slots {
+                    std::ptr::write_volatile((self.flags.host as *mut u64).add(r), self.base + plan.nv.len() as u64);
+                }
+                RingReport { submitted: self.enqueued, err: Some(format!("{ARENA_STAGE_ENV}: the stage ring reader died")), ..RingReport::default() }
+            }
+        };
+        let done = rep.submitted.max(self.enqueued);
+        for g in self.enqueued..done {
+            self.enqueue(g, None, rb, stream);
+        }
+        self.base += done as u64;
+        self.enqueued = 0;
+        rep
+    }
+
+    /// # Safety
+    /// A CUDA context is current; nothing waits on the staging copy stream any more.
+    unsafe fn free(&mut self, stream: sys::CUstream, rb: u64) {
+        let _ = self.finish(stream, rb);
+        cuda::stream_sync(stream);
+        self.ring.free();
+        self.flags.free();
+    }
+}
+
+impl Drop for StageEngine {
+    fn drop(&mut self) {
+        // never freed: stop the reader at once and join it (the arena drops before its source)
+        if let Some(t) = self.th.take() {
+            self.sh.stop.store(0, std::sync::atomic::Ordering::Release);
+            let _ = t.join();
+        }
+    }
 }
 
 /// two staging buffers of `nst` records and the copy stream that fills them one layer ahead
@@ -2027,6 +2379,8 @@ struct StageSet {
     gen: [u64; 2],
     in_forward: bool,
     stats: StageStats,
+    /// #196: the prefill stage engine (pinned ring, ring reader, forward plan)
+    eng: StageEngine,
 }
 
 /// The global arena on the device: the host policy, its switches, the VRAM chunks its slots live
@@ -2203,7 +2557,16 @@ impl ExpertTiers {
                     *b = cuda::try_alloc_zeroed("glm5 arena staging buffer", nst * rb as usize).map_err(|e| format!("{ARENA_STAGE_ENV}: the staging buffers do not fit: {e:?}"))?;
                 }
             }
+            // #196: the stage engine's copy stream waits on the ring's landed flags
+            let mut dev: sys::CUdevice = 0;
+            cuda::ck(sys::cuCtxGetDevice(&mut dev));
+            let mut ok = 0i32;
+            cuda::ck(sys::cuDeviceGetAttribute(&mut ok, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, dev));
+            if ok == 0 {
+                return Err(format!("{ARENA_STAGE_ENV}: this device has no 64-bit stream memory operations (CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS = 0); the stage engine's ring flags need cuStreamWaitValue64"));
+            }
             d.stage = Some(StageSet {
+                eng: StageEngine::new(prefill_ring_slots(nst), PREFILL_RING_QD, rb),
                 bufs,
                 nst,
                 permanent,
@@ -2214,7 +2577,7 @@ impl ExpertTiers {
                 layer: [usize::MAX; 2],
                 gen: [0; 2],
                 in_forward: false,
-                stats: StageStats::default(),
+                stats: StageStats { ring_slots: prefill_ring_slots(nst) as u64, ..StageStats::default() },
             });
         }
         if let Some(path) = d.cfg.warm.clone() {
@@ -2319,11 +2682,13 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current; no launch reading a staging buffer is pending.
     unsafe fn stage_end(&mut self) {
+        let rb = self.rb;
         let Some(d) = self.arena.as_mut() else { return };
         let Some(st) = d.stage.as_mut() else { return };
         if !st.in_forward {
             return;
         }
+        Self::stage_plan_end(st, rb);
         cuda::stream_sync(st.stream);
         st.layer = [usize::MAX; 2];
         st.in_forward = false;
@@ -2549,8 +2914,10 @@ impl ExpertTiers {
         for g in nv.chunks(cap) {
             let jobs: Vec<(ExpertRecord, RecordDst)> =
                 g.iter().enumerate().map(|(j, &(e, _))| (self.records[l][e as usize], RecordDst { gu: self.arena_landing.p.add(j * rb as usize), dn: std::ptr::null_mut() })).collect();
+            let t0 = std::time::Instant::now();
             let t = self.src.fetch(&jobs)?;
             self.nvme_bytes += self.src.wait(t)?.bytes;
+            st.stats.host_wait_ns += t0.elapsed().as_nanos() as u64;
             for (j, &(_, i)) in g.iter().enumerate() {
                 // pageable source: the call returns once the bytes are taken, so the landing is free again
                 cuda::ck(sys::cuMemcpyHtoDAsync_v2(buf + i as u64 * rb, self.arena_landing.p.add(j * rb as usize) as *const _, rb as usize, st.stream));
@@ -2565,6 +2932,117 @@ impl ExpertTiers {
         st.content[b] = ids;
         st.layer[b] = l;
         st.gen[b] = d.a.generation();
+        self.moves[l].add(&mv);
+        Ok(())
+    }
+
+    /// #196: end the stage engine's open plan (see [`StageEngine::finish`]) and count its reader's
+    /// report; a read error reaches the next staged call. Returns the host time it took.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn stage_plan_end(st: &mut StageSet, rb: u64) -> u64 {
+        let t0 = std::time::Instant::now();
+        let s = st.stream;
+        let rep = st.eng.finish(s, rb);
+        st.stats.ring_reads += rep.submitted as u64;
+        st.stats.ring_wraps += rep.wraps;
+        st.stats.in_flight_max = st.stats.in_flight_max.max(rep.in_flight_max);
+        if let Some(e) = rep.err {
+            st.eng.sh.fail(e);
+        }
+        t0.elapsed().as_nanos() as u64
+    }
+
+    /// #196 tests: a stage engine of `slots` ring slots and `qd` reads in flight in place of the
+    /// sized one
+    ///
+    /// # Safety
+    /// A CUDA context is current; no staged forward is open.
+    #[cfg(test)]
+    unsafe fn set_stage_ring(&mut self, slots: usize, qd: usize) {
+        let rb = self.rb;
+        let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("set_stage_ring without staging");
+        let s = st.stream;
+        st.eng.free(s, rb);
+        st.eng = StageEngine::new(slots, qd, rb);
+        st.stats.ring_slots = slots as u64;
+    }
+
+    /// #196, the template's `stage_begin`: end the open plan and plan the forward from MoE layer
+    /// `l` on the current placement; the ring reader starts reading its NVMe records at once.
+    ///
+    /// # Safety
+    /// A CUDA context is current; staging is on.
+    unsafe fn stage_plan_start(&mut self, l: usize) {
+        let (experts, rb, nl) = (self.cache.experts, self.rb, self.slots.len());
+        let d = self.arena.as_mut().expect("stage_plan_start without the global arena");
+        let st = d.stage.as_mut().expect("stage_plan_start without staging");
+        st.stats.host_wait_ns += Self::stage_plan_end(st, rb);
+        let a = &d.a;
+        let plan = stage_plan(&|l, e| a.place(l, e), l, nl, experts, st.nst, a.generation());
+        st.eng.begin(plan, &self.records, &self.src, rb);
+        st.stats.plans += 1;
+    }
+
+    /// #196, the template's `stage_layer`: enqueue MoE layer `l` of the open plan (its cursor)
+    /// into staging buffer `b` on the copy stream, behind the buffer's last reader: the pinned
+    /// records straight from their slot, the NVMe records from their ring slot behind a device
+    /// wait on its landed flag (the host never waits), each ring slot's event recorded after its
+    /// H2D. `only` = copy just these ids (the rest of the layer's reads are consumed, not copied);
+    /// `None` = the whole layer (the prefetch). Counted as layer `l`'s moves.
+    ///
+    /// # Safety
+    /// A CUDA context is current; the buffers are allocated; a plan is open at layer `l`.
+    unsafe fn stage_issue_plan(&mut self, l: usize, b: usize, only: Option<&[u32]>) -> Result<(), String> {
+        let (rb, ppl) = (self.rb, self.sizes.pinned);
+        let d = self.arena.as_mut().expect("stage_issue_plan without the global arena");
+        let gen = d.a.generation();
+        let st = d.stage.as_mut().expect("stage_issue_plan without staging");
+        let eng = &mut st.eng;
+        let plan = eng.plan.as_ref().expect("stage_issue_plan without a plan");
+        if eng.cursor != l || plan.gen != gen {
+            return Err(format!("{ARENA_STAGE_ENV}: the stage plan is at MoE layer {} (generation {}), asked for layer {l} (generation {gen})", eng.cursor, plan.gen));
+        }
+        let row = &plan.layers[l - plan.l0];
+        cuda::stream_wait_event(st.stream, st.used[b]);
+        let buf = st.bufs[b];
+        let mut content = vec![u32::MAX; row.len()];
+        let mut mv = Moves::default();
+        let mut reads = 0usize;
+        for (j, &(e, src)) in row.iter().enumerate() {
+            let copy = only.is_none_or(|o| o.contains(&e));
+            match src {
+                StageSrc::Ram(q) => {
+                    if copy {
+                        let host = (self.pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize);
+                        cuda::ck(sys::cuMemcpyHtoDAsync_v2(buf + j as u64 * rb, host as *const _, rb as usize, st.stream));
+                        content[j] = e;
+                        mv.pinned_to_stage += 1;
+                        st.stats.from_pinned += 1;
+                    }
+                }
+                StageSrc::Nvme(g) => {
+                    eng.enqueue(g, copy.then_some(buf + j as u64 * rb), rb, st.stream);
+                    if copy {
+                        content[j] = e;
+                        mv.landing_to_stage += 1;
+                        st.stats.from_nvme += 1;
+                    }
+                    reads += 1;
+                }
+            }
+        }
+        mv.nvme_to_landing += reads as u64;
+        self.nvme_reads += reads as u64;
+        self.nvme_bytes += reads as u64 * rb;
+        eng.enqueued += reads;
+        eng.cursor = l + 1;
+        cuda::event_record(st.ready[b], st.stream);
+        cuda::stream_query(st.stream);
+        st.content[b] = content;
+        st.layer[b] = l;
+        st.gen[b] = gen;
         self.moves[l].add(&mv);
         Ok(())
     }
@@ -2604,12 +3082,30 @@ impl ExpertTiers {
             let d = self.arena.as_ref().expect("stage_call without the global arena");
             ids.iter().copied().filter(|&e| !matches!(d.a.place(l, e), Place::Vram(_))).collect()
         };
+        let b = l % 2;
+        // #196: the open plan covers layer l (prefetched into buffer b, or the next to enqueue),
+        // else the forward is planned from l on
+        let covered = {
+            let d = self.arena.as_ref().expect("arena");
+            let st = d.stage.as_ref().expect("staging");
+            st.eng.plan.as_ref().is_some_and(|p| p.gen == d.a.generation()) && (st.eng.cursor == l || (st.eng.cursor == l + 1 && st.layer[b] == l))
+        };
+        if !covered {
+            self.stage_plan_start(l);
+        }
+        if let Some(e) = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").eng.sh.err.lock().unwrap().take() {
+            return Err(e);
+        }
+        let cursor = self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").eng.cursor;
         if need.len() > nst {
+            if cursor == l {
+                // the layer's reads are in the ring reader's FIFO: consume them
+                self.stage_issue_plan(l, b, Some(&[]))?;
+            }
             let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
             st.stats.fallbacks += 1;
             return Ok(false);
         }
-        let b = l % 2;
         let fresh = {
             let d = self.arena.as_ref().expect("arena");
             let st = d.stage.as_ref().expect("staging");
@@ -2625,7 +3121,15 @@ impl ExpertTiers {
             }
         }
         if !fresh {
-            self.stage_issue(l, b, need.clone())?;
+            if cursor == l {
+                self.stage_issue_plan(l, b, Some(&need))?;
+            }
+            let st = self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging");
+            if !need.iter().all(|e| st.content[b].contains(e)) {
+                // a selected id outside the layer's plan (more non-VRAM experts than a buffer holds)
+                st.stats.sync_restaged += 1;
+                self.stage_issue(l, b, need.clone())?;
+            }
         }
         let d = self.arena.as_mut().expect("arena");
         let places = d.a.mark(l, &ids);
@@ -2648,11 +3152,9 @@ impl ExpertTiers {
         self.moves[l].add(&mv);
         self.routing_syncs += 1;
         self.sub_batches += 1;
-        // the next MoE layer into the other buffer while this one computes
-        if l + 1 < nl {
-            let d = self.arena.as_ref().expect("arena");
-            let next: Vec<u32> = (0..experts as u32).filter(|&e| !matches!(d.a.place(l + 1, e), Place::Vram(_))).take(nst).collect();
-            self.stage_issue(l + 1, (l + 1) % 2, next)?;
+        // the next MoE layer of the plan into the other buffer while this one computes
+        if l + 1 < nl && self.arena.as_ref().and_then(|d| d.stage.as_ref()).expect("staging").eng.cursor == l + 1 {
+            self.stage_issue_plan(l + 1, (l + 1) % 2, None)?;
             self.arena.as_mut().and_then(|d| d.stage.as_mut()).expect("staging").stats.prefetched += 1;
         }
         Ok(true)
@@ -2663,11 +3165,14 @@ impl ExpertTiers {
     /// # Safety
     /// No launch reading the store is pending.
     unsafe fn free_arena(&mut self) {
+        let rb = self.rb;
         let Some(d) = self.arena.as_mut() else { return };
         if let Some(mut r) = d.ring.take() {
             r.free();
         }
         if let Some(mut st) = d.stage.take() {
+            let s = st.stream;
+            st.eng.free(s, rb);
             cuda::stream_sync(st.stream);
             for b in &mut st.bufs {
                 if *b != 0 {
@@ -3479,6 +3984,121 @@ mod arena_gpu_tests {
         }
         drop(cnq);
     }
+
+    #[test]
+    fn the_stage_plan_lists_every_non_vram_expert_and_numbers_the_nvme_reads_in_layer_order() {
+        // layer l: expert e in VRAM when e % 4 == 0, in pinned slot 10 l + e when e % 4 == 1
+        let place = |l: usize, e: u32| match e % 4 {
+            0 => Place::Vram(e),
+            1 => Place::Ram(10 * l as u32 + e),
+            _ => Place::Nvme,
+        };
+        let p = stage_plan(&place, 1, 3, 8, 8, 7);
+        assert_eq!((p.l0, p.gen, p.layers.len()), (1, 7, 2));
+        use StageSrc::{Nvme, Ram};
+        assert_eq!(p.layers[0], vec![(1, Ram(11)), (2, Nvme(0)), (3, Nvme(1)), (5, Ram(15)), (6, Nvme(2)), (7, Nvme(3))]);
+        assert_eq!(p.layers[1], vec![(1, Ram(21)), (2, Nvme(4)), (3, Nvme(5)), (5, Ram(25)), (6, Nvme(6)), (7, Nvme(7))]);
+        assert_eq!(p.nv, vec![(1, 2), (1, 3), (1, 6), (1, 7), (2, 2), (2, 3), (2, 6), (2, 7)]);
+        // a staging buffer of 3 records: the first 3 non-VRAM experts per layer, reads renumbered
+        let p = stage_plan(&place, 1, 3, 8, 3, 7);
+        assert_eq!(p.layers[0], vec![(1, Ram(11)), (2, Nvme(0)), (3, Nvme(1))]);
+        assert_eq!(p.layers[1], vec![(1, Ram(21)), (2, Nvme(2)), (3, Nvme(3))]);
+        assert_eq!(p.nv, vec![(1, 2), (1, 3), (2, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn the_prefill_ring_is_sized_from_the_staging_buffers_and_booked_off_the_pinned_budget() {
+        assert_eq!((prefill_ring_slots(0), prefill_ring_slots(16), prefill_ring_slots(288), PREFILL_RING_QD), (1, 16, PREFILL_RING_MAX, 24));
+        let env = |kv: &'static [(&'static str, &'static str)]| move |k: &str| kv.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+        // GLM-5.3-Flash 3-bit record: 2.5 GiB of staging hold 283 records -> 192 ring slots
+        let rec = 9_474_048u64;
+        assert_eq!(prefill_ring_pinned_bytes(&env(&[(ARENA_ENV, "global"), (ARENA_STAGE_ENV, "2.5")]), rec), 192 * rec + 4096);
+        assert_eq!(prefill_ring_pinned_bytes(&env(&[(ARENA_ENV, "global"), (ARENA_STAGE_ENV, "0.1")]), rec), 11 * rec + 4096);
+        for off in [&[(ARENA_STAGE_ENV, "2.5")][..], &[(ARENA_ENV, "global")][..], &[(ARENA_ENV, "layer"), (ARENA_STAGE_ENV, "2.5")][..]] {
+            assert_eq!(prefill_ring_pinned_bytes(&env(off), rec), 0, "{off:?}");
+        }
+    }
+
+    /// #196: prompt calls over four MoE layers whose experts are mostly or all on the NVMe, staged
+    /// through the stage engine with a ring smaller than one forward's reads (4 slots, 2 reads in
+    /// flight): every table entry holds its record's bytes, the reads ran through the ring (the
+    /// plan's count, the slots reused), at most the queue depth in flight, no synchronous restage
+    /// and no NVMe wait on the host thread beyond joining a finished reader.
+    #[test]
+    #[ignore = "needs the GPU (about 1 GB VRAM, a 606 MB synthetic container in the temp dir): cargo test --release --lib glm5_stage_engine_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_stage_engine_gpu_reads_ahead_through_the_ring_without_a_host_wait() {
+        let (nl, ex) = (4usize, 16u32);
+        let s = synth(nl as u32, ex);
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk) = (3 + nl, 3, ex as usize, 8);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rb = spec.bytes as usize;
+        let want: Vec<Vec<Vec<u8>>> =
+            (0..nl).map(|l| (0..ex).map(|e| cnq.read_range(&cnq.find(&crate::nvme_source::glm5_expert_tensor_name(3 + l as u32, e, "gate"), "text").clone(), 0, rb)).collect()).collect();
+        let tr = routing(16, nl, ex as u64, 8, 0x196);
+        let stage_gb = format!("{}", ex as f64 * REC as f64 / (1u64 << 30) as f64);
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for (v, p, decode) in [(0, 0, 0), (2, 3, 6)] {
+                let _env = Env::set(&[(ARENA_ENV, "global"), (ARENA_VRING_ENV, "0"), (ARENA_STAGE_ENV, &stage_gb), (ARENA_STAGE_MIN_ENV, "16")]);
+                let what = format!("V {v} P {p}");
+                let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: v, pinned: p }, 1, 16).unwrap();
+                assert_eq!(t.arena_stage_stats().unwrap().0.ring_slots, ex as u64, "{what}: one buffer's worth of ring slots");
+                t.set_stage_ring(4, 2);
+                // decode calls fill VRAM and pinned (none with V 0 P 0)
+                for tok in &tr[..decode] {
+                    for (l, ids) in tok.iter().enumerate() {
+                        let sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                        t.table_for(3 + l, &sel).unwrap();
+                    }
+                }
+                t.decode_ready();
+                let a = t.arena().unwrap();
+                let nvme: Vec<usize> = (0..nl).map(|l| (0..ex).filter(|&e| a.place(l, e) == Place::Nvme).count()).collect();
+                let reads0 = t.nvme_reads;
+                // two prompt calls (forwards) of 4 rows per layer, 32 picks each
+                for c in 0..2 {
+                    for l in 0..nl {
+                        let sel: Vec<i32> = (0..4).flat_map(|r| tr[decode + 4 * c + r][l].iter().map(|&e| e as i32)).collect();
+                        let mut rows = 0;
+                        t.tables_for_chunk(3 + l, &sel, &mut |r0, n, tb| {
+                            let mut ids: Vec<u32> = sel[r0 * 8..(r0 + n) * 8].iter().map(|&e| e as u32).collect();
+                            ids.sort_unstable();
+                            ids.dedup();
+                            cuda::sync();
+                            let table = cuda::dtoh_u64(tb, ex as usize);
+                            for e in 0..ex {
+                                assert_eq!(table[e as usize] != 0, ids.contains(&e), "{what}: call {c} layer {l} table entry of expert {e}");
+                                if ids.contains(&e) {
+                                    let got: Vec<u8> = cuda::dtoh_t(table[e as usize], rb);
+                                    assert!(got == want[l][e as usize], "{what}: call {c} layer {l} expert {e}: the bytes differ from read_range");
+                                }
+                            }
+                            rows += n;
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert_eq!(rows, 4, "{what}: every row served in one run");
+                    }
+                }
+                t.decode_ready();
+                let st = t.arena_stage_stats().unwrap().0;
+                let per_forward: usize = nvme.iter().sum();
+                eprintln!("glm5_stage_engine synthetic {what}: NVMe per layer {nvme:?}, stage {st:?}, host wait per staged call {} ns", st.host_wait_ns / st.calls.max(1));
+                assert_eq!((st.calls, st.plans, st.fallbacks, st.sync_restaged), (2 * nl as u64, 2, 0, 0), "{what}: every call staged on a plan per forward");
+                assert_eq!(st.ring_reads, 2 * per_forward as u64, "{what}: every non-VRAM NVMe expert of every layer read once per forward through the ring");
+                assert_eq!(t.nvme_reads - reads0, st.ring_reads, "{what}: the store counts the ring's reads");
+                assert!(per_forward <= 4 || st.ring_wraps > 0, "{what}: the 4-slot ring was reused");
+                assert!(st.in_flight_max >= 1 && st.in_flight_max <= 2, "{what}: at most the queue depth in flight: {}", st.in_flight_max);
+                assert_eq!(st.prefetched, 2 * (nl as u64 - 1), "{what}: the next layer staged ahead in every call but the last");
+                assert!(st.host_wait_ns / st.calls < 1_000_000, "{what}: no NVMe wait on the host thread: {} ns per call", st.host_wait_ns / st.calls);
+                t.free();
+            }
+        }
+        drop(cnq);
+    }
 }
 
 // ---------------------------------------------------------------- the device store
@@ -3857,7 +4477,8 @@ impl ExpertTiers {
 
     /// the pinned bytes this store holds
     pub fn pinned_bytes(&self) -> u64 {
-        self.pinned.iter().map(|p| p.bytes as u64).sum::<u64>() + self.stager.as_ref().map_or(0, |st| st.pinned_bytes()) + self.prefetch.as_ref().map_or(0, |p| p.pinned_bytes())
+        let ring = self.arena.as_ref().and_then(|d| d.stage.as_ref()).map_or(0, |st| st.eng.pinned_bytes());
+        self.pinned.iter().map(|p| p.bytes as u64).sum::<u64>() + self.stager.as_ref().map_or(0, |st| st.pinned_bytes()) + self.prefetch.as_ref().map_or(0, |p| p.pinned_bytes()) + ring
     }
 
     /// the VRAM bytes this store holds (arenas, staging, tables)
