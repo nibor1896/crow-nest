@@ -426,7 +426,8 @@ unsafe fn gemv(kk: &KdaKernels, sc: &KdaScratch, w: Dev, x: Dev, y: Dev, k_slot:
 pub unsafe fn prompt(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, t: usize, out: Dev) {
     let d = &kk.d;
     assert!((1..=sc.max_t).contains(&t), "#162: KDA prompt call of {t} rows (scratch holds {})", sc.max_t);
-    cuda::to_i32_into(sc.params, &[t as i32]);
+    // #196: the row count by a stream-ordered memset, not a pageable upload + host sync
+    cuda::set_i32_async(sc.params, t as i32);
     let (cc, hd, heads) = (d.conv_ch(), d.head_dim as u32, d.heads as u32);
     // q | k | v rows, then the causal conv over time on [C][T] with the window of the previous call
     gemm(kk, sc, w.qkv, x, sc.qkv, P_HIDDEN, cc, P_CONV, t);
@@ -491,7 +492,8 @@ pub enum KdaProj {
 pub unsafe fn prompt_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, t: usize, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
     let d = &kk.d;
     assert!((1..=sc.max_t).contains(&t), "#162: KDA prompt call of {t} rows (scratch holds {})", sc.max_t);
-    cuda::to_i32_into(sc.params, &[t as i32]);
+    // #196: the row count by a stream-ordered memset, not a pageable upload + host sync
+    cuda::set_i32_async(sc.params, t as i32);
     let (cc, hd, heads) = (d.conv_ch(), d.head_dim as u32, d.heads as u32);
     proj(KdaProj::Qkv, x, sc.qkv, t);
     launch_v(kk.transpose, cc as u32, 1, 1, 256, &[sc.qkv, sc.qkv_t, sc.p(P_T), sc.p(P_CONV)]);
@@ -928,6 +930,50 @@ mod tests_gpu {
             l.w.free();
             l.st.free();
             l.sc.free();
+        }
+    }
+
+    /// #196: a prompt call stages its row count without a host sync (it cost one
+    /// `cuStreamSynchronize` per sub-block: 272 of them, about 2.0 s, in an 8192-row prefill chunk
+    /// of GLM-5.3-Flash). A kernel holds the stream for 300 ms, then 8 prompt calls of 1..=8 rows:
+    /// the host returns long before the kernel ends, and the device holds the last call's count.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_kda::tests_gpu -- --ignored --nocapture --test-threads 1"]
+    fn kda_gpu_prompt_stages_its_row_count_without_a_host_sync() {
+        const SLOW: &str = r#"
+extern "C" __global__ void hold(long long ns)
+{
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while ((long long) (t - t0) < ns);
+}
+"#;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut m = cuda::compile(SLOW);
+            let hold = m.get("hold");
+            let mut l = layer(8);
+            let h = l.kk.d.hidden;
+            let (mut x, mut out) = (cuda::to_f32_dev(&synth::input(8, h)), cuda::alloc_zeroed(8 * h * 4));
+            cuda::sync();
+            kernels::launch_v(hold, 1, 1, 1, 32, &[300_000_000u64]);
+            let t0 = std::time::Instant::now();
+            for t in 1..=8usize {
+                prompt(&l.kk, &l.w, &l.st, &l.sc, x, t, out);
+            }
+            let host = t0.elapsed();
+            cuda::sync();
+            let waited = t0.elapsed();
+            let par: Vec<i32> = cuda::dtoh_t(l.sc.params, 1);
+            eprintln!("glm5 kda prompt row count: 8 calls {host:?} on the host, stream done after {waited:?}, params[0] {par:?}");
+            assert_eq!(par, vec![8], "the device holds the last call's row count");
+            assert!(waited.as_millis() >= 250, "the kernel must hold the stream for the check to mean something");
+            assert!(host.as_millis() < 100, "the prompt call waited for the stream: {host:?}");
+            cuda::free_dev(&mut x);
+            cuda::free_dev(&mut out);
+            l.st.free();
+            l.sc.free();
+            m.unload();
         }
     }
 
