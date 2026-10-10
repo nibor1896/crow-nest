@@ -1066,6 +1066,12 @@ pub struct ArenaStats {
     pub ram_evictions: u64,
     /// calls whose admissions stopped because every VRAM slot was pinned by the call
     pub no_victim: u64,
+    /// #203: guessed records taken into the pinned tier ([`GlobalArena::prefetch_admit`]), those
+    /// a demand then used, those evicted unused, and demands on a slot whose read was in flight
+    pub pf_admitted: u64,
+    pub pf_used: u64,
+    pub pf_wasted: u64,
+    pub joins: u64,
 }
 
 /// sybil-solutions/glm53-flash-offload 6769b27 (`glm53/expert_cache.py` `ec_step_k`,
@@ -1104,6 +1110,13 @@ pub struct GlobalArena {
     oldest: u32,
     newest: u32,
     rfree: Vec<u32>,
+    /// #203 per pinned slot: the landed value of the NVMe read still writing it (0 = none; never
+    /// a victim, never admitted while non-zero), a guessed record no demand used yet, and the
+    /// epoch in which an admission freed it (a guess of that call does not take it: the call's
+    /// queued copy still reads it)
+    rflight: Vec<u64>,
+    rpf: Vec<bool>,
+    rfreed: Vec<u64>,
     /// the epoch in which a key was routed (never a pinned LRU victim in that call)
     prot: Vec<u64>,
     /// the epoch in which a key's place before the call was recorded
@@ -1144,6 +1157,9 @@ impl GlobalArena {
             newest: NONE,
             // popped from the back: slot 0 first
             rfree: (0..ram as u32).rev().collect(),
+            rflight: vec![0; ram],
+            rpf: vec![false; ram],
+            rfreed: vec![u64::MAX; ram],
             prot: vec![0; keys],
             seen: vec![0; keys],
             touched: Vec::new(),
@@ -1357,18 +1373,9 @@ impl GlobalArena {
         let q = match self.rfree.pop() {
             Some(q) => q,
             None => {
-                let mut x = self.oldest;
-                while x != NONE && self.prot[self.rowner[x as usize] as usize] == self.epoch {
-                    x = self.next[x as usize];
-                }
-                if x == NONE {
-                    return None;
-                }
-                let o = self.rowner[x as usize] as usize;
-                self.record(o);
-                self.place[o] = Place::Nvme;
-                self.ram_unlink(x);
-                self.stats.ram_evictions += 1;
+                let x = self.ram_victim()?;
+                self.record(self.rowner[x as usize] as usize);
+                self.ram_evict(x);
                 x
             }
         };
@@ -1376,6 +1383,76 @@ impl GlobalArena {
         self.ram_push_newest(q);
         self.place[k] = Place::Ram(q);
         Some(q)
+    }
+
+    /// the pinned LRU victim: the oldest slot whose expert is not routed in this call and whose
+    /// read has landed
+    fn ram_victim(&self) -> Option<u32> {
+        let mut x = self.oldest;
+        while x != NONE && (self.prot[self.rowner[x as usize] as usize] == self.epoch || self.rflight[x as usize] != 0) {
+            x = self.next[x as usize];
+        }
+        (x != NONE).then_some(x)
+    }
+
+    /// drop the expert of pinned slot `x` to the NVMe (the slot is the caller's); an unused
+    /// guess counts wasted
+    fn ram_evict(&mut self, x: u32) {
+        let o = self.rowner[x as usize] as usize;
+        self.place[o] = Place::Nvme;
+        self.ram_unlink(x);
+        self.stats.ram_evictions += 1;
+        if std::mem::take(&mut self.rpf[x as usize]) {
+            self.stats.pf_wasted += 1;
+        }
+    }
+
+    /// #203 D2 (sybil's `start_read` for a hint + `lru_push_old`): the guessed expert `e` of
+    /// layer `l` (on the NVMe) into a pinned slot at the OLD end of the LRU, its read in flight
+    /// until [`GlobalArena::landed`] (`landed` = the value its landed flag will reach, non-zero).
+    /// The slot: a free one not freed by this call, else the oldest landed expert not routed in
+    /// this call (an unused guess counts wasted). `None` = no such slot (the guess is dropped).
+    /// Call it after this call's [`GlobalArena::step`].
+    pub fn prefetch_admit(&mut self, l: usize, e: u32, landed: u64) -> Option<u32> {
+        assert!(landed != 0, "a read in flight has a non-zero landed value");
+        let k = l * self.experts + e as usize;
+        assert_eq!(self.place[k], Place::Nvme, "global arena: a guess of layer {l} expert {e} that is not on the NVMe");
+        let q = match self.rfree.iter().rposition(|&q| self.rfreed[q as usize] != self.epoch) {
+            Some(i) => self.rfree.remove(i),
+            None => {
+                let x = self.ram_victim()?;
+                self.ram_evict(x);
+                x
+            }
+        };
+        self.gen += 1;
+        self.rowner[q as usize] = k as u32;
+        self.prev[q as usize] = NONE;
+        self.next[q as usize] = self.oldest;
+        if self.oldest != NONE {
+            self.prev[self.oldest as usize] = q;
+        } else {
+            self.newest = q;
+        }
+        self.oldest = q;
+        self.place[k] = Place::Ram(q);
+        self.rflight[q as usize] = landed;
+        self.rpf[q as usize] = true;
+        self.stats.pf_admitted += 1;
+        Some(q)
+    }
+
+    /// the read into pinned slot `q` has landed
+    pub fn landed(&mut self, q: u32) {
+        self.rflight[q as usize] = 0;
+    }
+
+    /// the landed value of the read still writing expert `e` of layer `l` (`None`: none)
+    pub fn in_flight(&self, l: usize, e: u32) -> Option<u64> {
+        match self.place(l, e) {
+            Place::Ram(q) if self.rflight[q as usize] != 0 => Some(self.rflight[q as usize]),
+            _ => None,
+        }
     }
 
     /// CLOCK: the VRAM slot the hand stops at (skipping slots pinned in this call, clearing set
@@ -1419,8 +1496,14 @@ impl GlobalArena {
                     self.vpin[s as usize] = ep;
                     self.counters[l][0] += 1;
                 }
-                Place::Ram(_) => {
+                Place::Ram(q) => {
                     self.counters[l][1] += 1;
+                    if std::mem::take(&mut self.rpf[q as usize]) {
+                        self.stats.pf_used += 1;
+                    }
+                    if self.rflight[q as usize] != 0 {
+                        self.stats.joins += 1;
+                    }
                     misses.push(k);
                 }
                 Place::Nvme => {
@@ -1434,6 +1517,10 @@ impl GlobalArena {
                 if (self.pin_stay && matches!(self.place[k], Place::Ram(_))) || (self.noadmit && self.place[k] == Place::Nvme) {
                     continue;
                 }
+                // #203: a slot whose read is in flight stays (the call reads it where it lands)
+                if matches!(self.place[k], Place::Ram(q) if self.rflight[q as usize] != 0) {
+                    continue;
+                }
                 let Some(s) = self.victim() else {
                     self.stats.no_victim += 1;
                     break;
@@ -1444,6 +1531,7 @@ impl GlobalArena {
                 if let Place::Ram(q) = self.place[k] {
                     self.ram_unlink(q);
                     self.rowner[q as usize] = NONE;
+                    self.rfreed[q as usize] = ep;
                     self.rfree.push(q);
                 }
                 self.vowner[s] = k as u32;
@@ -1506,6 +1594,9 @@ impl GlobalArena {
             n += 1;
             last = x;
             x = self.next[x as usize];
+        }
+        if let Some(q) = (0..self.rowner.len()).find(|&q| (self.rflight[q] != 0 || self.rpf[q]) && self.rowner[q] == NONE) {
+            return Err(format!("pinned slot {q} is free but marked in flight or guessed"));
         }
         let res = self.rowner.iter().filter(|&&k| k != NONE).count();
         if last != self.newest || n != res || res + self.rfree.len() != self.rowner.len() {
@@ -2821,6 +2912,47 @@ mod arena_tests {
 
     /// a prompt call (no admission) reads its misses where they lie: NVMe misses land in pinned,
     /// VRAM is untouched
+    /// #203 D2: a guessed record enters the pinned LRU at its OLD end (sybil's `lru_push_old`),
+    /// in flight it is never a victim; landed and unused it is the first victim (counted wasted);
+    /// a demand on it while in flight joins the read, is not admitted, counts it used and
+    /// promotes it to the new end.
+    #[test]
+    fn a_guess_enters_the_ram_tier_at_the_old_end_and_joins_in_flight() {
+        let mut a = GlobalArena::new(2, 16, 0, 4).unwrap();
+        a.step(0, &[0, 1, 2], true);
+        let q = a.prefetch_admit(1, 5, 7).expect("a free slot");
+        assert_eq!((a.place(1, 5), a.in_flight(1, 5)), (Place::Ram(q), Some(7)));
+        a.step(0, &[3, 4], true);
+        assert_eq!(a.place(1, 5), Place::Ram(q), "an in-flight slot is no victim");
+        assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Nvme, Place::Nvme), "the oldest landed experts went");
+        a.landed(q);
+        assert_eq!(a.in_flight(1, 5), None);
+        a.step(0, &[6], true);
+        assert_eq!(a.place(1, 5), Place::Nvme, "a landed unused guess at the old end is the first victim");
+        assert_eq!(a.stats.pf_wasted, 1);
+        let q2 = a.prefetch_admit(1, 7, 9).expect("a victim");
+        a.step(1, &[7], true);
+        assert_eq!((a.stats.joins, a.stats.pf_used, a.place(1, 7)), (1, 1, Place::Ram(q2)));
+        a.landed(q2);
+        a.step(0, &[8], true);
+        assert_eq!(a.place(1, 7), Place::Ram(q2), "a used guess was promoted to the new end");
+        assert_eq!(a.stats.pf_admitted, 2);
+        a.check().unwrap();
+        // with VRAM: a demand on an in-flight guess is not admitted (it stays where its read lands)
+        let mut b = GlobalArena::new(1, 16, 4, 4).unwrap();
+        b.prefetch_admit(0, 3, 1).unwrap();
+        b.step(0, &[3, 4], true);
+        assert!(matches!(b.place(0, 3), Place::Ram(_)) && matches!(b.place(0, 4), Place::Vram(_)), "{:?} {:?}", b.place(0, 3), b.place(0, 4));
+        // a slot freed by this call's admission is not taken by a guess of the same call
+        let mut c = GlobalArena::new(2, 16, 4, 1).unwrap();
+        c.step(0, &[1], false);
+        c.step(0, &[1], true);
+        assert!(matches!(c.place(0, 1), Place::Vram(_)));
+        assert_eq!(c.prefetch_admit(1, 2, 1), None, "the only pinned slot was freed in this call");
+        b.check().unwrap();
+        c.check().unwrap();
+    }
+
     #[test]
     fn a_call_without_admission_moves_nothing_into_vram() {
         let mut a = GlobalArena::new(1, 16, 4, 8).unwrap();
