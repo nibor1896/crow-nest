@@ -42,6 +42,7 @@ pub const NAMES: &[&str] = &[
     "gm_gemv",
     "gm_absorb1",
     "gm_out_v1",
+    "gm_attn2",
 ];
 
 /// the most rows a call may have to run on the decode kernels `gm_gemv`, `gm_absorb1`,
