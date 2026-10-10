@@ -31,6 +31,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_NVME_POOL_THREADS",
     "CROW_NVME_POOL_PIECE_KB",
     "CROW_GLM_HCFUSE",
+    "CROW_GLM_DENSE_GEMM",
     "CROW_CHUNK",
     "CROW_GLM_FLAGS",
     "CROW_GLM_STAGER",
@@ -577,6 +578,88 @@ fn glm5_int_gpu_the_full_template_arm_is_the_default_path() {
     assert!(outs.iter().all(|o| o.lane_experts > 0), "the lane ran in every arm");
     assert_same(&["lane split V0 P16", "full with the lane, without the chunk V0 P16"], &outs[..2]);
     assert_same(&["lane split chunk 12 V0 P16", "full V0 P16"], &outs[2..]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The measurement arm of the GLM-5.3-Flash rows (global arena with warm start, elastic and stage
+/// budgets, NVMe piece pool of 8 workers, HC fuse, #186 dense tensor-core GEMM, prompt chunk 8192,
+/// flags + stager + prefetch on the side stream + shared overlap + controller + LA, CPU lane split
+/// on host pinned memory) against the default path (every switch off) on the synthetic model, a
+/// 300-id prompt (one prompt call) and 6 greedy ids. The tensor-core GEMM and the lane change bits
+/// by design (#186, #188), so the bar is accuracy, not bits: the same ids, and per generated row a
+/// logit cosine >= 0.9999 (KL reported). Two sizings: the arm's own budgets (10 GB elastic, 2.6 GB
+/// stage: the whole synthetic model fits) at V 3 + P 4, and budgets of a few records (the arena
+/// spills to the tiers, the piece pool reads) at V 3 + P 4 and V 0 + P 16 (every expert pinned,
+/// the lane computes). The warm file is the synthetic model's (the real one has the real geometry).
+#[test]
+#[ignore = "needs the GPU (about 12 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_the_measurement_arm_is_the_default_path_within_the_accuracy_bar() {
+    let dir = std::env::temp_dir().join(format!("crow-int-arm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let s = |v: &str| v.to_string();
+    let arm_env = |elastic: String, stage: String| -> Vec<(&'static str, String)> {
+        vec![
+            ("CROW_NVME_POOL", s("1")),
+            ("CROW_NVME_POOL_THREADS", s("8")),
+            ("CROW_GLM_HCFUSE", s("1")),
+            ("CROW_GLM_DENSE_GEMM", s("1")),
+            ("CROW_GLM_CPU_LANE", s("split")),
+            ("CROW_PINNED_ALLOC", s("host")),
+            ("CROW_GLM_ARENA", s("global")),
+            ("CROW_GLM_ARENA_WARM", warm.clone()),
+            ("CROW_GLM_ARENA_ELASTIC_GB", elastic),
+            ("CROW_GLM_ARENA_STAGE_GB", stage),
+            ("CROW_CHUNK", s("8192")),
+            ("CROW_GLM_FLAGS", s("1")),
+            ("CROW_GLM_STAGER", s("1")),
+            ("CROW_GLM_PREFETCH", s("1")),
+            ("CROW_GLM_PREFETCH_SIDE", s("1")),
+            ("CROW_GLM_SHARED_OVERLAP", s("1")),
+            ("CROW_GLM_CONTROLLER", s("1")),
+            ("CROW_GLM_LA", s("1")),
+        ]
+    };
+    let gib = |records: f64| format!("{}", records * REC as f64 / (1u64 << 30) as f64);
+    let literal = arm_env(s("10"), s("2.6"));
+    let small = arm_env(gib(2.0 * 3.0), gib(12.0));
+    let prompt: Vec<i64> = (0..300).map(|i| (i * 77 + 3) % 2048).collect();
+    let n = 6;
+    let cos = |a: &[f32], b: &[f32]| -> f64 {
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            let (x, y) = (*x as f64, *y as f64);
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        ab / (aa.sqrt() * bb.sqrt())
+    };
+    let kl = |p: &[f32], q: &[f32]| -> f64 {
+        let sm = |v: &[f32]| -> Vec<f64> {
+            let m = v.iter().cloned().fold(f32::MIN, f32::max) as f64;
+            let e: Vec<f64> = v.iter().map(|x| (*x as f64 - m).exp()).collect();
+            let z: f64 = e.iter().sum();
+            e.into_iter().map(|x| x / z).collect()
+        };
+        let (p, q) = (sm(p), sm(q));
+        p.iter().zip(&q).map(|(a, b)| if *a > 0.0 { a * (a / b.max(1e-300)).ln() } else { 0.0 }).sum()
+    };
+    let check = |what: &str, outs: &[Out]| {
+        let (d, a) = (&outs[0].gen, &outs[1].gen);
+        let c: Vec<f64> = d.logits.iter().zip(&a.logits).map(|(x, y)| cos(x, y)).collect();
+        let k: Vec<f64> = d.logits.iter().zip(&a.logits).map(|(x, y)| kl(x, y)).collect();
+        eprintln!("glm5 int arm {what}: ids default {:?} arm {:?}, logit cosine {c:.9?}, KL {:?}, arm NVMe reads {}, CPU experts {}", d.ids, a.ids, k.iter().map(|x| format!("{x:.3e}")).collect::<Vec<_>>(), outs[1].nvme_reads, outs[1].lane_experts);
+        assert_eq!(a.ids, d.ids, "{what}: the arm's ids against the default path");
+        assert!(c.iter().all(|&x| x >= 0.9999), "{what}: logit cosine below 0.9999: {c:?}");
+    };
+    let outs = run_loaded_arms(&[("default", Vec::new()), ("arm 10 / 2.6 GB", literal)], &prompt, n, TierSizes { vram: 3, pinned: 4 });
+    check("10 / 2.6 GB V3 P4", &outs);
+    let outs = run_loaded_arms(&[("default", Vec::new()), ("arm small budgets", small.clone())], &prompt, n, TierSizes { vram: 3, pinned: 4 });
+    check("small budgets V3 P4", &outs);
+    let outs = run_loaded_arms(&[("default", Vec::new()), ("arm small budgets", small)], &prompt, n, TierSizes { vram: 0, pinned: 16 });
+    assert!(outs[1].lane_experts > 0, "the lane ran in the arm");
+    check("small budgets V0 P16", &outs);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
