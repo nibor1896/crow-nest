@@ -639,3 +639,41 @@ fn glm5_int_gpu_nvme_overlap_counters() {
         assert_g3(a.name, o, &outs[0]);
     }
 }
+
+/// #202 D4: the prefetch store never waits for its own reads. A half of 8 store records of
+/// 1 MiB read through one pool worker in 4 KiB pieces, then the next guess of the same parity:
+/// its `issue` returns while those reads still run (the slots still in flight are skipped, not
+/// waited for), and `forget` then drains them.
+#[test]
+#[ignore = "needs the GPU (pinned store): cargo test --release --lib glm5_int_gpu -- --ignored --test-threads 1"]
+fn glm5_int_gpu_the_prefetch_store_does_not_wait_for_its_reads() {
+    use crate::geo::ExpertCodec;
+    use crate::nvme_source::{ExpertRecord, NvmeConfig, NvmeSource, PoolAsk, PoolConfig, RecordLayout, Span};
+    const LEN: usize = 16 << 20;
+    let dir = std::env::temp_dir().join(format!("crow-int-retire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("raw.bin");
+    std::fs::write(&path, vec![7u8; LEN]).unwrap();
+    let rec = |id: u32, off: u64| ExpertRecord { layer: 0, id, gu: Span { off, len: 1 << 20 }, dn: Span { off: 0, len: 0 }, codec: ExpertCodec::Mul1, layout: RecordLayout::OneUnit };
+    let recs: Vec<ExpertRecord> = (0..16).map(|k| rec(k, (k as u64) << 20)).collect();
+    let mut cfg = NvmeConfig::new(&path);
+    cfg.pool = PoolAsk::On(PoolConfig { threads: 1, piece: 4096 });
+    let src = NvmeSource::open(&cfg).unwrap();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        let mut pf = crate::glm5_flags::Prefetch::new(8, 1 << 20);
+        assert_eq!(pf.issue(&src, &recs, 0, &[], &(0..8).collect::<Vec<u32>>()).unwrap(), 8);
+        let t0 = std::time::Instant::now();
+        let n = pf.issue(&src, &recs, 2, &[], &(8..16).collect::<Vec<u32>>()).unwrap();
+        let dt = t0.elapsed();
+        let first_left = !pf.landed_value(7);
+        eprintln!("glm5 int store: the second issue took {dt:?}, issued {n}, the first half's last read still running {first_left}");
+        assert_eq!(n, 0, "the second issue rewrote slots whose reads it had waited for (issued {n})");
+        assert!(first_left, "the first half's reads landed before the second issue returned");
+        pf.forget(&src).unwrap();
+        assert!(pf.landed_value(7), "forget drains the reads");
+        pf.free(&src).unwrap();
+    }
+    drop(src);
+    let _ = std::fs::remove_dir_all(&dir);
+}
