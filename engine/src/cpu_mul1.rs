@@ -27,8 +27,10 @@
 //!   exllamav3 `LinearEXL3.get_weight_tensor` / `reconstruct_hgemm` (`exl3.py:193-249`). The
 //!   kernel computes `xh = H (x * suh)`, `y' = xh W_hat` (decoding W_hat in the inner loop) and
 //!   `y = (H y') / 128 * svh`. Activations stay f32 throughout: exllamav3's own CPU path
-//!   (`moe_mul1.cpp:35-45`) quantizes them to int8 (~0.9 % output RMS in its author's words); that
-//!   lossy arm is out of this module.
+//!   (`moe_mul1.cpp:35-45`) quantizes them to int8 (~0.9 % output RMS in its author's words). The
+//!   one lossy arm here is the #188 lane's [`experts_ffn`] at 1 or 2 rows since #200 (int16
+//!   activations, affine weights, sybil `ft_n135.h`; 1 - cosine <= 1e-6 per expert output against
+//!   this exact order); [`gemv`] and [`expert_ffn`] keep the exact order below.
 //!
 //! # The f32 order (one order, both paths)
 //!
@@ -297,6 +299,22 @@ const K3: Bitrate = Bitrate { bits: 3, half: false };
 
 /// the K = 3 lane table, built at compile time
 static K3_LANES: [Lane; 32] = lane_table(K3);
+
+// the int16 pair kernel (`avx2::kp`) takes one right-shift vector for every K = 3 lane: position
+// j's state starts at stream bit `3 (8 g + j) + 3 - 16`, so its bit offset in a byte, `(3 j + 3)
+// mod 8`, does not depend on the lane g
+const _: () = {
+    let t = lane_table(K3);
+    let mut g = 0;
+    while g < 32 {
+        let mut j = 0;
+        while j < 8 {
+            assert!(t[g].shv[j] == t[0].shv[j], "cpu_mul1: the K = 3 lanes differ in their shifts");
+            j += 1;
+        }
+        g += 1;
+    }
+};
 
 /// The tables of bitrate `b`, built once per process.
 fn tables(b: Bitrate) -> &'static Tables {
@@ -909,6 +927,209 @@ mod avx2 {
         unit_k3_vnni, tile_k3_vnni, "avx2,fma,avxvnni"
     );
 
+    /// The constants of the int16 pair kernel ([`i16_kernels`]): the right shifts of the K = 3
+    /// lanes (the same for every lane, checked at compile time next to [`K3_LANES`]), the left
+    /// shifts `16 - shr` that put a state in the high half, the two 16-bit halves of `MUL1`.
+    pub(super) struct Kp {
+        shr: __m256i,
+        shl: __m256i,
+        c1: __m256i,
+        c2: __m256i,
+        one8: __m256i,
+    }
+
+    /// # Safety
+    /// The CPU must have AVX2.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn kp() -> Kp {
+        // SAFETY: Lane is 32-byte aligned, shv a 32-byte array inside it
+        let shr = unsafe { _mm256_load_si256(K3_LANES[0].shv.as_ptr() as *const __m256i) };
+        Kp {
+            shr,
+            shl: _mm256_sub_epi32(_mm256_set1_epi32(16), shr),
+            c1: _mm256_set1_epi16((MUL1 & 0xffff) as u16 as i16),
+            c2: _mm256_set1_epi16((MUL1 >> 16) as u16 as i16),
+            one8: _mm256_set1_epi8(1),
+        }
+    }
+
+    /// 8 tile rows (one 128-row scale block) of one tile, column groups listed, into
+    /// register accumulators, then flushed into `af` (`[c][M][8]` f32) with the block
+    /// scales `sc`.
+    macro_rules! rows8 {
+        ($p:ident, $row:ident, $x:ident, $k:ident, $af:ident, $sc:ident; $($g:literal => $c:literal),*) => {{
+            let mut acc = [[_mm256_setzero_si256(); M]; 8];
+            for rr in 0..8 {
+                let t = $p.add(rr * $row);
+                let mut xr = [std::ptr::null::<i16>(); M];
+                for i in 0..M {
+                    xr[i] = $x[i].add(rr * 32);
+                }
+                $( col::<M>(t, $g, &xr, &mut acc[$c], &$k); )*
+            }
+            $(
+                for i in 0..M {
+                    let f = $af.add(($g / 4 * M + i) * 8);
+                    _mm256_storeu_ps(f, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[$c][i]), $sc[i], _mm256_loadu_ps(f)));
+                }
+            )*
+        }};
+    }
+
+    /// Defines module `$m`: the int16 band kernel (#200 D-B, sybil `ft_n135.h` p16 + rt1 at
+    /// `6769b27`) with the dot step `$dot` (`vpdpwssd` under AVX-VNNI, `vpmaddwd` + `vpaddd`
+    /// without). Weights are the affine byte sums `s` (`w = s k_inv - 3.453125` without the fp16
+    /// rounding), activations int16 per 128-block: the lane's lossy arm, see [`experts_ffn`].
+    macro_rules! i16_kernels {
+        ($m:ident, $feat:literal, |$a:ident, $s:ident, $x:ident| $dot:expr) => {
+            pub(in crate::cpu_mul1) mod $m {
+                use super::*;
+
+                #[inline]
+                #[target_feature(enable = $feat)]
+                unsafe fn dot($a: __m256i, $s: __m256i, $x: __m256i) -> __m256i {
+                    $dot
+                }
+
+                /// The byte sums of K = 3 lanes `g` (low 16-bit halves) and `g + 1` (high halves)
+                /// as int16: the two states extracted into one register (`vpsrlvd` / `vpsllvd` /
+                /// `vpblendw`), `state * MUL1` mod 2^32 from three 16-bit multiplies, the four
+                /// product bytes summed by two `vpmaddubsw`.
+                ///
+                /// # Safety
+                /// The target features; `tile` points at a 96-byte K = 3 tile; `g + 1 < 32`.
+                #[inline]
+                #[target_feature(enable = $feat)]
+                unsafe fn pair(tile: *const u8, g: usize, k: &Kp) -> __m256i {
+                    // SAFETY: the caller's contract; Lane is 32-byte aligned, ctrl its first 32 bytes
+                    unsafe {
+                        let (la, lb) = (&K3_LANES[g], &K3_LANES[g + 1]);
+                        let a = _mm256_srlv_epi32(_mm256_shuffle_epi8(window(tile, la), _mm256_load_si256(la.ctrl.as_ptr() as *const __m256i)), k.shr);
+                        let b = _mm256_sllv_epi32(_mm256_shuffle_epi8(window(tile, lb), _mm256_load_si256(lb.ctrl.as_ptr() as *const __m256i)), k.shl);
+                        let st = _mm256_blend_epi16::<0xAA>(a, b);
+                        let lo = _mm256_mullo_epi16(st, k.c1);
+                        let hi = _mm256_add_epi16(_mm256_mulhi_epu16(st, k.c1), _mm256_mullo_epi16(st, k.c2));
+                        _mm256_add_epi16(_mm256_maddubs_epi16(lo, k.one8), _mm256_maddubs_epi16(hi, k.one8))
+                    }
+                }
+
+                /// Column group `g0 / 4` of one tile row for M tokens: lanes g0 .. g0 + 3 against
+                /// the row's two int16 pair vectors of each token.
+                ///
+                /// # Safety
+                /// As `pair`; `xr[i]` points at 32 readable int16.
+                #[inline]
+                #[target_feature(enable = $feat)]
+                unsafe fn col<const M: usize>(tile: *const u8, g0: usize, xr: &[*const i16; M], acc: &mut [__m256i; M], k: &Kp) {
+                    // SAFETY: the caller's contract
+                    unsafe {
+                        let (s0, s1) = (pair(tile, g0, k), pair(tile, g0 + 2, k));
+                        for i in 0..M {
+                            let x0 = _mm256_loadu_si256(xr[i] as *const __m256i);
+                            let x1 = _mm256_loadu_si256(xr[i].add(16) as *const __m256i);
+                            acc[i] = dot(dot(acc[i], s0, x0), s1, x1);
+                        }
+                    }
+                }
+
+                /// One band unit: tile rows `r0 .. r0 + nr` (a multiple of 8) x tile columns
+                /// `t0 .. t0 + nc` of a K = 3 trellis with `tn` tiles per row, for M tokens. Token
+                /// i's band input `xq[i]` (pair layout, 32 int16 per tile row, band-local), its
+                /// block scales `qs[i]` (band-local); `accf` holds `nc * 64 * M` f32. Writes
+                /// `y[i][16 t + c] = k_inv dot + (-3.453125) sums[i]` for the band's columns (the
+                /// affine weight applied to the band's quantized inputs, whose sum is `sums[i]`).
+                /// Per 8-row block each tile's accumulators stay in registers over the 8 rows
+                /// (int32 exact: 8 rows x 4 products <= 8 x 4 x 1020 x 16383 < 2^31), then one
+                /// `vfmadd` per accumulator with the block scale; the next block of the band is
+                /// prefetched into L2 alongside.
+                ///
+                /// # Safety
+                /// The target features; the trellis has rows `r0 .. r0 + nr` with `t0 + nc <= tn`
+                /// tiles, `xq[i]` `nr * 32` int16, `qs[i]` `nr / 8` f32, `y[i]` `16 nc` f32.
+                #[allow(clippy::too_many_arguments)]
+                #[target_feature(enable = $feat)]
+                pub(in crate::cpu_mul1) unsafe fn band<const M: usize>(
+                    tr: *const u8,
+                    tn: usize,
+                    r0: usize,
+                    nr: usize,
+                    t0: usize,
+                    nc: usize,
+                    xq: [*const i16; M],
+                    qs: [*const f32; M],
+                    sums: [f32; M],
+                    accf: *mut f32,
+                    y: [*mut f32; M],
+                ) {
+                    // SAFETY (whole body): the caller's contract
+                    unsafe {
+                        let k = kp();
+                        let row = tn * 96;
+                        let zero = _mm256_setzero_ps();
+                        let mut o = 0;
+                        while o < nc * 64 * M {
+                            _mm256_storeu_ps(accf.add(o), zero);
+                            o += 8;
+                        }
+                        let base = tr.add(r0 * row + t0 * 96);
+                        // the band's first block, into L1
+                        let lines = (nc * 96).div_ceil(64);
+                        for rr in 0..8usize.min(nr) {
+                            for l in 0..lines {
+                                _mm_prefetch::<_MM_HINT_T0>(base.add(rr * row + (l * 64).min(nc * 96 - 1)) as *const i8);
+                            }
+                        }
+                        let mut g8 = 0;
+                        while g8 < nr {
+                            let mut sc = [zero; M];
+                            let mut xb = [std::ptr::null::<i16>(); M];
+                            for i in 0..M {
+                                sc[i] = _mm256_set1_ps(*qs[i].add(g8 / 8));
+                                xb[i] = xq[i].add(g8 * 32);
+                            }
+                            let pfn = g8 + 8 < nr;
+                            for t in 0..nc {
+                                let p = base.add(g8 * row + t * 96);
+                                if pfn && t % 2 == 0 {
+                                    for rr in 8..16 {
+                                        let q = p.add(rr * row);
+                                        _mm_prefetch::<_MM_HINT_T1>(q as *const i8);
+                                        _mm_prefetch::<_MM_HINT_T1>(q.add(64) as *const i8);
+                                        if t + 1 < nc {
+                                            _mm_prefetch::<_MM_HINT_T1>(q.add(128) as *const i8);
+                                        }
+                                    }
+                                }
+                                let af = accf.add(t * 64 * M);
+                                if M == 1 {
+                                    rows8!(p, row, xb, k, af, sc; 0 => 0, 4 => 1, 8 => 2, 12 => 3, 16 => 4, 20 => 5, 24 => 6, 28 => 7);
+                                } else {
+                                    // 2 tokens: two passes of 4 column groups (8 accumulators each)
+                                    rows8!(p, row, xb, k, af, sc; 0 => 0, 4 => 1, 8 => 2, 12 => 3);
+                                    rows8!(p, row, xb, k, af, sc; 16 => 0, 20 => 1, 24 => 2, 28 => 3);
+                                }
+                            }
+                            g8 += 8;
+                        }
+                        for i in 0..M {
+                            let off = CAFF * sums[i];
+                            for t in 0..nc {
+                                for c in 0..8 {
+                                    let v = std::slice::from_raw_parts(accf.add(t * 64 * M + (c * M + i) * 8), 8);
+                                    *y[i].add(t * 16 + c) = KINV * ((v[0] + v[1]) + (v[2] + v[3])) + off;
+                                    *y[i].add(t * 16 + c + 8) = KINV * ((v[4] + v[5]) + (v[6] + v[7])) + off;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+    }
+    i16_kernels!(i16_vnni, "avx2,fma,avxvnni", |a, s, x| _mm256_dpwssd_avx_epi32(a, s, x));
+    i16_kernels!(i16_plain, "avx2,fma", |a, s, x| _mm256_add_epi32(a, _mm256_madd_epi16(s, x)));
+
     /// The 8 weights of trellis lane `g` of one tile, in position order j = 0..7.
     ///
     /// # Safety
@@ -1469,8 +1690,319 @@ pub(crate) fn expert_ffn_with(im: Impl, e: &Mul1Expert, x: &[f32], y: &mut [f32]
 /// for bit `expert_ffn` of that expert alone, and with any `act` bit for bit
 /// `gemv(down, act(gemv(gate, x), gemv(up, x)))`. Every expert has the shape and bitrate of the
 /// first.
+///
+/// **The int16 arm (#200 D-B).** With at most [`I16_MAX_TOKENS`] rows, K = 3 experts and the
+/// AVX2 + FMA kernel (`path` not `Scalar`), the call takes the lossy arm of sybil's `ft_n135.h`
+/// (`6769b27`) instead: the affine weights `s k_inv - 3.453125` (no fp16 rounding of the codec
+/// value), each 128-block of a transformed input quantized to int16 with its own scale, one
+/// `vpdpwssd` (AVX-VNNI; `vpmaddwd` + `vpaddd` without) per 16 weights and token, the matrices in
+/// contiguous row bands whose f32 partials the next stage sums ([`Bands`]), all stages of all
+/// experts one dataflow queue in one pool run. Not bit-identical to the exact arm; the bar
+/// (`cpu_mul1_lane_i16_holds_the_accuracy_bar`): 1 - cosine <= 1e-6 per expert output against the
+/// exact arm (which is within 3e-13 of the GPU path, #188).
 pub fn experts_ffn(es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act: &Act, threads: usize, path: Path) {
+    if let Some(e0) = es.first() {
+        if x.len() % e0.hidden == 0 {
+            if let Some(vnni) = i16_kern(es, x.len() / e0.hidden, path) {
+                return experts_ffn_i16(es, x, ys, act, threads, vnni, BANDS);
+            }
+        }
+    }
     experts_ffn_with(Impl::NEW, es, x, ys, act, threads, path)
+}
+
+/// the int16 arm of [`experts_ffn`]: at most this many rows per call (sybil's `i16max`)
+pub const I16_MAX_TOKENS: usize = 2;
+
+/// Unit shapes of the int16 arm: gate / up units of `rg` tile rows x `cg` tiles, down units of
+/// `rd` x `cd` (rows multiples of 8 up to [`I16_MAX_ROWS`], tiles up to [`I16_MAX_COLS`]). A tile
+/// row of gate / up is 128 tiles x 96 B = 12 KB contiguous, so a band of full rows is one run of
+/// `rg` x 12 KB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Bands {
+    pub(crate) rg: usize,
+    pub(crate) cg: usize,
+    pub(crate) rd: usize,
+    pub(crate) cd: usize,
+}
+
+/// the shipped shapes: `cpu_mul1_lane_bench` shape sweep (2026-10-10, 285K, 20 threads, two
+/// runs, ms per expert at n = 1 / 2 / 4 / 8 experts): this shape 0.180 / 0.166 / 0.154 / 0.145,
+/// the best at every n; (32, 64, 16, 64) 0.183-0.189 / 0.170-0.174 / 0.157-0.161 / 0.144-0.151;
+/// sybil's (32, 128, 16, 128) 0.311 / 0.178 / 0.165 / 0.152 (too few units for one expert);
+/// (64, 128, 32, 128) 0.513 / 0.272 / 0.154 / 0.150
+const BANDS: Bands = Bands { rg: 32, cg: 32, rd: 16, cd: 32 };
+const I16_MAX_ROWS: usize = 64;
+const I16_MAX_COLS: usize = 256;
+
+/// The int16 kernel `experts_ffn` runs on (`Some(vnni)`), or `None` for the exact arm: 1 or 2
+/// rows, every matrix K = 3, the AVX2 + FMA kernel.
+fn i16_kern(es: &[Mul1Expert], tokens: usize, path: Path) -> Option<bool> {
+    if !(1..=I16_MAX_TOKENS).contains(&tokens) || kern(path) != Kern::Fast {
+        return None;
+    }
+    if !es.iter().all(|e| e.gate.bitrate == K3 && e.up.bitrate == K3 && e.down.bitrate == K3) {
+        return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    return Some(vnni());
+    #[cfg(not(target_arch = "x86_64"))]
+    None
+}
+
+/// row of lane position j inside a lane's 4-row group pair: `ROW_OFF[j % 4]`
+const DR: [usize; 8] = [0, 1, 8, 9, 0, 1, 8, 9];
+
+/// The int16 quantization of one transformed 128-block `v` (sybil `quant_block_p16`): scale
+/// `max |v| / 16383`, values rounded to nearest even, laid out for its 8 tile rows as row `tt`,
+/// pair `p`, 32-bit lane j = (input of lane 4C + 2p at position j, input of lane 4C + 2p + 1 at
+/// position j), the rows `16 tt + 4 p + DR[j]` and `+ 2`. Returns (scale, sum of the quantized
+/// values times the scale).
+fn quant_block(v: &[f32; HAD], out: &mut [i16]) -> (f32, f32) {
+    let amax = v.iter().fold(0f32, |m, &a| m.max(a.abs()));
+    let sc = if amax > 0.0 { amax / 16383.0 } else { 1.0 };
+    let rs = 1.0 / sc;
+    let mut xi = [0i32; HAD];
+    let mut si = 0i64;
+    for (q, &a) in xi.iter_mut().zip(v) {
+        *q = (a * rs).round_ties_even() as i32;
+        si += *q as i64;
+    }
+    let out = &mut out[..8 * 32];
+    for tt in 0..8 {
+        for p in 0..2 {
+            for (j, &d) in DR.iter().enumerate() {
+                out[tt * 32 + p * 16 + 2 * j] = xi[tt * 16 + 4 * p + d] as i16;
+                out[tt * 32 + p * 16 + 2 * j + 1] = xi[tt * 16 + 4 * p + 2 + d] as i16;
+            }
+        }
+    }
+    (sc, si as f32 * sc)
+}
+
+/// The int16 input of one band (tile rows `r0 .. r0 + nr`) of matrix `m` for one row `x`: per
+/// 128-block `x * suh`, the FWHT, [`quant_block`]; `pre` = true when `x` is already transformed
+/// (down's input from the activation stage) and holds the band's rows only. Returns the band's
+/// quantized sum.
+fn prep_band_i16(x: &[f32], m: &Mul1Matrix, r0: usize, nr: usize, pre: bool, xq: &mut [i16], qs: &mut [f32]) -> f32 {
+    let mut v = [0f32; HAD];
+    let mut sum = 0f32;
+    for bl in 0..nr / 8 {
+        let b = r0 / 8 + bl;
+        if pre {
+            v.copy_from_slice(&x[bl * HAD..(bl + 1) * HAD]);
+        } else {
+            for (r, d) in v.iter_mut().enumerate() {
+                *d = x[b * HAD + r] * Mul1Matrix::scale(m.suh, b * HAD + r);
+            }
+            fwht128(&mut v);
+        }
+        let (sc, s) = quant_block(&v, &mut xq[bl * 256..]);
+        qs[bl] = sc;
+        sum += s;
+    }
+    sum
+}
+
+/// The scratch of the int16 arm: one per calling thread, kept at its largest size (the lane's
+/// up to 32 experts per layer need ~10 MB; `with_scratch` keeps at most 4 MB).
+fn with_i16_scratch<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|s| match s.try_borrow_mut() {
+        Ok(mut v) => {
+            if v.len() < len {
+                v.resize(len, 0.0);
+            }
+            #[cfg(test)]
+            if POISON_SCRATCH.with(|p| p.get()) {
+                v[..len].fill(f32::NAN);
+            }
+            f(&mut v[..len])
+        }
+        Err(_) => f(&mut vec![0f32; len]),
+    })
+}
+
+/// One band unit of the int16 arm on this CPU's kernel.
+#[allow(clippy::too_many_arguments)]
+fn band_i16(vnni: bool, tokens: usize, m: &Mul1Matrix, r0: usize, nr: usize, t0: usize, nc: usize, xq: &[[i16; I16_MAX_ROWS * 32]; I16_MAX_TOKENS], qs: &[[f32; I16_MAX_ROWS / 8]; I16_MAX_TOKENS], sums: &[f32; I16_MAX_TOKENS], accf: &mut [f32], y: [Out; I16_MAX_TOKENS]) {
+    let (tk, tn) = (m.k / 16, m.n / 16);
+    assert!(m.bitrate == K3 && m.trellis.len() >= tk * tn * 96 && r0 % 8 == 0 && nr % 8 == 0 && nr <= I16_MAX_ROWS && r0 + nr <= tk);
+    assert!(t0 + nc <= tn && nc <= I16_MAX_COLS && accf.len() >= nc * 64 * tokens);
+    for o in &y[..tokens] {
+        assert!(o.1 >= 16 * nc);
+    }
+    let tr = m.trellis.as_ptr();
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `i16_kern` chose an int16 kernel only after AVX2 and FMA (`Kern::Fast`) and, for
+    // `vnni`, AVX-VNNI were detected; the bounds of `band` are asserted above
+    unsafe {
+        let (x1, q1, s1, y1) = ([xq[0].as_ptr()], [qs[0].as_ptr()], [sums[0]], [y[0].0]);
+        let (x2, q2, s2, y2) = ([xq[0].as_ptr(), xq[1].as_ptr()], [qs[0].as_ptr(), qs[1].as_ptr()], [sums[0], sums[1]], [y[0].0, y[1].0]);
+        let a = accf.as_mut_ptr();
+        match (vnni, tokens) {
+            (true, 1) => avx2::i16_vnni::band::<1>(tr, tn, r0, nr, t0, nc, x1, q1, s1, a, y1),
+            (true, _) => avx2::i16_vnni::band::<2>(tr, tn, r0, nr, t0, nc, x2, q2, s2, a, y2),
+            (false, 1) => avx2::i16_plain::band::<1>(tr, tn, r0, nr, t0, nc, x1, q1, s1, a, y1),
+            (false, _) => avx2::i16_plain::band::<2>(tr, tn, r0, nr, t0, nc, x2, q2, s2, a, y2),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unreachable!("cpu_mul1: the int16 arm needs x86_64 ({vnni} {tokens} {tr:?} {xq:p} {qs:p} {sums:?} {accf:p} {})", y.len());
+}
+
+/// The int16 arm of [`experts_ffn`] (#200 D-B, sybil `ft_n135.h` `moe_forward4` at `6769b27`):
+/// one queue of units over all experts, taken in order from one counter in ONE pool run, each
+/// waiting only for the work it reads (queued before it, so the queue always progresses):
+/// gate / up bands (expert by expert, band by band, gate and up alternating; each quantizes its
+/// own band of the input, so it waits for nothing), activation blocks (expert j's after all its
+/// gate / up bands: the band partials summed, Hadamard out, `act`, down's input transform), down
+/// bands (each after the activation blocks of its rows, quantizing its band), output blocks
+/// (expert j's after all its down bands: partials summed, Hadamard out into `ys`).
+#[allow(clippy::too_many_arguments)]
+fn experts_ffn_i16(es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act: &Act, threads: usize, vnni: bool, sh: Bands) {
+    let n = es.len();
+    let e0 = &es[0];
+    let (h, i) = (e0.hidden, e0.inter);
+    for e in es {
+        assert!(e.hidden == h && e.inter == i, "cpu_mul1::experts_ffn: the experts differ in shape or bitrate");
+    }
+    assert!(x.len() % h == 0, "cpu_mul1::expert_ffn: x is not [T][{h}]");
+    let tokens = x.len() / h;
+    assert!((1..=I16_MAX_TOKENS).contains(&tokens));
+    assert_eq!(ys.len(), n * tokens * h, "cpu_mul1::expert_ffn: y is not [{n}][T][{h}]");
+    for r in [sh.rg, sh.rd] {
+        assert!(r % 8 == 0 && (8..=I16_MAX_ROWS).contains(&r), "cpu_mul1: band of {r} tile rows");
+    }
+    for c in [sh.cg, sh.cd] {
+        assert!((1..=I16_MAX_COLS).contains(&c), "cpu_mul1: band of {c} tiles");
+    }
+    let (tkg, tng, tkd, tnd) = (h / 16, i / 16, i / 16, h / 16);
+    let (rg, cg, rd, cd) = (sh.rg.min(tkg), sh.cg.min(tng), sh.rd.min(tkd), sh.cd.min(tnd));
+    let (nbg, ncg, nbd, ncd) = (tkg.div_ceil(rg), tng.div_ceil(cg), tkd.div_ceil(rd), tnd.div_ceil(cd));
+    let (bi, bh) = (i / HAD, h / HAD);
+    let (ug, ua, ud) = (n * 2 * nbg * ncg, n * bi, n * nbd * ncd);
+    let total = ug + ua + ud + n * bh;
+    // gate / up band partials [n][nbg][T][i], the transformed down input [n][T][i], down band
+    // partials [n][nbd][T][h]
+    let (lg, lb, ld) = (n * nbg * tokens * i, n * tokens * i, n * nbd * tokens * h);
+    with_i16_scratch(2 * lg + lb + ld, |s| {
+        let o = |v: &mut [f32]| Out(v.as_mut_ptr(), v.len());
+        let (pg, s) = s.split_at_mut(lg);
+        let (pu, s) = s.split_at_mut(lg);
+        let (hb, pd) = s.split_at_mut(lb);
+        let (opg, opu, ohb, opd, oy) = (o(pg), o(pu), o(hb), o(pd), o(ys));
+        let ctr = |m: usize| (0..m).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+        let (gu_done, act_done, down_done) = (ctr(n), ctr(n * bi), ctr(n));
+        let next = AtomicUsize::new(0);
+        // a band's partial rows: `len` floats of token t at `at(t)` inside `v`
+        let rows = |v: Out, at: &dyn Fn(usize) -> usize, len: usize| {
+            let mut y = [Out(std::ptr::null_mut(), 0), Out(std::ptr::null_mut(), 0)];
+            for (t, yt) in y.iter_mut().enumerate().take(tokens) {
+                assert!(at(t) + len <= v.1);
+                // SAFETY: in bounds (asserted)
+                *yt = Out(unsafe { v.0.add(at(t)) }, len);
+            }
+            y
+        };
+        pool::run(threads.clamp(1, total), &|_| {
+            thread_local! {
+                static ACCF: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            ACCF.with(|a| {
+                let mut accf = a.borrow_mut();
+                if accf.len() < I16_MAX_COLS * 64 * I16_MAX_TOKENS {
+                    accf.resize(I16_MAX_COLS * 64 * I16_MAX_TOKENS, 0.0);
+                }
+                let mut xq = [[0i16; I16_MAX_ROWS * 32]; I16_MAX_TOKENS];
+                let mut qs = [[0f32; I16_MAX_ROWS / 8]; I16_MAX_TOKENS];
+                let mut sums = [0f32; I16_MAX_TOKENS];
+                loop {
+                    let u = next.fetch_add(1, Ordering::Relaxed);
+                    if u >= total {
+                        break;
+                    }
+                    if u < ug {
+                        let (j, r) = (u / (2 * nbg * ncg), u % (2 * nbg * ncg));
+                        let (b, c, w) = (r / (2 * ncg), r / 2 % ncg, r % 2);
+                        let (m, dst) = if w == 0 { (&es[j].gate, opg) } else { (&es[j].up, opu) };
+                        let (r0, nr, t0, nc) = (b * rg, rg.min(tkg - b * rg), c * cg, cg.min(tng - c * cg));
+                        for t in 0..tokens {
+                            sums[t] = prep_band_i16(&x[t * h..(t + 1) * h], m, r0, nr, false, &mut xq[t], &mut qs[t]);
+                        }
+                        let y = rows(dst, &|t| ((j * nbg + b) * tokens + t) * i + t0 * 16, nc * 16);
+                        band_i16(vnni, tokens, m, r0, nr, t0, nc, &xq, &qs, &sums, &mut accf, y);
+                        gu_done[j].fetch_add(1, Ordering::Release);
+                    } else if u < ug + ua {
+                        let (j, blk) = ((u - ug) / bi, (u - ug) % bi);
+                        let e = &es[j];
+                        // every gate / up band of expert j was taken before this unit
+                        wait_for(&gu_done[j], 2 * nbg * ncg);
+                        for t in 0..tokens {
+                            let (mut g, mut up) = ([0f32; HAD], [0f32; HAD]);
+                            for bb in 0..nbg {
+                                let at = ((j * nbg + bb) * tokens + t) * i + blk * HAD;
+                                for r in 0..HAD {
+                                    g[r] += opg.get(at + r);
+                                    up[r] += opu.get(at + r);
+                                }
+                            }
+                            fwht128(&mut g);
+                            fwht128(&mut up);
+                            let mut hv = [0f32; HAD];
+                            for (r, d) in hv.iter_mut().enumerate() {
+                                let gv = (g[r] * (1.0 / 128.0)) * Mul1Matrix::scale(e.gate.svh, blk * HAD + r);
+                                let uv = (up[r] * (1.0 / 128.0)) * Mul1Matrix::scale(e.up.svh, blk * HAD + r);
+                                *d = act(gv, uv) * Mul1Matrix::scale(e.down.suh, blk * HAD + r);
+                            }
+                            fwht128(&mut hv);
+                            for (r, &d) in hv.iter().enumerate() {
+                                ohb.put((j * tokens + t) * i + blk * HAD + r, d);
+                            }
+                        }
+                        act_done[j * bi + blk].fetch_add(1, Ordering::Release);
+                    } else if u < ug + ua + ud {
+                        let q = u - ug - ua;
+                        let (j, b, c) = (q / (nbd * ncd), q / ncd % nbd, q % ncd);
+                        let m = &es[j].down;
+                        let (r0, nr, t0, nc) = (b * rd, rd.min(tkd - b * rd), c * cd, cd.min(tnd - c * cd));
+                        // the activation blocks of this band's rows (queued before every down unit)
+                        for blk in r0 / 8..(r0 + nr) / 8 {
+                            wait_for(&act_done[j * bi + blk], 1);
+                        }
+                        for t in 0..tokens {
+                            // SAFETY: every write to these blocks of expert j's down input is
+                            // complete (acquire above); read only from here on
+                            let xd = unsafe { std::slice::from_raw_parts(ohb.0.add((j * tokens + t) * i + r0 * 16) as *const f32, nr * 16) };
+                            sums[t] = prep_band_i16(xd, m, r0, nr, true, &mut xq[t], &mut qs[t]);
+                        }
+                        let y = rows(opd, &|t| ((j * nbd + b) * tokens + t) * h + t0 * 16, nc * 16);
+                        band_i16(vnni, tokens, m, r0, nr, t0, nc, &xq, &qs, &sums, &mut accf, y);
+                        down_done[j].fetch_add(1, Ordering::Release);
+                    } else {
+                        let q = u - ug - ua - ud;
+                        let (j, blk) = (q / bh, q % bh);
+                        wait_for(&down_done[j], nbd * ncd);
+                        for t in 0..tokens {
+                            let mut v = [0f32; HAD];
+                            for bb in 0..nbd {
+                                let at = ((j * nbd + bb) * tokens + t) * h + blk * HAD;
+                                for (r, d) in v.iter_mut().enumerate() {
+                                    *d += opd.get(at + r);
+                                }
+                            }
+                            fwht128(&mut v);
+                            for (r, &d) in v.iter().enumerate() {
+                                oy.put((j * tokens + t) * h + blk * HAD + r, (d * (1.0 / 128.0)) * Mul1Matrix::scale(es[j].down.svh, blk * HAD + r));
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    });
 }
 
 fn experts_ffn_with(im: Impl, es: &[Mul1Expert], x: &[f32], ys: &mut [f32], act: &Act, threads: usize, path: Path) {
@@ -2715,7 +3247,9 @@ mod tests {
         }
     }
 
-    /// #188 CPU lane: `experts_ffn` (all experts of a call in one pool run) gives every expert
+    /// #188 CPU lane: the exact multi-expert arm (`experts_ffn_with(Impl::NEW)`, all experts of a
+    /// call in one pool run; `experts_ffn` itself since #200 takes the int16 arm at T <= 2, held by
+    /// `cpu_mul1_lane_i16_holds_the_accuracy_bar`) gives every expert
     /// the bits of `expert_ffn` on that expert alone: 1, 2, 3, 5 and 8 GLM experts (K = 3, T 1
     /// and 2) and 3 small K = 2.5 experts (T 1, 3), threads 1, 2, 8, 16, 24, the outputs NaN
     /// before the call; with the clamped SwiGLU as `act` (8 threads), the bits of the staged
@@ -2747,7 +3281,7 @@ mod tests {
                     .collect();
                 for th in [1usize, 2, 8, 16, 24] {
                     let mut ys = vec![f32::NAN; n * x.len()];
-                    experts_ffn(&es, &x, &mut ys, &silu_mul, th, Path::Auto);
+                    experts_ffn_with(Impl::NEW, &es, &x, &mut ys, &silu_mul, th, Path::Auto);
                     for (j, w) in want.iter().enumerate() {
                         assert_eq!(bits(&ys[j * x.len()..(j + 1) * x.len()]), bits(w), "{n} experts [{}, {}] T {t} threads {th}: expert {j}", c.hidden, c.inter);
                     }
@@ -2759,7 +3293,7 @@ mod tests {
                     (g / (1.0 + (-g).exp())) * u
                 };
                 let mut ys = vec![f32::NAN; n * x.len()];
-                experts_ffn(&es, &x, &mut ys, &clamp, 8, Path::Auto);
+                experts_ffn_with(Impl::NEW, &es, &x, &mut ys, &clamp, 8, Path::Auto);
                 for (j, e) in es.iter().enumerate() {
                     let (mut g, mut u) = (vec![0f32; t * c.inter], vec![0f32; t * c.inter]);
                     gemv(&e.gate, &x, &mut g, 8, Path::Auto);
@@ -2776,6 +3310,249 @@ mod tests {
             check(&glm, &cg, n, &[1, 2], &mut rng);
         }
         check(&small, &mk(10, 2.5, 512, 256), 3, &[1, 3], &mut rng);
+    }
+
+    /// `n` distinct GLM-shaped K = 3 synthetic records (#181 synthetic trellis, seeds from `seed`)
+    fn glm_records(n: usize, seed: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|j| {
+                record(&Case {
+                    name: format!("glm e{j}"),
+                    source: format!("synth:{}", seed + 9 * j),
+                    bitrate: K3,
+                    hidden: GLM_HIDDEN,
+                    inter: GLM_INTER,
+                    want: [String::new(), String::new(), String::new()],
+                })
+            })
+            .collect()
+    }
+
+    fn glm_experts(recs: &[Vec<u8>]) -> Vec<Mul1Expert<'_>> {
+        recs.iter().map(|r| Mul1Expert::from_record(r, GLM_HIDDEN, GLM_INTER, K3).unwrap()).collect()
+    }
+
+    /// 1 - cosine of two rows, in f64
+    fn one_minus_cos(a: &[f32], b: &[f32]) -> f64 {
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            let (x, y) = (x as f64, y as f64);
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        1.0 - ab / (aa.sqrt() * bb.sqrt())
+    }
+
+    /// GLM's clamped SwiGLU at limit 10 (`glm5_moe::swiglu_clamp`'s form)
+    fn clamp10(g: f32, u: f32) -> f32 {
+        let g = if g > 10.0 { 10.0 } else { g };
+        let u = u.clamp(-10.0, 10.0);
+        (g / (1.0 + (-g).exp())) * u
+    }
+
+    /// #200 D-B, the lane's int16 arm: `experts_ffn` at T 1 and 2 (1, 3 and 8 GLM K = 3 experts;
+    /// inputs uniform in [-0.17, 0.17], the GPU lane tests' `X_AMP` (gate outputs ~6.6 rms, part
+    /// of them clamp), the same with every 997th channel x 60, with `silu_mul` and the clamped
+    /// SwiGLU; uniform in [-2, 2] with `silu_mul`) is not the exact arm's bits (the int16 arm ran), gives the same bits at
+    /// threads 1, 2, 8 and 24 (a band is computed by one worker, its partials summed in band
+    /// order), and every expert's output row is within 1 - cosine <= 1e-6 of the exact arm (the
+    /// bar of #200; the exact arm is within 3e-13 of the GPU path, #188). At T 3 and on
+    /// `Path::Scalar` it is the exact arm, bit for bit; outputs are NaN before every call.
+    #[test]
+    fn cpu_mul1_lane_i16_holds_the_accuracy_bar() {
+        if kern(Path::Auto) != Kern::Fast {
+            eprintln!("cpu_mul1: no AVX2 + FMA here, the int16 arm is off");
+            return;
+        }
+        let recs = glm_records(8, 0x2000);
+        let es = glm_experts(&recs);
+        let mut rng = Rng(0x200);
+        let hh = GLM_HIDDEN;
+        let mut worst = (0f64, String::new());
+        let acts = [("silu", &silu_mul as &Act), ("clamp", &clamp10 as &Act)];
+        for t in [1usize, 2] {
+            for (amp, outliers) in [(0.17f32, false), (0.17, true), (2.0, false)] {
+                let mut x: Vec<f32> = (0..t * hh).map(|_| rng.f(amp)).collect();
+                if outliers {
+                    x.iter_mut().enumerate().filter(|(q, _)| q % 997 == 3).for_each(|(_, v)| *v *= 60.0);
+                }
+                for &(an, act) in &acts[..if amp > 1.0 { 1 } else { 2 }] {
+                    for n in [1usize, 3, 8] {
+                        let what = format!("T {t} x amp {amp} outliers {outliers} {an} {n} experts");
+                        let mut want = vec![f32::NAN; n * t * hh];
+                        experts_ffn_with(Impl::NEW, &es[..n], &x, &mut want, act, 8, Path::Auto);
+                        let mut first: Option<Vec<u32>> = None;
+                        for th in [1usize, 2, 8, 24] {
+                            let mut y = vec![f32::NAN; n * t * hh];
+                            experts_ffn(&es[..n], &x, &mut y, act, th, Path::Auto);
+                            assert!(y.iter().all(|v| v.is_finite()), "{what} threads {th}: a value is not finite");
+                            assert_ne!(bits(&y), bits(&want), "{what} threads {th}: the exact arm's bits, the int16 arm did not run");
+                            match &first {
+                                None => first = Some(bits(&y)),
+                                Some(b) => assert_eq!(&bits(&y), b, "{what}: threads {th} give other bits than threads 1"),
+                            }
+                            for r in 0..n * t {
+                                let c = one_minus_cos(&y[r * hh..(r + 1) * hh], &want[r * hh..(r + 1) * hh]);
+                                assert!(c <= 1e-6, "{what} threads {th}: expert {} row {}: 1 - cos {c:.3e}", r / t, r % t);
+                                if c > worst.0 {
+                                    worst = (c, what.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("cpu_mul1 int16 arm: worst 1 - cos per expert row vs the exact arm {:.3e} ({})", worst.0, worst.1);
+        for (t, path) in [(3usize, Path::Auto), (1, Path::Scalar), (2, Path::Scalar)] {
+            let x = xs(t * hh, &mut rng);
+            let (mut y, mut want) = (vec![f32::NAN; 2 * t * hh], vec![f32::NAN; 2 * t * hh]);
+            experts_ffn(&es[..2], &x, &mut y, &silu_mul, 8, path);
+            experts_ffn_with(Impl::NEW, &es[..2], &x, &mut want, &silu_mul, 8, path);
+            assert_eq!(bits(&y), bits(&want), "T {t} {path:?}: not the exact arm");
+        }
+    }
+
+    /// #200 D-B: the int16 arm's effect on a synthetic GLM MoE layer's next-token distribution.
+    /// 8 K = 3 experts, 16 rows uniform in [-0.17, 0.17] (the GPU lane tests' `X_AMP`; every
+    /// other row with outlier channels x 40), per row router weights a
+    /// softmax over 8 random logits, the layer output `sum_k w_k ffn_k(x)` with the clamped
+    /// SwiGLU from the exact arm and from the int16 arm (rows one at a time, T 1, and in pairs,
+    /// T 2); a synthetic head (4096 x 4096, uniform weights) over the output divided by its rms,
+    /// logits scaled to standard deviation sigma = 4 per row. Per row the same top-1 token and
+    /// KL(exact || int16) <= 1.6e-5: a logit error of relative size d gives KL ~ sigma^2 d^2 / 2
+    /// and 1 - cos ~ d^2 / 2, so 1.6e-5 = sigma^2 x 1e-6 is the KL the 1 - cos bar allows.
+    #[test]
+    fn cpu_mul1_lane_i16_keeps_a_synthetic_layer_s_logits() {
+        if kern(Path::Auto) != Kern::Fast {
+            eprintln!("cpu_mul1: no AVX2 + FMA here, the int16 arm is off");
+            return;
+        }
+        let recs = glm_records(8, 0x2100);
+        let es = glm_experts(&recs);
+        let hh = GLM_HIDDEN;
+        let mut rng = Rng(0x2001);
+        const ROWS: usize = 16;
+        const V: usize = 4096;
+        let mut x: Vec<f32> = (0..ROWS * hh).map(|_| rng.f(0.17)).collect();
+        for r in (1..ROWS).step_by(2) {
+            x[r * hh..(r + 1) * hh].iter_mut().enumerate().filter(|(q, _)| q % 509 == r).for_each(|(_, v)| *v *= 40.0);
+        }
+        let wts: Vec<[f32; 8]> = (0..ROWS)
+            .map(|_| {
+                let l: Vec<f32> = (0..8).map(|_| rng.f(2.0)).collect();
+                let m = l.iter().fold(f32::MIN, |a, &b| a.max(b));
+                let z: f32 = l.iter().map(|v| (v - m).exp()).sum();
+                std::array::from_fn(|k| (l[k] - m).exp() / z)
+            })
+            .collect();
+        let head: Vec<f32> = (0..V * hh).map(|_| rng.f(1.0)).collect();
+        // the layer outputs of rows r0 .. r0 + t through one arm
+        let layer = |exact: bool, r0: usize, t: usize| -> Vec<f32> {
+            let xr = &x[r0 * hh..(r0 + t) * hh];
+            let mut ys = vec![f32::NAN; 8 * t * hh];
+            if exact {
+                experts_ffn_with(Impl::NEW, &es, xr, &mut ys, &clamp10, 8, Path::Auto);
+            } else {
+                experts_ffn(&es, xr, &mut ys, &clamp10, 20, Path::Auto);
+            }
+            let mut y = vec![0f32; t * hh];
+            for tt in 0..t {
+                for k in 0..8 {
+                    for c in 0..hh {
+                        y[tt * hh + c] += wts[r0 + tt][k] * ys[(k * t + tt) * hh + c];
+                    }
+                }
+            }
+            y
+        };
+        let logits = |y: &[f32], rms: f64| -> Vec<f64> {
+            (0..V).map(|v| head[v * hh..(v + 1) * hh].iter().zip(y).map(|(&w, &a)| w as f64 * a as f64).sum::<f64>() / rms).collect()
+        };
+        let (mut kl_max, mut cos_max) = (0f64, 0f64);
+        for t in [1usize, 2] {
+            for r0 in (0..ROWS).step_by(t) {
+                let (ye, yi) = (layer(true, r0, t), layer(false, r0, t));
+                for tt in 0..t {
+                    let (a, b) = (&ye[tt * hh..(tt + 1) * hh], &yi[tt * hh..(tt + 1) * hh]);
+                    cos_max = cos_max.max(one_minus_cos(b, a));
+                    let rms = (a.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / hh as f64).sqrt();
+                    let (le, li) = (logits(a, rms), logits(b, rms));
+                    let mean = le.iter().sum::<f64>() / V as f64;
+                    let sd = (le.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / V as f64).sqrt();
+                    // log-softmax of logits scaled by 4 / sd
+                    let lsm = |l: &[f64]| -> Vec<f64> {
+                        let s: Vec<f64> = l.iter().map(|v| v * 4.0 / sd).collect();
+                        let m = s.iter().fold(f64::MIN, |a, &b| a.max(b));
+                        let z = m + s.iter().map(|v| (v - m).exp()).sum::<f64>().ln();
+                        s.iter().map(|v| v - z).collect()
+                    };
+                    let (pe, pi) = (lsm(&le), lsm(&li));
+                    let kl: f64 = pe.iter().zip(&pi).map(|(&e, &i)| e.exp() * (e - i)).sum();
+                    let top = |l: &[f64]| l.iter().enumerate().fold((0, f64::MIN), |a, (q, &v)| if v > a.1 { (q, v) } else { a }).0;
+                    assert_eq!(top(&le), top(&li), "T {t} row {}: top-1 differs", r0 + tt);
+                    assert!(kl <= 1.6e-5, "T {t} row {}: KL {kl:.3e}", r0 + tt);
+                    kl_max = kl_max.max(kl);
+                }
+            }
+        }
+        eprintln!("cpu_mul1 int16 arm, synthetic layer: max KL {kl_max:.3e}, top-1 equal in all {} rows, max 1 - cos of the layer output {cos_max:.3e}", 2 * ROWS);
+    }
+
+    /// #200 D-B against the GPU expert path itself: `kernels::mul1::FfnPlan` (VRAM records,
+    /// `silu_mul`) vs `experts_ffn`'s int16 arm and vs the exact arm, 8 GLM K = 3 experts, T 1 and
+    /// 2 (inputs as `cpu_mul1_lane_i16_holds_the_accuracy_bar`): 1 - cosine per expert row; the
+    /// int16 arm within 1e-6.
+    #[test]
+    #[ignore = "needs the GPU (80 MB VRAM): cargo test --release --lib cpu_mul1_gpu_lane_i16 -- --ignored --nocapture"]
+    fn cpu_mul1_gpu_lane_i16_against_the_gpu_expert_path() {
+        use crate::cuda;
+        let recs = glm_records(8, 0x2000);
+        let es = glm_experts(&recs);
+        let (hh, rb) = (GLM_HIDDEN, recs[0].len());
+        let mut rng = Rng(0x200);
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mk = crate::kernels::mul1::Kernels::new();
+            let mut dev = cuda::alloc_zeroed(8 * rb);
+            for (j, r) in recs.iter().enumerate() {
+                cuda::upload_into(dev + (j * rb) as u64, r);
+            }
+            let mut ptrs = cuda::alloc_zeroed(64);
+            cuda::to_u64_into(ptrs, &(0..8).map(|j| dev + (j * rb) as u64).collect::<Vec<_>>());
+            let (mut w16, mut wex) = (0f64, 0f64);
+            for t in [1usize, 2] {
+                for (amp, outliers) in [(0.17f32, false), (0.17, true), (2.0, false)] {
+                    let mut x: Vec<f32> = (0..t * hh).map(|_| rng.f(amp)).collect();
+                    if outliers {
+                        x.iter_mut().enumerate().filter(|(q, _)| q % 997 == 3).for_each(|(_, v)| *v *= 60.0);
+                    }
+                    // the GPU plan takes each slot's own rows: the same rows for every expert
+                    let x8: Vec<f32> = (0..8).flat_map(|_| x.iter().copied()).collect();
+                    let mut plan = crate::kernels::mul1::FfnPlan::new(hh, GLM_INTER, 3, false, 8, t);
+                    let (mut xd, mut yd) = (cuda::to_f32_dev(&x8), cuda::alloc_zeroed(8 * t * hh * 4));
+                    plan.run(&mk, ptrs, xd, yd);
+                    cuda::sync();
+                    let g = cuda::dtoh(yd, 8 * t * hh);
+                    let (mut y16, mut yex) = (vec![f32::NAN; 8 * t * hh], vec![f32::NAN; 8 * t * hh]);
+                    experts_ffn(&es, &x, &mut y16, &silu_mul, 20, Path::Auto);
+                    experts_ffn_with(Impl::NEW, &es, &x, &mut yex, &silu_mul, 8, Path::Auto);
+                    for r in 0..8 * t {
+                        let s = r * hh..(r + 1) * hh;
+                        let (c16, cex) = (one_minus_cos(&y16[s.clone()], &g[s.clone()]), one_minus_cos(&yex[s.clone()], &g[s]));
+                        assert!(c16 <= 1e-6, "T {t} x amp {amp} outliers {outliers} row {r}: int16 arm vs GPU 1 - cos {c16:.3e}");
+                        (w16, wex) = (w16.max(c16), wex.max(cex));
+                    }
+                    plan.free();
+                    cuda::free_dev(&mut xd);
+                    cuda::free_dev(&mut yd);
+                }
+            }
+            eprintln!("cpu_mul1 vs the GPU expert path, worst 1 - cos per expert row: int16 arm {w16:.3e}, exact arm {wex:.3e}");
+            cuda::free_dev(&mut dev);
+            cuda::free_dev(&mut ptrs);
+        }
     }
 
     /// #183 C1: the bit-built `f16_to_f32` is the former formula for all 65,536 inputs, and the
@@ -3022,12 +3799,15 @@ mod tests {
     }
 
     /// Micro-benchmark, not a gate (the split planner's CPU cost, `glm5_tiers::SplitCost`): the
-    /// #188 lane's call, `experts_ffn` over n = 1..8 distinct GLM-shaped K = 3 records in one pool
-    /// run, T 1, `swiglu`-free `silu_mul`, records rotated over 32 distinct copies (303 MB, far
-    /// beyond the L3) so every call streams its records from DRAM; threads 8, 12, 16, 20, 24.
-    /// Median of 32 calls per point after 4 warm-up calls, workers warm (spinning between calls, as
-    /// between the MoE layers of a decode step). Prints ms per call, ms per expert and the least
-    /// squares line `a + b n` per thread count (a = the run's fixed cost, b = ms per expert).
+    /// #188 lane's call over n = 1..8 distinct GLM-shaped K = 3 records in one pool run, T 1,
+    /// `silu_mul`, records rotated over 32 distinct copies (303 MB, far beyond the L3) so every
+    /// call streams its records from DRAM; threads 8, 12, 16, 20, 24. Two arms alternating call by
+    /// call (#200): `exact` = the exact multi-expert arm (`experts_ffn_with(Impl::NEW)`, the lane's
+    /// kernel before #200) and `int16` = `experts_ffn` (the int16 arm). Median of 32 calls per
+    /// point after 4 warm-up calls, workers warm. Prints ms per call, the least squares line
+    /// `a + b n` (a = the run's fixed cost, b = ms per expert), ms per expert at n = 8 and its
+    /// record bytes per second. Then (int16 arm, 20 threads, n = 1 and 8) a sweep of the unit
+    /// shapes ([`Bands`]).
     /// `cargo test --release --lib cpu_mul1_lane_bench -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -3047,31 +3827,80 @@ mod tests {
         let mut rng = Rng(0x5917);
         let x = xs(GLM_HIDDEN, &mut rng);
         let mut ys = vec![0f32; 8 * GLM_HIDDEN];
-        eprintln!("cpu_mul1 lane bench: {:?}, {} threads available, {} B per record", kern(Path::Auto), std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0), recs[0].len());
-        for &th in &[8usize, 12, 16, 20, 24] {
-            let mut pts = Vec::new();
-            for n in 1..=8usize {
-                let mut ms = Vec::new();
-                let mut at = 0usize;
-                for rep in 0..36 {
-                    let es: Vec<Mul1Expert> = (0..n).map(|j| experts[(at + j) % experts.len()]).collect();
-                    at += n;
-                    let t0 = std::time::Instant::now();
-                    experts_ffn(&es, &x, &mut ys[..n * GLM_HIDDEN], &silu_mul, th, Path::Auto);
-                    if rep >= 4 {
-                        ms.push(t0.elapsed().as_secs_f64() * 1e3);
-                    }
-                }
-                ms.sort_by(|a, b| a.total_cmp(b));
-                pts.push((n as f64, ms[ms.len() / 2]));
+        let rb = recs[0].len() as f64;
+        eprintln!(
+            "cpu_mul1 lane bench: {:?}, int16 kernel {:?} (Some(true) = AVX-VNNI), {} threads available, {} B per record",
+            kern(Path::Auto),
+            i16_kern(&experts[..1], 1, Path::Auto),
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+            recs[0].len()
+        );
+        let mut at = 0usize;
+        // one call of `arm` (0 exact, 1 int16, 2 int16 with shape `sh`) over n records
+        let mut call = |arm: usize, n: usize, th: usize, sh: Bands, ys: &mut [f32]| -> f64 {
+            let es: Vec<Mul1Expert> = (0..n).map(|j| experts[(at + j) % experts.len()]).collect();
+            at += n;
+            let t0 = std::time::Instant::now();
+            match arm {
+                0 => experts_ffn_with(Impl::NEW, &es, &x, &mut ys[..n * GLM_HIDDEN], &silu_mul, th, Path::Auto),
+                1 => experts_ffn(&es, &x, &mut ys[..n * GLM_HIDDEN], &silu_mul, th, Path::Auto),
+                _ => experts_ffn_i16(&es, &x, &mut ys[..n * GLM_HIDDEN], &silu_mul, th, vnni(), sh),
             }
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        let fit = |pts: &[(f64, f64)]| {
             let m = pts.len() as f64;
             let (sx, sy) = (pts.iter().map(|p| p.0).sum::<f64>(), pts.iter().map(|p| p.1).sum::<f64>());
             let (sxx, sxy) = (pts.iter().map(|p| p.0 * p.0).sum::<f64>(), pts.iter().map(|p| p.0 * p.1).sum::<f64>());
             let b = (m * sxy - sx * sy) / (m * sxx - sx * sx);
-            let a = (sy - b * sx) / m;
-            let row: Vec<String> = pts.iter().map(|&(n, t)| format!("{n:.0}:{t:.3}")).collect();
-            eprintln!("  threads {th:2}: ms per call {}; fit {a:.3} + {b:.3} n ms; 8 experts {:.3} ms per expert", row.join(" "), pts[7].1 / 8.0);
+            ((sy - b * sx) / m, b)
+        };
+        let med = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        };
+        for &th in &[8usize, 12, 16, 20, 24] {
+            let mut pts = [Vec::new(), Vec::new()];
+            for n in 1..=8usize {
+                let mut ms = [Vec::new(), Vec::new()];
+                for rep in 0..72 {
+                    let t = call(rep % 2, n, th, BANDS, &mut ys);
+                    if rep >= 8 {
+                        ms[rep % 2].push(t);
+                    }
+                }
+                for (arm, m) in ms.into_iter().enumerate() {
+                    pts[arm].push((n as f64, med(m)));
+                }
+            }
+            for (arm, p) in ["exact", "int16"].iter().zip(&pts) {
+                let (a, b) = fit(p);
+                let row: Vec<String> = p.iter().map(|&(n, t)| format!("{n:.0}:{t:.3}")).collect();
+                let pe = p[7].1 / 8.0;
+                eprintln!("  threads {th:2} {arm}: ms per call {}; fit {a:.3} + {b:.4} n ms; 8 experts {pe:.4} ms per expert ({:.1} GB/s)", row.join(" "), rb / (pe * 1e-3) / 1e9);
+            }
+        }
+        if i16_kern(&experts[..1], 1, Path::Auto).is_none() {
+            return;
+        }
+        for sh in [
+            BANDS,
+            Bands { rg: 32, cg: 128, rd: 16, cd: 128 },
+            Bands { rg: 16, cg: 128, rd: 8, cd: 128 },
+            Bands { rg: 8, cg: 128, rd: 8, cd: 128 },
+            Bands { rg: 16, cg: 64, rd: 8, cd: 64 },
+            Bands { rg: 8, cg: 64, rd: 8, cd: 64 },
+            Bands { rg: 32, cg: 64, rd: 16, cd: 64 },
+            Bands { rg: 16, cg: 32, rd: 8, cd: 32 },
+            Bands { rg: 64, cg: 128, rd: 32, cd: 128 },
+        ] {
+            let mut row = Vec::new();
+            for n in [1usize, 2, 4, 8] {
+                let ms: Vec<f64> = (0..40).map(|_| call(2, n, 20, sh, &mut ys)).skip(8).collect();
+                let pe = med(ms) / n as f64;
+                row.push(format!("n {n}: {pe:.4} ms/expert {:.1} GB/s", rb / (pe * 1e-3) / 1e9));
+            }
+            eprintln!("  shape {sh:?} at 20 threads: {}", row.join(", "));
         }
     }
 }
