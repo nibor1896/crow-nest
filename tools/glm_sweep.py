@@ -193,6 +193,14 @@ def med(xs):
     return {"median": statistics.median(xs), "min": min(xs), "max": max(xs), "n": len(xs), "all": xs}
 
 
+def error_row(res, key, rounds, power):
+    """a decode cell with a failed round: no rate, the rounds as received, the error named in res["errors"]"""
+    errs = [r["error"] for r in rounds if "error" in r]
+    res.setdefault("errors", []).extend(errs)
+    print(f"decode {key}: ERROR {errs[0]}" + (f" (+{len(errs) - 1} more)" if len(errs) > 1 else ""), flush=True)
+    return {"error": errs[0], "rounds": rounds, "gpu_power_w_mean": power}
+
+
 # ------------------------------------------------------------------ the sweep
 
 def main(argv=None, words=None):
@@ -271,6 +279,12 @@ def main(argv=None, words=None):
         tot = sum(o["tokens"] for o in out)
         span = max(o["last"] for o in out) - min(o["first"] for o in out)
         per = [(o["tokens"] - 1) / (o["last"] - o["first"]) for o in out if o["tokens"] > 1 and o["last"] > o["first"]]
+        if not per or span <= 0:
+            # no stream got past its first frame (serve died after the prefill, 2026-10-10): an error
+            # row with the streams as received, not a rate
+            return {"error": f"zero decode tokens in C{c} round {rnd}: no stream sent a token after its first frame "
+                             f"(finish {sorted({str(o['finish']) for o in out})}, frames {[o['frames'] for o in out]})",
+                    "tokens": tot, "streams": out}
         by_first = sorted(out, key=lambda o: o["first"])
         serial = c > 1 and all(b["first"] >= a_["last"] for a_, b in zip(by_first, by_first[1:]))
         return {"aggregate": round(tot / span, 2), "per_stream_mean": round(statistics.mean(per), 2),
@@ -285,6 +299,10 @@ def main(argv=None, words=None):
             power = pw.mean()
         else:
             rounds, power = [run_conc(c, r) for r in range(a.dec_reps)], None
+        if any("error" in r for r in rounds):
+            res["decode"][f"C{c}"] = error_row(res, f"C{c}", rounds, power)
+            save()
+            continue
         agg = [r["aggregate"] for r in rounds]
         res["decode"][f"C{c}"] = {"aggregate": med(agg), "per_stream_mean": med([r["per_stream_mean"] for r in rounds]),
                                   "rounds": rounds, "gpu_power_w_mean": power,
@@ -296,11 +314,14 @@ def main(argv=None, words=None):
     if ctx_len > 40000:
         pre = rand_words(words, 32768, seed + 99)
         r = [run_conc(1, 90 + i, prefix=pre) for i in range(a.dec_reps)]
-        res["decode"]["C1@32k"] = {"aggregate": med([x["aggregate"] for x in r]), "rounds": r}
-        print(f"decode C1@32k: {statistics.median([x['aggregate'] for x in r]):.2f} tok/s", flush=True)
+        if any("error" in x for x in r):
+            res["decode"]["C1@32k"] = error_row(res, "C1@32k", r, None)
+        else:
+            res["decode"]["C1@32k"] = {"aggregate": med([x["aggregate"] for x in r]), "rounds": r}
+            print(f"decode C1@32k: {statistics.median([x['aggregate'] for x in r]):.2f} tok/s", flush=True)
     res["prompt_sha256"] = PROMPT_HASHES
     res["nonce_prefix"] = NONCE
-    res["status"] = "DONE"
+    res["status"] = "DONE WITH ERRORS" if res.get("errors") else "DONE"
     res["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     save()
     print("SWEEP DONE", a.out, flush=True)
@@ -320,6 +341,8 @@ class MockServe(http.server.BaseHTTPRequestHandler):
     a final chunk with usage and timings, [DONE]. One word of content = one token."""
     bodies = []
     protocol_version = "HTTP/1.0"
+    # serve's crash of 2026-10-10: a decode request gets its role frame, then the stream ends
+    dead_decode = False
 
     def log_message(self, *a):
         pass
@@ -350,6 +373,8 @@ class MockServe(http.server.BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(d)}\n\n".encode())
             self.wfile.flush()
         frame({"role": "assistant"})
+        if MockServe.dead_decode and b["max_tokens"] != 1:
+            return
         for i in range(n - 1):
             time.sleep(MOCK_TOKEN_S)
             frame({"content": f" w{i}"})
@@ -410,6 +435,22 @@ def self_test():
           "decode: thinking closed, serve's max_tokens cap")
     check(all("Write a detailed, well-structured explanation of" in b["messages"][0]["content"] for b in dec), "his question text")
     check(len(r["prompt_sha256"]) == 8 and len(set(r["prompt_sha256"][1:3])) == 2, "8 decode prompts, distinct within a round")
+    # a serve that dies after the prefill: every decode cell is an error row, no ZeroDivisionError
+    srv = http.server.HTTPServer(("127.0.0.1", 0), MockServe)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    MockServe.dead_decode = True
+    out2 = os.path.join(tempfile.mkdtemp(), "sweep-dead.json")
+    try:
+        main(["--url", f"http://127.0.0.1:{srv.server_address[1]}", "--config", "self-test dead decode", "--out", out2,
+              "--prefill", "256", "--conc", "1", "--reps", "1", "--dec-reps", "1", "--no-power"], words=words)
+    finally:
+        MockServe.dead_decode = False
+        srv.shutdown()
+    r2 = json.load(open(out2, encoding="utf-8"))
+    check(r2["status"] == "DONE WITH ERRORS" and len(r2["errors"]) == 2, "dead decode: status and two errors")
+    check(all("zero decode tokens" in r2["decode"][c]["error"] and "aggregate" not in r2["decode"][c] for c in ("C1", "C1@32k")),
+          "dead decode: C1 and C1@32k are error rows without a rate")
+    check(r2["prefill"]["256"]["n"] == 1, "dead decode: the prefill cell stands")
     real = DEFAULT_TOKENIZER if os.path.exists(DEFAULT_TOKENIZER) else None
     if real:
         w = vocab_words(real)
@@ -422,4 +463,4 @@ def self_test():
 if __name__ == "__main__":
     if "--self-test" in sys.argv[1:]:
         sys.exit(self_test())
-    main()
+    sys.exit(1 if main().get("errors") else 0)

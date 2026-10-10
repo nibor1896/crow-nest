@@ -1046,6 +1046,9 @@ impl Glm5Pass {
                             if tb == 0 {
                                 return Err(format!("layer {}: {}: no record table for this layer", lw.layer, crate::glm5_flags::ENV_CONTROLLER));
                             }
+                            // at most CTL_AHEAD layers queued behind a device wait: a whole row
+                            // queued at once filled the launch queue and starved the controller
+                            c.pace().map_err(|e| format!("layer {}: {e}", lw.layer))?;
                             // the CPU lane: the MoE input row to the host before the request
                             let lane = c.lane;
                             if let Some(dl) = lane.as_ref() {

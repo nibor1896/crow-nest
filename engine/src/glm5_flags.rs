@@ -1047,6 +1047,11 @@ const CTL_ENTRY: usize = 256;
 pub const CTL_WAIT_NS: u64 = 1_000_000_000;
 /// the host gives up on a request the device did not publish after this long
 const CTL_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// requests the host may queue past the last one the controller answered ([`Ctl::pace`]): a
+/// decode layer is a few dozen launches and milliseconds of device time against microseconds of
+/// host enqueue, so 4 layers keep the device fed and the stream far below the launch queue that
+/// filled inside the first controlled row of GLM-5.3-Flash (2026-10-10)
+pub const CTL_AHEAD: u64 = 4;
 
 /// `CROW_GLM_CONTROLLER`: the device side of the reference's nv2 controller
 /// (`kernels/nv2/nv2_shared.h` `Req` ring, `nv2_dev.cu` `nv_pub_k` / the waits of `nv_step`).
@@ -1078,6 +1083,8 @@ pub struct Ctl {
     pub active: bool,
     /// requests handed to controller jobs so far (the host's ring position)
     host_seq: u64,
+    /// requests queued on the compute stream so far ([`Ctl::publish`]; the device counter follows)
+    queued: u64,
     /// raised by the host when a row it enqueued is abandoned: a job stops waiting for its requests
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// the guesses scored by the controller jobs
@@ -1200,10 +1207,48 @@ impl Ctl {
             lane: None,
             active: false,
             host_seq: 0,
+            queued: 0,
             cancel: Default::default(),
             score: Default::default(),
             poisoned: false,
         }
+    }
+
+    /// Hold the host before it queues request `queued + 1` until the controller has answered
+    /// request `queued + 1 - CTL_AHEAD` (the reply word, read on the host: no driver call). So
+    /// the compute stream never holds more than [`CTL_AHEAD`] layers of launches behind a device
+    /// wait. Unpaced, a row of the real model (42 MoE layers) went into the stream whole behind
+    /// the first wait, `cuLaunchKernel` blocked on the full launch queue, the controller thread's
+    /// next driver call (a stager copy) waited behind that blocked launch, and the device's wait
+    /// gave up after [`CTL_WAIT_NS`]: the experts read a stale table (CUDA_ERROR_ILLEGAL_ADDRESS,
+    /// 2026-10-10). After a failed job the reply word is `u64::MAX`, so this passes. `Err` by
+    /// name when a device wait timed out, the row was cancelled or [`CTL_HOST_TIMEOUT`] passed.
+    pub fn pace(&self) -> Result<(), String> {
+        let want = (self.queued + 1).saturating_sub(CTL_AHEAD);
+        if want == 0 {
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        let mut spins = 0u32;
+        // SAFETY: the live mapped reply word
+        while unsafe { std::ptr::read_volatile(self.reply.host as *const u64) } < want {
+            spins = spins.wrapping_add(1);
+            if spins % 64 == 0 {
+                let q = self.timed_out();
+                if q != 0 {
+                    return Err(format!("{ENV_CONTROLLER}: the device's wait for request {q} gave up after {} ms", CTL_WAIT_NS / 1_000_000));
+                }
+                if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(format!("{ENV_CONTROLLER}: the row was abandoned before request {want} was answered"));
+                }
+                if t0.elapsed() > CTL_HOST_TIMEOUT {
+                    return Err(format!("{ENV_CONTROLLER}: request {want} was not answered in {} s", CTL_HOST_TIMEOUT.as_secs()));
+                }
+                std::thread::yield_now();
+            }
+            std::hint::spin_loop();
+        }
+        Ok(())
     }
 
     /// Queue the request of decoder layer `layer`: its `n` ids at `ids` and, with the guess on,
@@ -1215,6 +1260,7 @@ impl Ctl {
         assert_eq!(n, self.k, "glm5 controller: a request of {n} ids on a ring of {}", self.k);
         let (pids, dtag) = guess.unwrap_or((0, 0));
         launch_v(self.publish, 1, 1, 1, 32, &[ids, n as u64, self.ring.dev, self.ctr, layer as u64, pids, self.k as u64, dtag]);
+        self.queued += 1;
         // WDDM: hand the request to the GPU now, the controller thread waits for it
         cuda::stream_query(cuda::cur_stream());
     }
@@ -2498,6 +2544,73 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
             assert!((0.9..1.9).contains(&dt), "the wait gave up after {dt:.3} s");
             eprintln!("glm5 controller: an unserved request released the stream after {dt:.3} s");
             cuda::free_dev(&mut ids);
+            c.free();
+            k.free();
+        }
+    }
+
+    /// A row as deep as the real model's keeps its controller served: 64 requests, each followed
+    /// by 40 launches on the compute stream (a MoE layer's worth), the host enqueuing the row
+    /// whole while a controller thread answers every request with a copy and the reply write on a
+    /// stream of its own (the stager's calls). Without [`Ctl::pace`] the host ran thousands of
+    /// launches ahead of the device's wait, `cuLaunchKernel` blocked on the full launch queue, the
+    /// controller's next driver call waited behind it, and the device's wait gave up after
+    /// `CTL_WAIT_NS` (the GLM-5.3-Flash ILLEGAL_ADDRESS of 2026-10-10: the experts then read a
+    /// stale table). With it no wait times out and every request is answered once.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_flags_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_flags_gpu_a_deep_row_keeps_the_controller_served() {
+        const REQUESTS: usize = 64;
+        const FILL: usize = 40;
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut k = Kernels::new(&g);
+            let mut c = Ctl::new(&k, g.topk, g.layers);
+            let mut w: Worker<usize> = Worker::new();
+            let mut ids = cuda::to_i32_dev(&[5, 4, 3, 2, 1, 0, 6, 7]);
+            // the filler: glm5_lane_merge with an all-zero mask returns at once
+            let mut mask = cuda::to_i32_dev(&vec![0; g.topk]);
+            let mut ye = cuda::alloc_named("glm5 controller test ye", g.topk * 4);
+            let mut dst = cuda::alloc_named("glm5 controller test copy", 4096);
+            let mut src = Pinned::alloc(4096);
+            let s = cuda::stream_create_non_blocking();
+            let (sp, srcp, dstp) = (s as u64, src.host as u64, dst);
+            let mut rd = c.reader(REQUESTS);
+            w.send(Box::new(move || {
+                let mut served = 0;
+                for _ in 0..REQUESTS {
+                    let rq = rd.next()?;
+                    let st = sp as sys::CUstream;
+                    cuda::ck(sys::cuMemcpyHtoDAsync_v2(dstp, srcp as *const std::ffi::c_void, 4096, st));
+                    cuda::ck(sys::cuStreamWriteValue64_v2(st, rd.reply_dev, rq.seq, 0));
+                    cuda::stream_query(st);
+                    served += 1;
+                }
+                Ok(served)
+            }));
+            let t0 = std::time::Instant::now();
+            for layer in 0..REQUESTS {
+                c.pace().unwrap();
+                c.publish(layer, ids, g.topk, None);
+                c.wait_reply();
+                for _ in 0..FILL {
+                    launch_v(k.lane_merge, 1, g.topk as u32, 1, 256, &[ye, 0, mask, 1]);
+                }
+            }
+            cuda::sync();
+            let served = w.wait().unwrap();
+            let dt = t0.elapsed().as_secs_f64();
+            eprintln!("glm5 controller: {REQUESTS} requests x {FILL} launches in {dt:.3} s, first timed-out request {}", c.timed_out());
+            assert_eq!(c.timed_out(), 0, "a device wait gave up: the controller was starved by the host's launches");
+            assert_eq!(served, REQUESTS);
+            w.free();
+            cuda::stream_sync(s);
+            cuda::stream_destroy(s);
+            src.free();
+            for d in [&mut ids, &mut mask, &mut ye, &mut dst] {
+                cuda::free_dev(d);
+            }
             c.free();
             k.free();
         }
