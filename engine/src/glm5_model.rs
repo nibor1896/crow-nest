@@ -693,21 +693,28 @@ impl Ints {
 
 /// `y [t][rows] = W x [t][cols]` on the glm5 NVFP4 GEMV (`glm5_gemv_fp4`, #191: bit-identical
 /// to the record `gemv_fp4_b`); with `ldy` the output row stride is `ldy` (the record's
-/// `gemv_fp4_bs`), else `rows`
+/// `gemv_fp4_bs`), else `rows`. #186: with `CROW_GLM_DENSE_GEMM=1` a call of at least
+/// `TC_MIN_ROWS` rows runs on the FP16 tensor-core GEMM instead (`glm5_gemm_fp4_tc`).
 unsafe fn fp4_gemv(kn: &Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, y: Dev, t: usize, ldy: Option<usize>) {
-    let (blocks, threads) = kernels::glm5_moe::fp4_launch(m.rows, m.cols);
     let ld = ldy.unwrap_or(m.rows);
+    if kn.moe.dense_tc(t) {
+        return kn.moe.gemm_tc([m.w; 3], [m.gs; 3], 1, x, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows), m.rows, t);
+    }
+    let (blocks, threads) = kernels::glm5_moe::fp4_launch(m.rows, m.cols);
     launch_v(kn.moe.fp4, blocks, t as u32, 1, threads, &[m.w, x, m.gs, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows)]);
 }
 
 /// [`fp4_gemv`] of three `[rows, cols]` matrices on one `x` in ONE launch (`glm5_gemv_fp4_x3`):
 /// matrix `m` writes the columns `m * rows ..` of `y` (row stride `ldy`), each output bit-identical
-/// to its own `fp4_gemv`. The KDA q|k|v projections of a call.
+/// to its own `fp4_gemv` (#186: on the tensor-core GEMM as `fp4_gemv`). The KDA q|k|v projections of a call.
 unsafe fn fp4_gemv_x3(kn: &Glm5Kernels, ints: &Ints, ms: [&GpuNvfp4; 3], x: Dev, y: Dev, t: usize, ldy: usize) {
     let (rows, cols) = (ms[0].rows, ms[0].cols);
     assert!(ms.iter().all(|m| m.rows == rows && m.cols == cols), "glm5_model: q|k|v of different shapes");
-    let (blocks, threads) = kernels::glm5_moe::fp4_launch(rows, cols);
     let [a, b, c] = ms;
+    if kn.moe.dense_tc(t) {
+        return kn.moe.gemm_tc([a.w, b.w, c.w], [a.gs, b.gs, c.gs], 3, x, y, ints.p(cols), ints.p(ldy), ints.p(rows), rows, t);
+    }
+    let (blocks, threads) = kernels::glm5_moe::fp4_launch(rows, cols);
     launch_v(kn.moe.fp4_x3, 3 * blocks, t as u32, 1, threads, &[a.w, b.w, c.w, a.gs, b.gs, c.gs, x, y, ints.p(cols), ints.p(ldy), ints.p(rows)]);
 }
 
@@ -793,7 +800,9 @@ impl Glm5Pass {
     /// A CUDA context is current.
     pub unsafe fn new(g: &Glm5Geo, moe: MoeGeo, max_t: usize, cap: usize) -> Glm5Pass {
         assert!(max_t >= 1 && cap >= max_t, "glm5_model: calls of {max_t} rows over {cap}");
-        let kn = Glm5Kernels::new(g);
+        let mut kn = Glm5Kernels::new(g);
+        // #186: the tensor-core path of prompt calls (`CROW_GLM_DENSE_GEMM`)
+        kn.moe.set_dense_tc(kernels::glm5_moe::dense_tc_for(max_t));
         let kd = KdaDims::of(g);
         let md = MlaDims::of(g);
         let h = g.hidden;
@@ -862,6 +871,7 @@ impl Glm5Pass {
         self.mla_sc = MlaScratch::new(&md, max_t, self.cap);
         self.collapsed = cuda::alloc_named("glm5 collapsed", max_t * h * 4);
         self.sub = cuda::alloc_named("glm5 sublayer out", max_t * h * 4);
+        self.kn.moe.set_dense_tc(kernels::glm5_moe::dense_tc_for(max_t));
         self.max_t = max_t;
     }
 
@@ -1279,12 +1289,12 @@ impl Glm5Pass {
 /// #186: the dense FFN of rows `0 .. t` of `x` into `y` in descending power-of-two row pieces,
 /// each on the `GpuFfnPlan` of its size (made here on first use; the sizes the plan books,
 /// `manager::glm5_prompt_call_sizes`). Every launch is per row, so each row gets the bits of one
-/// `t`-row plan.
+/// `t`-row plan (#186: the tensor-core kernel is picked by `t`, not by the piece).
 ///
 /// # Safety
 /// A CUDA context is current; `x` and `y` hold `t` rows of `hidden`.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn dense_rows(kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, plans: &mut Vec<GpuFfnPlan>, hidden: usize, inter: usize, limit: f32, w: &GpuFfnWeights, x: Dev, y: Dev, t: usize) {
+pub unsafe fn dense_rows(_kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, plans: &mut Vec<GpuFfnPlan>, hidden: usize, inter: usize, limit: f32, w: &GpuFfnWeights, x: Dev, y: Dev, t: usize) {
     let mut r = 0;
     while r < t {
         let s = 1usize << (usize::BITS - 1 - (t - r).leading_zeros());
@@ -1292,7 +1302,7 @@ pub unsafe fn dense_rows(kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels,
             plans.push(GpuFfnPlan::new(hidden, inter, s, limit));
         }
         let p = plans.iter().find(|p| p.tokens == s).unwrap();
-        p.run(kn, gk, w, x + (r * hidden * 4) as u64, y + (r * hidden * 4) as u64);
+        p.run_rows_of(gk, w, x + (r * hidden * 4) as u64, y + (r * hidden * 4) as u64, s, t);
         r += s;
     }
 }
@@ -2398,6 +2408,425 @@ mod tests_dense_gpu {
                 cuda::free_dev(&mut d);
             }
             assert_eq!(n, 1, "the KDA q|k|v projections of a call take {n} kernel launches");
+        }
+    }
+
+    // ------------------------------------------------ #186: the tensor-core GEMM of prompt calls
+
+    /// (cosine, max |a - b| / max |b|) of `got` against `want` (f64)
+    fn accuracy(got: &[f32], want: &[f32]) -> (f64, f64) {
+        let (mut ab, mut aa, mut bb, mut d, mut m) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        for (&a, &b) in got.iter().zip(want) {
+            let (a, b) = (a as f64, b as f64);
+            ab += a * b;
+            aa += a * a;
+            bb += b * b;
+            d = d.max((a - b).abs());
+            m = m.max(b.abs());
+        }
+        (ab / (aa.sqrt() * bb.sqrt()), d / m)
+    }
+
+    /// `m` on `t` rows of `x`, the GEMV and then the tensor-core GEMM (the pass's dispatch,
+    /// `kn.moe` switched), into NaN-filled outputs: (gemv, tc) `[t][ldy]`
+    unsafe fn both(kn: &mut Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, t: usize, ldy: Option<usize>) -> (Vec<f32>, Vec<f32>) {
+        let ld = ldy.unwrap_or(m.rows);
+        let nan = vec![f32::NAN; t * ld];
+        let (ya, yb) = (cuda::to_f32_dev(&nan), cuda::to_f32_dev(&nan));
+        kn.moe.set_dense_tc(false);
+        fp4_gemv(kn, ints, m, x, ya, t, ldy);
+        kn.moe.set_dense_tc(true);
+        assert!(kn.moe.dense_tc(t));
+        fp4_gemv(kn, ints, m, x, yb, t, ldy);
+        cuda::sync();
+        kn.moe.set_dense_tc(false);
+        let out = (cuda::dtoh(ya, t * ld), cuda::dtoh(yb, t * ld));
+        for mut d in [ya, yb] {
+            cuda::free_dev(&mut d);
+        }
+        out
+    }
+
+    /// `m` on `t` rows of `x` on one tensor-core kernel (`small`: `glm5_gemm_fp4_tcs`, else
+    /// `glm5_gemm_fp4_tc`) whatever the row count, into a NaN-filled `[t][ldy]`
+    unsafe fn tc_kernel(kn: &mut Glm5Kernels, ints: &Ints, m: &GpuNvfp4, x: Dev, t: usize, ldy: Option<usize>, small: bool) -> Vec<f32> {
+        let ld = ldy.unwrap_or(m.rows);
+        let mut y = cuda::to_f32_dev(&vec![f32::NAN; t * ld]);
+        kn.moe.set_dense_tc(true);
+        kn.moe.gemm_tc_on(small, [m.w; 3], [m.gs; 3], 1, x, y, ints.p(m.cols), ints.p(ld), ints.p(m.rows), m.rows, t);
+        cuda::sync();
+        kn.moe.set_dense_tc(false);
+        let out = cuda::dtoh(y, t * ld);
+        cuda::free_dev(&mut y);
+        out
+    }
+
+    /// the outputs of `[t][ld]` a `[rows]` projection writes: finite, the columns past `rows` untouched
+    fn written(y: &[f32], t: usize, ld: usize, rows: usize, what: &str) -> Vec<f32> {
+        let mut v = Vec::with_capacity(t * rows);
+        for r in 0..t {
+            let row = &y[r * ld..(r + 1) * ld];
+            assert!(row[..rows].iter().all(|x| x.is_finite()), "{what}: row {r} has an unwritten or non-finite output");
+            assert!(row[rows..].iter().all(|x| x.is_nan()), "{what}: row {r} wrote past its {rows} columns");
+            v.extend_from_slice(&row[..rows]);
+        }
+        v
+    }
+
+    /// G3's per-layer bar, the acceptance of the tensor-core path (robin, 2026-10-10)
+    const TC_COSINE: f64 = 0.9999;
+
+    /// #186 `CROW_GLM_DENSE_GEMM=1` on synthetic weights: every GLM-5.3-Flash dense shape plus a
+    /// shape with a tail in both tile directions, at row counts on and off the 128-row tile, the
+    /// tensor-core GEMM against the GEMV: every output written once (NaN-filled outputs, the
+    /// stride columns past `rows` untouched), cosine >= 0.9999, the dispatch and both kernels
+    /// (32 x 32 split-K tiles, 128 x 128 tiles) at every row count; and the q|k|v launch of three.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_dense_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_tc_matches_the_gemv_on_synthetic_shapes() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut kn = Glm5Kernels::new(&G);
+            let mut sh = shapes();
+            sh.push(Shape { what: "tail 200 x 192", rows: 200, cols: 192, ldy: Some(203), per_row: 0 });
+            let mut ints_v: Vec<usize> = sh.iter().flat_map(|s| [s.rows, s.cols, s.ldy.unwrap_or(s.rows)]).collect();
+            ints_v.sort_unstable();
+            ints_v.dedup();
+            let ints = Ints::new(&ints_v);
+            let mut rng = Rng(0x1860_7c01);
+            for s in &sh {
+                let wb = nvfp4(s.rows, s.cols, &mut rng, true);
+                let m = GpuNvfp4 { w: cuda::upload_dev(&wb), gs: cuda::to_f32_dev(&[0.37]), rows: s.rows, cols: s.cols };
+                for t in [2, 5, kernels::glm5_moe::TC_MIN_ROWS, 33, 128, 129, 300] {
+                    let mut x = cuda::to_f32_dev(&xs(t * s.cols, &mut rng));
+                    let ld = s.ldy.unwrap_or(s.rows);
+                    let what = format!("{} [{} x {}] t {t}", s.what, s.rows, s.cols);
+                    let a = if t >= kernels::glm5_moe::TC_MIN_ROWS {
+                        let (a, b) = both(&mut kn, &ints, &m, x, t, s.ldy);
+                        let (a, b) = (written(&a, t, ld, s.rows, &what), written(&b, t, ld, s.rows, &what));
+                        let (cos, rel) = accuracy(&b, &a);
+                        eprintln!("tc {what:<34} dispatch: cosine {cos:.9}, max |d| / max |ref| {rel:.2e}");
+                        assert!(cos >= TC_COSINE, "{what} dispatch: cosine {cos} below {TC_COSINE}");
+                        a
+                    } else {
+                        kn.moe.set_dense_tc(false);
+                        let mut ya = cuda::to_f32_dev(&vec![f32::NAN; t * ld]);
+                        fp4_gemv(&kn, &ints, &m, x, ya, t, s.ldy);
+                        cuda::sync();
+                        let a = written(&cuda::dtoh(ya, t * ld), t, ld, s.rows, &what);
+                        cuda::free_dev(&mut ya);
+                        a
+                    };
+                    for small in [true, false] {
+                        let b = written(&tc_kernel(&mut kn, &ints, &m, x, t, s.ldy, small), t, ld, s.rows, &what);
+                        let (cos, rel) = accuracy(&b, &a);
+                        let k = if small { "32x32" } else { "128x128" };
+                        eprintln!("tc {what:<34} {k:>8}: cosine {cos:.9}, max |d| / max |ref| {rel:.2e}");
+                        assert!(cos >= TC_COSINE, "{what} {k}: cosine {cos} below {TC_COSINE}");
+                    }
+                    cuda::free_dev(&mut x);
+                }
+                for mut d in [m.w, m.gs] {
+                    cuda::free_dev(&mut d);
+                }
+            }
+            // q|k|v in one launch: the three single launches' outputs, bit for bit
+            let (kd, h) = (KdaDims::of(&G), G.hidden);
+            let (w, cc) = (kd.width(), kd.conv_ch());
+            let t = 300;
+            let wb: Vec<Vec<u8>> = (0..3).map(|_| nvfp4(w, h, &mut rng, true)).collect();
+            let m = qkv([&wb[0], &wb[1], &wb[2]], [0.37, 0.21, 0.53]);
+            let x = cuda::to_f32_dev(&xs(t * h, &mut rng));
+            let (ya, yb) = (cuda::to_f32_dev(&vec![f32::NAN; t * cc]), cuda::to_f32_dev(&vec![f32::NAN; t * cc]));
+            kn.moe.set_dense_tc(true);
+            for (i, mi) in m.iter().enumerate() {
+                fp4_gemv(&kn, &ints, mi, x, ya + (i * w * 4) as u64, t, Some(cc));
+            }
+            fp4_gemv_x3(&kn, &ints, [&m[0], &m[1], &m[2]], x, yb, t, cc);
+            cuda::sync();
+            kn.moe.set_dense_tc(false);
+            let (a, b) = (bits(&cuda::dtoh(ya, t * cc)), bits(&cuda::dtoh(yb, t * cc)));
+            assert_eq!(a.iter().zip(&b).filter(|(p, q)| p != q).count(), 0, "tc q|k|v in one launch differs from three");
+            for mut d in m.iter().flat_map(|mi| [mi.w, mi.gs]).chain([x, ya, yb]) {
+                cuda::free_dev(&mut d);
+            }
+        }
+    }
+
+    /// #186 `CROW_GLM_DENSE_GEMM=1` on the real 3-bit container's weights: every dense NVFP4
+    /// projection of one layer of each kind (KDA, MLA, dense FFN, MoE shared expert) at 300 rows
+    /// of activations of RMS 1 (the normed inputs), the tensor-core GEMM against the GEMV:
+    /// cosine >= 0.9999 per projection.
+    #[test]
+    #[ignore = "needs the GPU and the real 3-bit container (CROW_CNQ; reads one layer's dense tensors per kind): cargo test --release --lib glm5_dense_gpu_tc_accuracy -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_tc_accuracy_on_real_weights() {
+        let path = std::env::var("CROW_CNQ").unwrap_or_else(|_| crate::geo::from_engine_dir(GLM5_MUL1K3_CNQ));
+        let mut cnq = Cnq::open(&path);
+        let kda = (0..G.layers).find(|&l| attn_kind(&G, l) == AttnKind::Kda).unwrap();
+        let mla = (0..G.layers).find(|&l| attn_kind(&G, l) == AttnKind::Mla).unwrap();
+        let moe = G.dense_prefix;
+        let mut picks: Vec<Planned> = Vec::new();
+        for (l, want) in [(kda, "self_attn"), (mla, "self_attn"), (0, "mlp"), (moe, "shared_expert")] {
+            picks.extend(layer_tensors(&G, l).into_iter().filter(|p| p.take == Take::Fp4 && p.name.contains(want)));
+        }
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut kn = Glm5Kernels::new(&G);
+            let mut v: Vec<usize> = picks.iter().flat_map(|p| [p.shape[0] as usize, p.shape[1..].iter().product::<u64>() as usize]).collect();
+            v.sort_unstable();
+            v.dedup();
+            let ints = Ints::new(&v);
+            let mut rng = Rng(0x1860_7c02);
+            let t = 300;
+            let mut worst = 1f64;
+            for p in &picks {
+                let ti = cnq.find(&p.name, "text").clone();
+                let mut raw = cnq.read_bytes(&ti);
+                crate::residency::sanitize_sf_slab(&mut raw);
+                let (rows, cols) = (p.shape[0] as usize, p.shape[1..].iter().product::<u64>() as usize);
+                let m = GpuNvfp4 { w: cuda::upload_dev(&raw), gs: cuda::to_f32_dev(&[ti.global_scale]), rows, cols };
+                // uniform in +-sqrt(3): RMS 1 per row
+                let xh: Vec<f32> = (0..t * cols).map(|_| rng.f(3f32.sqrt())).collect();
+                let x = cuda::to_f32_dev(&xh);
+                let (a, b) = both(&mut kn, &ints, &m, x, t, None);
+                let (a, b) = (written(&a, t, rows, rows, &p.name), written(&b, t, rows, rows, &p.name));
+                let (cos, rel) = accuracy(&b, &a);
+                // the 32 x 32 split-K kernel on the same rows (the dispatch takes it up to TC_SMALL_MAX_ROWS)
+                let bs = written(&tc_kernel(&mut kn, &ints, &m, x, t, None, true), t, rows, rows, &p.name);
+                let (cs, rs) = accuracy(&bs, &a);
+                eprintln!("tc real {:<62} [{rows:>5} x {cols:>5}]: cosine {cos:.9} / {cs:.9} (32x32), max |d| / max |ref| {rel:.2e} / {rs:.2e}", p.name);
+                worst = worst.min(cos).min(cs);
+                assert!(cos >= TC_COSINE && cs >= TC_COSINE, "{}: cosine {cos} / {cs} below {TC_COSINE}", p.name);
+                for mut d in [m.w, m.gs, x] {
+                    cuda::free_dev(&mut d);
+                }
+            }
+            eprintln!("tc real: {} projections, worst cosine {worst:.9}", picks.len());
+            assert!(picks.len() >= 10, "{} projections picked", picks.len());
+        }
+    }
+
+    /// KL(p || q) in nats of two logit rows (f64 softmax)
+    fn kl(p: &[f32], q: &[f32]) -> f64 {
+        let ls = |v: &[f32]| -> Vec<f64> {
+            let m = v.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x as f64));
+            let z: f64 = v.iter().map(|&x| (x as f64 - m).exp()).sum();
+            v.iter().map(|&x| x as f64 - m - z.ln()).collect()
+        };
+        let (a, b) = (ls(p), ls(q));
+        a.iter().zip(&b).map(|(x, y)| x.exp() * (x - y)).sum()
+    }
+
+    fn argmax(v: &[f32]) -> usize {
+        v.iter().enumerate().fold(0, |b, (i, &x)| if x > v[b] { i } else { b })
+    }
+
+    /// #186 `CROW_GLM_DENSE_GEMM=1` on a synthetic prompt call (the 8-layer model of the stager
+    /// tests: 3 dense layers, 5 MoE): (1) layer by layer, one 256-row prompt call per layer on two
+    /// passes (GEMV / tensor cores) from the same input: the residual's cosine after every layer
+    /// >= 0.9999, and the head's logits of every prompt row: KL and top-1; (2)
+    /// `Glm5Run::generate` with `CROW_CHUNK=256` (prompt calls 256 + 44 through the tiers, the
+    /// switch read at load) off and on: the generated ids and the KL of their logits. Reported.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_dense_gpu_tc_synthetic -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_tc_synthetic_prompt_call_layers_and_logits() {
+        use crate::glm5_flags::tests::{geo8, synth_model};
+        use crate::glm5_tiers::{ExpertTiers, Glm5Run, TierSizes};
+        let g = geo8();
+        let s = synth_model(&g, 9_474_048);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let rows = 256usize;
+        let prompt: Vec<i64> = (0..rows as i64).map(|i| (i * 131 + 7) % g.vocab as i64).collect();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            // (1) the chain
+            let row = g.hc_streams * g.hidden;
+            let mut pr = Glm5Pass::new(&g, moe, rows, rows);
+            let mut pt = Glm5Pass::new(&g, moe, rows, rows);
+            pr.kn.moe.set_dense_tc(false);
+            pt.kn.moe.set_dense_tc(true);
+            let x0 = trunk_input(&embed_rows(&mut cnq, &g, &prompt), g.hidden, g.hc_streams);
+            let (mut xr, mut xt) = (cuda::alloc_named("tc chain ref", rows * row * 4), cuda::alloc_named("tc chain tc", rows * row * 4));
+            cuda::to_f32_into(xr, &x0);
+            cuda::to_f32_into(xt, &x0);
+            let mut rep = LoadReport::default();
+            let mut cos_l = Vec::new();
+            for l in 0..g.layers {
+                let mut lw = load_layer(&mut cnq, &g, &moe, l, &mut rep);
+                pr.begin_layer();
+                pt.begin_layer();
+                pr.call(&lw, xr, 0, rows, false);
+                pt.call(&lw, xt, 0, rows, false);
+                cuda::sync();
+                let (cos, rel) = accuracy(&cuda::dtoh(xt, rows * row), &cuda::dtoh(xr, rows * row));
+                eprintln!("tc chain layer {l} ({}): residual cosine {cos:.9}, max |d| / max |ref| {rel:.2e}", kind_label(&g, l));
+                cos_l.push(cos);
+                lw.free();
+            }
+            let mut head = Head::new(head_geo(&g));
+            let mut hw = load_head(&mut cnq, &g, &mut rep);
+            let (mut normed, mut logits, mut ids) = (cuda::alloc_zeroed(rows * g.hidden * 4), cuda::alloc_zeroed(rows * g.vocab * 4), cuda::alloc_zeroed(rows * 4));
+            let mut lg = Vec::new();
+            for x in [xr, xt] {
+                run_head(&pr.kn, &head, &hw, x, normed, logits, ids, rows);
+                cuda::sync();
+                lg.push(cuda::dtoh(logits, rows * g.vocab));
+            }
+            let v = g.vocab;
+            let kls: Vec<f64> = (0..rows).map(|r| kl(&lg[0][r * v..(r + 1) * v], &lg[1][r * v..(r + 1) * v])).collect();
+            let top1 = (0..rows).filter(|&r| argmax(&lg[0][r * v..(r + 1) * v]) == argmax(&lg[1][r * v..(r + 1) * v])).count();
+            let finite = lg[0].iter().filter(|x| x.is_finite()).count();
+            eprintln!(
+                "tc chain head over {rows} prompt rows: KL mean {:.3e} max {:.3e}, top-1 agree {top1} / {rows}",
+                kls.iter().sum::<f64>() / rows as f64,
+                kls.iter().cloned().fold(0f64, f64::max)
+            );
+            for d in [&mut xr, &mut xt, &mut normed, &mut logits, &mut ids, &mut hw.norm, &mut hw.lm] {
+                cuda::free_dev(d);
+            }
+            head.free();
+            pr.free();
+            pt.free();
+            assert_eq!(finite, rows * v, "the synthetic model must stay finite for the comparison to mean something");
+            // (2) generate with prompt calls through the tiers, the switch read at load
+            let prompt2: Vec<i64> = (0..300i64).map(|i| (i * 77 + 3) % g.vocab as i64).collect();
+            let n = 6;
+            let keys = ["CROW_CHUNK", "CROW_GLM_DENSE_GEMM"];
+            let old: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+            let mut gens = Vec::new();
+            for on in [false, true] {
+                std::env::set_var("CROW_CHUNK", "256");
+                if on {
+                    std::env::set_var("CROW_GLM_DENSE_GEMM", "1")
+                } else {
+                    std::env::remove_var("CROW_GLM_DENSE_GEMM")
+                }
+                let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt2.len() + n + 1, &mut |_| {});
+                for (k, o) in keys.iter().zip(&old) {
+                    match o {
+                        Some(o) => std::env::set_var(k, o),
+                        None => std::env::remove_var(k),
+                    }
+                }
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+                gens.push(run.generate(&mut cnq, &mut tiers, &prompt2, n, true, &mut |_| {}).unwrap());
+                tiers.free();
+                run.free();
+            }
+            let gkl: Vec<f64> = gens[0].logits.iter().zip(&gens[1].logits).map(|(p, q)| kl(p, q)).collect();
+            eprintln!("tc generate (chunk 256, prompt 300): ids off {:?} on {:?}, KL per generated row {:?}", gens[0].ids, gens[1].ids, gkl.iter().map(|k| format!("{k:.3e}")).collect::<Vec<_>>());
+            let worst = cos_l.iter().cloned().fold(1f64, f64::min);
+            assert!(worst >= TC_COSINE, "per-layer residual cosine {worst} below {TC_COSINE}: {cos_l:?}");
+        }
+    }
+
+    /// #186 micro-bench: the dense NVFP4 projections of one 8192-row prompt chunk per layer kind
+    /// (KDA q|k|v + o, MLA q_a + q_b + kv_a + o, dense FFN and MoE shared expert gate + up + down;
+    /// the SwiGLU between them not timed), the GEMV path vs the tensor-core GEMM, in ms and rows/s;
+    /// then the row count from which the tensor cores win (every dense launch of one call,
+    /// VRAM-cold weights), the base of `TC_MIN_ROWS`. Prints only.
+    #[test]
+    #[ignore = "needs the GPU (about 3 GB VRAM, a few minutes): cargo test --release --lib glm5_dense_gpu_tc_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_dense_gpu_tc_bench_8192_row_chunk() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut kn = Glm5Kernels::new(&G);
+            let sh = shapes();
+            let ints = ints_for(&sh);
+            let mut rng = Rng(0x1860_be0c);
+            let kinds: [(&str, &[&str], usize); 4] = [
+                ("kda", &["kda q|k|v", "kda o"], G.kda_layers),
+                ("mla", &["mla q_a", "mla q_b", "mla kv_a", "mla o"], G.dsa_layers),
+                ("dense ffn", &["dense gate|up", "dense down"], G.dense_prefix),
+                ("moe shared", &["shared gate|up", "shared down"], G.moe_layers()),
+            ];
+            // launches of a layer per shape: q|k|v is one x3 launch, gate|up two
+            let launches = |what: &str| if what.ends_with("gate|up") { 2.0 } else { 1.0 };
+            let t = 8192;
+            let mut tot = [0f64; 2];
+            for (kind, whats, per) in kinds {
+                let mut ms = [0f64; 2];
+                for what in whats {
+                    let s = sh.iter().find(|s| s.what == *what).unwrap();
+                    let n3 = if *what == "kda q|k|v" { 3 } else { 1 };
+                    let ws: Vec<GpuNvfp4> = (0..n3).map(|_| GpuNvfp4 { w: cuda::upload_dev(&nvfp4(s.rows, s.cols, &mut rng, false)), gs: cuda::to_f32_dev(&[0.37]), rows: s.rows, cols: s.cols }).collect();
+                    let ld = s.ldy.unwrap_or(s.rows);
+                    let x = cuda::to_f32_dev(&xs(t * s.cols, &mut rng));
+                    let y = cuda::alloc_zeroed(t * ld * 4);
+                    for (k, on) in [false, true].into_iter().enumerate() {
+                        kn.moe.set_dense_tc(on);
+                        let reps = if on { 5 } else { 1 };
+                        let us = time_us(reps, |_| {
+                            if n3 == 3 {
+                                fp4_gemv_x3(&kn, &ints, [&ws[0], &ws[1], &ws[2]], x, y, t, ld)
+                            } else {
+                                fp4_gemv(&kn, &ints, &ws[0], x, y, t, s.ldy)
+                            }
+                        });
+                        ms[k] += us * launches(what) / 1e3;
+                    }
+                    kn.moe.set_dense_tc(false);
+                    for mut d in ws.iter().flat_map(|m| [m.w, m.gs]).chain([x, y]) {
+                        cuda::free_dev(&mut d);
+                    }
+                }
+                eprintln!(
+                    "tc bench {kind:<10} 8192 rows: GEMV {:>9.1} ms ({:>7.0} rows/s) | tensor cores {:>7.2} ms ({:>9.0} rows/s), x{:.0}",
+                    ms[0],
+                    t as f64 / ms[0] * 1e3,
+                    ms[1],
+                    t as f64 / ms[1] * 1e3,
+                    ms[0] / ms[1]
+                );
+                tot[0] += ms[0] * per as f64;
+                tot[1] += ms[1] * per as f64;
+            }
+            eprintln!(
+                "tc bench all {} layers, one 8192-row chunk, dense projections: GEMV {:.2} s ({:.0} rows/s) | tensor cores {:.3} s ({:.0} rows/s)",
+                G.layers,
+                tot[0] / 1e3,
+                t as f64 / tot[0] * 1e3,
+                tot[1] / 1e3,
+                t as f64 / tot[1] * 1e3
+            );
+            // the crossover: every dense launch of one call of t rows, VRAM-cold weights; the GEMM
+            // launched directly (below TC_MIN_ROWS the dispatch would take the GEMV)
+            for t in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+                let mut us = [0f64; 3];
+                for s in &sh {
+                    let wb = nvfp4(s.rows, s.cols, &mut rng, false);
+                    let copies = (256usize << 20).div_ceil(wb.len()).max(2);
+                    let first = cuda::upload_dev(&wb);
+                    let mut wsv = vec![first];
+                    for _ in 1..copies {
+                        let d = cuda::alloc_zeroed(wb.len());
+                        cuda::memcpy_async(d, first, wb.len());
+                        wsv.push(d);
+                    }
+                    let gs = cuda::to_f32_dev(&[0.37]);
+                    let x = cuda::to_f32_dev(&xs(t * s.cols, &mut rng));
+                    let ld = s.ldy.unwrap_or(s.rows);
+                    let y = cuda::alloc_zeroed(t * ld * 4);
+                    kn.moe.set_dense_tc(false);
+                    us[0] += s.per_row as f64 * time_us(2 * copies, |i| fp4_gemv(&kn, &ints, &GpuNvfp4 { w: wsv[i % copies], gs, rows: s.rows, cols: s.cols }, x, y, t, s.ldy));
+                    kn.moe.set_dense_tc(true);
+                    for (k, small) in [(1, false), (2, true)] {
+                        us[k] += s.per_row as f64 * time_us(2 * copies, |i| kn.moe.gemm_tc_on(small, [wsv[i % copies]; 3], [gs; 3], 1, x, y, ints.p(s.cols), ints.p(ld), ints.p(s.rows), s.rows, t));
+                    }
+                    kn.moe.set_dense_tc(false);
+                    for mut d in wsv.into_iter().chain([gs, x, y]) {
+                        cuda::free_dev(&mut d);
+                    }
+                }
+                eprintln!(
+                    "tc bench crossover t {t:>3}: dense launches of one call GEMV {:>8.2} ms | tensor cores 128x128 {:>8.2} ms | 32x32 split-K {:>8.2} ms",
+                    us[0] / 1e3,
+                    us[1] / 1e3,
+                    us[2] / 1e3
+                );
+            }
         }
     }
 }
