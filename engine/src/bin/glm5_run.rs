@@ -575,12 +575,14 @@ fn machine_line(m: &Value) -> String {
 /// and the handed-back elastic chunks left out; the lent prefill staging set in), the elastic
 /// chunks live, the elastic part's counters (`ElasticStats`: T's skipped refills, the lent
 /// staging set), whether the staging set is lent now, and the VRAM the `CROW_GLM_ARENA_STAGE_GB`
-/// buffers hold now (0 between staged forwards with an elastic part); `null` on the per-layer path
+/// buffers hold now (0 between staged forwards with an elastic part), and #188
+/// `CROW_GLM_ARENA_PROMPT_COUNT`'s prompt calls counted and phases folded; `null` on the per-layer path
 fn arena_json(tiers: &ExpertTiers) -> Value {
     let (Some(a), Some((live, all, vpl)), Some(e)) = (tiers.arena(), tiers.elastic_live(), tiers.arena_elastic_stats()) else { return Value::Null };
     json!({
         "vram_slots_enabled": a.enabled_vram(), "elastic_live_chunks": live, "elastic_chunks": all, "slots_per_chunk": vpl,
         "stage_lent": tiers.stage_lent(), "stage_buffers_vram_bytes": tiers.arena_stage_vram_bytes(),
+        "prompt_count": { "on": a.prompt_counting(), "calls": a.stats.prompt_calls, "folds": a.stats.prompt_folds },
         "elastic": {
             "chunks": e.chunks, "enter": e.enter, "exit": e.exit, "realloc_fail": e.realloc_fail, "write_backs": e.write_backs,
             "lifted": e.lifted, "lift_bytes": e.lift_bytes, "refills": e.refills, "refilled": e.refilled, "refill_nvme": e.refill_nvme,
@@ -596,11 +598,12 @@ fn arena_line(a: &Value) -> String {
     let e = &a["elastic"];
     let gib = |v: &Value| v.as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
     format!(
-        "VRAM slots {} ({} of {} elastic chunks x {} live); elastic enter {} exit {} realloc_fail {} write_backs {} refilled {} (NVMe {}), free VRAM at the last hand-back {:.2} GiB, at the last regrowth try {:.2} GiB; regrowths {} brought back {} chunks (floor {:.2} GiB); lazy refills {} left {} slots empty; staging set lent {} ({} slots, lends {} take-backs {} write-backs {}); staging buffers {:.2} GiB now",
+        "VRAM slots {} ({} of {} elastic chunks x {} live); elastic enter {} exit {} realloc_fail {} write_backs {} refilled {} (NVMe {}), free VRAM at the last hand-back {:.2} GiB, at the last regrowth try {:.2} GiB; regrowths {} brought back {} chunks (floor {:.2} GiB); lazy refills {} left {} slots empty; staging set lent {} ({} slots, lends {} take-backs {} write-backs {}); staging buffers {:.2} GiB now; prompt count {} ({} calls, {} folds)",
         a["vram_slots_enabled"], a["elastic_live_chunks"], a["elastic_chunks"], a["slots_per_chunk"],
         e["enter"], e["exit"], e["realloc_fail"], e["write_backs"], e["refilled"], e["refill_nvme"],
         gib(&e["enter_free_bytes"]), gib(&e["exit_free_bytes"]), e["regrows"], e["regrown"], gib(&e["regrow_floor_bytes"]),
-        e["lazy_refills"], e["lazy_slots"], a["stage_lent"], e["lend_slots"], e["lends"], e["take_backs"], e["lend_write_backs"], gib(&a["stage_buffers_vram_bytes"])
+        e["lazy_refills"], e["lazy_slots"], a["stage_lent"], e["lend_slots"], e["lends"], e["take_backs"], e["lend_write_backs"], gib(&a["stage_buffers_vram_bytes"]),
+        a["prompt_count"]["on"], a["prompt_count"]["calls"], a["prompt_count"]["folds"]
     )
 }
 

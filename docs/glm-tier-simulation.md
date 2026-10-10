@@ -407,12 +407,22 @@ the oldest pinned entry dropped, warm start from `CROW_GLM_ARENA_WARM`) and thro
 | `tinylfu` | `lfu`, and an NVMe miss scoring no higher than that victim is read for the call only (bypass) |
 | `noadmit` | NVMe misses land in pinned (`CROW_GLM_ARENA_NOADMIT=1`) |
 | `freq` | the frequency tiers of `CROW_GLM_ARENA_FREQ=1`: pinned victim = lowest score; a routed expert enters VRAM only into a free slot or above (1 + `--margin`) x the lowest VRAM score, that expert written back; other NVMe misses are read into pinned |
+| `fprompt` | `freq` with `CROW_GLM_ARENA_PROMPT_COUNT=1`: a prompt call moves nothing but notes its distinct experts; at the first decode call after the phase each one's score gains `--prompt-weight` (default 2) x (the phase's calls that routed it / the phase's calls) x the current increment |
+| `fpadmit` | `fprompt`, and a prompt call's NVMe experts are kept in pinned when pinned has room or their score with that gain is above the lowest pinned score (sim only, not built: the prompt path reads them into the landing, not into pinned) |
+| `fguard` | `freq`, and before the call of layer l a synthetic guess of layer l + 1 (each true id kept with `--guess-precision`, default 0.9, else a wrong id; seed 20261008) is no victim in that call |
 | `lru` | one LRU over VRAM + pinned (the exclusive two-tier LRU with promotion), NVMe reads only |
+| `arc` | ARC (Megiddo & Modha, FAST 2003, Fig. 4) over VRAM + pinned, the warm set in T2, NVMe reads only |
+| `s3fifo` | S3-FIFO (Yang et al., SOSP 2023: 10 % small FIFO, main FIFO with reinsertion, ghost FIFO of the main's size, counts capped at 3) over VRAM + pinned, the warm set in the main FIFO, NVMe reads only |
 | `min` | Belady's MIN with bypass over VRAM + pinned from the same warm set: the ceiling, guesses included |
 
+The union-only rows (`lru`, `arc`, `s3fifo`, `min`) run over the arena's capacity in decode (`arena_capacity`: enabled
+VRAM with the regrown chunks and the lent set, + pinned), started from the boot's resident experts (fewer than the
+capacity when slots come back empty); before round m they ran over the resident experts only.
+
 Scores start at `--prior-tokens` (default 0.5 x half-life / ln 2) x each expert's visits per token in the warm counts.
-Workloads: the held-out file of the corpus (generated positions decode, the rest are prompt calls that only set
-reference bits), and a run's own routing written by `CROW_GLM_ROUTE_LOG` with `--boot base:ring:chunks:chunk:handback`
+Workloads: the held-out file of the corpus (generated positions decode; a run of prompt positions is cut into prompt
+calls of `--prompt-chunk` positions, default 185, the decode-time prompt chunk of the round-l run, each call's distinct
+experts per layer as the engine hands them over; prompt calls only set reference bits or note `fprompt`'s counts), and a run's own routing written by `CROW_GLM_ROUTE_LOG` with `--boot base:ring:chunks:chunk:handback`
 (the elastic boot: ring slots disabled, warm, the handed-back chunks written back; a sixth field `:1` regrows them
 at the prompt's end and refills them from the experts the hand-back wrote out, then the warm scores, as
 `CROW_GLM_ARENA_REGROW=1` does). With `--decode-log` the `today`
@@ -420,6 +430,46 @@ replay is compared per token and layer with the run's `tiers v/p/n` rows. Per po
 reads per token (no guesses in the replay: speculative 0), H2D records (VRAM entries), promotions (pinned -> VRAM),
 D2H write-backs, VRAM hits, pinned-served visits, zero-copy GB (pinned-served x the measured zero-copy share 0.352 x
 9,474,048 B) and a critical-path cost per token from the decode profile of #202 (1.7 ms per demand read; zero-copy and
-promotions at 27.05 ms per 0.833 GB). Run of record: `runs/glm53-flash/cache-sim-20261010/`. Tests: `TestArena` in
-`tools/test_glm_tier_sim.py` (the engine's own CLOCK figures on its xorshift trace, hand traces of `lfu` and `freq`,
-the route-log check, MIN below every policy).
+promotions at 27.05 ms per 0.833 GB). Cost model B (`msB/tok`, the #188 task of 2026-10-10, DDR5-aware): 1.25 ms per
+NVMe-sourced expert (the span fit of #202 comment 6101494738), 0.35 ms per pinned hit served from pinned (pinned-tier
+visits not promoted), a promotion at the zero-copy rate as above. Model B values a promotion below a pinned hit, so it
+ranks `promote` first; the measurement of #188 (promote: 1.228 GB H2D + D2H per token) went the other way, so model B
+only ranks policies with equal promotions or fewer. Run of record: `runs/glm53-flash/cache-sim-20261010/`, round m
+`runs/glm53-flash/cache-sim-20261010m/`. Tests: `TestArena` in `tools/test_glm_tier_sim.py` (the engine's own CLOCK
+figures on its xorshift trace, hand traces of `lfu`, `freq` and `fprompt`, `fprompt` equal to the engine's
+`prompt_count_equals_glm_tier_sim_fprompt` figures, `fpadmit`, `fguard`, ARC and S3-FIFO by hand, the capacity, the
+held-out prompt calls, cost model B, the route-log check, MIN below every policy).
+
+### 9.1 Round m: MIN at today's capacity and the practical policies (#188, 2026-10-10)
+
+Capacity 7,436 slots on both workloads (2,480 VRAM incl. the 128 lent slots, 4,956 pinned; lazy refill, half-life 64,
+margin 1). Per decode token: NVMe-sourced experts, VRAM hits, promotions, ms per token (model A / model B).
+
+| policy | quick decode (127 tokens) | held-out todo-1006 (26,599 tokens) |
+|---|---|---|
+| `min` | 18.77 | 12.17 |
+| `freq` (operating set) | 27.07 / 189.1 / 19.20 / 65.7 / 75.0 | 33.21 / 174.1 / 8.33 / 75.6 / 86.2 |
+| `fprompt` (weight 2) | **25.04** / 193.3 / 16.80 / 61.2 / 71.8 | 33.21 / 173.7 / 8.13 / 75.6 / 86.4 |
+| `fpadmit` (not built) | 24.09 / 193.3 / 16.91 / 59.7 / 70.9 | 33.21 / 173.7 / 8.13 / 75.6 / 86.4 |
+| `fguard` (precision 0.9; 0.5 the same) | 27.07 / 189.1 / 19.20 / 65.7 / 75.0 | 33.19 / 174.1 / 8.33 / 75.6 / 86.2 |
+| `today` (CLOCK) | 29.42 / 130.0 / 0 / 69.1 / 98.6 | 38.33 / 104.0 / 0 / 86.1 / 115.7 |
+| `lfu` / `tinylfu` | 27.13 / 132.5 / 0 / 65.2 / 95.6 (both) | 33.74 / 82.1 / 0 / 81.2 / 119.2; 34.09 |
+| `promote` | 29.31 / 214.1 / 92.59 / 78.3 / 65.1 | 35.89 / 184.0 / 116.07 / 96.7 / 80.6 |
+| `lru` / `arc` / `s3fifo` | 30.43 / 33.00 / 34.37 | 35.78 / 35.78 / 33.54 |
+| `freq` half-life 32 / 128 | 27.08 / 28.64 | 33.97 / 35.20 |
+| `freq` margin 0 / 0.5 / 2 | 27.07, VRAM 206.4 / 196.3 / 180.3, promotions 58.03 / 26.58 / 13.38 | 33.21, VRAM 185.3 / 177.9 / 169.8, promotions 38.15 / 12.38 / 5.53 |
+| `fprompt` weight 1 / 4 | 25.30 / 24.92 | 33.13 / 33.41 |
+
+- On the quick decode MIN is the compulsory floor: 2,384 experts the decode routes are not in the boot's resident set,
+  2,384 / 127 = 18.77 per token. Of `freq`'s 27.07, 18.19 are first reads of experts outside its start set and 8.88
+  re-reads of experts it evicted, 92 % of those warm experts evicted before their first use in this decode.
+- On the held-out MIN reads 12.17, `freq` 2.7 times that. No replacement rule over the routing history comes closer:
+  LRU, ARC, S3-FIFO, other half-lives and a pinned admission filter (`tinylfu`) all read as many or more.
+- The next-layer guess as a protection (`fguard`) changes nothing: a call evicts about 0.6 experts of 7,436, the chance
+  that one of them is a guessed expert of the next layer is near 0.
+- The prompt's routing is the one signal the history lacks: `fprompt` reads 2.03 fewer experts per token on the quick
+  decode, with more VRAM hits and fewer promotions, and is neutral on the held-out (32 tool-output phases). It is the
+  built policy (`CROW_GLM_ARENA_PROMPT_COUNT`). `fpadmit` reads 0.95 fewer again, but needs the prompt path to read its
+  NVMe experts into pinned slots instead of the landing.
+- The margin moves only VRAM hits against promotions, not NVMe reads. Model A ranks margin 2 first (65.4 ms), model B
+  margin 0 (67.2 ms): the promotion's cost decides, so the margin stays the measured `FREQ_MARGIN`.
