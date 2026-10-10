@@ -6502,6 +6502,7 @@ mod arena_gpu_tests {
                 ARENA_REGROW_ENV,
                 ARENA_LAZY_REFILL_ENV,
                 ARENA_STAGE_LEND_ENV,
+                ARENA_PROMPT_COUNT_ENV,
             ];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {
