@@ -1074,6 +1074,30 @@ pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig,
     Ok(c)
 }
 
+/// #188: `CROW_GLM_ROUTE_LOG=<file>`: every routing call of the expert tiers appended as one text
+/// line `<d|p> <decoder layer> <id> <id> ...` (`d` a decode call, `table_for`; `p` a prompt call,
+/// `tables_for_prompt`, its `sel` as handed over), for `tools/glm_tier_sim.py arena --route-log`
+/// to replay a run's own routing. Off when unset or empty; it moves nothing.
+pub const ROUTE_LOG_ENV: &str = "CROW_GLM_ROUTE_LOG";
+
+fn route_log(kind: char, layer: usize, sel: &[i32]) {
+    use std::io::Write;
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let path = std::env::var(ROUTE_LOG_ENV).ok().filter(|p| !p.trim().is_empty())?;
+        let f = std::fs::File::create(path.trim()).unwrap_or_else(|e| panic!("{ROUTE_LOG_ENV}={path}: {e}"));
+        Some(std::sync::Mutex::new(std::io::BufWriter::new(f)))
+    });
+    if let Some(w) = log {
+        let mut line = format!("{kind} {layer}");
+        for id in sel {
+            line.push_str(&format!(" {id}"));
+        }
+        let mut w = w.lock().expect("the route log");
+        writeln!(w, "{line}").and_then(|_| w.flush()).unwrap_or_else(|e| panic!("{ROUTE_LOG_ENV}: {e}"));
+    }
+}
+
 /// The routing scores of a warm-start file (sybil's `GLM53_EC_WARM`, `data/stats_own_dec.json`
 /// format): a JSON object whose keys end in the decoder layer index (`"3"`, or
 /// `"model.language_model.layers.3.mlp"`), each an array of `experts` scores (keys starting with
@@ -6835,6 +6859,7 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current; no launch reading this layer's slots or table is pending.
     pub unsafe fn table_for(&mut self, layer: usize, sel: &[i32]) -> Result<(Dev, Served), String> {
+        route_log('d', layer, sel);
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         let ids = distinct_ids(sel, self.cache.experts)?;
         if self.arena.is_some() {
@@ -6936,7 +6961,8 @@ impl ExpertTiers {
     /// # Safety
     /// As [`ExpertTiers::tables_for_chunk`].
     pub unsafe fn tables_for_prompt(&mut self, layer: usize, sel: &[i32], picks: usize, run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
-        let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
+        route_log('p', layer, sel);
+        let l =layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         if self.arena.is_some() {
             return self.tables_for_chunk_global(l, sel, picks, run);
         }

@@ -1,0 +1,141 @@
+{
+ "halflife_tokens": 32.0,
+ "margin": 1.0,
+ "prior_tokens": 23.083120654223414,
+ "pinned_slots": 4956,
+ "cost_model": {
+  "ms_per_demand_read": 1.7,
+  "ms_per_zero_copy_gb": 32.472989195678274,
+  "source": "decode Nsight profile ARM2 + RT2, crow-nest-wt-int runs/glm53-flash/profile-20261010j-decode/budget.txt (#202 comment 6099823660): 1.7 ms GPU idle per demand read; zero-copy 0.833 GB in 27.05 ms; promotions charged at that rate, write-backs not"
+ },
+ "record_bytes": 9474048,
+ "zero_copy_share": 0.3517425580493689,
+ "zero_copy_share_source": "runs/glm53-flash/quick/q7-rt2-nopf/decode.json (crow-nest-wt-int): 8,165 of 23,213 pinned-served visits zero-copy, the rest on the CPU lane",
+ "workloads": [
+  {
+   "name": "held-out todo-1006",
+   "decode_tokens": 26599,
+   "prompt_tokens": 6169,
+   "boot": [
+    2220,
+    4956
+   ],
+   "rows": [
+    {
+     "policy": "freq",
+     "tokens": 26599,
+     "h2d_per_token": 18.2641076732208,
+     "promotions_per_token": 18.263468551449304,
+     "d2h_per_token": 18.26275423888116,
+     "dropped_per_token": 0.0,
+     "pinned_served_per_token": 146.86322794090003,
+     "vram_per_token": 170.87266438587918,
+     "pinned_per_token": 127.72104214444153,
+     "nvme_per_token": 37.40629346967931,
+     "nvme_reads": {
+      "mean": 37.40629346967931,
+      "ci": [
+       35.25208557692308,
+       39.48347980769231
+      ],
+      "n": 26599
+     },
+     "zero_copy_gb_per_token": 0.489410821405354,
+     "nvme_demand_per_token": 37.40629346967931,
+     "nvme_speculative_per_token": 0.0,
+     "cost_ms_per_token": 85.10209933768513
+    },
+    {
+     "policy": "lfu",
+     "tokens": 26599,
+     "h2d_per_token": 37.522613632091435,
+     "promotions_per_token": 0.0,
+     "d2h_per_token": 37.52126019775179,
+     "dropped_per_token": 0.0,
+     "pinned_served_per_token": 218.31031241776006,
+     "vram_per_token": 80.1670739501485,
+     "pinned_per_token": 218.31031241776006,
+     "nvme_per_token": 37.522613632091435,
+     "nvme_reads": {
+      "mean": 37.522613632091435,
+      "ci": [
+       35.32760576923077,
+       39.6475423076923
+      ],
+      "n": 26599
+     },
+     "zero_copy_gb_per_token": 0.727502934666742,
+     "nvme_demand_per_token": 37.522613632091435,
+     "nvme_speculative_per_token": 0.0,
+     "cost_ms_per_token": 87.41263811181278
+    }
+   ]
+  },
+  {
+   "name": "route log route.log",
+   "decode_tokens": 127,
+   "prompt_tokens": 1,
+   "boot": [
+    1848,
+    24,
+    13,
+    44,
+    4
+   ],
+   "rows": [
+    {
+     "policy": "freq",
+     "tokens": 127,
+     "h2d_per_token": 29.937007874015748,
+     "promotions_per_token": 29.89763779527559,
+     "d2h_per_token": 29.937007874015748,
+     "dropped_per_token": 0.0,
+     "pinned_served_per_token": 114.28346456692914,
+     "vram_per_token": 191.7795275590551,
+     "pinned_per_token": 114.90551181102362,
+     "nvme_per_token": 29.31496062992126,
+     "nvme_reads": {
+      "mean": 29.31496062992126,
+      "ci": [
+       NaN,
+       NaN
+      ],
+      "n": 127
+     },
+     "zero_copy_gb_per_token": 0.3808411748191873,
+     "nvme_demand_per_token": 29.31496062992126,
+     "nvme_speculative_per_token": 0.0,
+     "cost_ms_per_token": 71.4005123766662
+    },
+    {
+     "policy": "lfu",
+     "tokens": 127,
+     "h2d_per_token": 29.31496062992126,
+     "promotions_per_token": 0.0,
+     "d2h_per_token": 29.31496062992126,
+     "dropped_per_token": 0.0,
+     "pinned_served_per_token": 181.77165354330708,
+     "vram_per_token": 124.91338582677166,
+     "pinned_per_token": 181.77165354330708,
+     "nvme_per_token": 29.31496062992126,
+     "nvme_reads": {
+      "mean": 29.31496062992126,
+      "ci": [
+       NaN,
+       NaN
+      ],
+      "n": 127
+     },
+     "zero_copy_gb_per_token": 0.6057405622640857,
+     "nvme_demand_per_token": 29.31496062992126,
+     "nvme_speculative_per_token": 0.0,
+     "cost_ms_per_token": 69.50563980465188
+    }
+   ]
+  }
+ ],
+ "calibration_routing": {
+  "from": "warm file",
+  "path": "runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json"
+ }
+}

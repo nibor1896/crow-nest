@@ -1017,5 +1017,103 @@ class TestG1dCli(unittest.TestCase):
             self.assertEqual(ts.main(["g1d", "--corpus", c.path, "--runs", c.rdir, "--capture", cap,
                                       "--cells", "3.1:46:V25"]), 2)
 
+
+def xorshift_trace(tokens, layers, experts, k):
+    """engine/src/glm5_tiers.rs tests `trace` (docs/expert-cache.md): k distinct ascending ids per token per layer, a
+    hot set drifting every 200 tokens"""
+    m, x, out = (1 << 64) - 1, 0x9E3779B97F4A7C15, []
+    for t in range(tokens):
+        base, tok = (t // 200) * 16, []
+        for l in range(layers):
+            got = []
+            while len(got) < k:
+                x ^= (x << 13) & m
+                x ^= x >> 7
+                x ^= (x << 17) & m
+                e = ((base + l * 7 + x % 48) % experts) if (x >> 32) % 10 < 7 else (x >> 8) % experts
+                if e not in got:
+                    got.append(e)
+            tok.append(sorted(got))
+        out.append(tok)
+    return out
+
+
+class TestArena(unittest.TestCase):
+    """#188 `arena`: the engine's global arena on the host and the frequency tiers"""
+
+    def test_engine_arena_equals_the_engines_own_figures(self):
+        # glm5_tiers.rs vram_hits_equal_glm_tier_sim_global_clock: VRAM hits and admissions of GlobalArena
+        tr = xorshift_trace(600, L, E, K)
+        self.assertEqual(tr[0][0], [6, 9, 31, 36, 42, 44, 45, 66], "the generator drifted from the engine's")
+        for cv, cp, hits, adm in ((25 * 42, 83 * 42, 46_635, 154_965), (46 * 42, 124 * 42, 88_748, 112_852),
+                                  (8 * 42, 0, 16_712, 184_888)):
+            a = ts.EngineArena(cv, cp, pin_stay=False)
+            vh = sum(a.step(l, ids).count(ts.VRAM) for tok in tr for l, ids in enumerate(tok))
+            self.assertEqual((vh, a.c["h2d"]), (hits, adm), (cv, cp))
+
+    def test_pinned_hits_stay_and_the_lfu_victim(self):
+        a = ts.EngineArena(1, 2, layers=1, experts=6)              # today: pinned hits stay, NVMe -> VRAM
+        for ids in ([0], [1], [2], [1], [3]):
+            a.step(0, ids)
+            a.tick()
+        # 0 -> V; 1 -> V, 0 -> P; 2 -> V, 1 -> P; 1 stays in P (touched); 3 -> V, 2 -> P evicts the oldest: 0
+        self.assertEqual((a.vram_keys(), a.pinned_keys()), ([3], [1, 2]))
+        b = ts.EngineArena(1, 2, victim="lfu", halflife=1e9, layers=1, experts=6)
+        for ids in ([0], [0], [0], [1], [2], [3]):
+            b.step(0, ids)
+            b.tick()
+        # scores 0:3 1:1 2:1 3:1; when 3 enters, 2 goes to P and the lowest score in P is 1 (not 0, the oldest)
+        self.assertEqual((b.vram_keys(), sorted(b.pinned_keys())), ([3], [0, 2]))
+
+    def test_freq_tiers_hand_trace(self):
+        a = ts.FreqTiers(1, 1, halflife=1e9, margin=1.0, layers=1, experts=6)
+        self.assertEqual(a.step(0, [0]), [ts.NVME])                 # a free VRAM slot: in
+        a.step(0, [1])                                              # 1 > 2 x 1? no: read into pinned
+        self.assertEqual((a.vram_keys(), a.pinned_keys(), a.c["h2d"], a.c["pinned_served"]), ([0], [1], 1, 1))
+        a.step(0, [1])                                              # 2 > 2? no: stays
+        self.assertEqual(a.step(0, [1]), [ts.PIN])                  # 3 > 2: promoted, 0 written back
+        self.assertEqual((a.vram_keys(), a.pinned_keys()), ([1], [0]))
+        self.assertEqual((a.c["h2d"], a.c["promotions"], a.c["d2h"], a.c["dropped"]), (2, 1, 1, 0))
+        a.step(0, [2])                                              # 1 <= 6: to pinned, the lowest score (0) out
+        self.assertEqual((a.vram_keys(), a.pinned_keys()), ([1], [2]))
+        b = ts.FreqTiers(1, 1, halflife=1e9, margin=3.0, layers=1, experts=6)
+        for ids in ([0], [1], [1], [1]):
+            b.step(0, ids)
+        self.assertEqual(b.vram_keys(), [0], "3 > 4 x 1 is false: no promotion at margin 3")
+
+    def test_route_log_check_and_min_bounds_every_policy(self):
+        tr = xorshift_trace(60, L, E, K)
+        with tempfile.TemporaryDirectory() as d:
+            log, dlog = os.path.join(d, "route.log"), os.path.join(d, "decode.log")
+            with open(log, "w", encoding="utf-8") as f:
+                for l, ids in enumerate(tr[0]):
+                    f.write("p %d %s\n" % (l + 3, " ".join(map(str, ids + ids))))   # a prompt call, rows repeat
+                for tok in tr[1:]:
+                    for l, ids in enumerate(tok):
+                        f.write("d %d %s\n" % (l + 3, " ".join(map(str, ids))))
+            ev = ts.arena_events_log(log)
+            self.assertEqual([k for k, _ in ev], ["p"] + ["d"] * 59)
+            self.assertEqual(ev[0][1][5], tr[0][5])
+            counts = np.ones((L, E))
+            boot = (40 * 42 + 2 * 21, 21, 2, 21, 1)              # base, ring, chunks, chunk, hand-back
+            a = ts.arena_boot("today", counts, boot, 30 * 42, None, 64.0, 1.0)
+            per, tiers = ts.arena_replay(a, ev)
+            with open(dlog, "w", encoding="utf-8") as f:
+                for t, row in enumerate(tiers):
+                    f.write("glm5_run row %d gen rep 1 tiers [%s]\n"
+                            % (t, " ".join("l%d %d/%d/%d" % (l + 3, *x) for l, x in enumerate(row))))
+            self.assertTrue((ts.arena_log_rows(dlog) == tiers).all())
+            res = ts.arena_simulate([("log", ev, boot, ts.arena_log_rows(dlog))], ts.ARENA_POLICIES, counts, 30 * 42,
+                                    out=lambda *x: None)
+            rows_ = {r["policy"]: r for r in res["workloads"][0]["rows"]}
+            self.assertEqual(rows_["today"]["check"]["cells_equal"], 1.0)
+            for p in ts.ARENA_POLICIES:
+                self.assertGreaterEqual(rows_[p]["nvme_per_token"], rows_["min"]["nvme_per_token"] - 1e-12, p)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("d 7 1 2 3\n")
+            with self.assertRaises(ts.SimError):
+                ts.arena_events_log(log)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

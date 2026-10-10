@@ -1,0 +1,13 @@
+self-test todo-1006                positions   32768 generated  26599  routing files == manifest sha256: True
+self-test omarchy-0915a            positions   32768 generated   5441  capture ids.i32 == capture.json sha256: True
+self-test lenis-0830               positions   32768 generated   7136  capture ids.i32 == capture.json sha256: True
+self-test ctx7-0830                positions   32768 generated  10450  capture ids.i32 == capture.json sha256: True
+self-test zetalab-0829             positions   32768 generated  15166  capture ids.i32 == capture.json sha256: True
+
+held-out todo-1006: 26599 decode tokens, 6169 prompt positions/calls; boot (2220, 4956), pinned 4956; halflife 64 tokens, margin 0.5, prior 46.2 tokens
+  policy     demand     spec  H2D/tok    promo  D2H/tok VRAM/tok  pin/tok ZC GB/tok   ms/tok     check
+  freq        36.84     0.00    11.04    11.04    11.04    167.2    157.7     0.526     83.1         -
+
+route log route.log: 127 decode tokens, 1 prompt positions/calls; boot (1848, 24, 13, 44, 4), pinned 4956; halflife 64 tokens, margin 0.5, prior 46.2 tokens
+  policy     demand     spec  H2D/tok    promo  D2H/tok VRAM/tok  pin/tok ZC GB/tok   ms/tok     check
+  freq        29.50     0.00    24.31    24.31    24.31    186.2    125.5     0.418     71.2         -
