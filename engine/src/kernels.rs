@@ -6215,8 +6215,8 @@ pub mod mul1 {
     pub const MAXT: usize = 8;
     /// activation rows one k-split stages in shared memory (`MUL1_XROWS`)
     pub const XROWS: usize = 512;
-    /// #187: trellis words one `mul1_gemv2` block holds (`MUL1_G2_WORDS`)
-    pub const G2_WORDS: usize = 4096;
+    /// #187: shared words of one `mul1_gemv2` buffer (`MUL1_G2_WORDS`): tiles and activations
+    pub const G2_WORDS: usize = 3840;
 
     /// #187: `CROW_GLM_GEMV2=1` runs the T = 1 GEMVs of new plans on `mul1_gemv2` (same bits as
     /// `mul1_gemv`); unset or anything else: `mul1_gemv` (the path of record)
@@ -6225,9 +6225,11 @@ pub mod mul1 {
     }
 
     /// #187: `mul1_gemv2` takes this GEMV shape at `tokens` rows: T = 1 and one block's k-split
-    /// (k / 16 / S tile rows x 8 tiles) within `G2_WORDS`
+    /// (tps = k / 16 / S tile rows x 8 tiles of n32 + 4 words, then tps * 16 activations) within
+    /// `G2_WORDS` (GLM K = 3: gate and up 3840, down 1920)
     pub fn gemv2_fits(spec: &MatSpec, tokens: usize) -> bool {
-        tokens == 1 && spec.k / 16 / ksplit(spec.k) * 8 * spec.n32() <= G2_WORDS
+        let tps = spec.k / 16 / ksplit(spec.k);
+        tokens == 1 && spec.bits <= 8 && !(spec.bits == 8 && spec.half) && tps * (8 * (spec.n32() + 4) + 16) <= G2_WORDS
     }
 
     /// The k-split S of a GEMV with input width `k`: the largest power of two <= 16 that divides
@@ -6324,14 +6326,11 @@ pub mod mul1 {
             self.gemv = if on { self.gemv_warp } else { self.gemv_block };
         }
 
-        /// #187: the GEMV entry of a plan: `mul1_gemv2` when the plan takes it and the reference
-        /// arm (`use_warp_gemv`) is off, else the current `gemv`
-        fn gemv_for(&self, v2: bool) -> CUfunction {
-            if v2 && self.gemv == self.gemv_block {
-                self.gemv2
-            } else {
-                self.gemv
-            }
+        /// #187: queue the GEMV of `slots` slots over grid (n / 128, S, slots): `mul1_gemv2` when
+        /// the plan takes it and the reference arm (`use_warp_gemv`) is off, else the current `gemv`
+        unsafe fn launch_gemv_on(&self, v2: bool, n: usize, s: usize, slots: usize, args: &[u64]) {
+            let f = if v2 && self.gemv == self.gemv_block { self.gemv2 } else { self.gemv };
+            launch_v(f, (n / 128) as u32, s as u32, slots as u32, 256, args);
         }
     }
 
@@ -6385,7 +6384,7 @@ pub mod mul1 {
 
         pub(crate) unsafe fn launch_gemv(&self, kn: &Kernels, ptrs: CUdeviceptr) {
             assert!(!self.gemv2 || gemv2_fits(&self.spec, self.tokens), "mul1: gemv2 on a shape it does not take");
-            launch_v(kn.gemv_for(self.gemv2), (self.spec.n / 128) as u32, self.s as u32, self.slots as u32, 256, &[ptrs, self.xh, self.part, self.prm_gemv]);
+            kn.launch_gemv_on(self.gemv2, self.spec.n, self.s, self.slots, &[ptrs, self.xh, self.part, self.prm_gemv]);
         }
 
         unsafe fn launch_out(&self, kn: &Kernels, ptrs: CUdeviceptr, y: CUdeviceptr) {
@@ -6412,7 +6411,7 @@ pub mod mul1 {
             assert!((1..=self.slots).contains(&n), "mul1: {n} of {} slots", self.slots);
             let (kc, nc, t) = ((self.spec.k / 128) as u32, (self.spec.n / 128) as u32, self.tokens as u32);
             launch_v(kn.had_in, kc, t, n as u32, 32, &[ptrs, x, self.xh, self.prm_in]);
-            launch_v(kn.gemv_for(self.gemv2), nc, self.s as u32, n as u32, 256, &[ptrs, self.xh, self.part, self.prm_gemv]);
+            kn.launch_gemv_on(self.gemv2, self.spec.n, self.s, n, &[ptrs, self.xh, self.part, self.prm_gemv]);
             launch_v(kn.had_out, nc, t, n as u32, 32, &[ptrs, self.part, y, self.prm_out]);
         }
 
@@ -7294,6 +7293,14 @@ extern "C" __global__ void rd_linear(const unsigned long long* __restrict__ ptrs
             let mut ptr_v = cuda::to_u64_dev(&pv);
             let rec_bytes = (3 * tb + 6 * (c.hidden + c.inter)) as f64;
             eprintln!("mul1 gemv2 bench: K = 3, T 1, VRAM, gate trellis {tb} B, record {rec_bytes} B, {NREC} records rotated");
+            for name in ["mul1_gemv", "mul1_gemv2"] {
+                use cudarc::driver::sys;
+                let f = kn.module.get(name);
+                let (mut regs, mut blocks) = (0i32, 0i32);
+                cuda::ck(sys::cuFuncGetAttribute(&mut regs, sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS, f));
+                cuda::ck(sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut blocks, f, 256, 0));
+                eprintln!("  {name}: {regs} registers, {blocks} blocks of 256 per SM");
+            }
             for slots in [1usize, 8] {
                 let x = xs(slots * c.hidden, &mut Rng(7));
                 let (mut xd, mut yd) = (cuda::to_f32_dev(&x), cuda::alloc_zeroed(slots * c.hidden * 4));
