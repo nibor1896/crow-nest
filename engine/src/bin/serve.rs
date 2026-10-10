@@ -6697,6 +6697,13 @@ fn glm_alloc_503(stream: &mut TcpStream, head_sent: bool, failed: &crow_nest_eng
     glm_fail(stream, head_sent, "503 Service Unavailable", body)
 }
 
+/// - #196: an engine error of an accepted request: the line with its text (the frame alone
+///   reaches only the client), then the 500
+fn glm_engine_500(stream: &mut TcpStream, head_sent: bool, e: &str) -> &'static str {
+    tracing::info!(target: "serve", "[serve] the request failed: {e}");
+    glm_fail(stream, head_sent, "500 Internal Server Error", error_json(e))
+}
+
 /// - #185 part 2: an error after the request was accepted: a JSON answer while no head left the
 ///   socket, else an SSE error frame and `[DONE]` (the stream's only way to say it)
 fn glm_fail(stream: &mut TcpStream, head_sent: bool, status: &'static str, body: serde_json::Value) -> &'static str {
@@ -6794,13 +6801,13 @@ fn glm_chat_on(
         match res {
             Ok(out) if out.aborted => "200 OK (client gone)",
             Ok(_) => "200 OK (text/event-stream)",
-            Err(e) => glm_fail(stream, true, "500 Internal Server Error", error_json(&e)),
+            Err(e) => glm_engine_500(stream, true, &e),
         }
     } else {
         let mut sink = CollectSink::watching(stream);
         let out = match glm_generate_on(seq, book, &req, &ids, tk, &mut sink) {
             Ok(o) => o,
-            Err(e) => return glm_fail(stream, false, "500 Internal Server Error", error_json(&e)),
+            Err(e) => return glm_engine_500(stream, false, &e),
         };
         let mut doc = completion_json(&ChunkCtx::new(&out.id, out.created, &req.model), &sink.content, &sink.reasoning, &sink.calls, out.finish, &out.timing);
         attach_malformed(&mut doc, &out.malformed);
@@ -11778,5 +11785,52 @@ Red is #FF0000."), "{off}");
         let (status, text) = one(None, &doc);
         assert!(status.starts_with("200") && text.starts_with("HTTP/1.1 200"), "{status} {text}");
         assert!(text.contains("\"completion_tokens\":8"), "{text}");
+    }
+
+    /// #196: an engine error of an accepted request reaches the log with its text, as a JSON 500
+    /// before the head and as an SSE error frame after it (red before: only the client saw it)
+    #[test]
+    fn glm_engine_errors_are_logged_with_their_text() {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let Some(tk) = glm_tk() else { return };
+        let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8 });
+        let mut sse = doc.clone();
+        sse["stream"] = serde_json::json!(true);
+        let (_, ids) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, doc.to_string().as_bytes()).unwrap();
+        let fail = ids.len() + 3;
+        for (what, body, head) in [("document", &doc, "HTTP/1.1 500"), ("stream", &sse, "HTTP/1.1 200")] {
+            eng.rows_mut().fail_at = Some(fail);
+            let buf = Buf::default();
+            let w = buf.clone();
+            let sub = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(crow_nest_engine::log::DEFAULT_FILTER))
+                .with_ansi(false)
+                .with_writer(move || w.clone())
+                .finish();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (mut server, _) = l.accept().unwrap();
+            let mut head_sent = false;
+            let status = tracing::subscriber::with_default(sub, || glm_chat_on(&mut server, &tk, &mut eng, &book, Markup::Glm, 4096, &mut head_sent, body.to_string().as_bytes()));
+            let _ = server.shutdown(Shutdown::Write);
+            let mut text = String::new();
+            client.read_to_string(&mut text).unwrap();
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            let line = format!("fake: row {fail} failed");
+            assert!(text.starts_with(head) && text.contains(&line), "{what}: {status} {text}");
+            assert!(log.contains("[serve] the request failed: ") && log.contains(&line), "{what}: the log lacks the engine error: {log:?}");
+        }
     }
 }
