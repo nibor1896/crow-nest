@@ -1151,6 +1151,86 @@ class TestArena(unittest.TestCase):
         self.assertEqual((a.lend_on, sum(a.dis)), (True, 0), "lent again after the second prompt")
         self.assertEqual(sum(p["lend_wb"] for p in per), 21, "the second prompt took every lent expert back")
 
+    def test_prompt_count_hand_trace(self):
+        # #188 CROW_GLM_ARENA_PROMPT_COUNT (fprompt), as glm5_tiers.rs prompt_count_by_hand_and_the_switch: 1 VRAM +
+        # 1 pinned slot, no decay, margin 1, weight 2; a phase of two calls [2], [2, 3] moves and counts nothing until
+        # the next decode call adds 2 x 2/2 to expert 2 and 2 x 1/2 to expert 3; then 2 (3 > 2 x 1) enters VRAM
+        for w in (0.0, 2.0):
+            a = ts.FreqTiers(1, 1, halflife=1e9, margin=1.0, layers=1, experts=4, prompt_weight=w)
+            a.mark(0, [2])
+            a.mark(0, [2, 3])
+            self.assertEqual((a.vram_keys(), a.pinned_keys(), a.score[2]), ([], [], 0.0))
+            a.step(0, [0])
+            a.tick()
+            self.assertEqual((a.score[2], a.score[3]), (w, w / 2))
+            a.step(0, [1])
+            a.tick()
+            self.assertEqual((a.vram_keys(), a.pinned_keys()), ([0], [1]))
+            a.step(0, [2])
+            a.tick()
+            want = ([2], [0]) if w else ([0], [2])
+            self.assertEqual((a.vram_keys(), a.pinned_keys()), want, w)
+            self.assertEqual(a.c["prompt_folds"], 1 if w else 0)
+
+    def test_prompt_count_equals_the_engines_figures(self):
+        # glm5_tiers.rs prompt_count_equals_glm_tier_sim_fprompt: prompt tokens 0-99 (4 calls of 25 rows, each call's
+        # distinct experts), decode 100-299, prompt 300-349 (2 calls), decode 350-599
+        tr = xorshift_trace(600, L, E, K)
+        ev = []
+        for lo, hi, kind in ((0, 100, "p"), (100, 300, "d"), (300, 350, "p"), (350, 600, "d")):
+            if kind == "d":
+                ev += [("d", tr[t]) for t in range(lo, hi)]
+                continue
+            for c in range(lo, hi, 25):
+                ev.append(("p", [sorted(set(e for t in range(c, c + 25) for e in tr[t][l])) for l in range(L)]))
+        for cv, cp, w, hits, adm, wb, nvme, folds in ((25 * 42, 83 * 42, 0.0, 51_898, 3_161, 2_111, 33_471, 0),
+                                                       (25 * 42, 83 * 42, 2.0, 51_770, 2_778, 1_728, 33_505, 2),
+                                                       (8 * 42, 20 * 42, 0.0, 16_997, 1_314, 978, 91_051, 0),
+                                                       (8 * 42, 20 * 42, 2.0, 16_932, 1_099, 763, 90_765, 2)):
+            a = ts.FreqTiers(cv, cp, 64.0, 1.0, None, prompt_weight=w)
+            _, tiers = ts.arena_replay(a, ev)
+            got = (int(tiers[:, :, 0].sum()), a.c["h2d"], a.c["d2h"], int(tiers[:, :, 2].sum()), a.c["prompt_folds"])
+            self.assertEqual(got, (hits, adm, wb, nvme, folds), (cv, cp, w))
+        self.assertEqual(ts.ARENA_PROMPT_WEIGHT, 2.0, "the engine's PROMPT_COUNT_WEIGHT")
+
+    def test_prompt_admit_guard_and_union_policies(self):
+        # fpadmit: a prompt call's NVMe expert is kept in pinned above the lowest pinned score
+        a = ts.FreqTiers(0, 1, halflife=1e9, layers=1, experts=4, prompt_weight=2.0, prompt_admit=True)
+        a.mark(0, [3])
+        self.assertEqual((a.pinned_keys(), a.c["prompt_admits"]), ([3], 1))
+        a.score[3] = 5.0
+        a.mark(0, [1])                             # 0 + 2 x 1/2 = 1 is not above 5: not kept
+        self.assertEqual(a.pinned_keys(), [3])
+        # fguard: the next layer's guessed expert is no victim in this call (precision 1: the true ids)
+        for p, want in ((1.0, [4]), (0.0, [1])):
+            g = ts.FreqTiers(0, 1, halflife=1e9, layers=2, experts=4, guess=(p, 7))
+            g.step(1, [0])                         # layer 1 expert 0 (key 4) into the only pinned slot
+            g.tick()
+            g.guard(1, [0])
+            g.step(0, [1])                         # layer 0 expert 1 (key 1): no victim when key 4 is guessed
+            self.assertEqual(g.pinned_keys(), want, p)
+        # union policies by hand: ARC (c 2) A B A C A -> misses 1 1 0 1 0 (B leaves T1 for C, A stays in T2)
+        self.assertEqual(ts._arc_miss([0, 1, 0, 2, 0], 2, []).astype(int).tolist(), [1, 1, 0, 1, 0])
+        # S3-FIFO (c 4): a key hit once more than the one-hit scan keys moves to the main FIFO and stays
+        seq = [x for i in range(20) for x in (99, 100 + i)]
+        m = ts._s3fifo_miss(seq, 4, [])
+        self.assertEqual(int(m[0::2].sum()), 1, "the hot key misses once")
+        self.assertEqual(int(m[1::2].sum()), 20, "every scan key misses")
+        # the union capacity in decode: enabled VRAM (regrown chunks, the lent set) + pinned
+        self.assertEqual(ts.arena_capacity((1848, 24, 12, 44, 4, 1), 4956, 128), 7436)
+        self.assertEqual(ts.arena_capacity((1848, 24, 12, 44, 4), 4956, 128), 1824 + 8 * 44 + 128 + 4956)
+        self.assertEqual(ts.arena_capacity((2352, 4956), 4956, 128), 7436)
+        # held-out prompt runs as calls of `chunk` positions, each call's distinct experts per layer
+        held = type("H", (), {})()
+        held.routes = np.asarray([[[1, 2]], [[2, 3]], [[4, 5]], [[0, 1]], [[1, 5]]])
+        held.gen = np.asarray([False, False, False, True, False])
+        self.assertEqual(ts.arena_events_held(held, 2),
+                         [("p", [[1, 2, 3]]), ("p", [[4, 5]]), ("d", [[0, 1]]), ("p", [[1, 5]])])
+        self.assertEqual(len(ts.arena_events_held(held)), 5)
+        # cost model B: NVMe 1.25 ms, a pinned hit served from pinned 0.35 ms, a promotion one record at the zero-copy rate
+        row = {"nvme_per_token": 2.0, "pinned_hits_served_per_token": 10.0, "promotions_per_token": 1.0}
+        self.assertAlmostEqual(ts.arena_cost_b_ms(row), 2.5 + 3.5 + 9_474_048 / 1e9 * 27.05 / 0.833)
+
     def test_route_log_check_and_min_bounds_every_policy(self):
         tr = xorshift_trace(60, L, E, K)
         with tempfile.TemporaryDirectory() as d:

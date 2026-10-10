@@ -30,7 +30,7 @@
 
   # 6. the engine's global arena (today's policy, checked against a run's own routing) against alternatives (#188;
   #    docs/glm-tier-simulation.md section 9)
-  python -I tools/glm_tier_sim.py arena --corpus <dir>/corpus.json --runs <runs> --capture <capture-ids>       [--warm <warm.json>] [--route-log <CROW_GLM_ROUTE_LOG file> --decode-log <glm5_run log> --boot 1848:24:13:44:4[:1]]       [--vram 2220 --pinned 4956] [--lend 128] [--lazy] [--policies today,promote,lfu,tinylfu,noadmit,freq,lru,min] [--halflife 64]       [--margin 1] [--json <out.json>]
+  python -I tools/glm_tier_sim.py arena --corpus <dir>/corpus.json --runs <runs> --capture <capture-ids>       [--warm <warm.json>] [--route-log <CROW_GLM_ROUTE_LOG file> --decode-log <glm5_run log> --boot 1848:24:13:44:4[:1]]       [--vram 2220 --pinned 4956] [--lend 128] [--lazy] [--policies today,promote,lfu,tinylfu,noadmit,freq,fprompt,fpadmit,fguard,lru,arc,s3fifo,min]       [--halflife 64] [--margin 1] [--prompt-weight 2] [--guess-precision 0.9] [--prompt-chunk 185] [--json <out.json>]
 
 Policy per MoE layer (PREREG G1, ticket #147): the experts are ranked by their routed count over the
 GENERATED positions of the calibration files (the `G` rule of #106: frequency order, ties lower id);
@@ -1488,7 +1488,23 @@ def g1d_cmd(a):
 
 # ------------------------------------------------------------------ arena: the engine's global arena and alternatives (#188)
 
-ARENA_POLICIES = ("today", "promote", "lfu", "tinylfu", "noadmit", "freq", "lru", "min")
+ARENA_POLICIES = ("today", "promote", "lfu", "tinylfu", "noadmit", "freq", "fprompt", "fpadmit", "fguard", "lru", "arc",
+                  "s3fifo", "min")
+# the policies replayed over the union of the tiers only (NVMe reads, no tier detail)
+ARENA_UNION = ("lru", "arc", "s3fifo", "min")
+# #188 CROW_GLM_ARENA_PROMPT_COUNT: a prompt phase adds this x (its calls that routed the expert / its calls) to the
+# frequency score at the first decode call after it (engine/src/glm5_tiers.rs PROMPT_COUNT_WEIGHT; the sim's choice on
+# the quick decode and the held-out, runs/glm53-flash/cache-sim-20261010m)
+ARENA_PROMPT_WEIGHT = 2.0
+# the engine's prompt chunk in decode-time prompt phases: 185 rows of scratch borrowed from the elastic arena
+# (crow-nest-wt-int runs/glm53-flash/profile-20261010l-decode/plain.json prompt_chunk.chunk); a held-out prompt run is
+# cut into calls of this many positions, each call's distinct experts per layer as the engine hands them over
+ARENA_PROMPT_CHUNK = 185
+# Cost model B, ms per token on the critical path (#188 task of 2026-10-10, "DDR5-aware cost"): an NVMe-sourced expert
+# 1.25 ms (the span fit 1,255 us per demand read, #202 comment 6101494738), a pinned hit served from pinned (zero-copy
+# or the CPU lane) 0.35 ms more than a VRAM hit, a promotion one H2D record at the zero-copy rate (as model A).
+ARENA_MS_NVME_B = 1.25
+ARENA_MS_PIN_B = 0.35
 ARENA_RECORD = BPW_BYTES["3.05"]            # MUL1 record of GLM-5.3-Flash-MUL1K3.cnq, 9,474,048 B
 # zero-copy share of the pinned-served visits under CROW_GLM_CPU_LANE=split (the rest run on the CPU lane):
 # 8,165 of 23,213, runs/glm53-flash/quick/q7-rt2-nopf/decode.json (crow-nest-wt-int, 2026-10-10, #188)
@@ -1723,10 +1739,21 @@ class FreqTiers:
     (half-life `halflife` tokens, started at `prior`); the pinned victim is the lowest score not routed in the call;
     a routed expert outside VRAM enters VRAM only while VRAM has a free slot or its score is above (1 + margin) x the
     lowest VRAM score not routed in the call (that expert is written back into pinned); an NVMe miss that does not
-    enter VRAM is read into a pinned slot and served from there (zero-copy or the CPU lane)."""
+    enter VRAM is read into a pinned slot and served from there (zero-copy or the CPU lane).
 
-    def __init__(self, nv, nr, halflife=64.0, margin=1.0, prior=None, layers=SHAPE[0], experts=SHAPE[1]):
+    `prompt_weight` w > 0 (#188 CROW_GLM_ARENA_PROMPT_COUNT, `fprompt`): a prompt call moves nothing but notes its
+    distinct experts; at the first decode call after the phase each noted expert's score gains w x (the phase's calls
+    that routed it / the phase's calls) x the current increment. `prompt_admit` (`fpadmit`, sim only, not built): a
+    prompt call's NVMe experts are also kept in pinned when pinned has room or their score with that gain is above the
+    lowest pinned score (the prompt reads them anyway). `guess` = (precision, seed) (`fguard`): before the call of layer
+    l, a synthetic guess of layer l + 1 (each true id kept with that probability, else a wrong id of the layer) is
+    protected from being a victim in that call, as the call's own picks are."""
+
+    def __init__(self, nv, nr, halflife=64.0, margin=1.0, prior=None, layers=SHAPE[0], experts=SHAPE[1],
+                 prompt_weight=0.0, prompt_admit=False, guess=None):
         self.L, self.E, self.nv, self.nr, self.margin = layers, experts, nv, nr, margin
+        self.pw, self.padmit, self.pend, self.pcalls = prompt_weight, prompt_admit, {}, 0
+        self.guess_p, self.grng = (guess[0], random.Random(guess[1])) if guess else (None, None)
         n = layers * experts
         self.score = list(prior) if prior is not None else [0.0] * n
         self.vset, self.rset, self.vheap, self.rheap = set(), set(), [], []
@@ -1779,7 +1806,37 @@ class FreqTiers:
         self._push(self.rheap, self.rset, k)
         return True
 
+    def _fold(self):
+        """#188 CROW_GLM_ARENA_PROMPT_COUNT: the prompt phase's noted experts into the scores (GlobalArena::freq_count
+        at the first decode call after the phase)"""
+        n = self.pcalls
+        for k, m in self.pend.items():
+            self.score[k] += self.pw * self.inc * m / n
+            if k in self.vset:
+                self._push(self.vheap, self.vset, k)
+            elif k in self.rset:
+                self._push(self.rheap, self.rset, k)
+        self.pend, self.pcalls = {}, 0
+        self.c["prompt_folds"] += 1
+
+    def guard(self, l, ids):
+        """`fguard`: the synthetic guess of layer `l` (from its true ids) is no victim in the next call"""
+        p, r, pick = self.guess_p, self.grng, []
+        for e in ids:
+            if r.random() < p:
+                pick.append(e)
+                continue
+            while True:
+                w = r.randrange(self.E)
+                if w not in ids:
+                    break
+            pick.append(w)
+        for e in pick:
+            self.prot[l * self.E + e] = self.ep + 1
+
     def step(self, l, ids, admit=True, count=True):
+        if count and self.pcalls:
+            self._fold()
         self.ep += 1
         ep, base, c, tier = self.ep, l * self.E, self.c, []
         keys = [base + e for e in ids]
@@ -1830,7 +1887,32 @@ class FreqTiers:
         return tier
 
     def mark(self, l, ids):
-        pass
+        """a prompt call of layer `l` with its distinct experts `ids`: nothing moves (prompt calls admit nothing);
+        `prompt_weight`: noted for the phase's fold (a call of layer 0 starts a call); `prompt_admit`: its NVMe experts
+        kept in pinned (see the class)"""
+        if not self.pw:
+            return
+        if l == 0:
+            self.pcalls += 1
+        self.ep += 1
+        for e in ids:
+            k = l * self.E + e
+            self.pend[k] = self.pend.get(k, 0) + 1
+            self.prot[k] = self.ep
+        if not self.padmit:
+            return
+        for e in ids:
+            k = l * self.E + e
+            if k in self.vset or k in self.rset:
+                continue
+            if len(self.rset) >= self.nr:
+                v = self._low(self.rheap, self.rset)
+                if v is None or not self.score[k] + self.pw * self.inc * self.pend[k] / max(self.pcalls, 1) > self.score[v]:
+                    continue
+                self.rset.discard(v)
+            self.rset.add(k)
+            self._push(self.rheap, self.rset, k)
+            self.c["prompt_admits"] += 1
 
     def disable(self, keys):
         """an elastic hand-back of the VRAM experts `keys` (FreqTiers has no slot numbers): into pinned; returns the
@@ -1902,7 +1984,11 @@ class FreqTiers:
 
 # refill: records the synchronous refill placed (#195 S / REGROW / STAGE_LEND; a host-thread stall, not in the cost
 # model); lend_wb: experts the lent slots' take-backs wrote into pinned (#188 CROW_GLM_ARENA_STAGE_LEND)
-ARENA_COUNTERS = ("h2d", "promotions", "d2h", "dropped", "pinned_served", "refill", "lend_wb")
+# prompt_folds: prompt phases folded into the scores, prompt_admits: prompt experts kept in pinned (#188 fprompt,
+# fpadmit)
+ARENA_COUNTERS = ("h2d", "promotions", "d2h", "dropped", "pinned_served", "refill", "lend_wb", "prompt_folds",
+                  "prompt_admits")
+ARENA_FREQ = ("freq", "fprompt", "fpadmit", "fguard")
 
 
 def arena_prior(counts, tokens, k=SHAPE[2]):
@@ -1914,10 +2000,23 @@ def arena_prior(counts, tokens, k=SHAPE[2]):
     return (tokens * rate).reshape(-1).tolist()
 
 
-def arena_events_held(held):
-    """The held-out file in token order: ("p", [L][K]) for a prompt position, ("d", [L][K]) for a generated one."""
-    R = held.routes.tolist()
-    return [("d" if g else "p", R[t]) for t, g in enumerate(held.gen.tolist())]
+def arena_events_held(held, chunk=1):
+    """The held-out file in token order: ("d", [L][K]) for a generated position; a run of prompt positions as prompt
+    calls of at most `chunk` positions, ("p", [L][distinct ids of the call, ascending]) each, as the engine hands a
+    prompt call over (chunk 1: one call per position)."""
+    R, out, cur, n = held.routes.tolist(), [], None, 0
+    for t, g in enumerate(held.gen.tolist()):
+        if g:
+            out.append(("d", R[t]))
+            cur = None
+            continue
+        if cur is None or n >= chunk:
+            cur, n = [set() for _ in R[t]], 0
+            out.append(("p", cur))
+        for l, ids in enumerate(R[t]):
+            cur[l].update(ids)
+        n += 1
+    return [(k, [sorted(x) for x in tok] if k == "p" else tok) for k, tok in out]
 
 
 def arena_events_log(path, layers=SHAPE[0], first=CAPTURE_FIRST_LAYER):
@@ -1959,7 +2058,9 @@ def arena_log_rows(path, layers=SHAPE[0]):
     return np.asarray(out, np.int64).reshape(-1, layers, 3)
 
 
-def arena_make(pol, nv, nr, prior, halflife, margin):
+def arena_make(pol, nv, nr, prior, halflife, margin, opts=None):
+    """`opts`: {"prompt_weight": w, "guess": (precision, seed)} for fprompt / fpadmit / fguard"""
+    o = opts or {}
     if pol == "today":
         return EngineArena(nv, nr)
     if pol == "promote":
@@ -1972,6 +2073,11 @@ def arena_make(pol, nv, nr, prior, halflife, margin):
         return EngineArena(nv, nr, noadmit=True)
     if pol == "freq":
         return FreqTiers(nv, nr, halflife, margin, prior)
+    if pol in ("fprompt", "fpadmit"):
+        return FreqTiers(nv, nr, halflife, margin, prior, prompt_weight=o.get("prompt_weight", ARENA_PROMPT_WEIGHT),
+                         prompt_admit=pol == "fpadmit")
+    if pol == "fguard":
+        return FreqTiers(nv, nr, halflife, margin, prior, guess=o.get("guess", (0.9, SEED)))
     raise SimError("arena policy %r: one of %s" % (pol, ", ".join(ARENA_POLICIES)))
 
 
@@ -1991,7 +2097,7 @@ def arena_refill_plan(lent, score, room, busy):
     return sorted(out)
 
 
-def arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend=0, lazy=False):
+def arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend=0, lazy=False, opts=None):
     """The arena at the first decode call. boot = (V, P) slots, warmed at V; or the engine's elastic boot
     (base, ring, chunks, chunk, handback[, regrow]): base + chunks x chunk VRAM slots, the last `ring` base slots
     disabled (the write-back ring), warmed, then the last `handback` chunks disabled (handed back for the prompt
@@ -2003,11 +2109,11 @@ def arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend=0, lazy=Fals
     are left empty for the decode calls' admissions."""
     score = np.asarray(counts, float).reshape(-1).tolist()
     if len(boot) == 2:
-        if pol == "freq":
-            a = arena_make(pol, boot[0], nr, prior, halflife, margin)
+        if pol in ARENA_FREQ:
+            a = arena_make(pol, boot[0], nr, prior, halflife, margin, opts)
             a.lcap = lend
         else:
-            a = arena_make(pol, boot[0] + lend, nr, prior, halflife, margin)
+            a = arena_make(pol, boot[0] + lend, nr, prior, halflife, margin, opts)
             if lend:
                 a.lend_slots = list(range(boot[0], boot[0] + lend))
                 a.disable(a.lend_slots)
@@ -2016,11 +2122,11 @@ def arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend=0, lazy=Fals
     base, ring, chunks, chunk, hb = boot[:5]
     regrow = len(boot) > 5 and boot[5] == 1
     top = base + chunks * chunk
-    if pol == "freq":
+    if pol in ARENA_FREQ:
         # FreqTiers has no slot numbers: the same experts the engine's hand-back writes out
         t = arena_boot("today", counts, boot[:4] + (0,), nr, prior, halflife, margin)
         out = [t.vowner[s] for s in range(top - hb * chunk, top) if t.vowner[s] >= 0]
-        a = FreqTiers(top - ring, nr, halflife, margin, prior)
+        a = arena_make(pol, top - ring, nr, prior, halflife, margin, opts)
         a.warm(counts)
         a.nv = top - ring - hb * chunk
         a.lcap = lend
@@ -2030,7 +2136,7 @@ def arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend=0, lazy=Fals
         a.lend_on = lend > 0
         a.c = dict.fromkeys(ARENA_COUNTERS, 0)
         return a
-    a = arena_make(pol, top + lend, nr, prior, halflife, margin)
+    a = arena_make(pol, top + lend, nr, prior, halflife, margin, opts)
     a.lend_slots = list(range(top, top + lend))
     a.disable(range(base - ring, base))
     if lend:
@@ -2067,7 +2173,10 @@ def arena_replay(a, events, lazy=False, score=None):
         if lends and not a.lend_on:
             a.lend_out(lazy, score)
         row = []
+        guard = getattr(a, "guess_p", None) is not None
         for l, ids in enumerate(tok):
+            if guard and l + 1 < len(tok):
+                a.guard(l + 1, tok[l + 1])
             t = a.step(l, ids, True)
             row.append((t.count(VRAM), t.count(PIN), t.count(NVME)))
         a.tick()
@@ -2080,15 +2189,18 @@ def arena_replay(a, events, lazy=False, score=None):
 
 
 def arena_union_reads(events, cap, warm_keys, policy):
-    """NVMe reads per decode token of a policy over the union of the tiers: "lru" (one LRU of cap slots: the exclusive
-    two-tier LRU with promotion, Mattson et al. 1970) or "min" (Belady's MIN with bypass, the ceiling), both started
-    from warm_keys; prompt positions move nothing."""
+    """NVMe reads per decode token of a policy over the union of the tiers (cap slots, started from warm_keys, the
+    rest empty; prompt positions move nothing): "lru" (one LRU: the exclusive two-tier LRU with promotion, Mattson et
+    al. 1970), "arc" (Megiddo & Modha, FAST 2003, Fig. 4; warm keys in T2), "s3fifo" (Yang et al., SOSP 2023: a 10 %
+    small FIFO, a main FIFO with reinsertion of keys with a positive count, a ghost FIFO of the main's size, counts
+    capped at 3; warm keys in the main FIFO) or "min" (Belady's MIN with bypass, the ceiling)."""
     seq = [l * SHAPE[1] + e for kind, tok in events if kind == "d" for l, ids in enumerate(tok) for e in ids]
     toks = sum(1 for kind, _ in events if kind == "d")
     per_tok = np.repeat(np.arange(toks), [sum(len(ids) for ids in tok) for kind, tok in events if kind == "d"])
+    warm_keys = list(warm_keys)[:cap]
     if policy == "min":
-        miss = _min_miss(list(warm_keys) + seq, cap)[len(warm_keys):]
-    else:
+        miss = _min_miss(warm_keys + seq, cap)[len(warm_keys):]
+    elif policy == "lru":
         d, miss = OrderedDict((k, None) for k in warm_keys), np.zeros(len(seq), bool)
         for i, k in enumerate(seq):
             if k in d:
@@ -2098,7 +2210,128 @@ def arena_union_reads(events, cap, warm_keys, policy):
             if len(d) >= cap:
                 d.popitem(last=False)
             d[k] = None
+    elif policy == "arc":
+        miss = _arc_miss(seq, cap, warm_keys)
+    elif policy == "s3fifo":
+        miss = _s3fifo_miss(seq, cap, warm_keys)
+    else:
+        raise SimError("union policy %r" % policy)
     return np.bincount(per_tok[miss], minlength=toks).astype(np.int64)
+
+
+def _arc_miss(seq, c, warm):
+    """ARC (Megiddo & Modha 2003, Fig. 4) over c slots -> miss flag per access; the warm keys start in T2"""
+    t1, t2, b1, b2 = OrderedDict(), OrderedDict((k, None) for k in warm), OrderedDict(), OrderedDict()
+    p, miss = 0.0, np.zeros(len(seq), bool)
+
+    def replace(in_b2):
+        if t1 and (len(t1) > p or (in_b2 and len(t1) == p)):
+            x, _ = t1.popitem(last=False)
+            b1[x] = None
+        else:
+            x, _ = t2.popitem(last=False)
+            b2[x] = None
+    for i, x in enumerate(seq):
+        if x in t1:
+            del t1[x]
+            t2[x] = None
+            continue
+        if x in t2:
+            t2.move_to_end(x)
+            continue
+        miss[i] = True
+        if x in b1:
+            p = min(c, p + max(len(b2) / len(b1), 1.0))
+            replace(False)
+            del b1[x]
+            t2[x] = None
+            continue
+        if x in b2:
+            p = max(0.0, p - max(len(b1) / len(b2), 1.0))
+            replace(True)
+            del b2[x]
+            t2[x] = None
+            continue
+        l1 = len(t1) + len(b1)
+        if l1 == c:
+            if len(t1) < c:
+                b1.popitem(last=False)
+                replace(False)
+            else:
+                t1.popitem(last=False)
+        elif l1 < c and l1 + len(t2) + len(b2) >= c:
+            if l1 + len(t2) + len(b2) >= 2 * c:
+                b2.popitem(last=False)
+            if len(t1) + len(t2) >= c:
+                replace(False)
+        t1[x] = None
+    return miss
+
+
+def _s3fifo_miss(seq, c, warm, small=0.1):
+    """S3-FIFO (Yang et al. 2023, Algorithm 1) over c slots -> miss flag per access; the warm keys start in the main
+    FIFO (the overflow in the small one)"""
+    ns = max(1, int(c * small))
+    nm = c - ns
+    sq, mq, gq, freq = OrderedDict(), OrderedDict(), OrderedDict(), {}
+    for k in warm[:nm]:
+        mq[k], freq[k] = None, 0
+    for k in warm[nm:]:
+        sq[k], freq[k] = None, 0
+    miss = np.zeros(len(seq), bool)
+
+    def evict_m():
+        while mq:
+            x, _ = mq.popitem(last=False)
+            if freq[x] > 0:
+                freq[x] -= 1
+                mq[x] = None
+            else:
+                del freq[x]
+                return
+
+    def evict_s():
+        while sq:
+            x, _ = sq.popitem(last=False)
+            if freq[x] > 1:
+                if len(mq) >= nm:
+                    evict_m()
+                mq[x] = None
+                freq[x] = 0
+            else:
+                del freq[x]
+                gq[x] = None
+                if len(gq) > nm:
+                    gq.popitem(last=False)
+                return
+    for i, x in enumerate(seq):
+        if x in freq:
+            freq[x] = min(3, freq[x] + 1)
+            continue
+        miss[i] = True
+        while len(sq) + len(mq) >= c:
+            if len(sq) >= ns or not mq:
+                evict_s()
+            else:
+                evict_m()
+        if x in gq:
+            del gq[x]
+            if len(mq) >= nm:
+                evict_m()
+            mq[x] = None
+        else:
+            sq[x] = None
+        freq[x] = 0
+    return miss
+
+
+def arena_capacity(boot, nr, lend=0):
+    """the arena's slots in decode: enabled VRAM (the regrown chunks if regrow, the lent staging set) + pinned"""
+    if len(boot) == 2:
+        return boot[0] + lend + nr
+    base, ring, chunks, chunk, hb = boot[:5]
+    regrow = len(boot) > 5 and boot[5] == 1
+    return base - ring + (chunks if regrow else chunks - hb) * chunk + lend + nr
 
 
 def arena_row(name, per, rb=ARENA_RECORD, zc_share=ARENA_ZC_SHARE):
@@ -2113,6 +2346,9 @@ def arena_row(name, per, rb=ARENA_RECORD, zc_share=ARENA_ZC_SHARE):
     # no guesses in this replay: every NVMe read stalls (the operating set's guesses are a separate path)
     row["nvme_demand_per_token"], row["nvme_speculative_per_token"] = row["nvme_per_token"], 0.0
     row["cost_ms_per_token"] = arena_cost_ms(row, rb)
+    # pinned hits served from pinned (zero-copy or the CPU lane): pinned-tier visits not promoted
+    row["pinned_hits_served_per_token"] = row["pinned_per_token"] - row["promotions_per_token"]
+    row["cost_b_ms_per_token"] = arena_cost_b_ms(row, rb)
     return row
 
 
@@ -2123,10 +2359,20 @@ def arena_cost_ms(row, rb=ARENA_RECORD):
             + row.get("promotions_per_token", 0.0) * rb / 1e9) * ARENA_MS_PER_GB_ZC)
 
 
+def arena_cost_b_ms(row, rb=ARENA_RECORD):
+    """cost model B (DDR5-aware, #188): NVMe-sourced experts x 1.25 ms + pinned hits served from pinned x 0.35 ms +
+    promotions at the zero-copy rate (ARENA_MS_NVME_B, ARENA_MS_PIN_B, ARENA_MS_PER_GB_ZC)"""
+    return (row["nvme_per_token"] * ARENA_MS_NVME_B + row["pinned_hits_served_per_token"] * ARENA_MS_PIN_B
+            + row["promotions_per_token"] * rb / 1e9 * ARENA_MS_PER_GB_ZC)
+
+
 def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, prior_tokens=None, out=print, lend=0,
-                   lazy=False):
+                   lazy=False, opts=None):
     """Every `arena` row: workloads = [(name, events, boot, check_rows or None)]; returns the --json document. `lend`
-    and `lazy`: #188 CROW_GLM_ARENA_STAGE_LEND / CROW_GLM_ARENA_LAZY_REFILL (arena_boot, arena_replay)."""
+    and `lazy`: #188 CROW_GLM_ARENA_STAGE_LEND / CROW_GLM_ARENA_LAZY_REFILL (arena_boot, arena_replay); `opts`: the
+    fprompt / fpadmit / fguard options (arena_make). The union-only rows (ARENA_UNION) run over the arena's capacity in
+    decode (arena_capacity), started from the boot's resident experts."""
+    opts = dict(opts or {})
     prior_tokens = 0.5 * halflife / math.log(2) if prior_tokens is None else prior_tokens
     prior = arena_prior(counts, prior_tokens)
     score = np.asarray(counts, float).reshape(-1).tolist()
@@ -2137,6 +2383,13 @@ def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, p
                                     "profile-20261010j-decode/budget.txt (#202 comment 6099823660): 1.7 ms GPU idle per "
                                     "demand read; zero-copy 0.833 GB in 27.05 ms; promotions charged at that rate, "
                                     "write-backs not"},
+           "cost_model_b": {"ms_per_nvme_expert": ARENA_MS_NVME_B, "ms_per_pinned_hit": ARENA_MS_PIN_B,
+                            "ms_per_promotion": ARENA_RECORD / 1e9 * ARENA_MS_PER_GB_ZC,
+                            "source": "#188 task 2026-10-10 (DDR5-aware cost): an NVMe-sourced expert 1.25 ms (span fit "
+                                      "1,255 us per demand read, #202 comment 6101494738), a pinned hit served from "
+                                      "pinned 0.35 ms more than a VRAM hit, a promotion one H2D record at the "
+                                      "zero-copy rate"},
+           "prompt_weight": opts.get("prompt_weight", ARENA_PROMPT_WEIGHT), "guess": list(opts.get("guess", (0.9, SEED))),
            "record_bytes": ARENA_RECORD, "zero_copy_share": ARENA_ZC_SHARE,
            "zero_copy_share_source": "runs/glm53-flash/quick/q7-rt2-nopf/decode.json (crow-nest-wt-int): 8,165 of "
                                      "23,213 pinned-served visits zero-copy, the rest on the CPU lane",
@@ -2147,29 +2400,30 @@ def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, p
         out("\n%s: %d decode tokens, %d prompt positions/calls; boot %s, pinned %d; halflife %g tokens, margin %g, "
             "prior %.1f tokens; lent slots %d, refill %s" % (wname, toks, len(events) - toks, boot, nr, halflife, margin,
                                                            prior_tokens, lend, "lazy" if lazy else "eager"))
-        out("  %-8s %8s %8s %8s %8s %8s %8s %8s %9s %8s %9s" % (
+        out("  %-8s %8s %8s %8s %8s %8s %8s %8s %9s %8s %8s %9s" % (
             "policy", "demand", "spec", "H2D/tok", "promo", "D2H/tok", "VRAM/tok", "pin/tok", "ZC GB/tok", "ms/tok",
-            "check"))
-        warm_keys = None
+            "msB/tok", "check"))
+        warm_keys, cap = None, arena_capacity(boot, nr, lend)
+        w["capacity"] = cap
         for pol in policies:
-            if pol in ("lru", "min"):
+            if pol in ARENA_UNION:
                 if warm_keys is None:
                     t = arena_boot("today", counts, boot, nr, prior, halflife, margin, lend)
                     warm_keys = t.vram_keys() + t.pinned_keys()
-                    cap = len(warm_keys)
                 r = arena_union_reads(events, cap, warm_keys, pol)
                 row = {"policy": pol, "tokens": toks, "nvme_reads": stat(r.astype(float)),
-                       "nvme_per_token": float(r.mean()), "union_slots": cap,
+                       "nvme_per_token": float(r.mean()), "union_slots": cap, "union_start_keys": len(warm_keys),
                        "nvme_demand_per_token": float(r.mean()), "nvme_speculative_per_token": 0.0}
-                if pol == "lru":
-                    row["note"] = "one LRU over VRAM + pinned (exclusive tiers, every pinned hit promoted): NVMe only"
-                else:
-                    row["note"] = "Belady MIN with bypass over VRAM + pinned: the ceiling of any policy, guesses included"
-                out("  %-8s %8.2f %8.2f %8s %8s %8s %8s %8s %9s %8s %9s" % (pol, row["nvme_per_token"], 0.0, "-", "-",
-                                                                         "-", "-", "-", "-", "-", "-"))
+                row["note"] = {"lru": "one LRU over VRAM + pinned (exclusive tiers, every pinned hit promoted): NVMe only",
+                               "arc": "ARC over VRAM + pinned: NVMe only",
+                               "s3fifo": "S3-FIFO over VRAM + pinned: NVMe only",
+                               "min": "Belady MIN with bypass over VRAM + pinned: the ceiling of any policy, guesses "
+                                      "included"}[pol]
+                out("  %-8s %8.2f %8.2f %8s %8s %8s %8s %8s %9s %8s %8s %9s" % (
+                    pol, row["nvme_per_token"], 0.0, "-", "-", "-", "-", "-", "-", "-", "-", "-"))
                 w["rows"].append(row)
                 continue
-            a = arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend, lazy)
+            a = arena_boot(pol, counts, boot, nr, prior, halflife, margin, lend, lazy, opts)
             per, tiers = arena_replay(a, events, lazy, score)
             row = arena_row(pol, per)
             chk = "-"
@@ -2181,10 +2435,11 @@ def arena_simulate(workloads, policies, counts, nr, halflife=64.0, margin=1.0, p
                 row["check"] = {"cells_equal": float(eq.mean()), "tokens_equal": int(eq.all(1).sum()),
                                 "logged_nvme_per_token": float(check[:, :, 2].sum(1).mean())}
                 chk = "%.4f" % eq.mean()
-            out("  %-8s %8.2f %8.2f %8.2f %8.2f %8.2f %8.1f %8.1f %9.3f %8.1f %9s" % (
+            out("  %-8s %8.2f %8.2f %8.2f %8.2f %8.2f %8.1f %8.1f %9.3f %8.1f %8.1f %9s" % (
                 pol, row["nvme_demand_per_token"], row["nvme_speculative_per_token"], row["h2d_per_token"],
                 row["promotions_per_token"], row["d2h_per_token"], row["vram_per_token"],
-                row["pinned_served_per_token"], row["zero_copy_gb_per_token"], row["cost_ms_per_token"], chk))
+                row["pinned_served_per_token"], row["zero_copy_gb_per_token"], row["cost_ms_per_token"],
+                row["cost_b_ms_per_token"], chk))
             if "check" in row:
                 out("           check against the run's own log: NVMe %.2f logged; per (token, layer) v/p/n cells equal "
                     "%.4f, tokens equal %d of %d" % (row["check"]["logged_nvme_per_token"], row["check"]["cells_equal"],
@@ -2210,7 +2465,7 @@ def arena_cmd(a):
         held, cal, reasons = load_corpus(a.corpus, a.runs, source="g1d", capture=a.capture)
         if counts is None:
             counts, cal_src = gen_counts(cal), calibration_source(a, held, cal)
-        workloads.append(("held-out %s" % held.name, arena_events_held(held), (a.vram, nr), None))
+        workloads.append(("held-out %s" % held.name, arena_events_held(held, a.prompt_chunk), (a.vram, nr), None))
     if a.route_log:
         if counts is None:
             raise SimError("--route-log needs --warm or --corpus for the warm counts")
@@ -2221,7 +2476,10 @@ def arena_cmd(a):
         workloads.append(("route log %s" % os.path.basename(a.route_log), arena_events_log(a.route_log), boot, check))
     if not workloads:
         raise SimError("arena needs --corpus or --route-log")
-    res = arena_simulate(workloads, pols, counts, nr, a.halflife, a.margin, a.prior_tokens, lend=a.lend, lazy=a.lazy)
+    if a.prompt_weight < 0 or not 0 <= a.guess_precision <= 1 or a.prompt_chunk < 1:
+        raise SimError("--prompt-weight >= 0, --guess-precision in 0..1, --prompt-chunk >= 1")
+    res = arena_simulate(workloads, pols, counts, nr, a.halflife, a.margin, a.prior_tokens, lend=a.lend, lazy=a.lazy,
+                         opts={"prompt_weight": a.prompt_weight, "guess": (a.guess_precision, SEED)})
     res["calibration_routing"] = cal_src
     if a.json:
         jdump(res, a.json, indent=1, default=float)
@@ -2389,6 +2647,12 @@ def main(argv=None):
                                                          "every prompt")
     r.add_argument("--lazy", action="store_true", help="#188 CROW_GLM_ARENA_LAZY_REFILL: regrown and lent slots left "
                                                        "empty for the decode admissions instead of the refill")
+    r.add_argument("--prompt-weight", type=float, default=ARENA_PROMPT_WEIGHT,
+                   help="fprompt / fpadmit: a prompt phase adds this x the share of its calls that routed the expert")
+    r.add_argument("--guess-precision", type=float, default=0.9,
+                   help="fguard: each true id of the next layer's synthetic guess kept with this probability")
+    r.add_argument("--prompt-chunk", type=int, default=ARENA_PROMPT_CHUNK,
+                   help="held-out prompt runs as prompt calls of this many positions (1: per position)")
     r.add_argument("--json")
     a = ap.parse_args(argv)
     try:

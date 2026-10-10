@@ -1042,6 +1042,16 @@ pub const ARENA_LAZY_REFILL_ENV: &str = "CROW_GLM_ARENA_LAZY_REFILL";
 /// next prompt call ([`ExpertTiers::stage_lend_out`], [`ExpertTiers::stage_lend_back`]); `0`
 /// (default) = it stays idle through the decode
 pub const ARENA_STAGE_LEND_ENV: &str = "CROW_GLM_ARENA_STAGE_LEND";
+/// #188: `1` = prompt calls count into the frequency tiers' scores ([`GlobalArena::prompt_count`]):
+/// at the first decode call after a prompt phase every expert the phase routed gains
+/// [`PROMPT_COUNT_WEIGHT`] x (the phase's calls that routed it / the phase's calls) x the current
+/// increment; needs `CROW_GLM_ARENA_FREQ=1`. `0` (default) = prompt calls count nothing.
+/// Placement only: lossless.
+pub const ARENA_PROMPT_COUNT_ENV: &str = "CROW_GLM_ARENA_PROMPT_COUNT";
+/// #188 `CROW_GLM_ARENA_PROMPT_COUNT`: what one prompt phase adds at most to an expert's decayed
+/// count (`tools/glm_tier_sim.py arena` `fprompt`, runs/glm53-flash/cache-sim-20261010m: quick decode
+/// 27.07 -> 25.04 NVMe experts per token, held-out todo-1006 33.21 -> 33.21)
+pub const PROMPT_COUNT_WEIGHT: f64 = 2.0;
 /// #188 frequency tiers: the scores' half-life in decode tokens (`tools/glm_tier_sim.py arena`, runs/glm53-flash/cache-sim-20261010)
 pub const FREQ_HALFLIFE_TOKENS: f64 = 64.0;
 /// #188 frequency tiers: an expert enters a full VRAM tier only above (1 + margin) x the lowest VRAM score
@@ -1066,11 +1076,13 @@ pub struct ArenaConfig {
     pub lazy_refill: bool,
     /// #188 `CROW_GLM_ARENA_STAGE_LEND=1`: the prefill staging set lent to the decode arena
     pub stage_lend: bool,
+    /// #188 `CROW_GLM_ARENA_PROMPT_COUNT=1`: prompt calls count into the frequency tiers
+    pub prompt_count: bool,
 }
 
 impl Default for ArenaConfig {
     fn default() -> ArenaConfig {
-        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false }
+        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false }
     }
 }
 
@@ -1138,6 +1150,14 @@ pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig,
         Some("1") => true,
         Some(v) => return Err(format!("{ARENA_STAGE_LEND_ENV}={v:?}: accepted 0 (default), 1")),
     };
+    c.prompt_count = match val(ARENA_PROMPT_COUNT_ENV).as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(v) => return Err(format!("{ARENA_PROMPT_COUNT_ENV}={v:?}: accepted 0 (default), 1")),
+    };
+    if c.prompt_count && !c.freq {
+        return Err(format!("{ARENA_PROMPT_COUNT_ENV}=1 counts into the frequency tiers: it needs {ARENA_FREQ_ENV}=1"));
+    }
     Ok(c)
 }
 
@@ -1257,6 +1277,10 @@ pub struct ArenaStats {
     pub pf_used: u64,
     pub pf_wasted: u64,
     pub joins: u64,
+    /// #188 `CROW_GLM_ARENA_PROMPT_COUNT`: prompt calls counted (calls of the first MoE layer) and
+    /// prompt phases folded into the scores
+    pub prompt_calls: u64,
+    pub prompt_folds: u64,
 }
 
 /// sybil-solutions/glm53-flash-offload 6769b27 (`glm53/expert_cache.py` `ec_step_k`,
@@ -1346,11 +1370,18 @@ struct FreqState {
     rheap: FreqHeap,
     /// a VRAM slot may be empty (slots added, enabled or disabled since the last look)
     vfree: bool,
+    /// #188 `CROW_GLM_ARENA_PROMPT_COUNT`: the weight of a prompt phase (0 = prompt calls count
+    /// nothing), the calls of the open phase that routed each key, the keys with such a call, and
+    /// the phase's calls ([`GlobalArena::prompt_count`])
+    pw: f64,
+    pend: Vec<u32>,
+    ptouched: Vec<u32>,
+    pcalls: u32,
 }
 
 impl FreqState {
     fn new(keys: usize, halflife: f64, margin: f64, topk: usize) -> FreqState {
-        FreqState { fscore: vec![0.0; keys], prior: vec![0.0; keys], inc: 1.0, grow: 2f64.powf(1.0 / halflife), margin, topk, vheap: FreqHeap::new(), rheap: FreqHeap::new(), vfree: true }
+        FreqState { fscore: vec![0.0; keys], prior: vec![0.0; keys], inc: 1.0, grow: 2f64.powf(1.0 / halflife), margin, topk, vheap: FreqHeap::new(), rheap: FreqHeap::new(), vfree: true, pw: 0.0, pend: vec![0; keys], ptouched: Vec::new(), pcalls: 0 }
     }
 }
 
@@ -1402,7 +1433,7 @@ impl GlobalArena {
     /// are kept; the frequency tiers' scores restart at their prior
     pub fn reset(&mut self) {
         let (stay, noadmit, gen, score) = (self.pin_stay, self.noadmit, self.gen, std::mem::take(&mut self.score));
-        let freq = self.freq.take().map(|f| FreqState { fscore: f.prior.clone(), inc: 1.0, vheap: FreqHeap::new(), rheap: FreqHeap::new(), vfree: true, ..f });
+        let freq = self.freq.take().map(|f| FreqState { fscore: f.prior.clone(), inc: 1.0, vheap: FreqHeap::new(), rheap: FreqHeap::new(), vfree: true, pend: vec![0; f.pend.len()], ptouched: Vec::new(), pcalls: 0, ..f });
         let off: Vec<bool> = self.vpin.iter().map(|&p| p == DISABLED).collect();
         *self = GlobalArena::new(self.layers, self.experts, self.vowner.len(), self.rowner.len()).expect("the same shape");
         (self.pin_stay, self.noadmit, self.gen, self.score, self.freq) = (stay, noadmit, gen + 1, score, freq);
@@ -1553,15 +1584,68 @@ impl GlobalArena {
             self.freq_rebuild();
         }
         let f = self.freq.as_mut().expect("the frequency tiers");
+        // #188 CROW_GLM_ARENA_PROMPT_COUNT: the first decode call after a prompt phase folds it in
+        let folded = if l == 0 && f.pcalls > 0 {
+            let (w, n) = (f.pw * f.inc, f.pcalls as f64);
+            for &k in &f.ptouched {
+                let c = std::mem::take(&mut f.pend[k as usize]);
+                f.fscore[k as usize] += w * c as f64 / n;
+            }
+            f.pcalls = 0;
+            self.stats.prompt_folds += 1;
+            std::mem::take(&mut f.ptouched)
+        } else {
+            Vec::new()
+        };
         for &id in sel {
             if (id as usize) < e {
                 f.fscore[base + id as usize] += f.inc;
             }
         }
+        for &k in &folded {
+            self.freq_push(k as usize);
+        }
         for &id in sel {
             if (id as usize) < e {
                 self.freq_push(base + id as usize);
             }
+        }
+    }
+
+    /// #188 `CROW_GLM_ARENA_PROMPT_COUNT=1`: prompt calls count into the frequency tiers from now
+    /// on, `weight` per prompt phase ([`GlobalArena::prompt_count`]; 0 = off). Needs the frequency
+    /// tiers ([`GlobalArena::set_freq`]).
+    pub fn set_prompt_count(&mut self, weight: f64) {
+        assert!(weight.is_finite() && weight >= 0.0, "prompt count weight {weight}");
+        let f = self.freq.as_mut().expect("prompt counting needs the frequency tiers");
+        f.pw = weight;
+    }
+
+    /// whether prompt calls count ([`GlobalArena::set_prompt_count`])
+    pub fn prompt_counting(&self) -> bool {
+        self.freq.as_ref().is_some_and(|f| f.pw > 0.0)
+    }
+
+    /// #188 `CROW_GLM_ARENA_PROMPT_COUNT`: one prompt call of MoE layer `l` with its distinct
+    /// routed experts `ids` (a call of the first MoE layer opens a call of the phase). Nothing
+    /// moves; the next decode call of the first MoE layer ([`GlobalArena::freq_count`]) adds the
+    /// phase's weight x (the phase's calls that routed the expert / the phase's calls) x the
+    /// increment to every expert the phase routed. A no-op unless prompt counting is on.
+    pub fn prompt_count(&mut self, l: usize, ids: &[u32]) {
+        assert!(l < self.layers, "global arena: layer {l} outside 0..{}", self.layers);
+        let e = self.experts;
+        let Some(f) = self.freq.as_mut().filter(|f| f.pw > 0.0) else { return };
+        if l == 0 {
+            f.pcalls += 1;
+            self.stats.prompt_calls += 1;
+        }
+        for &id in ids {
+            assert!((id as usize) < e, "global arena: expert {id} outside 0..{e}");
+            let k = l * e + id as usize;
+            if f.pend[k] == 0 {
+                f.ptouched.push(k as u32);
+            }
+            f.pend[k] += 1;
         }
     }
 
@@ -3770,6 +3854,10 @@ impl ExpertTiers {
         d.a.set_noadmit(d.cfg.noadmit);
         if d.cfg.freq {
             d.a.set_freq(FREQ_HALFLIFE_TOKENS, FREQ_MARGIN, topk);
+            // #188 CROW_GLM_ARENA_PROMPT_COUNT (arena_config refuses it without the frequency tiers)
+            if d.cfg.prompt_count {
+                d.a.set_prompt_count(PROMPT_COUNT_WEIGHT);
+            }
         }
         let base = nl * vpl;
         if d.cfg.vring > 0 && base >= 2 * d.cfg.vring && d.a.ram_slots() > 0 {
@@ -5088,7 +5176,7 @@ mod arena_tests {
         }
         let none = |_: &str| None;
         assert_eq!(arena_config(&none).unwrap(), ArenaConfig::default());
-        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false });
+        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false });
         let set = |k: &str| match k {
             ARENA_ADMIT_MAX_ENV => Some("16".to_string()),
             ARENA_NOADMIT_ENV => Some("1".to_string()),
@@ -5100,7 +5188,7 @@ mod arena_tests {
             _ => None,
         };
         let c = arena_config(&set).unwrap();
-        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false, regrow: false, lazy_refill: false, stage_lend: false });
+        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false });
         for (k, v) in [(ARENA_ADMIT_MAX_ENV, "x"), (ARENA_NOADMIT_ENV, "yes"), (ARENA_VRING_ENV, "-1"), (ARENA_ELASTIC_ENV, "nan"), (ARENA_STAGE_MIN_ENV, "0")] {
             let one = |q: &str| (q == k).then(|| v.to_string());
             assert!(arena_config(&one).unwrap_err().contains(k), "{k}={v}");
@@ -5606,6 +5694,109 @@ mod arena_tests {
         assert!(arena_config(&get("1")).unwrap().freq);
         assert!(!arena_config(&get("0")).unwrap().freq);
         assert!(arena_config(&get("yes")).unwrap_err().contains(ARENA_FREQ_ENV));
+    }
+
+    /// #188 `CROW_GLM_ARENA_PROMPT_COUNT=1` on the shared trace is `tools/glm_tier_sim.py`
+    /// `FreqTiers` with `prompt_weight` 2 (`fprompt`; half-life 64, margin 1, no prior): prompt
+    /// tokens 0-99 (4 calls of 25 rows, each call's distinct experts per layer), decode 100-299,
+    /// prompt 300-349 (2 calls), decode 350-599. VRAM hits, admissions, write-backs, NVMe visits
+    /// and folds are the sim's, off and on (`tools/test_glm_tier_sim.py`
+    /// `test_prompt_count_equals_the_engines_figures`)
+    #[test]
+    fn prompt_count_equals_glm_tier_sim_fprompt() {
+        let tr = trace(600, 42, 288, 8);
+        for (cv, cp, w, hits, adm, wb, nvme, folds) in [
+            (25 * 42, 83 * 42, 0.0, 51_898u64, 3_161u64, 2_111u64, 33_471u64, 0u64),
+            (25 * 42, 83 * 42, PROMPT_COUNT_WEIGHT, 51_770, 2_778, 1_728, 33_505, 2),
+            (8 * 42, 20 * 42, 0.0, 16_997, 1_314, 978, 91_051, 0),
+            (8 * 42, 20 * 42, PROMPT_COUNT_WEIGHT, 16_932, 1_099, 763, 90_765, 2),
+        ] {
+            let mut a = GlobalArena::new(42, 288, cv, cp).unwrap();
+            a.set_freq(FREQ_HALFLIFE_TOKENS, FREQ_MARGIN, 8);
+            if w > 0.0 {
+                a.set_prompt_count(w);
+            }
+            for (lo, hi, prompt) in [(0usize, 100usize, true), (100, 300, false), (300, 350, true), (350, 600, false)] {
+                if prompt {
+                    for c in (lo..hi).step_by(25) {
+                        for l in 0..42 {
+                            let mut ids: Vec<u32> = (c..c + 25).flat_map(|t| tr[t][l].iter().copied()).collect();
+                            ids.sort_unstable();
+                            ids.dedup();
+                            a.prompt_count(l, &ids);
+                        }
+                    }
+                    continue;
+                }
+                for tok in &tr[lo..hi] {
+                    for (l, ids) in tok.iter().enumerate() {
+                        let sel: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+                        a.freq_count(l, &sel);
+                        a.step(l, ids, arena_admits(ids.len(), false, 64));
+                    }
+                }
+            }
+            let v: u64 = a.counters().iter().map(|c| c[0]).sum();
+            let n: u64 = a.counters().iter().map(|c| c[2]).sum();
+            assert_eq!((v, a.stats.admitted, a.stats.write_backs, n, a.stats.prompt_folds), (hits, adm, wb, nvme, folds), "V {cv} P {cp} weight {w}");
+            assert_eq!(a.stats.prompt_calls, if w > 0.0 { 6 } else { 0 }, "calls of the first MoE layer");
+            a.check().unwrap();
+        }
+    }
+
+    /// #188 `CROW_GLM_ARENA_PROMPT_COUNT` by hand (1 layer, 1 VRAM + 1 pinned slot, no decay,
+    /// margin 1, weight 2): a phase of two calls, [2] and [2, 3], moves nothing and counts nothing
+    /// until the next decode call, which adds 2 x 2/2 = 2 to expert 2 and 2 x 1/2 = 1 to expert 3.
+    /// Then 2 (3 > 2 x 1) enters VRAM on its first decode visit, where off it is read into pinned.
+    /// A phase folds once; a reset forgets an open phase; the switch parses, needs the frequency
+    /// tiers and refuses by name.
+    #[test]
+    fn prompt_count_by_hand_and_the_switch() {
+        fn call(a: &mut GlobalArena, e: u32) -> Vec<(u32, Place, Place)> {
+            a.freq_count(0, &[e as i32]);
+            a.step(0, &[e], true)
+        }
+        for on in [false, true] {
+            let mut a = GlobalArena::new(1, 4, 1, 1).unwrap();
+            a.set_freq(f64::INFINITY, 1.0, 1);
+            if on {
+                a.set_prompt_count(PROMPT_COUNT_WEIGHT);
+            }
+            assert_eq!(a.prompt_counting(), on);
+            a.prompt_count(0, &[2]);
+            a.prompt_count(0, &[2, 3]);
+            assert!((0..4).all(|e| a.place(0, e) == Place::Nvme), "a prompt call moves nothing");
+            assert_eq!((a.freq_score(0, 2), a.stats.prompt_calls), (Some(0.0), if on { 2 } else { 0 }), "nothing counts before the decode");
+            assert_eq!(call(&mut a, 0), vec![(0, Place::Nvme, Place::Vram(0))]);
+            let w = if on { 1.0 } else { 0.0 };
+            assert_eq!((a.freq_score(0, 2), a.freq_score(0, 3)), (Some(2.0 * w), Some(w)), "on {on}: the fold");
+            assert_eq!(call(&mut a, 1), vec![(1, Place::Nvme, Place::Ram(0))], "1 > 2 x 1 is false");
+            if on {
+                assert_eq!(call(&mut a, 2), vec![(0, Place::Vram(0), Place::Ram(0)), (1, Place::Ram(0), Place::Nvme), (2, Place::Nvme, Place::Vram(0))], "3 > 2 x 1: in VRAM");
+            } else {
+                assert_eq!(call(&mut a, 2), vec![(1, Place::Ram(0), Place::Nvme), (2, Place::Nvme, Place::Ram(0))], "1 > 2 x 1 is false: pinned");
+            }
+            assert_eq!(a.stats.prompt_folds, if on { 1 } else { 0 }, "one fold per phase");
+            assert_eq!(a.freq_score(0, 2), Some(if on { 3.0 } else { 1.0 }));
+            a.check().unwrap();
+            // an open phase is forgotten by a reset; the switch stays
+            a.prompt_count(0, &[1]);
+            a.reset();
+            assert_eq!(a.prompt_counting(), on);
+            call(&mut a, 3);
+            assert_eq!((a.freq_score(0, 1), a.stats.prompt_folds), (Some(0.0), 0), "on {on}: nothing folded after the reset");
+        }
+        let get = |p: &'static str, f: &'static str| move |k: &str| match k {
+            ARENA_PROMPT_COUNT_ENV => Some(p.to_string()),
+            ARENA_FREQ_ENV => Some(f.to_string()),
+            _ => None,
+        };
+        assert!(arena_config(&get("1", "1")).unwrap().prompt_count);
+        assert!(!arena_config(&get("0", "1")).unwrap().prompt_count);
+        assert!(!arena_config(&|_: &str| None).unwrap().prompt_count, "off by default");
+        let e = arena_config(&get("1", "0")).unwrap_err();
+        assert!(e.contains(ARENA_PROMPT_COUNT_ENV) && e.contains(ARENA_FREQ_ENV), "{e}");
+        assert!(arena_config(&get("yes", "1")).unwrap_err().contains(ARENA_PROMPT_COUNT_ENV));
     }
 
     /// #188 `CROW_GLM_ARENA_REGROW` on the quick decode's numbers (RTX 5090, ARM2, q7-rt2-nopf):
@@ -6497,7 +6688,9 @@ mod arena_gpu_tests {
     /// `decode_ready` and taken back by every prompt call; decode calls are served out of it (table
     /// entries inside `pf_stage`) and every table entry, decode and prompt, holds its record
     /// (`Cnq::read_range`), so the lent slots and the prompt's staging never overwrite each other.
-    /// Lazy: no refill runs, the admissions fill the slots; eager: the refill fills them.
+    /// Lazy: no refill runs, the admissions fill the slots; eager: the refill fills them. #188
+    /// `CROW_GLM_ARENA_PROMPT_COUNT` on the last arm: every prompt phase counted (one call of the
+    /// first MoE layer each), every one but the last folded at the next decode call; the tables the same.
     #[test]
     #[ignore = "needs the GPU (about 1 GB VRAM, a 455 MB synthetic container in the temp dir): cargo test --release --lib glm5_arena_gpu -- --ignored --nocapture --test-threads 1"]
     fn glm5_arena_gpu_stage_lend_and_lazy_refill_tables_hold_their_records() {
@@ -6516,8 +6709,15 @@ mod arena_gpu_tests {
         const PF: usize = 16;
         unsafe {
             let _ctx = cuda::Ctx::init();
-            // (name, lend, lazy, stager)
-            for (name, lend, lazy, stager) in [("off", false, false, false), ("lazy", false, true, true), ("lend", true, false, false), ("lend+lazy", true, true, false), ("lend+lazy+stager", true, true, true)] {
+            // (name, lend, lazy, stager, prompt count)
+            for (name, lend, lazy, stager, prompt) in [
+                ("off", false, false, false, false),
+                ("lazy", false, true, true, false),
+                ("lend", true, false, false, false),
+                ("lend+lazy", true, true, false, false),
+                ("lend+lazy+stager", true, true, true, false),
+                ("lend+lazy+stager+prompt count", true, true, true, true),
+            ] {
                 let kv = vec![
                     (ARENA_ENV, "global"),
                     (ARENA_VRING_ENV, "0"),
@@ -6526,6 +6726,7 @@ mod arena_gpu_tests {
                     (ARENA_REGROW_ENV, "1"),
                     (ARENA_STAGE_LEND_ENV, if lend { "1" } else { "0" }),
                     (ARENA_LAZY_REFILL_ENV, if lazy { "1" } else { "0" }),
+                    (ARENA_PROMPT_COUNT_ENV, if prompt { "1" } else { "0" }),
                 ];
                 let _env = Env::set(&kv);
                 let mut t = ExpertTiers::new(&cnq, &s.path, &g, &moe, TierSizes { vram: 3, pinned: 8 }, 1, 16).unwrap();
@@ -6597,6 +6798,8 @@ mod arena_gpu_tests {
                 } else {
                     assert!(e.refills >= 4 && e.refilled > 0 && e.lazy_refills == 0, "{name}: refilled ({e:?})");
                 }
+                let st = t.arena().unwrap().stats;
+                assert_eq!((t.arena().unwrap().prompt_counting(), st.prompt_calls, st.prompt_folds), (prompt, if prompt { 4 } else { 0 }, if prompt { 3 } else { 0 }), "{name}: prompt phases counted and folded");
                 t.free();
             }
         }
@@ -8407,6 +8610,11 @@ impl ExpertTiers {
         route_log('p', layer, sel);
         let l =layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         if self.arena.is_some() {
+            // #188 CROW_GLM_ARENA_PROMPT_COUNT: the call's distinct experts noted for the phase
+            let experts = self.cache.experts;
+            if let Some(d) = self.arena.as_mut().filter(|d| d.a.prompt_counting()) {
+                d.a.prompt_count(l, &distinct_ids(sel, experts)?);
+            }
             return self.tables_for_chunk_global(l, sel, picks, run);
         }
         if self.pf_cap == 0 {
