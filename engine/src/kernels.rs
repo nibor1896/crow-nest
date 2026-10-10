@@ -6533,7 +6533,7 @@ pub mod glm5_moe {
     use cudarc::driver::sys::CUfunction;
 
     /// every entry of `GLM5_MOE_SRC`
-    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_moe_combine_rows", "glm5_gemv_fp4", "glm5_gemv_fp4_x3", "glm5_gemm_fp4_tc", "glm5_gemm_fp4_tcs"];
+    pub const NAMES: &[&str] = &["glm5_router_sig_topk", "glm5_moe_gather", "glm5_swiglu_clamp", "glm5_moe_combine", "glm5_moe_combine_rows", "glm5_moe_tables_in", "glm5_gemv_fp4", "glm5_gemv_fp4_x3", "glm5_gemm_fp4_tc", "glm5_gemm_fp4_tcs"];
     /// #191: output rows of one `glm5_gemv_fp4` block (`GLM5_FP4_RB`)
     pub const FP4_ROWS_PER_BLOCK: usize = 2;
 
@@ -6595,6 +6595,9 @@ pub mod glm5_moe {
         pub combine: CUfunction,
         /// #202 `CROW_GLM_RT2`: `combine` with each combo's row through a pointer
         pub combine_rows: CUfunction,
+        /// #202 `CROW_GLM_RT2_TABLE_SM`: RT2's slot / row tables from mapped host memory into
+        /// VRAM on the SMs (no copy-engine command)
+        pub tables_in: CUfunction,
         /// #191: the dense NVFP4 GEMV of the glm5_next path, bit-identical to `gemv_fp4_b(s)`
         pub fp4: CUfunction,
         /// `fp4` over three matrices of one shape in one launch (the KDA q|k|v projections),
@@ -6620,6 +6623,7 @@ pub mod glm5_moe {
                 act: module.get("glm5_swiglu_clamp"),
                 combine: module.get("glm5_moe_combine"),
                 combine_rows: module.get("glm5_moe_combine_rows"),
+                tables_in: module.get("glm5_moe_tables_in"),
                 fp4: module.get("glm5_gemv_fp4"),
                 fp4_x3: module.get("glm5_gemv_fp4_x3"),
                 tc: module.get("glm5_gemm_fp4_tc"),
