@@ -888,7 +888,7 @@ pub fn plan_for_rows(g: &Glm5Geo, context: usize, rows: usize, vram_total: u64, 
     // CROW_GLM_PREFETCH's store and CROW_GLM_LA's host-mapped embedding table, the same way
     let pinned_budget = pinned_budget.saturating_sub(decode_switch_pinned_bytes(g, &Switches::from_env(), record_bytes));
     // #196: the prefill stage engine's pinned ring (CROW_GLM_ARENA=global with staging)
-    let pinned_budget = pinned_budget.saturating_sub(prefill_ring_pinned_bytes(&env, record_bytes));
+    let pinned_budget = pinned_budget.saturating_sub(prefill_ring_pinned_bytes(&env, g.experts, record_bytes));
     crate::manager::plan_glm5_next_chunk(g, context, vram_total, pinned_budget, crate::geo::GLM5_NEXT_DENSE_BYTES, record_bytes, crate::gen::pf_tg(), crate::gen::pf_async_on(), chunk)
 }
 
@@ -1747,20 +1747,67 @@ pub fn serve_global(a: &mut GlobalArena, l: usize, ids: &[u32], admit: bool, sta
     Ok(out)
 }
 
-/// the records one [`serve_global`] of `ids` in layer `l` would stage; the arena is left as it is
-pub fn staged_count_global(a: &GlobalArena, l: usize, ids: &[u32], admit: bool) -> usize {
-    let mut c = a.clone();
-    let ch = c.step(l, ids, admit);
-    ch.iter().filter(|x| matches!(x.2, Place::Vram(_)) && !matches!(x.1, Place::Vram(_))).count() + ids.iter().filter(|&&e| c.place(l, e) == Place::Nvme).count()
+/// #196 stage 2: one sub-batch of a prompt call of MoE layer `l` through the global arena, as
+/// [`serve_prefill`] on the per-layer path (glm53-flash-offload: prefill runs with admission off,
+/// the RAM LRU untouched): the selected experts are counted and the VRAM hits get their reference
+/// bit ([`GlobalArena::mark`]); nothing is admitted, no pinned slot is touched or filled, no
+/// place changes. Every selected record not in VRAM is staged for the call - a pinned one from
+/// its slot, an NVMe one through the landing - so no expert is read zero-copy from pinned.
+pub fn serve_global_prompt(a: &mut GlobalArena, l: usize, ids: &[u32], stage_cap: usize, m: &mut dyn Mover) -> Result<Served, String> {
+    let places = a.mark(l, ids);
+    let staged = places.iter().filter(|p| !matches!(p, Place::Vram(_))).count();
+    if staged > stage_cap {
+        return Err(format!("expert tiers: layer {l} stages {staged} records in one call, {stage_cap} staging slots"));
+    }
+    let mut out = Served::default();
+    out.moves.visits = ids.len() as u64;
+    let (mut from_nvme, mut s) = (Vec::new(), 0u32);
+    let mut locs = Vec::with_capacity(ids.len());
+    for (&e, &p) in ids.iter().zip(&places) {
+        let loc = match p {
+            Place::Vram(v) => Loc::Vram(v),
+            Place::Ram(q) => {
+                m.pinned_to_stage(q, s);
+                out.moves.pinned_to_stage += 1;
+                s += 1;
+                Loc::Stage(s - 1)
+            }
+            Place::Nvme => {
+                from_nvme.push((e, Dst::Landing(s)));
+                s += 1;
+                Loc::Stage(s - 1)
+            }
+        };
+        locs.push((e, loc));
+    }
+    // each read batch goes on to staging before the next lands
+    for c in from_nvme.chunks(MAX_IN_FLIGHT) {
+        out.nvme_bytes += m.nvme(c)?;
+        for &(_, d) in c {
+            if let Dst::Landing(i) = d {
+                m.landing_to_stage(i);
+            }
+        }
+    }
+    out.nvme_reads = from_nvme.len();
+    out.moves.nvme_to_landing = from_nvme.len() as u64;
+    out.moves.landing_to_stage = from_nvme.len() as u64;
+    out.locs = locs;
+    Ok(out)
 }
 
-/// [`fitting_rows`] for the global arena (a prompt call: no admission)
+/// the records one [`serve_global_prompt`] of `ids` in layer `l` stages: the ids not in VRAM
+fn staged_count_prompt(a: &GlobalArena, l: usize, ids: &[u32]) -> usize {
+    ids.iter().filter(|&&e| !matches!(a.place(l, e), Place::Vram(_))).count()
+}
+
+/// [`fitting_rows`] for the global arena (a prompt call, [`serve_global_prompt`])
 pub fn fitting_rows_global(a: &GlobalArena, l: usize, sel: &[i32], k: usize, cap: usize) -> Result<usize, String> {
     let t = sel.len() / k;
     if t == 0 || sel.len() != t * k {
         return Err(format!("expert tiers: layer {l}: a selection of {} ids is no [rows][{k}]", sel.len()));
     }
-    let fits = |r: usize| -> Result<bool, String> { Ok(staged_count_global(a, l, &distinct_ids(&sel[..r * k], a.experts)?, false) <= cap) };
+    let fits = |r: usize| -> Result<bool, String> { Ok(staged_count_prompt(a, l, &distinct_ids(&sel[..r * k], a.experts)?) <= cap) };
     if fits(t)? {
         return Ok(t);
     }
@@ -1774,12 +1821,12 @@ pub fn fitting_rows_global(a: &GlobalArena, l: usize, sel: &[i32], k: usize, cap
         }
         r /= 2;
     }
-    let one = staged_count_global(a, l, &distinct_ids(&sel[..k], a.experts)?, false);
+    let one = staged_count_prompt(a, l, &distinct_ids(&sel[..k], a.experts)?);
     Err(format!("expert tiers: layer {l}: one row stages {one} records, {cap} staging slots"))
 }
 
 /// [`serve_chunk`] for the global arena: a prompt call's `[t][k]` selection in row sub-batches,
-/// each one [`serve_global`] without admission
+/// each one [`serve_global_prompt`] (no admission, the RAM LRU untouched, nothing zero-copy)
 #[allow(clippy::too_many_arguments)]
 pub fn serve_chunk_global(
     a: &mut GlobalArena,
@@ -1798,7 +1845,7 @@ pub fn serve_chunk_global(
         }
         let rows = fitting_rows_global(a, l, &sel[r0 * k..], k, cap)?;
         let ids = distinct_ids(&sel[r0 * k..(r0 + rows) * k], a.experts)?;
-        let served = serve_global(a, l, &ids, false, cap, m)?;
+        let served = serve_global_prompt(a, l, &ids, cap, m)?;
         each(r0, rows, &served)?;
         batches += 1;
         r0 += rows;
@@ -2170,16 +2217,33 @@ pub fn prefill_ring_slots(stage_records: usize) -> usize {
     stage_records.clamp(1, PREFILL_RING_MAX)
 }
 
+/// #196 stage 2: the records one staging buffer holds under the arena switches `c`, `experts`
+/// per MoE layer: 0 = staging off (`CROW_GLM_ARENA_STAGE_GB` unset). With an elastic part the
+/// buffers are borrowed from it per staged forward and hold a whole layer (`experts`: every
+/// non-VRAM expert of any layer, so every prompt layer stages in one run); without one they stay
+/// allocated at the `CROW_GLM_ARENA_STAGE_GB` size, at most a whole layer.
+pub fn stage_records(c: &ArenaConfig, experts: usize, record_bytes: u64) -> usize {
+    if c.stage_bytes == 0 || record_bytes == 0 {
+        return 0;
+    }
+    if c.elastic_bytes > 0 {
+        experts
+    } else {
+        ((c.stage_bytes / record_bytes) as usize).min(experts)
+    }
+}
+
 /// #196: the pinned bytes of the stage engine (ring slots plus two flag words per slot, rounded up
-/// to 4096 B) under the arena switches `get` reads; 0 without `CROW_GLM_ARENA=global` and
-/// `CROW_GLM_ARENA_STAGE_GB`. [`plan_for_rows`] takes it off the pinned budget.
-pub fn prefill_ring_pinned_bytes(get: &dyn Fn(&str) -> Option<String>, record_bytes: u64) -> u64 {
+/// to 4096 B) under the arena switches `get` reads, `experts` per MoE layer; 0 without
+/// `CROW_GLM_ARENA=global` and `CROW_GLM_ARENA_STAGE_GB`. [`plan_for_rows`] takes it off the
+/// pinned budget.
+pub fn prefill_ring_pinned_bytes(get: &dyn Fn(&str) -> Option<String>, experts: usize, record_bytes: u64) -> u64 {
     if record_bytes == 0 || arena_kind(get(ARENA_ENV).as_deref()) != Ok(ArenaKind::Global) {
         return 0;
     }
     match arena_config(get) {
-        Ok(c) if c.stage_bytes > 0 => {
-            let r = prefill_ring_slots((c.stage_bytes / record_bytes) as usize);
+        Ok(c) if stage_records(&c, experts, record_bytes) > 0 => {
+            let r = prefill_ring_slots(stage_records(&c, experts, record_bytes));
             r as u64 * record_bytes + (2 * r * 8).next_multiple_of(4096) as u64
         }
         _ => 0,
@@ -2744,7 +2808,7 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current.
     unsafe fn arena_boot(&mut self) -> Result<(), String> {
-        let (rb, vpl, nl, topk) = (self.rb, self.sizes.vram, self.slots.len(), self.topk);
+        let (rb, vpl, nl, topk, experts) = (self.rb, self.sizes.vram, self.slots.len(), self.topk, self.cache.experts);
         let d = self.arena.as_mut().expect("arena_boot without the global arena");
         d.chunks = if vpl > 0 { self.vram.clone() } else { Vec::new() };
         d.base_chunks = d.chunks.len();
@@ -2774,11 +2838,13 @@ impl ExpertTiers {
             }
         }
         if d.cfg.stage_bytes > 0 {
-            let nst = (d.cfg.stage_bytes / rb) as usize;
+            // #196 stage 2: borrowed per forward from the elastic part, a buffer holds a whole layer
+            let permanent = d.elastic.chunks == 0;
+            let cfg = ArenaConfig { elastic_bytes: if permanent { 0 } else { d.cfg.elastic_bytes }, ..d.cfg.clone() };
+            let nst = stage_records(&cfg, experts, rb);
             if nst < topk {
                 return Err(format!("{ARENA_STAGE_ENV}: {:.2} GiB holds {nst} records, less than one row's top-{topk}", d.cfg.stage_bytes as f64 / GIB));
             }
-            let permanent = d.elastic.chunks == 0;
             let mut bufs = [0; 2];
             if permanent {
                 for b in &mut bufs {
@@ -3067,11 +3133,12 @@ impl ExpertTiers {
 
     /// [`ExpertTiers::tables_for_chunk`] through the global arena (a prompt call never admits):
     /// staged ([`ExpertTiers::stage_call`]) at `stage_min` picks or more with staging on, else in
-    /// row sub-batches through the prefill staging set as on the per-layer path
+    /// row sub-batches through the prefill staging set as on the per-layer path. `picks` = the
+    /// call's token rows x top-k (`sel` may be the expert-major pseudo-rows, far fewer).
     ///
     /// # Safety
     /// As [`ExpertTiers::tables_for_chunk`].
-    unsafe fn tables_for_chunk_global(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+    unsafe fn tables_for_chunk_global(&mut self, l: usize, sel: &[i32], picks: usize, run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
         if self.pf_cap == 0 {
             self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
         }
@@ -3083,7 +3150,7 @@ impl ExpertTiers {
         self.drain_flying()?;
         crate::glm5_moe::lane::post(None);
         let d = self.arena.as_ref().expect("tables_for_chunk_global without the global arena");
-        if d.stage.is_some() && sel.len() >= d.cfg.stage_min {
+        if d.stage.is_some() && picks >= d.cfg.stage_min {
             if self.stage_call(l, sel, run)? {
                 return Ok(());
             }
@@ -3890,6 +3957,91 @@ mod arena_tests {
         assert!(fitting_rows_global(&a, 1, &sel[..3], k, 8).unwrap_err().contains("no [rows]"));
     }
 
+    /// the pinned LRU, oldest to newest, as the keys in the slots
+    fn ram_lru(a: &GlobalArena) -> Vec<u32> {
+        let (mut v, mut x) = (Vec::new(), a.oldest);
+        while x != NONE {
+            v.push(a.rowner[x as usize]);
+            x = a.next[x as usize];
+        }
+        v
+    }
+
+    /// #196 stage 2: a prompt call with more non-VRAM experts in its layer than the 128 prefill
+    /// staging slots, handed over as expert-major pseudo-rows (every expert of the layer once):
+    /// served in sub-batches that stage every selected record not in VRAM (pinned ones from their
+    /// slot, NVMe ones through the landing), none read zero-copy, nothing admitted or inserted
+    /// into pinned; the places, the pinned LRU's order and the VRAM slots are what decode left.
+    #[test]
+    fn a_prompt_call_stages_every_non_vram_expert_and_leaves_the_ram_lru_alone() {
+        let (nl, ex, k, cap) = (2usize, 200usize, 8usize, 128usize);
+        let (v, p) = (16usize, 80usize);
+        let mut a = GlobalArena::new(nl, ex, v, p).unwrap();
+        let mut sim = GSim::new(ex, v, p, cap);
+        for tok in trace(120, nl, ex as u64, k) {
+            for (l, ids) in tok.iter().enumerate() {
+                sim.layer = l;
+                serve_global(&mut a, l, ids, true, cap, &mut sim).unwrap();
+                sim.barrier();
+            }
+        }
+        let l = 1;
+        sim.layer = l;
+        let places: Vec<Place> = (0..ex as u32).map(|e| a.place(l, e)).collect();
+        let (ram, nvme) = (places.iter().filter(|p| matches!(p, Place::Ram(_))).count(), places.iter().filter(|p| **p == Place::Nvme).count());
+        assert!(ram > 0 && ram + nvme > cap, "the layer must hold pinned experts and more non-VRAM experts ({}) than {cap} slots", ram + nvme);
+        let (lru0, all0, stats0) = (ram_lru(&a), keys(&a, |_| true).iter().map(|&(l, e)| a.place(l, e)).collect::<Vec<_>>(), a.stats);
+        // the expert-major pseudo-rows: every expert once, k per row
+        let sel: Vec<i32> = (0..ex as i32).collect();
+        let mut moves = Moves::default();
+        let mut rows = 0;
+        // the twin read by `each` while the call moves through it
+        struct Shared<'a>(&'a std::cell::RefCell<GSim>);
+        impl Mover for Shared<'_> {
+            fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+                self.0.borrow_mut().nvme(jobs)
+            }
+            fn landing_to_stage(&mut self, i: u32) {
+                self.0.borrow_mut().landing_to_stage(i)
+            }
+            fn pinned_to_stage(&mut self, q: u32, s: u32) {
+                self.0.borrow_mut().pinned_to_stage(q, s)
+            }
+            fn vram_to_stage(&mut self, v: u32, s: u32) {
+                self.0.borrow_mut().vram_to_stage(v, s)
+            }
+            fn barrier(&mut self) {
+                self.0.borrow_mut().barrier()
+            }
+            fn vram_to_pinned(&mut self, v: u32, q: u32) {
+                self.0.borrow_mut().vram_to_pinned(v, q)
+            }
+            fn stage_to_vram(&mut self, s: u32, v: u32) {
+                self.0.borrow_mut().stage_to_vram(s, v)
+            }
+        }
+        let cell = std::cell::RefCell::new(sim);
+        let mut each = |r0: usize, n: usize, s: &Served| -> Result<(), String> {
+            assert_eq!(r0, rows);
+            rows += n;
+            for &(e, loc) in &s.locs {
+                assert!(!matches!(loc, Loc::Pinned(_)), "expert {e} read zero-copy from pinned");
+                assert!(holds(&cell.borrow(), l, e, loc), "expert {e} at {loc:?}");
+            }
+            moves.add(&s.moves);
+            Ok(())
+        };
+        let n = serve_chunk_global(&mut a, l, &sel, k, cap, &mut Shared(&cell), &mut each).unwrap();
+        assert!(n >= 2, "more non-VRAM experts than staging slots: sub-batches");
+        assert_eq!(rows, ex / k);
+        assert_eq!((moves.zero_copy, moves.pinned_to_stage, moves.nvme_to_landing, moves.landing_to_stage), (0, ram as u64, nvme as u64, nvme as u64), "every non-VRAM expert staged once");
+        assert_eq!((moves.n2v, moves.p2v, moves.n2p, moves.v2p, moves.v2n, moves.p2n, moves.nvme_to_pinned), (0, 0, 0, 0, 0, 0, 0), "no tier change in a prompt call");
+        assert_eq!(ram_lru(&a), lru0, "the pinned LRU's order");
+        assert_eq!(keys(&a, |_| true).iter().map(|&(l, e)| a.place(l, e)).collect::<Vec<_>>(), all0, "every place");
+        assert_eq!((a.stats.admitted, a.stats.write_backs), (stats0.admitted, stats0.write_backs));
+        a.check().unwrap();
+    }
+
     /// the chunk mover addresses global slot `g` as slot `g % per` of chunk `g / per`
     #[test]
     fn the_chunk_mover_maps_global_slots_onto_the_chunks() {
@@ -4298,10 +4450,12 @@ mod arena_gpu_tests {
         let env = |kv: &'static [(&'static str, &'static str)]| move |k: &str| kv.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
         // GLM-5.3-Flash 3-bit record: 2.5 GiB of staging hold 283 records -> 192 ring slots
         let rec = 9_474_048u64;
-        assert_eq!(prefill_ring_pinned_bytes(&env(&[(ARENA_ENV, "global"), (ARENA_STAGE_ENV, "2.5")]), rec), 192 * rec + 4096);
-        assert_eq!(prefill_ring_pinned_bytes(&env(&[(ARENA_ENV, "global"), (ARENA_STAGE_ENV, "0.1")]), rec), 11 * rec + 4096);
+        assert_eq!(prefill_ring_pinned_bytes(&env(&[(ARENA_ENV, "global"), (ARENA_STAGE_ENV, "2.5")]), 288, rec), 192 * rec + 4096);
+        assert_eq!(prefill_ring_pinned_bytes(&env(&[(ARENA_ENV, "global"), (ARENA_STAGE_ENV, "0.1")]), 288, rec), 11 * rec + 4096);
+        // #196 stage 2: with an elastic part a buffer holds a whole layer (288 records -> 192 slots)
+        assert_eq!(prefill_ring_pinned_bytes(&env(&[(ARENA_ENV, "global"), (ARENA_STAGE_ENV, "0.1"), (ARENA_ELASTIC_ENV, "10")]), 288, rec), 192 * rec + 4096);
         for off in [&[(ARENA_STAGE_ENV, "2.5")][..], &[(ARENA_ENV, "global")][..], &[(ARENA_ENV, "layer"), (ARENA_STAGE_ENV, "2.5")][..]] {
-            assert_eq!(prefill_ring_pinned_bytes(&env(off), rec), 0, "{off:?}");
+            assert_eq!(prefill_ring_pinned_bytes(&env(off), 288, rec), 0, "{off:?}");
         }
     }
 
@@ -4384,6 +4538,219 @@ mod arena_gpu_tests {
             }
         }
         drop(cnq);
+    }
+}
+
+#[cfg(test)]
+mod stage2_gpu_tests {
+    //! #196 stage 2 on the GPU: the stage engine engages for the expert-major prompt call of
+    //! `Glm5Run` (its hook hands over pseudo-rows, far fewer than the call's picks), and a bench of
+    //! one 8192-row grouped-expert call reading its experts zero-copy against staged. `#[ignore]`:
+    //! CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_stage2_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+    use crate::glm5_flags::tests::synth_model;
+    use crate::glm5_int_tests::{g3, Env};
+
+    const REC: u64 = 9_474_048;
+
+    /// the pinned LRU, oldest to newest, as the keys in the slots
+    fn ram_lru(a: &GlobalArena) -> Vec<u32> {
+        let (mut v, mut x) = (Vec::new(), a.oldest);
+        while x != NONE {
+            v.push(a.rowner[x as usize]);
+            x = a.next[x as usize];
+        }
+        v
+    }
+
+    /// A synthetic glm5_next model (layers 0-2 dense, 3-4 MoE with 144 MUL1 experts, top-8), a
+    /// prompt of 80 ids in one prompt call (`CROW_CHUNK=80`: 640 picks, an expert-major selection
+    /// of about 140 ids in 18 pseudo-rows) and 6 greedy ids, then a second prompt of 80 ids at the
+    /// next row: per-layer against the global arena with staging (`CROW_GLM_ARENA_STAGE_GB` = one
+    /// layer, `CROW_GLM_ARENA_STAGE_MIN` default 512), VRAM 3 + pinned 40 slots per layer. On the
+    /// arena every prompt layer runs staged in one run (one staged call per MoE layer, no
+    /// fallback, no synchronous restage); the second prompt, whose layers hold more non-VRAM
+    /// experts than the 128 prefill staging slots, copies pinned experts into staging, reads none
+    /// zero-copy, and leaves every place and the pinned LRU's order as decode left them. Ids
+    /// equal and logits within G3 (cosine >= 0.9999) of the per-layer run.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 3.6 GB synthetic container in the temp dir): cargo test --release --lib glm5_stage2_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_stage2_gpu_an_expert_major_prompt_call_stages_every_non_vram_expert() {
+        let mut g = Glm5Geo::GLM_5_3_FLASH;
+        (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (5, 3, 144, 8, 2048);
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let p1: Vec<i64> = (0..80).map(|i| (i * 37 + 5) % 2048).collect();
+        let p2: Vec<i64> = (0..80).map(|i| (i * 53 + 11) % 2048).collect();
+        let n = 6;
+        let pos2 = p1.len() + n - 1;
+        let sizes = TierSizes { vram: 3, pinned: 40 };
+        let stage_gb = format!("{}", g.experts as f64 * REC as f64 / GIB);
+        let arms: [(&str, Vec<(&str, String)>); 2] = [
+            ("per-layer", vec![("CROW_CHUNK", "80".into())]),
+            (
+                "global staged",
+                vec![("CROW_CHUNK", "80".into()), ("CROW_GLM_ARENA", "global".into()), ("CROW_GLM_ARENA_VRING", "0".into()), ("CROW_GLM_ARENA_STAGE_GB", stage_gb.clone())],
+            ),
+        ];
+        let mut outs: Vec<(Generated, i64, Vec<f32>)> = Vec::new();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            for (name, env) in &arms {
+                let _env = Env::set(env);
+                let mut run = Glm5Run::load(&mut cnq, &g, &moe, pos2 + p2.len() + 1, &mut |s| eprintln!("{s}"));
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                let gen = run.generate(&mut cnq, &mut tiers, &p1, n, true, &mut |_| {}).unwrap();
+                let moved = |t: &ExpertTiers| t.moves.iter().fold((0u64, 0u64), |a, m| (a.0 + m.zero_copy, a.1 + m.pinned_to_stage));
+                let global = tiers.arena.is_some();
+                let before = if global {
+                    let st = tiers.arena_stage_stats().unwrap().0;
+                    assert_eq!((st.calls, st.fallbacks, st.sync_restaged), (2, 0, 0), "{name}: the first prompt staged every MoE layer in one run: {st:?}");
+                    let a = tiers.arena().unwrap();
+                    let non_vram: Vec<usize> = (0..2).map(|l| (0..g.experts as u32).filter(|&e| !matches!(a.place(l, e), Place::Vram(_))).count()).collect();
+                    let ram: usize = (0..2).map(|l| (0..g.experts as u32).filter(|&e| matches!(a.place(l, e), Place::Ram(_))).count()).sum();
+                    assert!(non_vram.iter().all(|&x| x > tiers.prefill_cap()) && ram > 0, "{name}: non-VRAM experts per layer {non_vram:?} above {} slots, {ram} pinned", tiers.prefill_cap());
+                    let places: Vec<Place> = (0..2).flat_map(|l| (0..g.experts as u32).map(move |e| (l, e))).map(|(l, e)| a.place(l, e)).collect();
+                    Some((st, ram_lru(a), places, moved(&tiers)))
+                } else {
+                    None
+                };
+                let id2 = run.prefill(&mut cnq, &mut tiers, &p2, pos2, &mut |_| {}).unwrap();
+                let lg = cuda::dtoh(run.logits_dev(), g.vocab);
+                if let Some((st0, lru0, places0, mv0)) = before {
+                    let st = tiers.arena_stage_stats().unwrap().0;
+                    let a = tiers.arena().unwrap();
+                    let mv = moved(&tiers);
+                    eprintln!("glm5_stage2 synthetic {name}: stage {st:?}, prompt 2 moves zero-copy {} pinned->stage {}", mv.0 - mv0.0, mv.1 - mv0.1);
+                    assert_eq!((st.calls - st0.calls, st.fallbacks, st.sync_restaged), (2, 0, 0), "{name}: the second prompt staged every MoE layer in one run: {st:?}");
+                    assert_eq!(mv.0 - mv0.0, 0, "{name}: no expert read zero-copy in the prompt");
+                    assert!(mv.1 > mv0.1, "{name}: pinned experts copied into staging");
+                    assert_eq!(ram_lru(a), lru0, "{name}: the pinned LRU's order");
+                    let places: Vec<Place> = (0..2).flat_map(|l| (0..g.experts as u32).map(move |e| (l, e))).map(|(l, e)| a.place(l, e)).collect();
+                    assert_eq!(places, places0, "{name}: every place");
+                    a.check().unwrap();
+                }
+                tiers.free();
+                run.free();
+                outs.push((gen, id2, lg));
+            }
+        }
+        let (base, got) = (&outs[0], &outs[1]);
+        assert_eq!((&got.0.ids, got.1), (&base.0.ids, base.1), "ids");
+        let mut r: Vec<(f64, f64, bool)> = got.0.logits.iter().zip(&base.0.logits).map(|(p, q)| g3(q, p)).collect();
+        r.push(g3(&base.2, &got.2));
+        let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
+        let kl = r.iter().map(|x| x.1).fold(0.0, f64::max);
+        eprintln!("glm5_stage2 G3: logits cosine min {cos:.7}, KL max {kl:.3e}, top-1 {}/{}", r.iter().filter(|x| x.2).count(), r.len());
+        assert!(cos >= 0.9999, "logits cosine {cos} under G3's 0.9999");
+    }
+
+    /// Bench: the routed experts of one 8192-row prompt call at GLM-5.3-Flash shapes, uniform
+    /// over 288 experts, `GpuMoeGroupedPlan::experts_items` (two `mul1_gemm_grp` launches) with
+    /// the table on 288 pinned records (zero-copy: each expert re-read per 16-row tile, the path
+    /// the profile measured) against the stage engine's way: each record copied once into a VRAM
+    /// staging buffer, the table on it. Median of 3 after 1 warm-up, host wall around a sync.
+    #[test]
+    #[ignore = "bench, needs the GPU (about 6 GB VRAM, 2.7 GB pinned): cargo test --release --lib glm5_stage2_gpu_grouped_bench -- --ignored --nocapture --test-threads 1"]
+    fn glm5_stage2_gpu_grouped_bench() {
+        use crate::geo::ExpertCodec;
+        use crate::glm5_moe::{ExpertMajor, GpuMoeGroupedPlan, GROUP_ROWS};
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let rb = crate::cpu_mul1::GLM_RECORD_BYTES_K3;
+        let moe = MoeGeo::new(&g, ExpertRecordSpec::new(ExpertCodec::Mul1, rb as u64).unwrap()).unwrap();
+        let (h, k, e, t) = (g.hidden, g.topk, g.experts, 8192usize);
+        let specs = crate::kernels::mul1::record_specs(g.hidden, g.expert_inter, 3, false);
+        let mut x = 0x05EE_D196u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mk = crate::kernels::mul1::Kernels::new();
+            let mut pinned = Pinned::alloc(e * rb);
+            for j in 0..e {
+                let mut r = vec![0u8; rb];
+                for w in r[..specs[0].suh_off].chunks_exact_mut(8) {
+                    w.copy_from_slice(&rnd().to_le_bytes());
+                }
+                // fp16 scales +-0.0625
+                for (i, w) in r[specs[0].suh_off..].chunks_exact_mut(2).enumerate() {
+                    w.copy_from_slice(&if (i + j) % 2 == 0 { 0x2C00u16 } else { 0xAC00u16 }.to_le_bytes());
+                }
+                pinned.write_bytes(j * rb, &r);
+            }
+            let mut stage = cuda::alloc_named("bench staging buffer", e * rb);
+            let mut tp = cuda::to_u64_dev(&(0..e).map(|j| pinned.dev + (j * rb) as u64).collect::<Vec<_>>());
+            let mut tv = cuda::to_u64_dev(&(0..e).map(|j| stage + (j * rb) as u64).collect::<Vec<_>>());
+            let mut ids = Vec::with_capacity(t * k);
+            for _ in 0..t {
+                let mut row: Vec<i32> = Vec::with_capacity(k);
+                while row.len() < k {
+                    let c = (rnd() % e as u64) as i32;
+                    if !row.contains(&c) {
+                        row.push(c);
+                    }
+                }
+                ids.extend(row);
+            }
+            let xs: Vec<f32> = (0..t * h).map(|_| ((rnd() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.2).collect();
+            let mut xd = cuda::to_f32_dev(&xs);
+            let sch = ExpertMajor::new(&ids, k, e, GROUP_ROWS).unwrap();
+            let mut b = GpuMoeGroupedPlan::new(&moe, t, &mk);
+            b.upload(&sch);
+            let med = |f: &mut dyn FnMut()| -> f64 {
+                let mut v = Vec::new();
+                for i in 0..4 {
+                    cuda::sync();
+                    let t0 = std::time::Instant::now();
+                    f();
+                    cuda::sync();
+                    if i >= 1 {
+                        v.push(t0.elapsed().as_secs_f64());
+                    }
+                }
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            };
+            let s = cuda::cur_stream();
+            let h2d = || {
+                for j in 0..e {
+                    cuda::ck(sys::cuMemcpyHtoDAsync_v2(stage + (j * rb) as u64, (pinned.host as *const u8).add(j * rb) as *const _, rb, s));
+                }
+            };
+            let zero_copy = med(&mut || b.experts_items(tp, xd, 0..sch.work.len()));
+            let copy = med(&mut || h2d());
+            let vram = med(&mut || b.experts_items(tv, xd, 0..sch.work.len()));
+            let staged = med(&mut || {
+                h2d();
+                b.experts_items(tv, xd, 0..sch.work.len());
+            });
+            eprintln!(
+                "glm5_stage2 grouped bench, t {t}: {} experts, {} items; zero-copy from pinned {:.1} ms; staged: H2D once {:.1} ms ({:.1} GB/s) + grouped on VRAM {:.1} ms = {:.1} ms serial ({:.1}x); per 42 MoE layers {:.2} s -> {:.2} s (H2D one layer ahead: {:.2} s)",
+                sch.experts.len(),
+                sch.work.len(),
+                zero_copy * 1e3,
+                copy * 1e3,
+                (e * rb) as f64 / copy / 1e9,
+                vram * 1e3,
+                staged * 1e3,
+                zero_copy / staged,
+                42.0 * zero_copy,
+                42.0 * staged,
+                42.0 * copy.max(vram)
+            );
+            b.free();
+            for d in [&mut stage, &mut tp, &mut tv, &mut xd] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
     }
 }
 
@@ -4870,9 +5237,20 @@ impl ExpertTiers {
     /// A CUDA context is current; no launch reading this layer's slots, its table or the prefill
     /// staging set is pending; `run` queues on the current stream.
     pub unsafe fn tables_for_chunk(&mut self, layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+        self.tables_for_prompt(layer, sel, sel.len(), run)
+    }
+
+    /// #196 stage 2: [`ExpertTiers::tables_for_chunk`] for a prompt call of `picks` = token rows x
+    /// top-k picks. The expert-major prompt call hands over its pseudo-rows (each selected expert
+    /// once, about `experts` ids), so `sel.len()` is no measure of the call's size: the global
+    /// arena stages the call at `stage_min` picks by `picks`.
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::tables_for_chunk`].
+    pub unsafe fn tables_for_prompt(&mut self, layer: usize, sel: &[i32], picks: usize, run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         if self.arena.is_some() {
-            return self.tables_for_chunk_global(l, sel, run);
+            return self.tables_for_chunk_global(l, sel, picks, run);
         }
         if self.pf_cap == 0 {
             self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
@@ -7816,7 +8194,9 @@ impl Glm5Run {
             if let Some(c) = self.mla[l].as_mut() {
                 self.pass.swap_mla_cache(c);
             }
-            let mut hook = |layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>| tiers.tables_for_chunk(layer, sel, run);
+            // the call's picks (t rows x top-k), not the pseudo-rows of its expert-major `sel`
+            let picks = t * self.moe.topk;
+            let mut hook = |layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>| tiers.tables_for_prompt(layer, sel, picks, run);
             let r = self.pass.call_with_expert_batches(&self.layers[l], self.x, pos0, t, &mut hook);
             // the layer's own state goes back even when the call failed
             if let Some(s) = self.kda[l].as_mut() {
