@@ -3560,6 +3560,9 @@ impl ExpertTiers {
         d.a.set_pin_stay(self.pinned_use.stay);
         // CROW_GLM_CONTROLLER with the CPU lane: the lane's worker waits per expert, not this thread
         let ctl_lane = reply.is_some() && self.dev_lane.is_some();
+        // #202 RT2: a one-row call off the controller through the stager splits early / late
+        let rt2 = self.rt2 && reply.is_none() && self.stager.is_some() && sel.len() == self.topk;
+        let mut written: Vec<Dev> = Vec::new();
         let mut waits = LaneWaits::default();
         let served = match self.stager.as_mut() {
             None => {
@@ -3629,16 +3632,19 @@ impl ExpertTiers {
                     early,
                     promote: self.lanes2,
                     moved: 0,
+                    written: Vec::new(),
                 };
                 let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut(), gpu_waits: 0 };
                 // #203: with the stager the guesses go into the arena's pinned tier (below), not
                 // the store
                 let served = serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?;
                 m.settle_locs(&served.locs);
-                if self.pinned_use.cpu_lane {
+                if self.pinned_use.cpu_lane || rt2 {
                     for &(e, loc) in &served.locs {
                         if let Loc::Pinned(q) = loc {
-                            if ctl_lane {
+                            // #202 RT2: a slot a write-back still lands in is late (the stager
+                            // stream waits for it), never the lane's; the host does not wait
+                            if ctl_lane || rt2 {
                                 let ev = m.wb_events(q);
                                 if !ev.is_empty() {
                                     waits.wb.push((e, ev));
@@ -3651,6 +3657,7 @@ impl ExpertTiers {
                 }
                 waits.landed = std::mem::take(&mut m.inner.landed);
                 waits.d2h = std::mem::take(&mut m.inner.d2h);
+                written = std::mem::take(&mut m.inner.written);
                 waits.row = m.inner.landed_host;
                 (waits.seq, waits.in_flight, waits.rb) = (m.inner.seq, self.src.records_in_flight(), rb);
                 let moves = m.inner.moved > 0 || m.gpu_waits > 0;
@@ -3693,13 +3700,41 @@ impl ExpertTiers {
                     t
                 }
             };
-            let state = |e: u32, rec: *const u8| if ctl_lane { waits.state(e, rec) } else { PinState::Resident };
-            self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state)
+            // #202 RT2: the experts whose record the call's stager batch writes or waits for: a
+            // staging slot, an address the batch writes, a write-back still landing, a read not
+            // landed yet (its flag below the value)
+            let late: Vec<u32> = if rt2 {
+                served
+                    .locs
+                    .iter()
+                    .filter(|&&(e, loc)| {
+                        matches!(loc, Loc::Stage(_))
+                            || written.contains(&tv[e as usize])
+                            || waits.wb.iter().any(|x| x.0 == e)
+                            || waits.landed.iter().any(|&(x, v)| x == e && std::ptr::read_volatile(waits.row.add(e as usize)) < v)
+                    })
+                    .map(|x| x.0)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let state = |e: u32, rec: *const u8| {
+                if ctl_lane {
+                    waits.state(e, rec)
+                } else if rt2 && late.contains(&e) {
+                    PinState::Busy
+                } else {
+                    PinState::Resident
+                }
+            };
+            let lane = self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state);
+            (lane, rt2.then_some(late))
         };
+        let (lane, rt2_late) = lane;
         match staged {
-            Some((trow, stream, event, early)) => self.finish_staged(l, sel, lane, waits, trow, stream, event, reply, early)?,
+            Some((trow, stream, event, early)) => self.finish_staged(l, sel, lane, waits, trow, stream, event, reply, early, rt2_late)?,
             None => {
-                let post = lane.map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None });
+                let post = lane.map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None, rt2: None });
                 crate::glm5_moe::lane::post(post);
             }
         }
@@ -6286,6 +6321,8 @@ pub struct ExpertTiers {
     prefetch: Option<glm5_flags::Prefetch>,
     /// #202 lanes (`CROW_GLM_LANES2=1`, [`ExpertTiers::set_lanes2`])
     lanes2: bool,
+    /// #202 RT2 (`CROW_GLM_RT2=1`, [`ExpertTiers::set_rt2`])
+    rt2: bool,
 }
 
 struct GpuMover<'a> {
@@ -6724,8 +6761,10 @@ impl ExpertTiers {
             stager: None,
             prefetch: None,
             lanes2: false,
+            rt2: false,
         };
         t.set_lanes2(glm5_flags::lanes2_on());
+        t.set_rt2(crate::glm5_moe::lane::rt2_on());
         t.set_pinned_use(pu)?;
         if t.arena.is_some() {
             t.arena_boot()?;
@@ -6814,7 +6853,7 @@ impl ExpertTiers {
         let host = self.pinned.get(l).map_or(std::ptr::null(), |p| p.host as *const u8);
         let post = self
             .lane_plan(l, sel, &mut served, &|e| table[e as usize], &|q| host.add(q as usize * rb as usize), &|_, _| PinState::Resident)
-            .map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None });
+            .map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None, rt2: None });
         crate::glm5_moe::lane::post(post);
         self.count_heat(l, sel);
         if let Some(pf) = self.prefetch.as_mut() {
@@ -7415,6 +7454,9 @@ struct StagerMover<'a> {
     /// #202 lanes: copies on the stream the call's experts read (into staging or VRAM, outside
     /// the tail): the device waits for the moves word only when there are any
     moved: u32,
+    /// #202 RT2: device addresses of the records the call's stager batch writes (staging slots,
+    /// VRAM entrants, pinned slots by D2H or NVMe): an expert read there runs after the batch
+    written: Vec<Dev>,
 }
 
 /// #202 early reply: what a [`StagerMover`] of a controlled call keeps off the stager stream
@@ -7643,6 +7685,9 @@ impl Mover for StagerMover<'_> {
             self.pending.push(t);
         }
         for &(e, d) in jobs {
+            if let Dst::Pinned(q) = d {
+                self.written.push(self.pinned.expect("a pinned destination without a pinned arena").dev + q as u64 * self.rb);
+            }
             let w = self.landed_dev + e as u64 * 8;
             match self.early.as_mut().filter(|x| !x.serial) {
                 Some(x) => {
@@ -7661,6 +7706,7 @@ impl Mover for StagerMover<'_> {
     fn landing_to_stage(&mut self, i: u32) {
         let rb = self.rb as usize;
         let (dst, src) = (self.stage + i as u64 * self.rb, unsafe { self.landing.add(i as usize * rb) } as *const u8);
+        self.written.push(dst);
         match self.early.as_mut().filter(|x| !x.serial) {
             Some(x) => {
                 x.tail.push(TailOp::H2d(dst, src));
@@ -7680,11 +7726,13 @@ impl Mover for StagerMover<'_> {
             unsafe { run_tail(self.s, &tail, self.rb) };
         }
         unsafe { cuda::ck(sys::cuMemcpyHtoDAsync_v2(self.stage + s as u64 * self.rb, src as *const _, self.rb as usize, self.s)) };
+        self.written.push(self.stage + s as u64 * self.rb);
         self.read_pinned.push(q);
         self.moved += 1;
     }
     fn vram_to_stage(&mut self, v: u32, s: u32) {
         unsafe { cuda::ck(sys::cuMemcpyDtoDAsync_v2(self.stage + s as u64 * self.rb, self.vram + v as u64 * self.rb, self.rb as usize, self.s)) };
+        self.written.push(self.stage + s as u64 * self.rb);
         self.moved += 1;
     }
     /// the stager stream orders phase B's copies behind phase A's; a host write into a pinned
@@ -7695,9 +7743,11 @@ impl Mover for StagerMover<'_> {
         let dst = unsafe { (p.host as *mut u8).add(q as usize * self.rb as usize) };
         unsafe { cuda::ck(sys::cuMemcpyDtoHAsync_v2(dst as *mut _, self.vram + v as u64 * self.rb, self.rb as usize, self.s)) };
         self.d2h.push(dst as usize);
+        self.written.push(p.dev + q as u64 * self.rb);
     }
     fn stage_to_vram(&mut self, s: u32, v: u32) {
         let (dst, src) = (self.vram + v as u64 * self.rb, self.stage + s as u64 * self.rb);
+        self.written.push(dst);
         match self.early.as_mut().filter(|x| !x.serial && x.late_stage.contains(&s)) {
             Some(x) => x.tail.push(TailOp::D2d(dst, src)),
             None => {
@@ -7857,6 +7907,24 @@ impl ExpertTiers {
         self.lanes2
     }
 
+    /// #202 RT2 (`CROW_GLM_RT2=1`; `new` takes it from the environment): a one-row decode call
+    /// through the global arena and the stager, off the controller, splits its GPU experts into
+    /// those whose records the call's stager batch neither writes nor waits for (they run at
+    /// once) and the late ones (behind the stager's event), and the CPU lane takes only resident
+    /// records, so it never waits for a landing or a write-back and starts right after the
+    /// router flag (`glm5_moe::GpuMoePlan::experts_rt2`); the decode call also queues x to the
+    /// lane ahead of the router's publish (`glm5_moe::lane::X_EARLY`). Off: the former path.
+    /// Not under the controller (its calls keep their own path).
+    pub fn set_rt2(&mut self, on: bool) {
+        self.rt2 = on;
+        crate::glm5_moe::lane::X_EARLY.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #202 RT2: on
+    pub fn rt2(&self) -> bool {
+        self.rt2
+    }
+
     /// #149 path B: the stager is on
     pub fn stager_on(&self) -> bool {
         self.stager.is_some()
@@ -8003,6 +8071,7 @@ impl ExpertTiers {
         event: sys::CUevent,
         reply: Option<CtlReply>,
         early: Option<EarlyCall>,
+        rt2: Option<Vec<u32>>,
     ) -> Result<(), String> {
         let experts = self.cache.experts;
         let plan_at = self.ctl_seen.map(|t| t.elapsed());
@@ -8114,9 +8183,24 @@ impl ExpertTiers {
                 cuda::event_record(event, stream);
                 // WDDM: submit the stager's batch now (it would otherwise wait for a later query or sync)
                 cuda::stream_query(stream);
-                cuda::stream_wait_event(cuda::cur_stream(), event);
-                let post = lane.map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: Some(event as u64) });
-                crate::glm5_moe::lane::post(post);
+                match rt2 {
+                    // #202 RT2: the compute stream waits for the event inside the experts, behind
+                    // the resident ones (`experts_rt2`); every combo posted, also without a CPU one
+                    Some(late) => {
+                        let combos = match lane {
+                            Some((combos, _)) => combos,
+                            None => sel.iter().map(|&e| crate::glm5_moe::lane::Combo::Gpu(*trow.add(e as usize))).collect(),
+                        };
+                        let late = sel.iter().map(|&e| late.contains(&(e as u32))).collect();
+                        let rt = crate::glm5_moe::lane::Rt2 { event: event as u64, late };
+                        crate::glm5_moe::lane::post(Some(crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: None, rt2: Some(rt) }));
+                    }
+                    None => {
+                        cuda::stream_wait_event(cuda::cur_stream(), event);
+                        let post = lane.map(|(combos, _)| crate::glm5_moe::lane::Call { table: self.tables[l], combos, clock: self.lane_clock.clone(), ready: Some(event as u64), rt2: None });
+                        crate::glm5_moe::lane::post(post);
+                    }
+                }
             }
             // CROW_GLM_CONTROLLER: the reply word behind the batch; the compute stream's device
             // wait for it was queued long before
@@ -8182,6 +8266,7 @@ impl ExpertTiers {
             early: None,
             promote: self.lanes2,
             moved: 0,
+            written: Vec::new(),
         };
         let mut served = match self.prefetch.as_mut() {
             Some(pf) => serve(&mut self.cache, l, &mut self.slots[l], ids, self.stage_cap, &mut glm5_flags::PrefetchMover::new(&mut m, pf, &self.src, l, self.stage, Some(st.stream)))?,
@@ -8216,7 +8301,7 @@ impl ExpertTiers {
             let state = |e: u32, rec: *const u8| if ctl_lane { waits.state(e, rec) } else { PinState::Resident };
             self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| pin_host.add(q as usize * rb as usize), &state)
         };
-        self.finish_staged(l, sel, lane, waits, trow, stream, event, reply, None)?;
+        self.finish_staged(l, sel, lane, waits, trow, stream, event, reply, None, None)?;
         self.count_heat(l, sel);
         if let Some(pf) = self.prefetch.as_mut() {
             let cache = &self.cache;
@@ -12091,7 +12176,7 @@ mod split_tests {
                         combos.push(if e < nc { lane::Combo::Cpu(phost.add(ps * rb)) } else { lane::Combo::Gpu(*t) });
                     }
                     cuda::to_u64_into(table, &tab);
-                    lane::post((nc > 0).then(|| lane::Call { table, combos, clock: clock.clone(), ready: None }));
+                    lane::post((nc > 0).then(|| lane::Call { table, combos, clock: clock.clone(), ready: None, rt2: None }));
                     cuda::sync();
                     let t0 = std::time::Instant::now();
                     plan.run(&kn, &mk, &gk, &w, table, xd, yd);

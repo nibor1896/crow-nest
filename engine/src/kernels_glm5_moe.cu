@@ -14,6 +14,7 @@
 //   glm5_moe_gather       combo c = t * K + k: ptrs[c] = table[ids[c]], xg[c] = x[t]
 //   glm5_swiglu_clamp     h = silu(min(g, L)) * clamp(u, -L, L), silu(v) = v / (1 + exp(-v))
 //   glm5_moe_combine      y[t] = (sum_k w[t][k] * ye[t * K + k]) + ys[t], k in pick order
+//   glm5_moe_combine_rows the same, each row through a pointer (#202 CROW_GLM_RT2)
 //
 // Every rounded add and multiply outside expf is an __fadd_rn / __fmul_rn / __fdiv_rn intrinsic,
 // which NVRTC never contracts into an fma (-fmad=true is its default), so the f32 order is the
@@ -130,6 +131,25 @@ extern "C" __global__ void glm5_moe_combine(const float* __restrict__ ye, const 
     if (j >= H) return;
     float acc = 0.0f;
     for (int k = 0; k < K; k++) acc = __fadd_rn(acc, __fmul_rn(w[(size_t)t * K + k], ye[((size_t)t * K + k) * H + j]));
+    y[(size_t)t * H + j] = __fadd_rn(acc, ys[(size_t)t * H + j]);
+}
+
+// #202 CROW_GLM_RT2: glm5_moe_combine with each combo's row read through a pointer:
+// rows [T * K] u64 device addresses of the [H] f32 output rows (a GPU slot of ye, or a CPU-lane
+// row in mapped host memory). The same expressions in the same order as glm5_moe_combine, so the
+// bits are those of the combine over the same rows. grid (ceil(H / 256), T), block 256.
+extern "C" __global__ void glm5_moe_combine_rows(const unsigned long long* __restrict__ rows, const float* __restrict__ w,
+                                                 const float* __restrict__ ys, float* __restrict__ y,
+                                                 const int* __restrict__ prm) {
+    const int K = prm[0], H = prm[1];
+    const int t = blockIdx.y;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= H) return;
+    float acc = 0.0f;
+    for (int k = 0; k < K; k++) {
+        const float* r = (const float*)rows[(size_t)t * K + k];
+        acc = __fadd_rn(acc, __fmul_rn(w[(size_t)t * K + k], r[j]));
+    }
     y[(size_t)t * H + j] = __fadd_rn(acc, ys[(size_t)t * H + j]);
 }
 

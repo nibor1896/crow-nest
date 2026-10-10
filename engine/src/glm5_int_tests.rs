@@ -46,6 +46,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_SHARED_OVERLAP",
     "CROW_GLM_MAX_BATCH",
     "CROW_GLM_LANES2",
+    "CROW_GLM_RT2",
 ];
 
 pub(crate) struct Env(Vec<(String, Option<String>)>);
@@ -770,6 +771,72 @@ fn glm5_int_gpu_lanes2_is_the_measurement_arm_within_the_accuracy_bar() {
             assert!(outs[2].lane_experts > 0, "{what}: the lane ran under lanes2");
         }
         assert!(outs[2].early.0 > 0, "{what}: the controller answered early under lanes2");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #202 RT2: the decode arm of record without the controller ("ARM2": global arena with warm
+/// start, small elastic and stage budgets so the arena spills and the NVMe reads, HC fuse, dense
+/// GEMM, prompt chunk 8192, flags + stager + prefetch on the side stream + shared overlap,
+/// `CROW_GLM_PINNED=zerocopy`, CPU lane split on host pinned memory) with and without
+/// `CROW_GLM_RT2=1`, on the synthetic model (300-id prompt, 6 greedy ids) at V 3 + P 4 and
+/// V 0 + P 16 (every expert pinned, the lane computes). Without the lane the RT2 arm has the
+/// arm's ids and logits bit for bit (the same experts on the GPU, the same combine sum); with the
+/// lane the same ids and a logit cosine >= 0.9999 per generated row (RT2's lane leaves a pick still
+/// landing or written back to the GPU, so the CPU set may differ). Every RT2 arm ran its decode
+/// layers through `experts_rt2`.
+#[test]
+#[ignore = "needs the GPU (about 12 GB VRAM, a 2.3 GB synthetic container in the temp dir)"]
+fn glm5_int_gpu_rt2_is_the_arm_without_the_controller_within_the_accuracy_bar() {
+    let dir = std::env::temp_dir().join(format!("crow-int-rt2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let s = |v: &str| v.to_string();
+    let gib = |records: f64| format!("{}", records * REC as f64 / (1u64 << 30) as f64);
+    let base: Vec<(&'static str, String)> = vec![
+        ("CROW_GLM_HCFUSE", s("1")),
+        ("CROW_GLM_DENSE_GEMM", s("1")),
+        ("CROW_GLM_PINNED", s("zerocopy")),
+        ("CROW_PINNED_ALLOC", s("host")),
+        ("CROW_GLM_ARENA", s("global")),
+        ("CROW_GLM_ARENA_WARM", warm.clone()),
+        ("CROW_GLM_ARENA_ELASTIC_GB", gib(2.0 * 3.0)),
+        ("CROW_GLM_ARENA_STAGE_GB", gib(12.0)),
+        ("CROW_CHUNK", s("8192")),
+        ("CROW_GLM_FLAGS", s("1")),
+        ("CROW_GLM_STAGER", s("1")),
+        ("CROW_GLM_PREFETCH", s("1")),
+        ("CROW_GLM_PREFETCH_SIDE", s("1")),
+        ("CROW_GLM_SHARED_OVERLAP", s("1")),
+    ];
+    let plus = |a: &[(&'static str, String)], b: &[(&'static str, &str)]| -> Vec<(&'static str, String)> { a.iter().cloned().chain(b.iter().map(|(k, v)| (*k, v.to_string()))).collect() };
+    let lane = plus(&base, &[("CROW_GLM_CPU_LANE", "split")]);
+    let prompt: Vec<i64> = (0..300).map(|i| (i * 77 + 3) % 2048).collect();
+    let n = 6;
+    let calls = || crate::glm5_moe::lane::RT2_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    for (what, sizes) in [("V3 P4", TierSizes { vram: 3, pinned: 4 }), ("V0 P16", TierSizes { vram: 0, pinned: 16 })] {
+        let c0 = calls();
+        let outs = run_loaded_arms(&[("arm no lane", base.clone()), ("arm no lane rt2", plus(&base, &[("CROW_GLM_RT2", "1")]))], &prompt, n, sizes);
+        let c1 = calls();
+        eprintln!("glm5 int rt2 {what} no lane: NVMe reads arm {} rt2 {}, RT2 calls {}", outs[0].nvme_reads, outs[1].nvme_reads, c1 - c0);
+        assert_same(&["arm no lane", "arm no lane rt2"], &outs);
+        assert_eq!(outs[0].nvme_reads, outs[1].nvme_reads, "{what}: RT2 moves no record differently");
+        assert!(c1 > c0, "{what}: no decode layer ran through experts_rt2");
+        let outs = run_loaded_arms(&[("arm", lane.clone()), ("arm rt2", plus(&lane, &[("CROW_GLM_RT2", "1")]))], &prompt, n, sizes);
+        let c2 = calls();
+        eprintln!(
+            "glm5 int rt2 {what} lane split: NVMe reads arm {} rt2 {}, CPU experts arm {} rt2 {}, RT2 calls {}",
+            outs[0].nvme_reads,
+            outs[1].nvme_reads,
+            outs[0].lane_experts,
+            outs[1].lane_experts,
+            c2 - c1
+        );
+        assert_g3(&format!("rt2 {what} lane split vs arm"), &outs[1], &outs[0]);
+        assert!(c2 > c1, "{what}: no decode layer ran through experts_rt2");
+        if sizes.vram == 0 {
+            assert!(outs[1].lane_experts > 0, "{what}: the lane ran under RT2");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
