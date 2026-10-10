@@ -582,6 +582,18 @@ pub unsafe fn to_i32_into(dst: CUdeviceptr, v: &[i32]) { into_dev(dst, v) }
 
 pub unsafe fn to_u64_into(dst: CUdeviceptr, v: &[u64]) { into_dev(dst, v) }
 
+/// #196: write one i32 into device memory on the current stream with `cuMemsetD32Async` - no
+/// host buffer and no host sync (memset Async is always host-asynchronous, stream-ordered and
+/// graph-capturable). The device sees exactly the word `to_i32_into(dst, &[v])` wrote; the
+/// difference is the `cuStreamSynchronize` that pageable form costs on the legacy stream.
+///
+/// # Safety
+///
+/// - a CUDA context must be current; `dst` is a 4-byte aligned device address
+pub unsafe fn set_i32_async(dst: CUdeviceptr, v: i32) {
+    ck(sys::cuMemsetD32Async(dst, v as u32, 1, cur_stream()));
+}
+
 /// blocking D2H of `n` elements. `cuMemcpyDtoH_v2` on the legacy stream is itself
 /// a sync point, so only `dtoh_u32` adds an explicit stream sync (see below).
 pub unsafe fn dtoh_t<T: Copy + Default>(src: CUdeviceptr, n: usize) -> Vec<T> {
