@@ -6210,7 +6210,7 @@ pub mod mul1 {
     use cudarc::driver::sys::{CUdeviceptr, CUfunction};
 
     /// every entry of `MUL1_SRC`
-    pub const NAMES: &[&str] = &["mul1_had_in", "mul1_gemv", "mul1_gemv_warp", "mul1_had_out", "mul1_act_had_in", "mul1_decode_states", "mul1_gemm_grp", "mul1_tc_in", "mul1_tc_recon", "mul1_tc_out", "mul1_gemm_tc", "mul1_gemv2"];
+    pub const NAMES: &[&str] = &["mul1_had_in", "mul1_gemv", "mul1_gemv_warp", "mul1_had_out", "mul1_act_had_in", "mul1_decode_states", "mul1_gemm_grp", "mul1_tc_in", "mul1_tc_recon", "mul1_tc_out", "mul1_gemm_tc", "mul1_gemv2", "mul1_tc2_recon", "mul1_tc2_in", "mul1_tc2_act", "mul1_tc2_gemm64", "mul1_tc2_gemm128", "mul1_tc2_gemm64f", "mul1_tc2_gemm128f"];
     /// tokens per slot (`MUL1_MAXT`)
     pub const MAXT: usize = 8;
     /// activation rows one k-split stages in shared memory (`MUL1_XROWS`)

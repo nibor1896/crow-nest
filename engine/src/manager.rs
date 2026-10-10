@@ -929,7 +929,7 @@ pub fn glm5_chunk_scratch_parts(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool)
         ("selection", above(&|m| MlaScratch::sel_bytes(&md, m))),
         ("moe", moe),
         ("tc", tc),
-        ("moe_tc", if crate::glm5_moe::moe_tc_from_env() { crate::glm5_moe::moe_tc_bytes(h, g.expert_inter, chunk) } else { 0 }),
+        ("moe_tc", crate::glm5_moe::moe_tc_mode_bytes(crate::glm5_moe::moe_tc_mode_from_env(), h, g.expert_inter, g.experts, g.topk, chunk)),
     ]
 }
 
