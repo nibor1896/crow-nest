@@ -324,12 +324,86 @@ extern "C" __global__ void glm5_ctl_wait(const unsigned long long* ctr, volatile
     }}
     __threadfence_system();
 }}
+// #202 early reply: the late ring entry of request q ({late_w} u64): [0] q, [1] mode (1: the moves
+// word before the experts, 2: every late item waited before the experts), [2] items, [3] a VRAM
+// record the spare late slots read, [4] the moves word's address, [5] its value; from [8] four
+// words per item: expert, record address, wait word address, wait value
+__device__ bool glm5_late_spin(const volatile unsigned long long* w, unsigned long long v, unsigned long long q, volatile unsigned long long* err, long long timeout_ns)
+{{
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    while (*w < v) {{
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if ((long long) (t - t0) > timeout_ns) {{
+            if (*err == 0) *err = q;
+            return false;
+        }}
+        __nanosleep(200);
+    }}
+    return true;
+}}
+// before the layer's experts: the moves word (records the stager stream copies before any
+// landing wait), and with mode 2 every late item (more late experts than the late pass holds)
+extern "C" __global__ void glm5_ctl_pre(const unsigned long long* ctr, const unsigned long long* late, volatile unsigned long long* err, long long timeout_ns)
+{{
+    const unsigned long long q = *ctr;
+    const volatile unsigned long long* en = (const volatile unsigned long long*) (late + (q % {ring}) * {late_w});
+    if (en[0] != q) return;
+    const unsigned long long mode = en[1];
+    bool ok = true;
+    if (mode & 1) ok = glm5_late_spin((const volatile unsigned long long*) en[4], en[5], q, err, timeout_ns);
+    if (ok && (mode & 2)) {{
+        const unsigned long long n = en[2];
+        for (unsigned long long i = 0; i < n && ok; ++i) ok = glm5_late_spin((const volatile unsigned long long*) en[8 + 4 * i + 2], en[8 + 4 * i + 3], q, err, timeout_ns);
+    }}
+    __threadfence_system();
+}}
+// after the layer's other experts: each late expert waits on its own word (its landed flag),
+// then goes into a late slot (its record, its combo); the spare slots read the VRAM record and
+// write nowhere (idx -1)
+extern "C" __global__ void glm5_ctl_late(const unsigned long long* ctr, const unsigned long long* late, const int* __restrict__ ids, int k, const unsigned long long* __restrict__ ptrs1,
+                                         unsigned long long* ptrs2, int* idx, int slots, volatile unsigned long long* err, long long timeout_ns)
+{{
+    const unsigned long long q = *ctr;
+    const volatile unsigned long long* en = (const volatile unsigned long long*) (late + (q % {ring}) * {late_w});
+    const bool mine = en[0] == q;
+    const unsigned long long spare = (mine && en[3]) ? en[3] : ptrs1[0];
+    int j = 0;
+    if (mine && !(en[1] & 2)) {{
+        const unsigned long long n = en[2];
+        bool ok = true;
+        for (unsigned long long i = 0; i < n; ++i) {{
+            if (ok) ok = glm5_late_spin((const volatile unsigned long long*) en[8 + 4 * i + 2], en[8 + 4 * i + 3], q, err, timeout_ns);
+            const int e = (int) en[8 + 4 * i];
+            for (int c = 0; c < k && j < slots; ++c)
+                if (ids[c] == e) {{
+                    ptrs2[j] = en[8 + 4 * i + 1];
+                    idx[j] = c;
+                    ++j;
+                    break;
+                }}
+        }}
+    }}
+    for (; j < slots; ++j) {{
+        ptrs2[j] = spare;
+        idx[j] = -1;
+    }}
+    __threadfence_system();
+}}
+// the late slots' outputs over their combos' rows of ye (blockIdx.y = slot)
+extern "C" __global__ void glm5_ctl_scatter(float* ye, const float* __restrict__ ye2, const int* __restrict__ idx)
+{{
+    const int c = idx[blockIdx.y];
+    if (c < 0) return;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < H; i += gridDim.x * blockDim.x) ye[(size_t) c * H + i] = ye2[(size_t) blockIdx.y * H + i];
+}}
 "#,
         h = g.hidden,
         v = g.vocab,
         s = g.hc_streams,
         ring = CTL_RING,
-        entry = CTL_ENTRY
+        entry = CTL_ENTRY,
+        late_w = LATE_WORDS
     )
 }
 
@@ -343,6 +417,9 @@ pub struct Kernels {
     ctl_publish: CUfunction,
     ctl_wait: CUfunction,
     lane_add: CUfunction,
+    ctl_pre: CUfunction,
+    ctl_late: CUfunction,
+    ctl_scatter: CUfunction,
 }
 
 impl Kernels {
@@ -350,7 +427,19 @@ impl Kernels {
     /// A CUDA context is current.
     pub unsafe fn new(g: &Glm5Geo) -> Kernels {
         let module = cuda::compile(&src(g));
-        Kernels { feed: module.get("glm5_feed"), publish: module.get("glm5_publish"), publish_pred: module.get("glm5_publish_pred"), pred_tag: module.get("glm5_pred_tag"), ctl_publish: module.get("glm5_ctl_publish"), ctl_wait: module.get("glm5_ctl_wait"), lane_add: module.get("glm5_lane_add"), module }
+        Kernels {
+            feed: module.get("glm5_feed"),
+            publish: module.get("glm5_publish"),
+            publish_pred: module.get("glm5_publish_pred"),
+            pred_tag: module.get("glm5_pred_tag"),
+            ctl_publish: module.get("glm5_ctl_publish"),
+            ctl_wait: module.get("glm5_ctl_wait"),
+            lane_add: module.get("glm5_lane_add"),
+            ctl_pre: module.get("glm5_ctl_pre"),
+            ctl_late: module.get("glm5_ctl_late"),
+            ctl_scatter: module.get("glm5_ctl_scatter"),
+            module,
+        }
     }
 
     /// # Safety
@@ -1143,6 +1232,82 @@ const CTL_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 /// host enqueue, so 4 layers keep the device fed and the stream far below the launch queue that
 /// filled inside the first controlled row of GLM-5.3-Flash (2026-10-10)
 pub const CTL_AHEAD: u64 = 4;
+/// #202: `1` keeps the former reply of the controller, written by the stager stream behind the
+/// layer's moves and NVMe landings; unset, the controller answers at once (a host store into the
+/// mapped reply word right after the plan, as the template's `serve`, sybil-solutions/
+/// glm53-flash-offload 6769b27 `kernels/nv2/nv2_host.cpp#L484-L520`) and every expert not yet in
+/// place waits on the device for its own word ([`EarlyReply`])
+pub const ENV_CTL_LATE_REPLY: &str = "CROW_GLM_CTL_LATE_REPLY";
+/// u64 words per entry of the late ring (see `glm5_ctl_pre`): a header of 8, then 4 per item
+pub const LATE_WORDS: usize = 128;
+/// most items one late entry holds
+pub const LATE_MAX: usize = (LATE_WORDS - 8) / 4;
+/// #202: experts per MoE layer the late pass computes after their own landing (more go through
+/// `glm5_ctl_pre`'s wait before the layer's experts); the pass costs this many expert GEMV sets
+/// per layer, also with no late expert
+pub const LATE_SLOTS: usize = 2;
+
+/// #202 early reply: one expert of a controlled call whose record is not in place at the reply:
+/// the GPU computes it from `addr` in the late pass once the u64 at device address `word`
+/// reached `value` (its landed flag, or the stager's done word)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LateItem {
+    pub e: u32,
+    pub addr: Dev,
+    pub word: Dev,
+    pub value: u64,
+}
+
+/// #202 early reply: the host side of one request's answer: the mapped reply word and the
+/// request's entry of the late ring
+#[derive(Clone, Copy, Debug)]
+pub struct EarlyReply {
+    pub reply: *mut u64,
+    pub entry: *mut u64,
+}
+
+unsafe impl Send for EarlyReply {}
+
+impl EarlyReply {
+    /// Write request `q`'s late entry: `mode` (1: the device waits for the moves word `moves`
+    /// before the experts; 2: for every item there too), `spare` the VRAM record the unused late
+    /// slots read, `items` the late experts (at most [`LATE_MAX`]). The entry's sequence number
+    /// goes last.
+    ///
+    /// # Safety
+    /// `entry` is request `q`'s live entry; the device reads it only after the reply reached `q`.
+    pub unsafe fn entry(&self, q: u64, mode: u64, moves: (Dev, u64), spare: Dev, items: &[LateItem]) {
+        assert!(items.len() <= LATE_MAX, "glm5 controller: {} late experts, the entry holds {LATE_MAX}", items.len());
+        let w = |i: usize, v: u64| std::ptr::write_volatile(self.entry.add(i), v);
+        w(1, mode);
+        w(2, items.len() as u64);
+        w(3, spare);
+        w(4, moves.0);
+        w(5, moves.1);
+        for (i, it) in items.iter().enumerate() {
+            w(8 + 4 * i, it.e as u64);
+            w(8 + 4 * i + 1, it.addr);
+            w(8 + 4 * i + 2, it.word);
+            w(8 + 4 * i + 3, it.value);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        w(0, q);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// the reply: `q` into the mapped reply word (a host store, no stream); never lowers it (a
+    /// failed job left `u64::MAX`)
+    ///
+    /// # Safety
+    /// `reply` is the live mapped reply word.
+    pub unsafe fn reply(&self, q: u64) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        if std::ptr::read_volatile(self.reply) < q {
+            std::ptr::write_volatile(self.reply, q);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// `CROW_GLM_CONTROLLER`: the device side of the reference's nv2 controller
 /// (`kernels/nv2/nv2_shared.h` `Req` ring, `nv2_dev.cu` `nv_pub_k` / the waits of `nv_step`).
@@ -1183,6 +1348,13 @@ pub struct Ctl {
     /// a job failed: the reply word was forced up; no further controlled row until the switches
     /// are set again
     pub poisoned: bool,
+    /// #202: the controller answers at once ([`ENV_CTL_LATE_REPLY`] unset): the late ring
+    /// (`CTL_RING` entries of [`LATE_WORDS`] u64, mapped) and the late pass's kernels
+    pub early: bool,
+    late: Pinned,
+    pre: CUfunction,
+    late_k: CUfunction,
+    scatter: CUfunction,
 }
 
 /// `CROW_GLM_CONTROLLER` with `CROW_GLM_PREFETCH`: the guesses as the controller saw them
@@ -1321,9 +1493,18 @@ pub struct RingReader {
     seq: u64,
     k: usize,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #202: the late ring (host), `None` with [`ENV_CTL_LATE_REPLY`]=1
+    late: Option<SendPtr<u64>>,
 }
 
 impl RingReader {
+    /// #202: request `q`'s early answer (its late entry and the reply word); `None` when the
+    /// controller keeps the former reply ([`ENV_CTL_LATE_REPLY`]=1)
+    pub fn early(&self, q: u64) -> Option<EarlyReply> {
+        // SAFETY: entry q % CTL_RING of the live mapped late ring
+        self.late.as_ref().map(|l| EarlyReply { reply: self.reply.0, entry: unsafe { l.0.add((q as usize % CTL_RING) * LATE_WORDS) } })
+    }
+
     /// the next request, once its entry's sequence number shows it; `Err` by name after
     /// [`CTL_HOST_TIMEOUT`] or when the host cancelled the row
     pub fn next(&mut self) -> Result<Request, String> {
@@ -1380,7 +1561,14 @@ impl Ctl {
         std::ptr::write_bytes(reply.host as *mut u8, 0, reply.bytes);
         let ctr = cuda::alloc_named("glm5 controller counter", 8);
         cuda::ck(sys::cuMemsetD8_v2(ctr, 0, 8));
+        let late = Pinned::alloc(CTL_RING * LATE_WORDS * 8);
+        std::ptr::write_bytes(late.host as *mut u8, 0, late.bytes);
         Ctl {
+            early: std::env::var(ENV_CTL_LATE_REPLY).ok().as_deref() != Some("1"),
+            late,
+            pre: kn.ctl_pre,
+            late_k: kn.ctl_late,
+            scatter: kn.ctl_scatter,
             ring,
             reply,
             ctr,
@@ -1483,9 +1671,77 @@ impl Ctl {
             seq: self.host_seq,
             k: self.k,
             cancel: self.cancel.clone(),
+            late: self.early.then(|| SendPtr(self.late.host as *mut u64)),
         };
         self.host_seq += n as u64;
         r
+    }
+
+    /// #202 early reply: the experts of the last published request's layer behind
+    /// [`Ctl::wait_reply`] (the table `table` read where the controller wrote it): `glm5_ctl_pre`
+    /// (the moves word; with more late experts than [`LATE_SLOTS`] every late one), the experts
+    /// (a late one reads a zeroed VRAM record there), the shared one, then the late pass:
+    /// `glm5_ctl_late` waits for each late expert's own word and puts it into a late slot, the
+    /// expert GEMVs over [`LATE_SLOTS`] slots, `glm5_ctl_scatter` over their combos' rows, the
+    /// combine. One row (`t = 1`).
+    ///
+    /// # Safety
+    /// [`Ctl::publish`] and [`Ctl::wait_reply`] were queued for this layer; `p` routed `x`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn experts_early(
+        &self,
+        p: &crate::glm5_moe::GpuMoePlan,
+        kn: &crate::kernels::Kernels,
+        mk: &crate::kernels::mul1::Kernels,
+        gk: &crate::kernels::glm5_moe::Kernels,
+        w: &crate::glm5_moe::GpuMoeWeights,
+        table: Dev,
+        x: Dev,
+        y: Dev,
+    ) {
+        self.experts_early_marked(p, kn, mk, gk, w, table, x, y, None);
+    }
+
+    /// [`Ctl::experts_early`] with `mark` (tests) recorded on the stream after the layer's other
+    /// experts and the shared one, right before the late pass's wait
+    ///
+    /// # Safety
+    /// As [`Ctl::experts_early`]; `mark` is a live event.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn experts_early_marked(
+        &self,
+        p: &crate::glm5_moe::GpuMoePlan,
+        kn: &crate::kernels::Kernels,
+        mk: &crate::kernels::mul1::Kernels,
+        gk: &crate::kernels::glm5_moe::Kernels,
+        w: &crate::glm5_moe::GpuMoeWeights,
+        table: Dev,
+        x: Dev,
+        y: Dev,
+        mark: Option<sys::CUevent>,
+    ) {
+        let err = self.reply.dev + 8;
+        launch_v(self.pre, 1, 1, 1, 1, &[self.ctr, self.late.dev, err, CTL_WAIT_NS]);
+        let (ctr, late, k, fill, scatter) = (self.ctr, self.late.dev, self.k, self.late_k, self.scatter);
+        let h = p.geo.hidden;
+        p.experts_late(
+            kn,
+            mk,
+            gk,
+            w,
+            table,
+            x,
+            y,
+            LATE_SLOTS,
+            &mut |ids, ptrs1, ptrs2, idx| {
+                if let Some(m) = mark {
+                    cuda::event_record(m, cuda::cur_stream());
+                }
+                launch_v(fill, 1, 1, 1, 1, &[ctr, late, ids, k as u64, ptrs1, ptrs2, idx, LATE_SLOTS as u64, err, CTL_WAIT_NS])
+            },
+            &mut |ye, ye2, idx| launch_v(scatter, h.div_ceil(256).min(64) as u32, LATE_SLOTS as u32, 1, 256, &[ye, ye2, idx]),
+        );
+        cuda::stream_query(cuda::cur_stream());
     }
 
     /// no request was handed to a job yet (a controller made by the last `set_switches`)
@@ -1509,6 +1765,7 @@ impl Ctl {
     pub unsafe fn free(&mut self) {
         self.ring.free();
         self.reply.free();
+        self.late.free();
         cuda::free_dev(&mut self.ctr);
     }
 }

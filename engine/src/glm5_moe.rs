@@ -548,6 +548,17 @@ pub struct GpuMoePlan {
     down: mul1::GemvPlan,
     /// #188 CPU lane: host buffer and event, made on the first lane call
     lane: std::cell::OnceCell<LaneBuf>,
+    /// #202 early reply: the late pass's slots, made on its first call
+    late: std::cell::OnceCell<LatePass>,
+}
+
+/// #202 early reply: the late pass of [`GpuMoePlan::experts_late`]: `slots` record bases, the
+/// combo of each slot (i32, -1 none) and the slots' outputs `[slots][H]` f32
+struct LatePass {
+    slots: usize,
+    ptrs: CUdeviceptr,
+    idx: CUdeviceptr,
+    ye: CUdeviceptr,
 }
 
 impl GpuMoePlan {
@@ -582,6 +593,7 @@ impl GpuMoePlan {
             up: mul1::GemvPlan::new(su, c, 1),
             down: mul1::GemvPlan::new(sd, c, 1),
             lane: std::cell::OnceCell::new(),
+            late: std::cell::OnceCell::new(),
         }
     }
 
@@ -671,6 +683,49 @@ impl GpuMoePlan {
         }
         merge(self.ye);
         launch_v(gk.combine, h.div_ceil(256) as u32, t as u32, 1, 256, &[self.ye, self.wts, self.ys, y, self.prm_kh2]);
+    }
+
+    /// #202 early reply (`CROW_GLM_CONTROLLER`, one row): [`GpuMoePlan::experts_merge`] with the
+    /// late pass between the experts (and the shared one) and the combine: `fill(ids, ptrs,
+    /// late ptrs, late idx)` queues what puts the late experts into the `slots` late slots (their
+    /// record bases, their combos; a spare slot a readable record and combo -1), then gate / up /
+    /// act / down over those slots (`run_slots`: every slot as in `run`, slots never interact;
+    /// the slots read `xg`, which holds x in every row at t = 1, and reuse `ge` / `ue` / `he`,
+    /// which the experts' down GEMV has read by then), and `scatter(ye, late ye, late idx)` puts
+    /// each slot's row over its combo's row of `ye`. A late combo's row from the experts (its
+    /// table entry a stand-in record) is replaced, so the combine sees what `experts` gives.
+    ///
+    /// # Safety
+    /// As [`GpuMoePlan::experts`], `tokens == 1`; `fill` and `scatter` only queue work on the
+    /// current stream.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn experts_late(
+        &self,
+        kn: &kernels::Kernels,
+        mk: &mul1::Kernels,
+        gk: &kernels::glm5_moe::Kernels,
+        w: &GpuMoeWeights,
+        table: CUdeviceptr,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        slots: usize,
+        fill: &mut dyn FnMut(CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr),
+        scatter: &mut dyn FnMut(CUdeviceptr, CUdeviceptr, CUdeviceptr),
+    ) {
+        let (h, k, i) = (self.geo.hidden, self.geo.topk, self.geo.expert_inter);
+        assert!(self.tokens == 1 && (1..=k).contains(&slots), "glm5_moe: a late pass of {slots} slots on a plan of {} rows x {k}", self.tokens);
+        // the CPU lane's host path is not posted for the controller's tables (consumed as `experts` does)
+        let _ = lane::take(table, self.tokens, k);
+        let lp = self.late.get_or_init(|| LatePass { slots, ptrs: cuda::alloc_zeroed(slots * 8), idx: cuda::alloc_zeroed(slots * 4), ye: cuda::alloc_zeroed(slots * h * 4) });
+        assert_eq!(lp.slots, slots, "glm5_moe: the late pass was made for {} slots", lp.slots);
+        self.experts_merge(kn, mk, gk, w, table, x, y, &mut |ye| {
+            fill(self.ids, self.ptrs, lp.ptrs, lp.idx);
+            self.gate.run_slots(mk, slots, lp.ptrs, self.xg, self.ge);
+            self.up.run_slots(mk, slots, lp.ptrs, self.xg, self.ue);
+            launch_v(gk.act, (k * i).div_ceil(256) as u32, 1, 1, 256, &[self.ge, self.ue, self.he, self.prm_n, self.prm_f]);
+            self.down.run_slots(mk, slots, lp.ptrs, self.he, lp.ye);
+            scatter(ye, lp.ye, lp.idx);
+        });
     }
 
     /// `CROW_GLM_SHARED_OVERLAP`: the shared expert of the coming [`GpuMoePlan::experts`] on `x`
@@ -841,6 +896,11 @@ impl GpuMoePlan {
         self.gate.free();
         self.up.free();
         self.down.free();
+        if let Some(mut lp) = self.late.take() {
+            cuda::free_dev(&mut lp.ptrs);
+            cuda::free_dev(&mut lp.idx);
+            cuda::free_dev(&mut lp.ye);
+        }
         if let Some(mut b) = self.lane.take() {
             b.host.free();
             cuda::event_destroy(b.ev as cudarc::driver::sys::CUevent);
