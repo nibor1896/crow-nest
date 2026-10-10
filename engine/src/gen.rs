@@ -1122,7 +1122,8 @@ fn stage_on() -> bool { env_flag!("CROW_STAGE", on) }
 /// CROW_STAGE_DMA (default off, measurement, #19b): the cold combos of a layer are
 /// staged by the COPY ENGINE (one cuMemcpyDtoDAsync per cold combo and matrix from the
 /// mapped host pointer, pcie_probe variant f = 55.0 GB/s) instead of the stage_cold
-/// kernel (31.5 GB/s SM-read ceiling). The routed pointers are known on the HOST only
+/// kernel (31.5 GB/s SM-read ceiling; the default stage_cold_ca reaches 51.1 to 52.4 GB/s,
+/// docs/architecture.md:1414, the pcie_probe ceilings of #19e). The routed pointers are known on the HOST only
 /// after router_top10 of that layer, so the path needs the decode graph off:
 /// graph_on() forces CROW_GRAPH off when this switch is on.
 pub fn stage_dma_on() -> bool { env_flag!("CROW_STAGE_DMA", exact1) }
@@ -1476,7 +1477,13 @@ impl Engine {
         let per_expert_unit = (slabs.gu_bytes + slabs.dn_bytes) * d.layers as u64;
         let s = Scratch::alloc(&d, cfg.prompt_chunk);
         // cold staging: decode-sized batches only (t*TOPK <= stage_max)
-        let stage_max = (2 * d.topk).max(pf_tg() * if pf_async_on() { 2 } else { 1 }); // 2 x 64 slots x 2.76 MB = 354 MB (default since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB)
+        // #176: sized by the model's stability policy; `OF_RECORD` (Flash-Next, the 27B) is one
+        // shared set, max(2 x topk, PF_TG x (1 + async)) = 2 x 64 slots x 2.76 MB = 354 MB (default
+        // since 2026-09-09; CROW_PF_ASYNC=0 CROW_PF_TG=32 = 88 MB). A policy with decode slots apart
+        // needs a prefill set of its own, which only the glm5_next arm will allocate (#149/#159).
+        let stage_slots = crate::geo::Stability::of(geo.family).stage_slots(d.topk, pf_tg(), pf_async_on());
+        assert!(stage_slots.shared, "decode staging sized apart from prefill needs the prefill slot set of the glm5_next arm (#149/#159), not built");
+        let stage_max = stage_slots.held();
         // #19e fix C4 of 19d: CROW_STAGE_SPLIT shapes the stage_cold grid only, so its
         // assert gates the kernel 1 fallback only. Kernel 2, the default, carries no
         // tail tile and needs 4 KB multiples instead, asserted here at load and again
@@ -1628,10 +1635,9 @@ impl Engine {
         let ring_reserve = if pf_dma_on() && mma_on() && pf_gemm_on() {
             2 * (d.e - cfg.n_hot.saturating_sub(24).min(d.e)) as u64 * (slabs.gu_bytes + slabs.dn_bytes)
         } else { 0 };
-        // VRAM the planner must leave free for launch/param plumbing. Sibling
-        // of `manager::SAFETY` (512 MiB), which covers the clamp loop's own
-        // pools + scratch + telemetry: two reserves, two sums, two numbers.
-        const LAUNCH_SLACK: u64 = 128 << 20;
+        // VRAM the planner must leave free for launch/param plumbing (`manager::LAUNCH_SLACK`,
+        // sibling of `manager::SAFETY`)
+        use crate::manager::LAUNCH_SLACK;
         // + TASK K: the image path's VRAM, when the tower is loaded. Everything
         // the #VIT path takes lazily inside a request (the cap-sized tower
         // scratch, the per-request splice buffer, the interleaved-mrope span
@@ -1649,7 +1655,9 @@ impl Engine {
         //   counts the GRANTED part as pending, which leaves it on the card.
         //   #110 follow-up: it is granted best-effort inside `allocate`
         //   (`grant_render_reserve`), so it is NOT in `pending` here.
-        let pending = crate::manager::planner_pending(LAUNCH_SLACK, ring_reserve, vit_reserve, 0);
+        // #159: plus the VRAM the family's stability policy keeps off the plan (`OF_RECORD`: 0 B)
+        let pending = crate::manager::planner_pending_for(
+            &crate::geo::Stability::of(geo.family), cuda::total_vram_bytes(), LAUNCH_SLACK, ring_reserve, vit_reserve, 0);
         // pinned-side sizing follows the cold tier actually used (record size
         // of a low-bit tier, full tier = constant; see residency::build)
         let (cold_unit, cold_fixed) = match std::env::var("CROW_COLD_TIER").ok() {

@@ -1,0 +1,65 @@
+entropy census of C:/Users/robin/dev/crow-nest/converter/GLM-5.3-Flash-CNQ4.5.cnq.sidecar.jsonl
+container: C:/Users/robin/dev/crow-nest/converter/GLM-5.3-Flash-CNQ4.5.cnq, 178490593097 B, trailer present, journal absent
+NVFP4 sidecar lines: 36716, every histogram sum == value count
+routed expert blocks: 12096 x 14155776 B, one static order-0 table per block (Huffman, 12/15-bit limit)
+  raw 171228266496 B, coded 159777173847 B incl. 1645056 B tables: saving 6.688 %
+  codes 152202903552 -> 151672590199 B (0.348 %), scales 19025362944 -> 8102938592 B (57.410 %), tables 1645056 B
+  order-0 entropy bound (no tables, no rounding): 7.522 %; a context coder may save more and costs more decode time
+  scales-only variant (codes raw, one 128-B table per block): 6.378 %
+  per block min-max: 4.236 % .. 7.112 %
+  per layer min-max: 5.387 % (L44) .. 6.797 % (L5) over 42 layers
+    L3  288 blocks  saving 6.694 %  (blocks 5.879 % .. 6.841 %)
+    L4  288 blocks  saving 6.785 %  (blocks 6.030 % .. 6.951 %)
+    L5  288 blocks  saving 6.797 %  (blocks 6.564 % .. 6.954 %)
+    L6  288 blocks  saving 6.788 %  (blocks 6.391 % .. 6.943 %)
+    L7  288 blocks  saving 6.778 %  (blocks 6.341 % .. 6.956 %)
+    L8  288 blocks  saving 6.767 %  (blocks 6.303 % .. 6.940 %)
+    L9  288 blocks  saving 6.774 %  (blocks 5.911 % .. 6.955 %)
+    L10 288 blocks  saving 6.758 %  (blocks 5.997 % .. 7.070 %)
+    L11 288 blocks  saving 6.767 %  (blocks 6.043 % .. 6.960 %)
+    L12 288 blocks  saving 6.772 %  (blocks 6.326 % .. 6.954 %)
+    L13 288 blocks  saving 6.721 %  (blocks 6.260 % .. 6.962 %)
+    L14 288 blocks  saving 6.746 %  (blocks 6.073 % .. 6.971 %)
+    L15 288 blocks  saving 6.760 %  (blocks 6.277 % .. 6.981 %)
+    L16 288 blocks  saving 6.745 %  (blocks 6.270 % .. 6.970 %)
+    L17 288 blocks  saving 6.714 %  (blocks 5.589 % .. 6.961 %)
+    L18 288 blocks  saving 6.722 %  (blocks 6.236 % .. 6.955 %)
+    L19 288 blocks  saving 6.738 %  (blocks 6.248 % .. 6.972 %)
+    L20 288 blocks  saving 6.696 %  (blocks 5.972 % .. 6.950 %)
+    L21 288 blocks  saving 6.645 %  (blocks 6.004 % .. 6.953 %)
+    L22 288 blocks  saving 6.615 %  (blocks 5.734 % .. 6.950 %)
+    L23 288 blocks  saving 6.625 %  (blocks 6.010 % .. 6.962 %)
+    L24 288 blocks  saving 6.617 %  (blocks 5.791 % .. 6.970 %)
+    L25 288 blocks  saving 6.772 %  (blocks 5.752 % .. 6.983 %)
+    L26 288 blocks  saving 6.769 %  (blocks 5.971 % .. 6.986 %)
+    L27 288 blocks  saving 6.789 %  (blocks 6.353 % .. 6.984 %)
+    L28 288 blocks  saving 6.742 %  (blocks 5.855 % .. 6.981 %)
+    L29 288 blocks  saving 6.738 %  (blocks 6.176 % .. 6.971 %)
+    L30 288 blocks  saving 6.742 %  (blocks 5.996 % .. 6.981 %)
+    L31 288 blocks  saving 6.769 %  (blocks 6.148 % .. 6.980 %)
+    L32 288 blocks  saving 6.743 %  (blocks 5.588 % .. 6.975 %)
+    L33 288 blocks  saving 6.779 %  (blocks 5.937 % .. 6.979 %)
+    L34 288 blocks  saving 6.779 %  (blocks 6.006 % .. 7.041 %)
+    L35 288 blocks  saving 6.777 %  (blocks 5.902 % .. 6.977 %)
+    L36 288 blocks  saving 6.763 %  (blocks 5.578 % .. 6.984 %)
+    L37 288 blocks  saving 6.729 %  (blocks 5.805 % .. 6.983 %)
+    L38 288 blocks  saving 6.729 %  (blocks 5.758 % .. 6.972 %)
+    L39 288 blocks  saving 6.718 %  (blocks 5.994 % .. 6.986 %)
+    L40 288 blocks  saving 6.651 %  (blocks 5.383 % .. 6.998 %)
+    L41 288 blocks  saving 6.582 %  (blocks 4.664 % .. 7.112 %)
+    L42 288 blocks  saving 6.487 %  (blocks 5.318 % .. 6.951 %)
+    L43 288 blocks  saving 6.409 %  (blocks 4.758 % .. 7.013 %)
+    L44 288 blocks  saving 5.387 %  (blocks 4.236 % .. 6.253 %)
+  effect: pinned tier 88.9 instead of 83 experts per layer; 13209092 B per NVMe visit = 1.889 ms instead of 2.024 ms at B = 6.994 GB/s (step 3, 1 reader; not the G1 B, which is not answered)
+per class, one table per tensor (min-max over tensors) | one table per class:
+  attn_kda         238 tensors  6.480 % (5.509 % .. 29.541 %) | 5.036 %
+  attn_mla          55 tensors  6.357 % (5.549 % .. 7.064 %) | 5.391 %
+  dense_mlp          9 tensors  6.149 % (5.334 % .. 6.802 %) | 5.629 %
+  expert_down    12096 tensors  6.922 % (5.487 % .. 7.211 %) | 6.380 %
+  expert_gate    12096 tensors  6.853 % (5.809 % .. 7.207 %) | 6.434 %
+  expert_up      12096 tensors  6.891 % (5.794 % .. 7.207 %) | 6.561 %
+  shared_expert    126 tensors  6.283 % (4.950 % .. 6.768 %) | 5.010 %
+shared expert blocks (not in the 12,096): 42, saving 5.755 % (4.581 % .. 6.369 %)
+converter code_summary expert_blocks: equal (blocks, raw, coded, table bytes; entropy)
+G2 failed: saving 6.688 % < 8 % incl. tables
+decoder draft: static Huffman decoder (one table per expert block, the G2 coder) on the CPU staging path: 28.195 ms per cold visit on one core (median of 9, beside the converter converting on one core), 2.784 ms on 16 threads, 2.657 ms on 24; the NVMe read of the same raw block at the step-3 one-reader rate 6.994 GB/s is 2.024 ms (coded 1.897 ms)

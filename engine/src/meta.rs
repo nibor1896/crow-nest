@@ -66,7 +66,7 @@
 //!   `boot::model_geo` right after this gate, still before the container and CUDA).
 
 use crate::geo;
-use crate::geo::{Attn, Family, FinalNorm, Ffn, GateAct, Geo, PleGeo, Residual};
+use crate::geo::{Attn, Family, FinalNorm, Ffn, GateAct, Geo, Glm5Geo, PleGeo, Residual, GLM5_NEXT_MODEL_TYPE, GLM5_NEXT_SOURCE};
 use crate::cnq::{sha256_hex, IndexPeek, ModelBlock};
 use crate::sample;
 use serde_json::Value;
@@ -79,10 +79,10 @@ pub const QWEN35_DENSE_SOURCE: &str = "Qwen/Qwen3.8-27B @ 1d4bf0f2 config.json";
 impl Family {
     /// family detection: `text_config.model_type` (else the flat top level's)
     pub fn detect(model_type: &str) -> Result<Family, String> {
-        Family::ALL.into_iter().find(|f| f.model_type() == model_type).ok_or_else(|| {
+        Family::KNOWN.into_iter().find(|f| f.model_type() == model_type).ok_or_else(|| {
             format!(
                 "text_config.model_type '{model_type}' is not a model family this engine knows \
-(known: qwen4_exp_text = Qwen3.8-Flash-Next, qwen3_5_text = dense Qwen3.5/3.8) - refusing (Crow #300)"
+(known: qwen4_exp_text = Qwen3.8-Flash-Next, qwen3_5_text = dense Qwen3.5/3.8, glm5_next_text = GLM-5.3-Flash) - refusing (Crow #300)"
             )
         })
     }
@@ -173,6 +173,8 @@ impl Expected {
         match family {
             Family::FlashNext => Expected::FLASH_NEXT,
             Family::Qwen35Dense => Expected::QWEN35_DENSE,
+            // #159: `checks` and `geo` branch before they ask for a row
+            Family::Glm5Next => panic!("Expected::of: glm5_next has no Qwen row; its row is Glm5Geo::GLM_5_3_FLASH (#159)"),
         }
     }
 
@@ -182,6 +184,7 @@ impl Expected {
         match self.family {
             Family::FlashNext => flash_site.to_string(),
             Family::Qwen35Dense => format!("qwen3_5_text family row, {QWEN35_DENSE_SOURCE}"),
+            Family::Glm5Next => format!("glm5_next_text family row, {GLM5_NEXT_SOURCE}"),
         }
     }
 }
@@ -244,6 +247,67 @@ const FLASH_NEXT_KEYS: &[&str] = &[
 /// keys only the dense family consumes
 const QWEN35_DENSE_KEYS: &[&str] = &["attn_output_gate", "intermediate_size"];
 
+// ---- #159: the glm5_next key ledger (its own: no RoPE keys, no GDN keys, no COMMON_KEYS) ----
+
+/// glm5_next keys read as unsigned integers
+const GLM5_NEXT_U64_KEYS: &[&str] = &[
+    "first_k_dense_replace",
+    "hc_mult",
+    "hc_sinkhorn_iters",
+    "head_dim",
+    "hidden_size",
+    "index_head_dim",
+    "index_kpool",
+    "index_n_heads",
+    "index_topk",
+    "intermediate_size",
+    "kv_lora_rank",
+    "max_position_embeddings",
+    "moe_intermediate_size",
+    "n_group",
+    "n_routed_experts",
+    "n_shared_experts",
+    "num_attention_heads",
+    "num_experts_per_tok",
+    "num_hidden_layers",
+    "num_key_value_heads",
+    "num_nextn_predict_layers",
+    "q_lora_rank",
+    "qk_head_dim",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "topk_group",
+    "v_head_dim",
+    "vocab_size",
+];
+/// glm5_next keys read as numbers
+const GLM5_NEXT_F64_KEYS: &[&str] = &["hc_eps", "rms_norm_eps", "routed_scaling_factor", "swiglu_limit"];
+/// glm5_next keys read as booleans
+const GLM5_NEXT_BOOL_KEYS: &[&str] = &[
+    "attention_bias",
+    "index_kpool_always_select_tail",
+    "index_kpool_compress",
+    "mhc",
+    "mla_use_nope",
+    "norm_topk_prob",
+    "tie_word_embeddings",
+];
+/// glm5_next keys read as strings
+const GLM5_NEXT_STR_KEYS: &[&str] = &["hidden_act", "model_type", "moe_router_dtype", "scoring_func", "topk_method"];
+/// glm5_next keys read as per-layer string lists (one entry per trunk layer)
+const GLM5_NEXT_LIST_KEYS: &[&str] = &["indexer_types", "layer_types", "mlp_layer_types"];
+/// the other glm5_next keys: the stop ids and the KDA object
+const GLM5_NEXT_OTHER_KEYS: &[&str] = &["eos_token_id", "linear_attn_config"];
+/// the keys of `linear_attn_config` (the KDA layers) the reader consumes
+const LINEAR_ATTN_CONFIG_KEYS: &[&str] = &["full_attn_layers", "gate_lower_bound", "head_dim", "kda_layers", "num_heads", "short_conv_kernel_size"];
+
+/// every glm5_next key the reader consumes
+fn glm5_next_consumes(k: &str) -> bool {
+    [GLM5_NEXT_U64_KEYS, GLM5_NEXT_F64_KEYS, GLM5_NEXT_BOOL_KEYS, GLM5_NEXT_STR_KEYS, GLM5_NEXT_LIST_KEYS, GLM5_NEXT_OTHER_KEYS]
+        .iter()
+        .any(|l| l.contains(&k))
+}
+
 /// keys READ AND DROPPED on purpose, per family (`None` = every family), each
 /// with the reason it cannot change a logit of this engine
 pub const IGNORED_KEYS: &[(Option<Family>, &str, &str)] = &[
@@ -259,6 +323,10 @@ pub const IGNORED_KEYS: &[(Option<Family>, &str, &str)] = &[
     (Some(Family::FlashNext), "output_router_logits", "training-only router loss"),
     (Some(Family::FlashNext), "router_aux_loss_coef", "training-only router loss"),
     (Some(Family::FlashNext), "split_ngram_parts", "PLE table sizing; the container's shard shapes are the truth"),
+    (Some(Family::Glm5Next), "index_share_for_mtp_iteration", "MTP is not executed (GLM plan step 21; docs/glm5-next-recipe.md O1)"),
+    (Some(Family::Glm5Next), "indexer_rope_interleave", "no RoPE dims exist (qk_rope_head_dim 0): the indexer applies no rotation (docs/glm5-next-recipe.md section 14)"),
+    (Some(Family::Glm5Next), "output_router_logits", "training-only router loss"),
+    (Some(Family::Glm5Next), "router_aux_loss_coef", "training-only router loss"),
 ];
 
 /// the multimodal wrapper keys a FLAT config (no `text_config`) carries beside
@@ -283,9 +351,13 @@ pub fn unknown_keys(tc: &Value, family: Family, flat: bool) -> Vec<String> {
     let family_keys = match family {
         Family::FlashNext => FLASH_NEXT_KEYS,
         Family::Qwen35Dense => QWEN35_DENSE_KEYS,
+        Family::Glm5Next => &[],
     };
+    // #159: glm5_next has its own ledger; the Qwen COMMON_KEYS are unknown to it
+    let glm = family == Family::Glm5Next;
     let known = |k: &str| {
-        COMMON_KEYS.contains(&k)
+        (!glm && COMMON_KEYS.contains(&k))
+            || (glm && glm5_next_consumes(k))
             || family_keys.contains(&k)
             || IGNORED_KEYS.iter().any(|(f, key, _)| *key == k && f.is_none_or(|f| f == family))
             || (flat && WRAPPER_KEYS.contains(&k))
@@ -302,6 +374,13 @@ pub fn unknown_keys(tc: &Value, family: Family, flat: bool) -> Vec<String> {
             rp.keys()
                 .filter(|k| !ROPE_PARAMETER_KEYS.contains(&k.as_str()))
                 .map(|k| format!("text_config.rope_parameters.{k}")),
+        );
+    }
+    if let Some(lac) = tc.get("linear_attn_config").and_then(Value::as_object).filter(|_| glm) {
+        out.extend(
+            lac.keys()
+                .filter(|k| !LINEAR_ATTN_CONFIG_KEYS.contains(&k.as_str()))
+                .map(|k| format!("text_config.linear_attn_config.{k}")),
         );
     }
     out.sort();
@@ -334,6 +413,34 @@ pub enum FamilyKeys {
     Qwen35Dense {
         intermediate_size: u64,
         attn_output_gate: bool,
+    },
+    /// #159: GLM-5.3-Flash; the layer lists are 0-based positions in the trunk
+    Glm5Next {
+        first_k_dense_replace: u64,
+        hc_mult: u64,
+        hc_sinkhorn_iters: u64,
+        hc_eps: f64,
+        q_lora_rank: u64,
+        kv_lora_rank: u64,
+        qk_nope_head_dim: u64,
+        v_head_dim: u64,
+        index_n_heads: u64,
+        index_head_dim: u64,
+        index_kpool: u64,
+        index_topk: u64,
+        linear_num_heads: u64,
+        linear_head_dim: u64,
+        linear_conv_kernel: u64,
+        linear_lower_bound: f64,
+        intermediate_size: u64,
+        n_routed_experts: u64,
+        num_experts_per_tok: u64,
+        n_shared_experts: u64,
+        moe_intermediate_size: u64,
+        routed_scaling_factor: f64,
+        swiglu_limit: f64,
+        dsa_layers: Vec<u64>,
+        kda_layers: Vec<u64>,
     },
 }
 
@@ -679,6 +786,13 @@ impl ModelMeta {
         let text_eos_token_id = first_id(tc, "eos_token_id");
         let text_bos_token_id = first_id(tc, "bos_token_id");
 
+        // #159: glm5_next has its own key ledger (no RoPE, no GDN keys), parsed apart so the
+        // Qwen families' path below is unchanged
+        if tc.get("model_type").and_then(Value::as_str) == Some(GLM5_NEXT_MODEL_TYPE) {
+            let ids = GenIds { eos_token_ids, eos_from_generation, text_eos_token_id, bos_token_id, text_bos_token_id };
+            return ModelMeta::from_glm5_next(&config, tc, config_path, generation_config_path, ids);
+        }
+
         // collect EVERY missing key in one pass, so the error names them all
         let mut missing: Vec<String> = Vec::new();
         let mut need = |cond: bool, key: &str| {
@@ -742,6 +856,7 @@ impl ModelMeta {
                 need(u64_of(tc, "intermediate_size").is_some(), "text_config.intermediate_size");
                 need(bool_of("attn_output_gate").is_some(), "text_config.attn_output_gate");
             }
+            Some(Family::Glm5Next) => unreachable!("glm5_next is parsed by from_glm5_next (#159)"),
             None => {}
         }
         if !missing.is_empty() {
@@ -806,6 +921,7 @@ silently ignoring them (Crow #300); each must be consumed or put on the ignore l
                 intermediate_size: u("intermediate_size"),
                 attn_output_gate: bool_of("attn_output_gate").unwrap(),
             },
+            Family::Glm5Next => unreachable!("glm5_next is parsed by from_glm5_next (#159)"),
         };
 
         // #96: rope_scaling, after the required-key pass so the fallback context
@@ -869,6 +985,10 @@ silently ignoring them (Crow #300); each must be consumed or put on the ignore l
     /// `Err` names the value that has no `Geo` form (a non-integral rope pair
     /// count, an eos list that is not two ids, a malformed mrope section).
     pub fn geo(&self) -> Result<Geo, String> {
+        // #159: glm5_next has no runtime `Geo` (its layers run in `glm5_model`, #161); its geometry is `glm5_geo`
+        if self.family == Family::Glm5Next {
+            return Err(glm5_not_built(self.checks().len(), &self.config_path));
+        }
         let e = Expected::of(self.family);
         let pairs = self.partial_rotary_factor * self.head_dim as f64 / 2.0;
         if pairs.fract() != 0.0 || pairs <= 0.0 {
@@ -958,6 +1078,7 @@ silently ignoring them (Crow #300); each must be consumed or put on the ignore l
                 FinalNorm::Rms,
                 *attn_output_gate,
             ),
+            FamilyKeys::Glm5Next { .. } => unreachable!("glm5_next returned above"),
         };
         Ok(Geo {
             family: self.family,
@@ -1006,6 +1127,9 @@ silently ignoring them (Crow #300); each must be consumed or put on the ignore l
     /// constants verified" (21 on Flash-Next, whose row is today's pins; the
     /// dense row has no PLE, so no `ple_eos`).
     pub fn checks(&self) -> Vec<Check> {
+        if self.family == Family::Glm5Next {
+            return self.glm5_checks();
+        }
         let e = Expected::of(self.family);
         let mut c = Vec::with_capacity(20);
         c.push(Check::cmp("rms_norm_eps", e.rms_norm_eps, self.rms_norm_eps, &e.at("kernels.rs, every rms + LayerNorm site"), "text_config.rms_norm_eps"));
@@ -1381,6 +1505,382 @@ pub fn gate(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) -> Result
     Ok(Some((meta, geo)))
 }
 
+// ---- #159: the glm5_next family at the gate ----
+
+/// the stop and start ids `from_config_texts` read before it knew the family
+struct GenIds {
+    eos_token_ids: Option<Vec<i64>>,
+    eos_from_generation: bool,
+    text_eos_token_id: Option<i64>,
+    bos_token_id: Option<i64>,
+    text_bos_token_id: Option<i64>,
+}
+
+/// #159: the boot refusal of a glm5_next config that passed its family row. The gate accepts
+/// the family (parse, key ledger, `Glm5Geo` equal to the row) and the planner plans it. #161:
+/// the layer arms exist (`glm5_model`, run layer by layer by `decode glmgolden`); what the boot
+/// still lacks is named here, so it stops before the container is mapped and before any CUDA
+/// call.
+pub fn glm5_not_built(checks: usize, config_path: &str) -> String {
+    format!(
+        "[meta] family Glm5Next ({GLM5_NEXT_MODEL_TYPE}): {checks} constants verified against the family row \
+({GLM5_NEXT_SOURCE}) [{config_path}]; its layers are built (mHC, KDA, MLA + DSA, router and MUL1 experts, head: \
+#161-#165, layer by layer in `decode glmgolden`), its boot is not yet: the dynamic expert cache (#175), the NVMe \
+expert tier and the 200k boot (#149, plan step 14) and the vision tower (plan step 20) for family Glm5Next not built \
+yet - refusing to boot (#159); `states --plan` prints its three-tier plan"
+    )
+}
+
+impl ModelMeta {
+    /// #159: parse a glm5_next config. Its own ledger: every key in the `GLM5_NEXT_*` lists is
+    /// required with its type (one error names every missing key), every other key refuses by
+    /// name unless it is on the ignore list, and the formula facts this family has exactly one
+    /// form of refuse any other value by name.
+    fn from_glm5_next(
+        config: &Value,
+        tc: &Value,
+        config_path: &str,
+        generation_config_path: Option<&str>,
+        ids: GenIds,
+    ) -> Result<ModelMeta, String> {
+        let family = Family::Glm5Next;
+        let str_list = |key: &str| -> Option<Vec<String>> {
+            tc.get(key)?.as_array()?.iter().map(|v| v.as_str().map(str::to_string)).collect()
+        };
+        let lac = tc.get("linear_attn_config").filter(|v| v.is_object());
+        let lac_list = |key: &str| -> Option<Vec<u64>> { lac?.get(key)?.as_array()?.iter().map(Value::as_u64).collect() };
+        let mut missing: Vec<String> = Vec::new();
+        for k in GLM5_NEXT_U64_KEYS {
+            if u64_of(tc, k).is_none() {
+                missing.push(format!("text_config.{k}"));
+            }
+        }
+        for k in GLM5_NEXT_F64_KEYS {
+            if f64_of(tc, k).is_none() {
+                missing.push(format!("text_config.{k}"));
+            }
+        }
+        for k in GLM5_NEXT_BOOL_KEYS {
+            if tc.get(*k).and_then(Value::as_bool).is_none() {
+                missing.push(format!("text_config.{k}"));
+            }
+        }
+        for k in GLM5_NEXT_STR_KEYS {
+            if tc.get(*k).and_then(Value::as_str).is_none() {
+                missing.push(format!("text_config.{k}"));
+            }
+        }
+        for k in GLM5_NEXT_LIST_KEYS {
+            if str_list(k).is_none_or(|l| l.is_empty()) {
+                missing.push(format!("text_config.{k}"));
+            }
+        }
+        if ids.eos_token_ids.as_ref().is_none_or(|v| v.is_empty()) {
+            missing.push("generation_config.json eos_token_id (or text_config.eos_token_id)".to_string());
+        }
+        match lac {
+            None => missing.push("text_config.linear_attn_config".to_string()),
+            Some(l) => {
+                for k in ["num_heads", "head_dim", "short_conv_kernel_size"] {
+                    if u64_of(l, k).is_none() {
+                        missing.push(format!("text_config.linear_attn_config.{k}"));
+                    }
+                }
+                if f64_of(l, "gate_lower_bound").is_none() {
+                    missing.push("text_config.linear_attn_config.gate_lower_bound".to_string());
+                }
+                for k in ["kda_layers", "full_attn_layers"] {
+                    if lac_list(k).is_none() {
+                        missing.push(format!("text_config.linear_attn_config.{k}"));
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() {
+            return Err(format!("{config_path}: missing required key(s): {}", missing.join(", ")));
+        }
+        let flat = !config.get("text_config").is_some_and(Value::is_object);
+        let unknown = unknown_keys(tc, family, flat);
+        if !unknown.is_empty() {
+            return Err(format!(
+                "{config_path}: key(s) this engine does not know for family {family:?} ({}): {} - refusing rather than \
+silently ignoring them (Crow #300, #159); each must be consumed or put on the ignore list in meta.rs with its reason",
+                family.model_type(),
+                unknown.join(", ")
+            ));
+        }
+        let u = |key: &str| u64_of(tc, key).unwrap();
+        let f = |key: &str| f64_of(tc, key).unwrap();
+        let b = |key: &str| tc.get(key).and_then(Value::as_bool).unwrap();
+        let st = |key: &str| tc.get(key).and_then(Value::as_str).unwrap().to_string();
+        let lu = |key: &str| u64_of(lac.unwrap(), key).unwrap();
+        // the formula facts with exactly one implemented form, refused by name
+        let refuse = |key: &str, got: String, want: String| -> Result<(), String> {
+            Err(format!(
+                "{config_path}: text_config.{key} {got} is not implemented for family Glm5Next (implemented: {want}) - refusing (#159)"
+            ))
+        };
+        for (key, want) in [("scoring_func", "sigmoid"), ("topk_method", "noaux_tc"), ("moe_router_dtype", "float32"), ("hidden_act", "silu")] {
+            if st(key) != want {
+                refuse(key, format!("'{}'", st(key)), want.to_string())?;
+            }
+        }
+        for (key, want) in [
+            ("mhc", true),
+            ("mla_use_nope", true),
+            ("norm_topk_prob", true),
+            ("index_kpool_compress", true),
+            ("index_kpool_always_select_tail", true),
+            ("attention_bias", false),
+        ] {
+            if b(key) != want {
+                refuse(key, b(key).to_string(), want.to_string())?;
+            }
+        }
+        for (key, want) in [("n_group", 1), ("topk_group", 1), ("qk_rope_head_dim", 0)] {
+            if u(key) != want {
+                refuse(key, u(key).to_string(), want.to_string())?;
+            }
+        }
+        // the head dims: qk = nope + rope (HF), `head_dim` is HF's placeholder 0 or that sum
+        let qk = u("qk_nope_head_dim") + u("qk_rope_head_dim");
+        if u("qk_head_dim") != qk {
+            refuse("qk_head_dim", u("qk_head_dim").to_string(), format!("qk_nope_head_dim + qk_rope_head_dim = {qk}"))?;
+        }
+        if u("head_dim") != 0 && u("head_dim") != qk {
+            refuse("head_dim", u("head_dim").to_string(), format!("0 or qk_head_dim {qk}"))?;
+        }
+        // HF `validate_architecture`: the selection budget is whole pools
+        if u("index_kpool") == 0 || u("index_topk") % u("index_kpool") != 0 {
+            refuse("index_topk", u("index_topk").to_string(), format!("a multiple of index_kpool {}", u("index_kpool")))?;
+        }
+        // the per-layer lists: one entry per trunk layer, each a form the family row names
+        let layers = u("num_hidden_layers") as usize;
+        let positions = |list: &[String], what: &str| -> Vec<u64> {
+            list.iter().enumerate().filter(|(_, t)| t.as_str() == what).map(|(i, _)| i as u64).collect()
+        };
+        let layer_types = str_list("layer_types").unwrap();
+        let mlp_types = str_list("mlp_layer_types").unwrap();
+        let indexer_types = str_list("indexer_types").unwrap();
+        for (key, list, forms) in [
+            ("layer_types", &layer_types, &["linear_attention", "deepseek_sparse_attention"][..]),
+            ("mlp_layer_types", &mlp_types, &["dense", "sparse"][..]),
+            // a "shared" layer reuses another layer's top-k: no arm for it (#159)
+            ("indexer_types", &indexer_types, &["full"][..]),
+        ] {
+            if list.len() != layers {
+                refuse(key, format!("with {} entries", list.len()), format!("one per layer, {layers}"))?;
+            }
+            if let Some((i, t)) = list.iter().enumerate().find(|(_, t)| !forms.contains(&t.as_str())) {
+                refuse(&format!("{key}[{i}]"), format!("'{t}'"), forms.join(", "))?;
+            }
+        }
+        let dsa_layers = positions(&layer_types, "deepseek_sparse_attention");
+        let kda_layers = positions(&layer_types, "linear_attention");
+        for (key, from_types) in [("full_attn_layers", &dsa_layers), ("kda_layers", &kda_layers)] {
+            if lac_list(key).unwrap() != *from_types {
+                refuse(&format!("linear_attn_config.{key}"), format!("{:?}", lac_list(key).unwrap()), format!("the positions layer_types names, {from_types:?}"))?;
+            }
+        }
+        let dense = positions(&mlp_types, "dense");
+        let k = u("first_k_dense_replace");
+        if dense != (0..k).collect::<Vec<_>>() {
+            refuse("mlp_layer_types", format!("dense at {dense:?}"), format!("dense at the first first_k_dense_replace = {k} layers"))?;
+        }
+        let tie_word_embeddings = b("tie_word_embeddings");
+        if let Some(top) = config.get("tie_word_embeddings").and_then(Value::as_bool) {
+            if top != tie_word_embeddings {
+                return Err(format!(
+                    "{config_path}: tie_word_embeddings {top} (top level) disagrees with text_config.tie_word_embeddings {tie_word_embeddings} - refusing (Crow #300)"
+                ));
+            }
+        }
+        let family_keys = FamilyKeys::Glm5Next {
+            first_k_dense_replace: k,
+            hc_mult: u("hc_mult"),
+            hc_sinkhorn_iters: u("hc_sinkhorn_iters"),
+            hc_eps: f("hc_eps"),
+            q_lora_rank: u("q_lora_rank"),
+            kv_lora_rank: u("kv_lora_rank"),
+            qk_nope_head_dim: u("qk_nope_head_dim"),
+            v_head_dim: u("v_head_dim"),
+            index_n_heads: u("index_n_heads"),
+            index_head_dim: u("index_head_dim"),
+            index_kpool: u("index_kpool"),
+            index_topk: u("index_topk"),
+            linear_num_heads: lu("num_heads"),
+            linear_head_dim: lu("head_dim"),
+            linear_conv_kernel: lu("short_conv_kernel_size"),
+            linear_lower_bound: f64_of(lac.unwrap(), "gate_lower_bound").unwrap(),
+            intermediate_size: u("intermediate_size"),
+            n_routed_experts: u("n_routed_experts"),
+            num_experts_per_tok: u("num_experts_per_tok"),
+            n_shared_experts: u("n_shared_experts"),
+            moe_intermediate_size: u("moe_intermediate_size"),
+            routed_scaling_factor: f("routed_scaling_factor"),
+            swiglu_limit: f("swiglu_limit"),
+            dsa_layers,
+            kda_layers,
+        };
+        // no RoPE: the Qwen rope fields read as "none"; the GDN-named fields carry the KDA numbers
+        let no_rope = "none: glm5_next has no RoPE (text_config.qk_rope_head_dim 0)".to_string();
+        Ok(ModelMeta {
+            config_path: config_path.to_string(),
+            generation_config_path: generation_config_path.map(str::to_string),
+            model_type: family.model_type().to_string(),
+            rms_norm_eps: f("rms_norm_eps"),
+            rope_theta: 0.0,
+            rope_theta_source: no_rope.clone(),
+            partial_rotary_factor: 0.0,
+            head_dim: u("head_dim"),
+            hidden_size: u("hidden_size"),
+            num_attention_heads: u("num_attention_heads"),
+            num_key_value_heads: u("num_key_value_heads"),
+            num_hidden_layers: u("num_hidden_layers"),
+            layer_types,
+            full_attention_interval: None,
+            vocab_size: u("vocab_size"),
+            max_position_embeddings: u("max_position_embeddings"),
+            eos_token_ids: ids.eos_token_ids.unwrap(),
+            eos_from_generation: ids.eos_from_generation,
+            text_eos_token_id: ids.text_eos_token_id,
+            bos_token_id: ids.bos_token_id,
+            text_bos_token_id: ids.text_bos_token_id,
+            mrope_section: None,
+            rope_type: "none".to_string(),
+            rope_type_source: no_rope,
+            rope_scaling: None,
+            family,
+            hidden_act: st("hidden_act"),
+            attention_bias: b("attention_bias"),
+            mamba_ssm_dtype: String::new(),
+            output_gate_type: String::new(),
+            mrope_interleaved: None,
+            linear_num_key_heads: lu("num_heads"),
+            linear_num_value_heads: lu("num_heads"),
+            linear_key_head_dim: lu("head_dim"),
+            linear_value_head_dim: lu("head_dim"),
+            linear_conv_kernel_dim: lu("short_conv_kernel_size"),
+            tie_word_embeddings,
+            mtp_num_hidden_layers: u("num_nextn_predict_layers"),
+            vision_out_hidden: config.get("vision_config").and_then(|v| u64_of(v, "out_hidden_size")),
+            family_keys,
+        })
+    }
+
+    /// #159: the glm5_next geometry of a parsed glm5_next config. `Err` names the value that
+    /// has no `Glm5Geo` form (another family, a stop-id list that is not three ids, MLA + DSA
+    /// layers that are not every n-th layer).
+    pub fn glm5_geo(&self) -> Result<Glm5Geo, String> {
+        let FamilyKeys::Glm5Next {
+            first_k_dense_replace,
+            hc_mult,
+            hc_sinkhorn_iters,
+            hc_eps,
+            q_lora_rank,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            v_head_dim,
+            index_n_heads,
+            index_head_dim,
+            index_kpool,
+            index_topk,
+            linear_num_heads,
+            linear_head_dim,
+            linear_conv_kernel,
+            linear_lower_bound,
+            intermediate_size,
+            n_routed_experts,
+            num_experts_per_tok,
+            n_shared_experts,
+            moe_intermediate_size,
+            routed_scaling_factor,
+            swiglu_limit,
+            dsa_layers,
+            kda_layers,
+        } = &self.family_keys
+        else {
+            return Err(format!("family {:?} has no Glm5Geo", self.family));
+        };
+        let z = |v: u64| v as usize;
+        let eos_ids: [usize; 3] = match self.eos_token_ids.as_slice() {
+            [a, b, c] if *a >= 0 && *b >= 0 && *c >= 0 => [*a as usize, *b as usize, *c as usize],
+            other => return Err(format!("eos_token_id {other:?}: the glm5_next row holds exactly three stop ids")),
+        };
+        let layers = z(self.num_hidden_layers);
+        let attn_interval = dsa_layers.first().map_or(0, |p| z(*p) + 1);
+        let periodic: Vec<u64> = (0..layers as u64).filter(|l| attn_interval > 0 && *l as usize % attn_interval == attn_interval - 1).collect();
+        if attn_interval == 0 || *dsa_layers != periodic {
+            return Err(format!("text_config.layer_types: deepseek_sparse_attention at {dsa_layers:?} is not every n-th layer"));
+        }
+        Ok(Glm5Geo {
+            hidden: z(self.hidden_size),
+            layers,
+            attn_interval,
+            dsa_layers: dsa_layers.len(),
+            kda_layers: kda_layers.len(),
+            hc_streams: z(*hc_mult),
+            hc_sinkhorn_iters: z(*hc_sinkhorn_iters),
+            hc_eps: *hc_eps,
+            mla_heads: z(self.num_attention_heads),
+            q_lora: z(*q_lora_rank),
+            kv_lora: z(*kv_lora_rank),
+            nope_dim: z(*qk_nope_head_dim),
+            v_dim: z(*v_head_dim),
+            index_heads: z(*index_n_heads),
+            index_head_dim: z(*index_head_dim),
+            index_kpool: z(*index_kpool),
+            index_topk: z(*index_topk),
+            kda_heads: z(*linear_num_heads),
+            kda_head_dim: z(*linear_head_dim),
+            kda_conv: z(*linear_conv_kernel),
+            kda_lower_bound: *linear_lower_bound,
+            dense_prefix: z(*first_k_dense_replace),
+            dense_inter: z(*intermediate_size),
+            experts: z(*n_routed_experts),
+            topk: z(*num_experts_per_tok),
+            shared_experts: z(*n_shared_experts),
+            expert_inter: z(*moe_intermediate_size),
+            routed_scaling: *routed_scaling_factor,
+            swiglu_limit: *swiglu_limit,
+            rms_eps: self.rms_norm_eps,
+            vocab: z(self.vocab_size),
+            tie_word_embeddings: self.tie_word_embeddings,
+            context_max: z(self.max_position_embeddings),
+            context_floor: geo::CONTEXT_FLOOR,
+            eos_ids,
+            mtp_layers: z(self.mtp_num_hidden_layers),
+            vision_out_hidden: self.vision_out_hidden.map(z),
+        })
+    }
+
+    /// #159: the glm5_next checks: every `Glm5Geo` field against the family row
+    /// ([`Glm5Geo::GLM_5_3_FLASH`]), then the stop ids inside the vocab. A config with no
+    /// `Glm5Geo` form is one red row naming why.
+    fn glm5_checks(&self) -> Vec<Check> {
+        let at = format!("glm5_next_text family row, {GLM5_NEXT_SOURCE}");
+        let source = "config.json via meta::ModelMeta::glm5_geo".to_string();
+        let mut c: Vec<Check> = match self.glm5_geo() {
+            Ok(g) => g
+                .rows()
+                .into_iter()
+                .zip(Glm5Geo::GLM_5_3_FLASH.rows())
+                .map(|((name, got), (_, pin))| Check { name, pinned: format!("{pin} ({at})"), ok: got == pin, config: got, source: source.clone() })
+                .collect(),
+            Err(why) => vec![Check { name: "glm5_geo", pinned: format!("a Glm5Geo ({at})"), config: why, source, ok: false }],
+        };
+        let vocab = self.vocab_size as i64;
+        c.push(Check {
+            name: "eos_ids_in_vocab",
+            pinned: format!("0 <= id < {}", Glm5Geo::GLM_5_3_FLASH.vocab),
+            config: format!("{:?} against vocab {}", self.eos_token_ids, self.vocab_size),
+            source: "generation_config.json eos_token_id vs text_config.vocab_size".to_string(),
+            ok: !self.eos_token_ids.is_empty() && self.eos_token_ids.iter().all(|id| *id >= 0 && *id < vocab),
+        });
+        c
+    }
+}
+
 // ---- the boot door ----
 
 /// Crow #300 C5: the 27B fixture's derived `Geo` (engine/tests/fixtures/Qwen3.8-27B),
@@ -1423,6 +1923,10 @@ pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
             meta.config_path
         ));
     }
+    // #159: glm5_next passed its family row; its boot refuses naming what is not built (#161)
+    if meta.family == Family::Glm5Next {
+        return Err(glm5_not_built(all.len(), &meta.config_path));
+    }
     let geo = meta.geo().map_err(|why| format!("[meta] {why} - refusing to boot (Crow #300) [{}]", meta.config_path))?;
     match meta.family {
         Family::FlashNext => {
@@ -1445,6 +1949,7 @@ pub fn verdict(meta: &ModelMeta) -> Result<Geo, String> {
             ))
         }
         Family::Qwen35Dense => Ok(geo),
+        Family::Glm5Next => unreachable!("glm5_next returned above"),
     }
 }
 
@@ -1511,6 +2016,7 @@ pub fn assert_pinned(cnq_path: &str, peek: &IndexPeek, model_dir: Option<&str>) 
                 tracing::info!(target: "meta", "{line}");
             }
         }
+        Family::Glm5Next => unreachable!("verdict refuses glm5_next at its first unbuilt arm (#159)"),
     }
     // #96: stash the rope truth for the two boot-time readers that cannot be
     // handed it as a parameter (ThreeStates::allocate builds the table,
@@ -1952,5 +2458,140 @@ mod tests {
         let m = doctored_from(DENSE_DIR, |c, _| c["text_config"]["hidden_size"] = json!(4096)).unwrap();
         let err = verdict(&m).unwrap_err();
         assert!(err.contains("hidden_size: pinned 5120 (qwen3_5_text family row"), "{err}");
+    }
+
+    // ---- #159: the glm5_next family at the gate ----
+
+    const GLM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/GLM-5.3-Flash");
+    const FN_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/Qwen3.8-Flash-Next");
+
+    fn glm_meta() -> ModelMeta {
+        ModelMeta::from_config_files(&format!("{GLM_DIR}/config.json"), Some(&format!("{GLM_DIR}/generation_config.json"))).unwrap()
+    }
+
+    /// the doctored GLM config's parse error, which must name `want`
+    fn glm_refused(want: &str, mutate: impl FnOnce(&mut Value, &mut Value)) -> String {
+        let err = doctored_from(GLM_DIR, mutate).unwrap_err();
+        assert!(err.contains(want), "expected {want:?} in: {err}");
+        err
+    }
+
+    /// #159: the GLM-5.3-Flash config (rev eb9eb208, sha256 bb8f01c4...) parses as glm5_next,
+    /// every check of its family row is green, and its geometry is the row
+    #[test]
+    fn the_glm_config_parses_into_its_family_row() {
+        let m = glm_meta();
+        assert_eq!((m.family, m.model_type.as_str()), (Family::Glm5Next, "glm5_next_text"));
+        for c in m.checks() {
+            assert!(c.ok, "expected green against the glm5_next row: {}", c.line());
+        }
+        assert_eq!(m.checks().len(), 38, "37 Glm5Geo rows + eos_ids_in_vocab");
+        assert_eq!(m.glm5_geo(), Ok(Glm5Geo::GLM_5_3_FLASH));
+        assert_eq!(m.eos_token_ids, vec![154_820, 154_827, 154_829]);
+        assert!(m.eos_from_generation);
+        assert_eq!((m.rope_scaling, m.rope_type.as_str()), (None, "none"), "no RoPE");
+        assert!(matches!(m.family_keys, FamilyKeys::Glm5Next { .. }));
+    }
+
+    /// #159: the gate accepts the family, the boot refuses it at its first unbuilt arm, by name,
+    /// in the gate (before the container is mapped and before CUDA)
+    #[test]
+    fn a_glm_boot_refuses_at_its_first_unbuilt_arm() {
+        let m = glm_meta();
+        let err = verdict(&m).unwrap_err();
+        assert!(err.contains("family Glm5Next (glm5_next_text): 38 constants verified"), "{err}");
+        assert!(err.contains("its layers are built (mHC, KDA, MLA + DSA, router and MUL1 experts, head: #161-#165"), "{err}");
+        assert!(err.contains("the dynamic expert cache (#175), the NVMe expert tier and the 200k boot (#149, plan step 14) and the vision tower (plan step 20) for family Glm5Next not built yet"), "{err}");
+        assert!(err.contains("refusing to boot (#159)"), "{err}");
+        assert_eq!(m.geo().unwrap_err(), err, "no runtime Geo until the arms exist");
+    }
+
+    /// #159: a model type that is not exactly glm5_next_text (another variant of the name, the
+    /// HF wrapper's type) is refused by name; the refusal lists glm5_next_text as known
+    #[test]
+    fn an_unknown_glm_model_type_variant_is_refused_by_name() {
+        for variant in ["glm5_next", "glm5_text", "glm5_next_vl_text", "GLM5_NEXT_TEXT"] {
+            let err = glm_refused(&format!("'{variant}' is not a model family"), |c, _| c["text_config"]["model_type"] = json!(variant));
+            assert!(err.contains("glm5_next_text = GLM-5.3-Flash"), "{err}");
+        }
+    }
+
+    /// #159: every missing glm5_next key is named in one error, nested KDA keys included
+    #[test]
+    fn a_missing_glm_key_is_a_named_error() {
+        let err = glm_refused("missing required key(s)", |c, _| {
+            let tc = c["text_config"].as_object_mut().unwrap();
+            tc.remove("kv_lora_rank");
+            tc.remove("mlp_layer_types");
+            tc.remove("scoring_func");
+            c["text_config"]["linear_attn_config"].as_object_mut().unwrap().remove("num_heads");
+        });
+        for key in ["text_config.kv_lora_rank", "text_config.mlp_layer_types", "text_config.scoring_func", "text_config.linear_attn_config.num_heads"] {
+            assert!(err.contains(key), "{key} not named: {err}");
+        }
+        glm_refused("generation_config.json eos_token_id", |c, g| {
+            c["text_config"].as_object_mut().unwrap().remove("eos_token_id");
+            g.as_object_mut().unwrap().remove("eos_token_id");
+        });
+    }
+
+    /// #159: glm5_next has its own ledger: an unknown key, a Qwen key and an unknown KDA key
+    /// refuse by name; a key on the glm5_next ignore list does not
+    #[test]
+    fn an_unknown_glm_key_is_refused_by_name() {
+        glm_refused("text_config.sliding_window", |c, _| c["text_config"]["sliding_window"] = json!(4096));
+        let err = glm_refused("text_config.partial_rotary_factor", |c, _| c["text_config"]["partial_rotary_factor"] = json!(0.25));
+        assert!(err.contains("family Glm5Next"), "{err}");
+        glm_refused("text_config.linear_attn_config.chunk_size", |c, _| c["text_config"]["linear_attn_config"]["chunk_size"] = json!(64));
+        assert!(doctored_from(GLM_DIR, |c, _| c["text_config"]["router_aux_loss_coef"] = json!(0.01)).is_ok());
+        assert_eq!(IGNORED_KEYS.iter().filter(|(f, _, _)| *f == Some(Family::Glm5Next)).count(), 4);
+    }
+
+    /// #159: each formula fact glm5_next has one form of refuses another value by its key
+    #[test]
+    fn each_glm_formula_fact_refuses_another_value_by_name() {
+        glm_refused("text_config.scoring_func 'softmax' is not implemented for family Glm5Next", |c, _| c["text_config"]["scoring_func"] = json!("softmax"));
+        glm_refused("text_config.topk_method 'greedy'", |c, _| c["text_config"]["topk_method"] = json!("greedy"));
+        glm_refused("text_config.moe_router_dtype 'bfloat16'", |c, _| c["text_config"]["moe_router_dtype"] = json!("bfloat16"));
+        glm_refused("text_config.mhc false", |c, _| c["text_config"]["mhc"] = json!(false));
+        glm_refused("text_config.mla_use_nope false", |c, _| c["text_config"]["mla_use_nope"] = json!(false));
+        glm_refused("text_config.norm_topk_prob false", |c, _| c["text_config"]["norm_topk_prob"] = json!(false));
+        glm_refused("text_config.n_group 2", |c, _| c["text_config"]["n_group"] = json!(2));
+        glm_refused("text_config.qk_rope_head_dim 64", |c, _| c["text_config"]["qk_rope_head_dim"] = json!(64));
+        glm_refused("text_config.index_topk 2050", |c, _| c["text_config"]["index_topk"] = json!(2050));
+        glm_refused("text_config.indexer_types[7] 'shared'", |c, _| c["text_config"]["indexer_types"][7] = json!("shared"));
+        glm_refused("text_config.layer_types[5] 'full_attention'", |c, _| c["text_config"]["layer_types"][5] = json!("full_attention"));
+        glm_refused("text_config.linear_attn_config.kda_layers", |c, _| c["text_config"]["linear_attn_config"]["kda_layers"][0] = json!(3));
+        glm_refused("text_config.mlp_layer_types dense at [0, 1, 2, 4]", |c, _| c["text_config"]["mlp_layer_types"][4] = json!("dense"));
+        glm_refused("tie_word_embeddings true (top level) disagrees", |c, _| c["tie_word_embeddings"] = json!(true));
+    }
+
+    /// #159: a value the parse accepts but the family row pins otherwise fires its row by
+    /// name, and the gate refuses with the table (not with the not-built line)
+    #[test]
+    fn a_doctored_glm_value_fires_its_row_by_name() {
+        let m = doctored_from(GLM_DIR, |c, _| {
+            c["text_config"]["hidden_size"] = json!(5120);
+            c["text_config"]["n_routed_experts"] = json!(256);
+        })
+        .unwrap();
+        assert!(fired(&m, "hidden") && fired(&m, "experts"), "{:?}", m.verify().iter().map(Check::line).collect::<Vec<_>>());
+        let err = verdict(&m).unwrap_err();
+        assert!(err.starts_with("[meta] 2 of 38 constants differ"), "{err}");
+        assert!(err.contains("hidden: pinned 4096 (glm5_next_text family row, zai-org/GLM-5.3-Flash @ eb9eb208"), "{err}");
+        let m = doctored_from(GLM_DIR, |_, g| g["eos_token_id"] = json!([154820, 154827])).unwrap();
+        assert!(fired(&m, "glm5_geo"), "two stop ids have no Glm5Geo form");
+        assert!(m.verify()[0].config.contains("exactly three stop ids"), "{}", m.verify()[0].line());
+    }
+
+    /// #159: the Flash-Next fixture still passes its 21 checks into `Geo::FLASH_NEXT`, and the
+    /// 27B its 20, with the glm5_next family beside them
+    #[test]
+    fn the_families_of_record_pass_the_gate_as_before() {
+        let m = ModelMeta::from_config_files(&format!("{FN_FIXTURE}/config.json"), Some(&format!("{FN_FIXTURE}/generation_config.json"))).unwrap();
+        assert_eq!((m.family, m.checks().len(), m.verify().len()), (Family::FlashNext, 21, 0));
+        assert_eq!(verdict(&m), Ok(Geo::FLASH_NEXT));
+        assert!(m.glm5_geo().is_err());
+        assert_eq!((dense_meta().checks().len(), verdict(&dense_meta()).map(|g| g.family)), (20, Ok(Family::Qwen35Dense)));
     }
 }

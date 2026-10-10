@@ -65,10 +65,28 @@
 //! - Outside a call the price is `Gate::armed` (0.38 ns) plus the advance that watches for
 //!   the opener (2.4 ns) per generated id.
 //!
+//! #160, the second frame (`Markup::Glm`, GLM-5.3-Flash's `chat_template.jinja`, rendered tight):
+//!
+//! ```text
+//! <tool_call>NAME<arg_key>P</arg_key><arg_value>VALUE</arg_value> ... </tool_call>
+//! ```
+//!
+//! - the same machine, the same schema rules for NAME, P (declared, each once) and VALUE, the
+//!   same lazy trigger (the `<tool_call>` id, 154843 in GLM's vocabulary), the same `Between`
+//!   and EOS rules; only the frame literals differ, and no newline is part of the frame
+//! - a string VALUE may not contain `</arg_value>` or `</tool_call>` (the parser ends the value
+//!   at the first `</arg_value>`); `<arg_value>`, `<arg_key>` and `</arg_key>` inside it are free
+//! - a JSON VALUE may be followed by `[ \t]*` before `</arg_value>` (the parser trims it)
+//! - NAME and P may not contain `<` either: the frame would be ambiguous
+//! - the six markers are added tokens with `special: false`, so they are in the vocabulary
+//!   trie as text and a marker id steps through the machine like any other id
+//!
 //! What this module does NOT do: sampling, the logits row, the device - `bin/serve.rs`
 //! owns the redraw (`chat_generate`) and `gen.rs` the device re-booking.
 
 use std::collections::HashMap;
+
+pub use crate::toolcall::Markup;
 
 /// JSON container nesting the machine tracks; deeper schemas degrade to `Any`
 pub const MAX_JSON_DEPTH: usize = 6;
@@ -89,7 +107,12 @@ const L_FCLOSE: u8 = 4; // entered at offset 2 from `BodyLt`
 const L_CALL_CLOSE: u8 = 5;
 const L_PCLOSE: u8 = 6; // after a JSON value / an enum option
 const L_NL: u8 = 7; // after the `\n</parameter>` a raw string's guard detected
-const LITS: [&[u8]; 8] = [
+// #160 GLM
+const L_G_KEY: u8 = 8; // entered at offset 2 from `GBodyLt`
+const L_G_KV: u8 = 9; // after a key: `</arg_key><arg_value>`
+const L_G_VCLOSE: u8 = 10; // after a JSON value / an enum option
+const L_G_CALL_CLOSE: u8 = 11; // entered at offset 2 from `GBodyLt`
+const LITS: [&[u8]; 12] = [
     b"\n<function=",
     b">\n",
     b"<parameter=",
@@ -98,11 +121,19 @@ const LITS: [&[u8]; 8] = [
     b"\n</tool_call>",
     b"\n</parameter>\n",
     b"\n",
+    b"<arg_key>",
+    b"</arg_key><arg_value>",
+    b"</arg_value>",
+    b"</tool_call>",
 ];
 
 /// the two markers a value may not contain: `toolcall` cuts a value at either
 const GUARD: [&[u8]; 2] = [b"</parameter>", b"</tool_call>"];
+/// #160 GLM: the same two roles; `toolcall` ends a GLM value at the first `</arg_value>`
+const GUARD_GLM: [&[u8]; 2] = [b"</arg_value>", b"</tool_call>"];
+/// every guard marker is this long and starts `</`; `guard_step` relies on both
 const GUARD_LEN: u8 = 12;
+const _: () = assert!(GUARD[0].len() == 12 && GUARD[1].len() == 12 && GUARD_GLM[0].len() == 12 && GUARD_GLM[1].len() == 12);
 
 // ------------------------------------------------------------------ the compiled schema
 
@@ -166,6 +197,8 @@ pub struct ToolGrammar {
     nodes: Vec<Node>,
     mode: Mode,
     parallel: bool,
+    /// #160: the frame the model writes
+    markup: Markup,
 }
 
 // ------------------------------------------------------------------ the matcher state
@@ -251,6 +284,10 @@ enum Ph {
     JTail { ws: u8 },
     /// after `</tool_call>`: whitespace, then EOS or (parallel) the next `<tool_call>`
     Between { ws: u8, nls: u8 },
+    /// #160 GLM: after the name or a `</arg_value>`: `<`
+    GBody,
+    /// #160 GLM: after `<`: `a` (`<arg_key>`) or `/` (`</tool_call>`)
+    GBodyLt,
 }
 
 /// the matcher state of one generation; `Copy`, and `Hash` so masks can be cached per state
@@ -299,18 +336,23 @@ fn choice_step(opts: &[Vec<u8>], lo: usize, hi: usize, off: usize, b: u8, alive:
     ChoiceR::Rej
 }
 
-/// the next state of a guard scan (`</parameter>` / `</tool_call>`), `Err(pat)` when a
-/// marker just COMPLETED
-fn guard_step(g: u8, pat: u8, b: u8) -> Result<(u8, u8), u8> {
+/// the next state of a guard scan over `gd` (`</parameter>` / `</tool_call>`, #160 GLM:
+/// `</arg_value>` / `</tool_call>`), `Err(pat)` when a marker just COMPLETED; both markers
+/// share `</` and part at byte 2
+fn guard_step(gd: &[&[u8]; 2], g: u8, pat: u8, b: u8) -> Result<(u8, u8), u8> {
     if g > 0 {
         let hit = match g {
             1 => (b == b'/').then_some(0),
-            2 => match b {
-                b'p' => Some(0),
-                b't' => Some(1),
-                _ => None,
-            },
-            _ => (GUARD[pat as usize][g as usize] == b).then_some(pat),
+            2 => {
+                if b == gd[0][2] {
+                    Some(0)
+                } else if b == gd[1][2] {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+            _ => (gd[pat as usize][g as usize] == b).then_some(pat),
         };
         if let Some(p) = hit {
             let g = g + 1;
@@ -378,8 +420,21 @@ impl ToolGrammar {
     /// - `Err` names why no grammar can be built (no usable tool, a tool with more than
     ///   64 parameters, ...); the caller runs the request unconstrained and says so
     pub fn build(tools: &serde_json::Value, mode: Mode, parallel: bool, only: Option<&str>) -> Result<Self, String> {
+        Self::build_markup(tools, mode, parallel, only, Markup::Qwen)
+    }
+
+    /// #160: `build` for the frame `markup` writes; `build` is `Markup::Qwen`
+    pub fn build_markup(
+        tools: &serde_json::Value,
+        mode: Mode,
+        parallel: bool,
+        only: Option<&str>,
+        markup: Markup,
+    ) -> Result<Self, String> {
         let arr = tools.as_array().ok_or("tools is not an array")?;
-        let mut g = ToolGrammar { names: Vec::new(), tools: Vec::new(), nodes: Vec::new(), mode, parallel };
+        // GLM's frame has no `>` after a name, so a `<` would end it early
+        let glm = markup == Markup::Glm;
+        let mut g = ToolGrammar { names: Vec::new(), tools: Vec::new(), nodes: Vec::new(), mode, parallel, markup };
         g.nodes.push(Node::Any);
         g.nodes.push(Node::OpenObj);
         g.nodes.push(Node::Arr(N_ANY));
@@ -390,7 +445,7 @@ impl ToolGrammar {
             if only.is_some_and(|o| o != name) {
                 continue;
             }
-            if name.is_empty() || name.len() > 255 || name.contains('>') || name.contains('\n') {
+            if name.is_empty() || name.len() > 255 || name.contains('>') || name.contains('\n') || (glm && name.contains('<')) {
                 return Err(format!("tool name {name:?} cannot be written in the markup"));
             }
             if by_name.iter().any(|(n, _)| n == name.as_bytes()) {
@@ -406,7 +461,7 @@ impl ToolGrammar {
             let mut ps: Vec<(Vec<u8>, &serde_json::Value)> = Vec::new();
             if let Some(props) = props {
                 for (k, v) in props {
-                    if k.is_empty() || k.len() > 255 || k.contains('>') || k.contains('\n') {
+                    if k.is_empty() || k.len() > 255 || k.contains('>') || k.contains('\n') || (glm && k.contains('<')) {
                         return Err(format!("parameter {k:?} of {name:?} cannot be written in the markup"));
                     }
                     ps.push((k.as_bytes().to_vec(), v));
@@ -582,6 +637,28 @@ impl ToolGrammar {
         self.parallel
     }
 
+    /// #160: the frame this grammar constrains
+    pub fn markup(&self) -> Markup {
+        self.markup
+    }
+
+    /// #160: the state right after the `<tool_call>` id - Qwen's frame continues with
+    /// `\n<function=`, GLM's with the name itself
+    fn open_state(&self) -> St {
+        match self.markup {
+            Markup::Qwen => St { ph: Ph::Lit { id: L_OPEN, off: 0 }, ..St::IDLE },
+            Markup::Glm => St { ph: Ph::FName { lo: 0, hi: self.names.len() as u16, off: 0 }, ..St::IDLE },
+        }
+    }
+
+    /// the two markers a value may not contain, for this frame
+    fn guard(&self) -> &'static [&'static [u8]; 2] {
+        match self.markup {
+            Markup::Qwen => &GUARD,
+            Markup::Glm => &GUARD_GLM,
+        }
+    }
+
     // -------------------------------------------------------------- the byte machine
 
     fn unseen_param(&self, s: &St) -> bool {
@@ -594,7 +671,7 @@ impl ToolGrammar {
             L_OPEN => Ph::FName { lo: 0, hi: self.names.len() as u16, off: 0 },
             L_FGT | L_PCLOSE | L_NL => Ph::Body,
             L_PARAM => Ph::PName { lo: 0, hi: self.tools[s.tool as usize].pnames.len() as u16, off: 0 },
-            L_PGT => match &self.tools[s.tool as usize].kinds[s.param as usize] {
+            L_PGT | L_G_KV => match &self.tools[s.tool as usize].kinds[s.param as usize] {
                 PKind::RawStr => Ph::RawStr { g: 0, pat: 0, nlb: false, nl: false },
                 PKind::RawEnum(o) => Ph::REnum { lo: 0, hi: o.len() as u16, off: 0 },
                 PKind::Json(n) => {
@@ -603,7 +680,9 @@ impl ToolGrammar {
                 }
             },
             L_FCLOSE => Ph::Lit { id: L_CALL_CLOSE, off: 0 },
-            L_CALL_CLOSE => Ph::Between { ws: 0, nls: 0 },
+            L_CALL_CLOSE | L_G_CALL_CLOSE => Ph::Between { ws: 0, nls: 0 },
+            L_G_KEY => Ph::PName { lo: 0, hi: self.tools[s.tool as usize].pnames.len() as u16, off: 0 },
+            L_G_VCLOSE => Ph::GBody,
             _ => unreachable!("literal id"),
         };
     }
@@ -635,7 +714,10 @@ impl ToolGrammar {
                         ChoiceR::Done(i) => {
                             s.tool = i as u16;
                             s.seen = 0;
-                            s.ph = Ph::Lit { id: L_FGT, off: 0 };
+                            s.ph = match self.markup {
+                                Markup::Qwen => Ph::Lit { id: L_FGT, off: 0 },
+                                Markup::Glm => Ph::GBody,
+                            };
                         }
                         ChoiceR::Rej => return false,
                     }
@@ -669,13 +751,25 @@ impl ToolGrammar {
                         ChoiceR::Done(i) => {
                             s.param = i as u16;
                             s.seen |= 1u64 << i;
-                            s.ph = Ph::Lit { id: L_PGT, off: 0 };
+                            s.ph = match self.markup {
+                                Markup::Qwen => Ph::Lit { id: L_PGT, off: 0 },
+                                Markup::Glm => Ph::Lit { id: L_G_KV, off: 0 },
+                            };
                         }
                         ChoiceR::Rej => return false,
                     }
                 }
                 Ph::RawStr { g, pat, nlb, nl } => {
-                    match guard_step(g, pat, b) {
+                    match guard_step(self.guard(), g, pat, b) {
+                        Err(p) if self.markup == Markup::Glm => {
+                            // #160: the first `</arg_value>` ends the value; `</tool_call>`
+                            // inside a value stays refused, as for Qwen
+                            if p == 0 {
+                                s.ph = Ph::GBody;
+                                return true;
+                            }
+                            return false;
+                        }
                         Err(p) => {
                             // a marker completed: `</parameter>` closes the value whether or
                             // not a newline stood before it - `toolcall::find_marker` cuts there
@@ -712,7 +806,12 @@ impl ToolGrammar {
                             s.ph = Ph::REnum { lo: a as u16, hi: z as u16, off: off + 1 };
                             return true;
                         }
-                        ChoiceR::Done(_) => s.ph = Ph::Lit { id: L_PCLOSE, off: 0 },
+                        ChoiceR::Done(_) => {
+                            s.ph = match self.markup {
+                                Markup::Qwen => Ph::Lit { id: L_PCLOSE, off: 0 },
+                                Markup::Glm => Ph::Lit { id: L_G_VCLOSE, off: 0 },
+                            }
+                        }
                         ChoiceR::Rej => return false,
                     }
                 }
@@ -725,9 +824,27 @@ impl ToolGrammar {
                     }
                 },
                 Ph::JTail { ws } => {
+                    s.ph = match (b, self.markup) {
+                        (b' ' | b'\t', _) if ws < WS_MAX => Ph::JTail { ws: ws + 1 },
+                        (b'\n', Markup::Qwen) => Ph::Lit { id: L_PCLOSE, off: 1 },
+                        (b'<', Markup::Glm) => Ph::Lit { id: L_G_VCLOSE, off: 1 },
+                        _ => return false,
+                    };
+                    return true;
+                }
+                Ph::GBody => {
+                    if b != b'<' {
+                        return false;
+                    }
+                    s.ph = Ph::GBodyLt;
+                    return true;
+                }
+                Ph::GBodyLt => {
                     s.ph = match b {
-                        b' ' | b'\t' if ws < WS_MAX => Ph::JTail { ws: ws + 1 },
-                        b'\n' => Ph::Lit { id: L_PCLOSE, off: 1 },
+                        b'a' if self.unseen_param(s) => Ph::Lit { id: L_G_KEY, off: 2 },
+                        // as Qwen's `</function>`: the call may close with a required key
+                        // missing; the client reports the schema error
+                        b'/' => Ph::Lit { id: L_G_CALL_CLOSE, off: 2 },
                         _ => return false,
                     };
                     return true;
@@ -915,7 +1032,7 @@ impl ToolGrammar {
                         R::Ok
                     }
                     0..=0x1f => R::Rej,
-                    _ => match guard_step(g, pat, b) {
+                    _ => match guard_step(self.guard(), g, pat, b) {
                         Ok((g, pat)) => {
                             j.sc = Sc::Str { g, pat, esc: 0 };
                             R::Ok
@@ -1217,7 +1334,7 @@ impl Vocab {
             return false;
         }
         if id == self.tool_open {
-            *s = St { ph: Ph::Lit { id: L_OPEN, off: 0 }, ..St::IDLE };
+            *s = g.open_state();
             return true;
         }
         if s.ph == Ph::Idle || self.eos.contains(&id) {
@@ -1387,7 +1504,7 @@ impl<'v> Gate<'v> {
             Ph::Idle => "idle",
             Ph::Lit { .. } => "markup",
             Ph::FName { .. } => "function name",
-            Ph::Body | Ph::BodyLt => "function body",
+            Ph::Body | Ph::BodyLt | Ph::GBody | Ph::GBodyLt => "function body",
             Ph::PName { .. } => "parameter name",
             Ph::RawStr { .. } => "string value",
             Ph::REnum { .. } => "enum value",
@@ -1840,5 +1957,237 @@ mod tests {
         );
         eprintln!("[toolgrammar cost] {line}");
         assert!(worst < 2000.0, "{line}");
+    }
+}
+
+#[cfg(test)]
+mod glm_tests {
+    //! #160: the GLM frame `<tool_call>NAME<arg_key>P</arg_key><arg_value>V</arg_value>...</tool_call>`
+    //! - byte level on the Crow tool set, token level on GLM-5.3-Flash's own vocabulary
+    //!   (when `models/GLM-5.3-Flash-original/` is on this machine), and the round trip of
+    //!   every call Python's template rendered (goldens)
+    use super::*;
+
+    const TOOLS_3DBC015: &str = include_str!("../../tools/corpora/crow-3dbc015-tools.json");
+    const GOLDENS: &str = include_str!("../tests/fixtures/GLM-5.3-Flash/tokenizer-goldens.json");
+    const DIR: &str = "../models/GLM-5.3-Flash-original";
+
+    fn crow_glm() -> ToolGrammar {
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        ToolGrammar::build_markup(&tools, Mode::Auto, true, None, Markup::Glm).expect("builds")
+    }
+
+    /// the byte machine from just after the `<tool_call>` id; `Err(offset)` at the first refused byte
+    fn run(g: &ToolGrammar, text: &str) -> Result<St, usize> {
+        let mut s = g.open_state();
+        for (i, &b) in text.as_bytes().iter().enumerate() {
+            if !g.step(&mut s, b) {
+                return Err(i);
+            }
+        }
+        Ok(s)
+    }
+
+    fn complete(g: &ToolGrammar, text: &str) -> bool {
+        matches!(run(g, text), Ok(s) if g.eos_ok(&s))
+    }
+
+    #[test]
+    fn build_keeps_qwen_and_build_markup_takes_glm() {
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        assert_eq!(ToolGrammar::build(&tools, Mode::Auto, true, None).unwrap().markup(), Markup::Qwen);
+        let g = crow_glm();
+        assert_eq!((g.markup(), g.n_tools(), g.n_params()), (Markup::Glm, 26, 51));
+        // a `<` in a name cannot be written in GLM's frame; Qwen's frame allows it
+        let lt = serde_json::json!([{"type": "function", "function": {"name": "a<b", "parameters": {"type": "object"}}}]);
+        assert!(ToolGrammar::build_markup(&lt, Mode::Auto, true, None, Markup::Glm).is_err());
+        assert!(ToolGrammar::build(&lt, Mode::Auto, true, None).is_ok());
+    }
+
+    #[test]
+    fn well_formed_glm_calls_are_accepted_and_complete() {
+        let g = crow_glm();
+        for t in [
+            "read_file<arg_key>path</arg_key><arg_value>/a b/c.md</arg_value><arg_key>start_line</arg_key><arg_value>10</arg_value></tool_call>",
+            "read_file<arg_key>start_line</arg_key><arg_value>-3 \t</arg_value><arg_key>path</arg_key><arg_value></arg_value></tool_call>",
+            "edit_file<arg_key>path</arg_key><arg_value>x.rs</arg_value><arg_key>old</arg_key><arg_value>let a = 1;\n</arg_value><arg_key>new</arg_key><arg_value>let a = \"<arg_value>\"; // </arg_key> <arg_key>\n</arg_value></tool_call>",
+            "git_commit<arg_key>message</arg_key><arg_value>m</arg_value><arg_key>paths</arg_key><arg_value>[\"a\", \"\u{fc}\"]</arg_value></tool_call>",
+        ] {
+            assert!(complete(&g, t), "{t:?}: {:?}", run(&g, t));
+        }
+    }
+
+    #[test]
+    fn the_glm_failure_shapes_are_refused_at_the_first_wrong_byte() {
+        let g = crow_glm();
+        let rf = "read_file<arg_key>path</arg_key><arg_value>";
+        let cases: Vec<(String, usize)> = vec![
+            // the template renders tight: no newline after the opener, none in the frame
+            ("\nread_file</tool_call>".to_string(), 0),
+            ("read_file\n<arg_key>".to_string(), 9),
+            // Qwen's frame in a GLM grammar
+            ("\n<function=read_file>".to_string(), 0),
+            // an unknown tool, an undeclared key, a key twice
+            ("reed_file".to_string(), 2),
+            ("read_file<arg_key>pfad</arg_key>".to_string(), 19),
+            (format!("{rf}a</arg_value><arg_key>path</arg_key>"), rf.len() + "a</arg_value><arg_key>".len()),
+            // a value cannot contain `</arg_value>`: the value ENDS there, and the rest is refused
+            (format!("{rf}a</arg_value>b</arg_value></tool_call>"), rf.len() + "a</arg_value>".len()),
+            // `</tool_call>` inside a string value is refused at its last byte
+            (format!("{rf}a</tool_call>"), rf.len() + "a</tool_call".len()),
+            // an integer is an integer
+            ("read_file<arg_key>start_line</arg_key><arg_value>1.5".to_string(), "read_file<arg_key>start_line</arg_key><arg_value>1".len()),
+            ("read_file<arg_key>start_line</arg_key><arg_value>\"1\"".to_string(), "read_file<arg_key>start_line</arg_key><arg_value>".len()),
+            // a JSON value is followed by `[ \t]*` and `</arg_value>`, not a newline
+            ("read_file<arg_key>start_line</arg_key><arg_value>1\n".to_string(), "read_file<arg_key>start_line</arg_key><arg_value>1".len()),
+        ];
+        for (t, at) in &cases {
+            assert_eq!(run(&g, t).err(), Some(*at), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn eos_and_the_next_call_follow_the_qwen_rules() {
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        let call = "read_file<arg_key>path</arg_key><arg_value>p</arg_value></tool_call>";
+        for (mode, parallel) in [(Mode::Auto, true), (Mode::Required, false)] {
+            let g = ToolGrammar::build_markup(&tools, mode, parallel, None, Markup::Glm).unwrap();
+            let s = run(&g, call).unwrap();
+            assert!(g.eos_ok(&s));
+            assert_eq!(g.open_ok(&s), parallel);
+            // inside the call EOS is refused
+            let mid = run(&g, &call[..20]).unwrap();
+            assert!(!g.eos_ok(&mid));
+            assert_eq!(g.eos_ok(&St::IDLE), mode == Mode::Auto);
+        }
+        // a tool with no parameters: `<tool_call>name</tool_call>`, no `<arg_key>` possible
+        let none = serde_json::json!([{"type": "function", "function": {"name": "now", "parameters": {"type": "object", "properties": {}}}}]);
+        let g = ToolGrammar::build_markup(&none, Mode::Auto, true, None, Markup::Glm).unwrap();
+        assert!(complete(&g, "now</tool_call>"));
+        assert_eq!(run(&g, "now<arg_key>").err(), Some(4));
+    }
+
+    /// every call Python's template rendered (goldens) is accepted by the grammar built from
+    /// the same `tools`, byte for byte, and completes
+    #[test]
+    fn every_golden_tool_call_is_inside_the_grammar() {
+        let g: serde_json::Value = serde_json::from_str(GOLDENS).unwrap();
+        let mut n = 0;
+        for case in g["render"].as_array().unwrap() {
+            let render = case["render"].as_str().unwrap();
+            if case["tools"].is_null() {
+                continue;
+            }
+            let gr = ToolGrammar::build_markup(&case["tools"], Mode::Auto, true, None, Markup::Glm).unwrap();
+            let Some(at) = render.find("<|assistant|>") else { continue };
+            for call in render[at..].split("<tool_call>").skip(1) {
+                let Some(end) = call.find("</tool_call>") else { continue };
+                let one = &call[..end + "</tool_call>".len()];
+                assert!(complete(&gr, one), "{}: {one:?} {:?}", case["name"], run(&gr, one));
+                n += 1;
+            }
+        }
+        assert_eq!(n, 6);
+    }
+
+    // ------------------------------------------------------------- GLM's own vocabulary
+
+    fn glm() -> Option<(crate::tokenizer::ChatTokenizer, Vocab)> {
+        let t = format!("{DIR}/tokenizer.json");
+        if !std::path::Path::new(&t).is_file() {
+            eprintln!("no {t} on this machine - skipped");
+            return None;
+        }
+        let tk = crate::tokenizer::ChatTokenizer::load(&t, &crate::tokenizer::sibling_config(&t)).expect("loads");
+        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{DIR}/config.json")).unwrap()).unwrap();
+        let n = cfg["vocab_size"].as_u64().or_else(|| cfg["text_config"]["vocab_size"].as_u64()).unwrap_or(154880) as usize;
+        let open = tk.token_id("<tool_call>").expect("<tool_call> id");
+        assert_eq!(open, 154843);
+        let eos = crate::glm5_template::EOS_IDS;
+        let v = Vocab::build(n, |id| tk.token_bytes(id), |id| tk.is_special(id), &eos, open);
+        Some((tk, v))
+    }
+
+    /// the tokenizer's own split of a GLM call - every marker an added-token id - is
+    /// allowed id by id, and the mask agrees with the per-token check on random ids
+    #[test]
+    fn token_masks_on_the_glm_vocabulary_agree_with_the_per_token_check() {
+        let Some((tk, v)) = glm() else { return };
+        let g = crow_glm();
+        let text = "edit_file<arg_key>path</arg_key><arg_value>/home/nibor1896/a.rs</arg_value><arg_key>old</arg_key><arg_value>let x = \"<arg_value>\";</arg_value><arg_key>new</arg_key><arg_value>let x = 2; // gr\u{fc}\u{df}e</arg_value></tool_call>";
+        let mut seq = vec![tk.token_id("<tool_call>").unwrap()];
+        seq.extend(tk.encode_raw(text).unwrap());
+        // the markers are single ids
+        for m in ["<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", "</tool_call>"] {
+            assert!(seq.contains(&tk.token_id(m).unwrap()), "{m}");
+        }
+        let mut s = St::IDLE;
+        let mut bits = Vec::new();
+        let mut rng = crate::sample::Rng::new(160);
+        for (k, &id) in seq.iter().enumerate() {
+            v.mask(&g, &s, &mut bits);
+            assert!(allowed(&bits, id as usize), "the tokenizer's own split refused at id #{k} ({id})");
+            let mut probe: Vec<u32> = (0..400).map(|_| (rng.next_u64() % v.len() as u64) as u32).collect();
+            probe.extend(crate::glm5_template::EOS_IDS);
+            probe.extend(154838..154856u32);
+            for p in probe {
+                assert_eq!(allowed(&bits, p as usize), v.token_ok(&g, &s, p), "state #{k} id {p}");
+            }
+            assert!(bits.iter().any(|&w| w != 0));
+            assert!(v.accept(&g, &mut s, id));
+        }
+        assert!(g.eos_ok(&s), "the call closed");
+        // and `<|observation|>`, GLM's end of a tool turn, is the EOS it may write now
+        assert!(v.token_ok(&g, &s, 154829));
+    }
+
+    /// what the grammar lets through on GLM's vocabulary, the GLM parser turns into calls
+    /// with JSON arguments; random walks over allowed ids never reach a dead end
+    #[test]
+    fn a_random_walk_on_the_glm_vocabulary_parses_and_never_dead_ends() {
+        let Some((tk, v)) = glm() else { return };
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        let g = crow_glm();
+        let mut rng = crate::sample::Rng::new(1600);
+        let mut bits = Vec::new();
+        let mut closed = 0;
+        for round in 0..6 {
+            let mut s = St::IDLE;
+            let open = tk.token_id("<tool_call>").unwrap();
+            assert!(v.accept(&g, &mut s, open));
+            let mut ids = vec![open];
+            for step in 0..300 {
+                v.mask(&g, &s, &mut bits);
+                let ok: Vec<u32> = (0..v.len() as u32).filter(|&i| allowed(&bits, i as usize)).collect();
+                assert!(!ok.is_empty(), "dead end in round {round} step {step}: {s:?}");
+                if g.eos_ok(&s) {
+                    break;
+                }
+                let short: Vec<u32> = ok.iter().copied().filter(|&i| v.bytes_of(i).len() <= 2 || i >= 154838).collect();
+                let pool = if !short.is_empty() && !rng.next_u64().is_multiple_of(4) { &short } else { &ok };
+                let id = pool[(rng.next_u64() % pool.len() as u64) as usize];
+                assert!(v.accept(&g, &mut s, id));
+                ids.push(id);
+            }
+            if g.eos_ok(&s) {
+                let text = tk.decode(&ids).unwrap();
+                let mut ts = crate::toolcall::ToolStream::with_markup(Some(&tools), Markup::Glm);
+                ts.arm();
+                let mut out = ts.feed(&text);
+                assert!(!ts.finish(&mut out), "{text:?}");
+                assert_eq!(ts.closed(), 1, "{text:?}");
+                let args: String = out
+                    .iter()
+                    .filter_map(|e| match e {
+                        crate::toolcall::Emit::Args { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let a: serde_json::Value = serde_json::from_str(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+                assert!(a.is_object() && a.get("_truncated").is_none(), "{text:?} -> {args}");
+                closed += 1;
+            }
+        }
+        eprintln!("{closed} of 6 random walks closed a call within 300 ids");
     }
 }

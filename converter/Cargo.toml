@@ -5,7 +5,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
-serde_json = "1"
+# crow-nest #155: `float_roundtrip` parses floats correctly rounded, so an f64 written into the
+# conversion journal reads back bit-identical (the default parser can be 1 ulp off), and a resumed
+# conversion writes the same index and sidecar bytes as an uninterrupted one
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Crow #300 C6: the index v2 records the sha256 of the config files and of every source shard
 # the Hugging Face cache has no LFS record for. RustCrypto sha2 at the version the engine
 # already pins (engine/Cargo.toml, #114: no hand-rolled crypto).

@@ -59,6 +59,19 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 - A `serve` decode number enters `docs/architecture.md` on Linux only in the drift-chain form (issue #38, relaxed by robin 2026-09-18): at least 3 counted serve runs in one chain, one fresh process per run, the generated-ids sha256 identical across them, an adjacent `decode run` arm in the same chain, and the figure quoted as its arm mean with its max-over-min spread beside that decode arm's mean and spread. Anything else is refused; on Windows the older bar stands until the M2a form is rerun there (2026-09-10).
 - The sampler default is decided (issue #55, 2026-09-11): the request decides, no `temperature` is greedy, `temperature > 0` samples with the data-sheet defaults (`engine/src/bin/serve.rs:1041`); the six-seed and the greedy rows above are the measured basis.
 
+### GLM-5.3-Flash (glm5_next), measurement only
+
+- Not an operating point: every GLM switch is default off, G3 with the operating set, G4 (200k boot), G5 (Crow) and G6 are not run (#149, #151, #169). The PREREG G5 bar is decode ≥ 40 tok/s (`runs/glm53-flash/PREREG.md`).
+- One RTX 5090, Windows 11, container `GLM-5.3-Flash-MUL1K3.cnq` (3-bit MUL1 routed experts, 124,591,634,567 B), `glm5_run --cold --reps 1`, real text, N=1 per arm, raw data `runs/glm53-flash/quick/` (`README.md` there lists every arm).
+
+| arm | prefill, 8,192 tokens | TTFT | decode, 127 tokens, median over tokens | decode wall | date | source |
+|---|---|---|---|---|---|---|
+| `arm2.env` (start of the day) | 994.55 tok/s | 8.24 s | 11.07 tok/s | 10.62 tok/s | 2026-10-10 | `quick/q6-arm2` |
+| `arm2.env` + `CROW_GLM_RT2=1` | 999.47 tok/s | 8.20 s | 11.71 tok/s | 11.45 tok/s | 2026-10-10 | `quick/b1-base` |
+| `arm3.env` (crow-nest v0.11.0 operating set) | 1137.54 tok/s | 7.20 s | 16.84 tok/s | 16.27 tok/s | 2026-10-10 | `quick/b6-promptcount` |
+
+- Decode is bound by one NVMe: on the routing of the cold decode check Belady MIN still sources 18.77 experts per token from NVMe, the operating set's policy 25.04 (`tools/glm_tier_sim.py arena`, 7,436 slots, `runs/glm53-flash/cache-sim-20261010m/`, 2026-10-10).
+
 ### Targets
 
 - Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:18-19`, `:57-58`).

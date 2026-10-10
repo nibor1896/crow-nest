@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# #90: the LLAMA arm of the long-context oracle form - one command, whenever the
-# GGUF is whole again (2026-09-20: shard 1 of the Unsloth UD-Q2_K_XL GGUF is
-# broken/incomplete, so this is a harness, not a run).
+# #90: the LLAMA arm of the long-context oracle form - one command against a running
+# llama-server with the Unsloth UD-Q2_K_XL GGUF. On 2026-09-20 shard 1 of that GGUF
+# was broken, so this was written as a harness. On 2026-09-23 llama-server served the
+# GGUF again (CHANGELOG v0.4.0, #91 multi-site probe). This arm has not been run yet.
 #
-# WHAT IT DOES when the server is back:
+# WHAT IT DOES once the server answers:
 #   1. /props + the tokenizer round-trip check on the anchor's prefix ids
 #      (the check that decides whether the ids survive as ids - docs/oracle-kld.md 4.1)
 #   2. tools/llama-row-probs.py over the plan's row block, --no-cache-prompt
@@ -29,7 +30,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-url) BASE_URL="$2"; shift 2 ;;
     --anchors)  ANCHORS="$2";  shift 2 ;;
-    -h|--help)  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg $1 (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -40,8 +41,8 @@ PY=${VENV_PY:-python3}
 [[ -x $PY ]] || PY=python3
 
 if ! curl -fsS --max-time 5 "$BASE_URL/props" >/dev/null 2>&1; then
-  echo "llama arm: no server at $BASE_URL - the GGUF shard 1 is broken as of" \
-       "2026-09-20; start it with the command in this file's header and rerun" >&2
+  echo "llama arm: no server at $BASE_URL - start it with the command in this" \
+       "file's header and rerun" >&2
   exit 3
 fi
 

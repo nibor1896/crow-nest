@@ -1,0 +1,1373 @@
+// crow-nest #180: MUL1 trellis expert kernels (NVRTC, compute_120a), the GPU half of
+// `cpu_mul1.rs`. Its own module (`kernels::mul1::Kernels::new` compiles `MUL1_SRC` alone):
+// one more `.entry` in KERNEL_SRC would break the PTX of record (`kernels::tests_300_c4`).
+//
+// Format: the CNQ MUL1 record of #181 (`converter/src/mul1.rs`), one per expert:
+// [gate.trellis][up.trellis][down.trellis][gate.suh][gate.svh][up.suh][up.svh][down.suh][down.svh]
+// [zeros]. A linear [k = in, n = out] is a trellis of (k/16)(n/16) tiles of `n32` u32 words
+// (tile kb * n/16 + nb holds the 16x16 block of rows 16 kb.., columns 16 nb..), plus fp16 suh
+// [k] and svh [n]. y = x W with W = diag(suh) H W_hat H diag(svh) / 128 (H the 128-wide
+// Sylvester Hadamard, entries +-1): exllamav3 `LinearEXL3.get_weight_tensor` and the
+// `had_r_128` / `hgemm` forward path (`exllamav3/modules/quant/exl3.py:193-249` at commit
+// 151539c7). So every GEMV is three steps, none of which writes a dequantized weight:
+//   mul1_had_in   xh = H (x * suh)                    (activations only)
+//   mul1_gemv     y' = xh W_hat, W_hat decoded from the trellis in the inner loop
+//   mul1_had_out  y  = (H y') / 128 * svh             (also sums the k-split partials)
+// mul1_act_had_in is mul1_had_out for gate and up, silu(g) * u, and mul1_had_in for down.
+//
+// Decode, after exllamav3 (MIT, turboderp-org/exllamav3 @ 151539c7):
+// `exllamav3_ext/quant/codebook.cuh:38-52` (decode_mul1_product_2: state * 0x83DCD12D,
+// __dp4a byte sum + 0x6400, one fp16 fma with k_inv = 0x1eee, k_bias = 0xc931) and the
+// in-warp window extraction of `exllamav3_ext/quant/exl3_gemv_kernel.cuh:1-21` (tile words
+// staged through shared memory, the SMEM_STAGE form). The words reach shared memory as whole
+// 128-byte lines loaded by the whole block, two stages deep (#183, mul1_gemv): from pinned RAM
+// the first kernel's 96-byte warp loads (mul1_gemv_warp, kept as the reference) read ~8 GB/s,
+// the block runs ~36 GB/s on the RTX 5090. Unlike exllamav3 (fp16
+// MMA, fp16 accumulation) every product and sum here is f32. `mul1_w` computes the exact
+// value (1024 + s) * k_inv + k_bias in f32 (11-bit by 10-bit product, sum on a 2^-18 grid
+// below 2^4: exact) and rounds it once to fp16 (cvt.rn), which is __hfma's one rounding, so
+// the weight is the codec's fp16 value bit for bit (`mul1_decode_states`, tested).
+//
+// The f32 order (the rounding count n of docs/mul1-gemv.md section 3, `mul1::rounding_steps`):
+// x * suh (1), FWHT 7 stages (7), per lane an fmaf chain over its k-split: 4 terms per tile,
+// k / (16 S) tiles (k / (4 S)), two xor-shuffle adds (2), S partials summed left to right
+// (S - 1), FWHT (7), * 2^-7 (exact), * svh (1): n = k / (4 S) + S + 17.
+// Every rounded add and multiply outside the fmaf chain is an __fadd_rn / __fmul_rn
+// intrinsic, which NVRTC never contracts into an fma (-fmad=true is its default), so the
+// order above is the compiled order. expf is the accurate one (no --use_fast_math).
+// Scalar arguments come in one device int buffer per launch (the KERNEL_SRC rule).
+
+#define MUL1_MAXT 8
+#define MUL1_XROWS 512
+#define MUL1_U 4
+// u32 words of the largest tile (K = 8: 16 * 8 / 2), and 16-byte loads per thread per stage
+#define MUL1_N32MAX 64
+#define MUL1_PIECES ((MUL1_U * 8 * MUL1_N32MAX / 4 + 255) / 256)
+
+__device__ __forceinline__ float mul1_h2f(unsigned short h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+
+// the codec weight of one 16-bit trellis state (exact fp16 value as f32)
+__device__ __forceinline__ float mul1_w(unsigned int state) {
+    unsigned int x = state * 0x83DCD12Du;
+    unsigned int s;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(s) : "r"(x), "r"(0x01010101u), "r"(0u));
+    // 0x1eee = 1774 * 2^-18, 0xc931 = -10.3828125: both exact in f32, so is the result
+    float v = (float)(1024u + s) * 6.76727294921875e-3f + (-10.3828125f);
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+    return mul1_h2f(h);
+}
+
+// exclusive end bit of trellis position t in a tile's circular stream (#181 `Bitrate::end_bit`)
+__device__ __forceinline__ int mul1_end_bit(int t, int bits, int half) {
+    if (!half) return (t + 1) * bits;
+    return (t & 1) ? (t / 2 + 1) * (2 * bits + 1) : (t / 2) * (2 * bits + 1) + bits;
+}
+
+// In-place natural-order Walsh-Hadamard transform of 128 floats over one warp, element
+// 4 * lane + j in v[j]: stages on bits 0, 1 in-thread, bits 2..6 by xor shuffles, each
+// stage (a, b) -> (a + b, a - b). The same order as cpu_mul1::fwht128.
+__device__ __forceinline__ void mul1_fwht128(float v[4], int lane) {
+    float a0 = __fadd_rn(v[0], v[1]), a1 = __fsub_rn(v[0], v[1]), a2 = __fadd_rn(v[2], v[3]), a3 = __fsub_rn(v[2], v[3]);
+    v[0] = __fadd_rn(a0, a2);
+    v[1] = __fadd_rn(a1, a3);
+    v[2] = __fsub_rn(a0, a2);
+    v[3] = __fsub_rn(a1, a3);
+    #pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
+            v[j] = (lane & m) ? __fsub_rn(o, v[j]) : __fadd_rn(v[j], o);
+        }
+    }
+}
+
+// xh = H (x * suh) for one 128-block of one token row; v in, v out
+__device__ __forceinline__ void mul1_in_block(float v[4], const unsigned short* __restrict__ suh, int c0, int lane) {
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = __fmul_rn(v[j], mul1_h2f(suh[c0 + j]));
+    mul1_fwht128(v, lane);
+}
+
+// y = (H sum_s part[s]) / 128 * svh for outputs blk*128 .. +128 of token t, slot e
+__device__ __forceinline__ void mul1_out_block(float v[4], const float* __restrict__ part, const unsigned short* __restrict__ svh,
+                                               int e, int S, int T, int t, int n, int blk, int lane) {
+    int c0 = blk * 128 + 4 * lane;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float s = part[(((size_t)e * S + 0) * T + t) * n + c0 + j];
+        for (int sp = 1; sp < S; sp++) s = __fadd_rn(s, part[(((size_t)e * S + sp) * T + t) * n + c0 + j]);
+        v[j] = s;
+    }
+    mul1_fwht128(v, lane);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = __fmul_rn(__fmul_rn(v[j], 0.0078125f), mul1_h2f(svh[c0 + j]));
+}
+
+// grid (k/128, T, E), block 32. p: [0] k, [1] T, [2] suh_off (bytes into the record).
+// x, xh: [E][T][k]; ptrs[e]: record base (VRAM slot or pinned UVA address)
+extern "C" __global__ void mul1_had_in(const unsigned long long* __restrict__ ptrs, const float* __restrict__ x,
+                                       float* __restrict__ xh, const int* __restrict__ p) {
+    const int k = p[0], T = p[1];
+    const int e = blockIdx.z, t = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
+    const unsigned short* suh = (const unsigned short*)(ptrs[e] + (unsigned long long)p[2]);
+    const size_t row = ((size_t)e * T + t) * k;
+    const int c0 = blk * 128 + 4 * lane;
+    float v[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = x[row + c0 + j];
+    mul1_in_block(v, suh, c0, lane);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) xh[row + c0 + j] = v[j];
+}
+
+// One tile of the GEMV inner loop for one warp: lane g decodes its 8 weights from the tile's
+// words w (n32 u32, shared memory) and adds them into its fmaf chains, token by token. Both GEMV
+// kernels call exactly this, so their f32 operation order is one and the same.
+__device__ __forceinline__ void mul1_tile_fma(const unsigned int* w, const int lo[8], int n32, const float* xs, int rows,
+                                              int r0, int T, float acc0[MUL1_MAXT], float acc1[MUL1_MAXT]) {
+    float wv[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int i = lo[j] >> 5, o = lo[j] & 31;
+        int i1 = (i + 1 == n32) ? 0 : i + 1;
+        unsigned long long pair = ((unsigned long long)w[i] << 32) | w[i1];
+        wv[j] = mul1_w((unsigned int)(pair >> (48 - o)) & 0xffffu);
+    }
+    #pragma unroll
+    for (int t = 0; t < MUL1_MAXT; t++) {
+        if (t < T) {
+            const float* xr = xs + t * rows + r0;
+            float x0 = xr[0], x1 = xr[1], x8 = xr[8], x9 = xr[9];
+            float a = acc0[t], b = acc1[t];
+            a = fmaf(wv[0], x0, a);
+            a = fmaf(wv[1], x1, a);
+            a = fmaf(wv[2], x8, a);
+            a = fmaf(wv[3], x9, a);
+            b = fmaf(wv[4], x0, b);
+            b = fmaf(wv[5], x1, b);
+            b = fmaf(wv[6], x8, b);
+            b = fmaf(wv[7], x9, b);
+            acc0[t] = a;
+            acc1[t] = b;
+        }
+    }
+}
+
+// the lane chains of one warp into its k-split partials (two xor-shuffle adds per chain)
+__device__ __forceinline__ void mul1_store_part(float* __restrict__ part, const float acc0[MUL1_MAXT], const float acc1[MUL1_MAXT],
+                                                int e, int S, int sp, int T, int n, int nb, int lane) {
+    #pragma unroll
+    for (int t = 0; t < MUL1_MAXT; t++) {
+        if (t < T) {
+            float a = acc0[t], b = acc1[t];
+            a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 1));
+            b = __fadd_rn(b, __shfl_xor_sync(0xffffffffu, b, 1));
+            a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 2));
+            b = __fadd_rn(b, __shfl_xor_sync(0xffffffffu, b, 2));
+            if ((lane & 3) == 0) {
+                float* pp = part + (((size_t)e * S + sp) * T + t) * n + nb * 16 + (lane >> 2);
+                pp[0] = a;
+                pp[8] = b;
+            }
+        }
+    }
+}
+
+// the activation rows of k-split sp into shared memory, xs[t * rows + r]
+__device__ __forceinline__ void mul1_stage_x(float* xs, const float* __restrict__ xh, int e, int T, int k, int kb0, int rows) {
+    for (int i = threadIdx.x; i < T * rows; i += blockDim.x) {
+        int t = i / rows, r = i - t * rows;
+        xs[t * rows + r] = xh[((size_t)e * T + t) * k + (size_t)kb0 * 16 + r];
+    }
+}
+
+// window start bit of each of lane g's 8 trellis positions
+__device__ __forceinline__ void mul1_lane_lo(int lo[8], int lane, int bits, int half, int n32) {
+    const int sbits = n32 * 32;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) lo[j] = (mul1_end_bit(8 * lane + j, bits, half) - 16 + sbits) % sbits;
+}
+
+// grid (n/128, S, E), block 256 = 8 warps. Block bx owns the 8 adjacent tile columns
+// nb = 8 bx .. 8 bx + 7 over the tile rows kb = blockIdx.y * tps .. + tps (tps = k / 16 / S); warp
+// w computes tile column 8 bx + w. Lane g is trellis lane g: positions 8 g + j land at rows
+// 2 (g % 4) + {0, 1, 8, 9}[j % 4], column g / 4 + 8 (j / 4) of the tile (#181 `tile_index`).
+// Loads: the 8 tiles of one tile row are one contiguous run of 32 n32 bytes, a multiple of 128
+// for every bitrate (n32 = 8 bits, or 8 bits + 4), so the runs are 128-byte aligned whenever the
+// trellis base is. The whole block reads MUL1_U runs per stage with 16-byte loads, whole 128-byte
+// lines, so a zero-copy read from pinned RAM leaves the GPU as full-line PCIe requests (EMOGI,
+// arXiv 2006.06890 section 3.3), into a two-deep shared ring: the loads of stage s + 1 are in
+// flight while the warps compute stage s. A trellis base that is not 16-byte aligned falls back
+// to 4-byte loads of the same words. The f32 order is that of mul1_gemv_warp (both call
+// mul1_tile_fma per tile, kb ascending, then mul1_store_part), so the bits are the same.
+// p: [0] k, [1] n, [2] S, [3] tr_off, [4] n32 (u32 words per tile), [5] bits, [6] half, [7] T.
+// xh: [E][T][k]; part: [E][S][T][n] (raw y' partials, one per k-split)
+// #202 F: the body of mul1_gemv (below, kept as it was so its code does not move) for slot e
+// (row e of xh and part), k-split sp, the trellis at tbase, statement for statement: the GEMV of
+// mul1_gemv_gu and mul1_gemv_o, so their f32 order is mul1_gemv's.
+__device__ __forceinline__ void mul1_gemv_body(const unsigned long long tbase, const float* __restrict__ xh, float* __restrict__ part,
+                                               const int k, const int n, const int S, const int n32, const int bits, const int half,
+                                               const int T, const int e, const int sp) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S;
+    const int nb0 = blockIdx.x * 8, nb = nb0 + warp;
+    const int kb0 = sp * tps, rows = tps * 16;
+    __shared__ float xs[MUL1_MAXT * MUL1_XROWS];
+    __shared__ __align__(16) unsigned int ring[2][MUL1_U * 8 * MUL1_N32MAX];
+    mul1_stage_x(xs, xh, e, T, k, kb0, rows);
+    const int run4 = 2 * n32;          // 16-byte pieces of one tile row's run (8 n32 words)
+    const int stage4 = MUL1_U * run4;  // pieces per stage, <= MUL1_PIECES * 256
+    const bool vec = (tbase & 15ull) == 0;
+    uint4 rg[MUL1_PIECES];
+    int lo[8];
+    mul1_lane_lo(lo, lane, bits, half, n32);
+    float acc0[MUL1_MAXT], acc1[MUL1_MAXT];
+    #pragma unroll
+    for (int t = 0; t < MUL1_MAXT; t++) {
+        acc0[t] = 0.0f;
+        acc1[t] = 0.0f;
+    }
+    const int rbase = 2 * (lane & 3);
+    for (int kt = 0, buf = 0; kt < tps + MUL1_U; kt += MUL1_U, buf ^= 1) {
+        // issue the loads of the stage at tile row kt (if any) into registers
+        if (kt < tps) {
+            #pragma unroll
+            for (int q = 0; q < MUL1_PIECES; q++) {
+                const int i = threadIdx.x + q * 256;
+                const int u = i / run4, c = i - u * run4;
+                if (i < stage4 && kt + u < tps) {
+                    const size_t w0 = ((size_t)(kb0 + kt + u) * tiles_n + nb0) * n32 + 4 * c;
+                    if (vec) {
+                        rg[q] = ((const uint4*)tbase)[w0 >> 2];
+                    } else {
+                        const unsigned int* s = (const unsigned int*)tbase + w0;
+                        rg[q] = make_uint4(s[0], s[1], s[2], s[3]);
+                    }
+                }
+            }
+        }
+        // compute the previous stage (rows kt - MUL1_U ..) from the other ring slot
+        if (kt > 0) {
+            const int kp = kt - MUL1_U;
+            #pragma unroll
+            for (int u = 0; u < MUL1_U; u++) {
+                if (kp + u < tps)
+                    mul1_tile_fma(ring[buf ^ 1] + u * (8 * MUL1_N32MAX) + warp * n32, lo, n32, xs, rows, (kp + u) * 16 + rbase, T, acc0, acc1);
+            }
+        }
+        // the stage at kt into its ring slot
+        if (kt < tps) {
+            #pragma unroll
+            for (int q = 0; q < MUL1_PIECES; q++) {
+                const int i = threadIdx.x + q * 256;
+                const int u = i / run4, c = i - u * run4;
+                if (i < stage4 && kt + u < tps) ((uint4*)ring[buf])[u * (2 * MUL1_N32MAX) + c] = rg[q];
+            }
+        }
+        __syncthreads();
+    }
+    mul1_store_part(part, acc0, acc1, e, S, sp, T, n, nb, lane);
+}
+
+extern "C" __global__ void __launch_bounds__(256) mul1_gemv(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh,
+                                                            float* __restrict__ part, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6], T = p[7];
+    const int e = blockIdx.z, sp = blockIdx.y;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
+    const unsigned long long tbase = ptrs[e] + (unsigned long long)p[3];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S;
+    const int nb0 = blockIdx.x * 8, nb = nb0 + warp;
+    const int kb0 = sp * tps, rows = tps * 16;
+    __shared__ float xs[MUL1_MAXT * MUL1_XROWS];
+    __shared__ __align__(16) unsigned int ring[2][MUL1_U * 8 * MUL1_N32MAX];
+    mul1_stage_x(xs, xh, e, T, k, kb0, rows);
+    const int run4 = 2 * n32;          // 16-byte pieces of one tile row's run (8 n32 words)
+    const int stage4 = MUL1_U * run4;  // pieces per stage, <= MUL1_PIECES * 256
+    const bool vec = (tbase & 15ull) == 0;
+    uint4 rg[MUL1_PIECES];
+    int lo[8];
+    mul1_lane_lo(lo, lane, bits, half, n32);
+    float acc0[MUL1_MAXT], acc1[MUL1_MAXT];
+    #pragma unroll
+    for (int t = 0; t < MUL1_MAXT; t++) {
+        acc0[t] = 0.0f;
+        acc1[t] = 0.0f;
+    }
+    const int rbase = 2 * (lane & 3);
+    for (int kt = 0, buf = 0; kt < tps + MUL1_U; kt += MUL1_U, buf ^= 1) {
+        // issue the loads of the stage at tile row kt (if any) into registers
+        if (kt < tps) {
+            #pragma unroll
+            for (int q = 0; q < MUL1_PIECES; q++) {
+                const int i = threadIdx.x + q * 256;
+                const int u = i / run4, c = i - u * run4;
+                if (i < stage4 && kt + u < tps) {
+                    const size_t w0 = ((size_t)(kb0 + kt + u) * tiles_n + nb0) * n32 + 4 * c;
+                    if (vec) {
+                        rg[q] = ((const uint4*)tbase)[w0 >> 2];
+                    } else {
+                        const unsigned int* s = (const unsigned int*)tbase + w0;
+                        rg[q] = make_uint4(s[0], s[1], s[2], s[3]);
+                    }
+                }
+            }
+        }
+        // compute the previous stage (rows kt - MUL1_U ..) from the other ring slot
+        if (kt > 0) {
+            const int kp = kt - MUL1_U;
+            #pragma unroll
+            for (int u = 0; u < MUL1_U; u++) {
+                if (kp + u < tps)
+                    mul1_tile_fma(ring[buf ^ 1] + u * (8 * MUL1_N32MAX) + warp * n32, lo, n32, xs, rows, (kp + u) * 16 + rbase, T, acc0, acc1);
+            }
+        }
+        // the stage at kt into its ring slot
+        if (kt < tps) {
+            #pragma unroll
+            for (int q = 0; q < MUL1_PIECES; q++) {
+                const int i = threadIdx.x + q * 256;
+                const int u = i / run4, c = i - u * run4;
+                if (i < stage4 && kt + u < tps) ((uint4*)ring[buf])[u * (2 * MUL1_N32MAX) + c] = rg[q];
+            }
+        }
+        __syncthreads();
+    }
+    mul1_store_part(part, acc0, acc1, e, S, sp, T, n, nb, lane);
+}
+
+// ---------------- #202 F (CROW_GLM_MUL1_FUSE): the decode FFN of a slot set in three launches ----------------
+// The unfused FFN of GemvPlan::run_slots x 3 + glm5_swiglu_clamp is ten launches: had_in, gemv,
+// had_out per projection and the activation. Fused, with the same operations in the same order on
+// every value, so every output bit is the same:
+//   mul1_had_in2  mul1_had_in of gate and of up (the same x, each its own suh) in one launch
+//   mul1_gemv_gu  mul1_gemv of gate and of up in one launch (blockIdx.z = matrix * E + slot); the
+//                 LAST of the 2 S blocks of one (slot, 128 outputs) to finish - a per-(slot, block)
+//                 counter, reset by that block (the glm5_mhc_mix pattern) - sums the k-split
+//                 partials of both (mul1_out_block, partials read back through L2 with __ldcg), so
+//                 g and u are mul1_had_out's; then h = glm5_swiglu_clamp(g, u) (mul1_clamp_swiglu,
+//                 the kernels_glm5_moe.cu expression) and xh_d = mul1_had_in of h with the down
+//                 suh: the act launch and the down had_in folded in. g, u and h are stored as before.
+//   mul1_gemv_o   mul1_gemv of down; the last of the S blocks of one (slot, 128 outputs) runs
+//                 mul1_had_out into y.
+// A null record (a spare late slot) returns at once in every block, so its counters stay 0 and
+// nothing of its rows is written, as in the unfused kernels (its h row is not written either).
+
+// glm5_swiglu_clamp's expression (defined with the prefill kernels below)
+__device__ __forceinline__ float mul1_clamp_swiglu(float gv, float uv, float L);
+
+// mul1_out_block with the partials read through L2 (another block of this launch wrote them)
+__device__ __forceinline__ void mul1_out_block_cg(float v[4], const float* part, const unsigned short* __restrict__ svh,
+                                                  int e, int S, int T, int t, int n, int blk, int lane) {
+    int c0 = blk * 128 + 4 * lane;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float s = __ldcg(part + (((size_t)e * S + 0) * T + t) * n + c0 + j);
+        for (int sp = 1; sp < S; sp++) s = __fadd_rn(s, __ldcg(part + (((size_t)e * S + sp) * T + t) * n + c0 + j));
+        v[j] = s;
+    }
+    mul1_fwht128(v, lane);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = __fmul_rn(__fmul_rn(v[j], 0.0078125f), mul1_h2f(svh[c0 + j]));
+}
+
+// true (block-uniform) in the last of `total` blocks that count on cnt[idx]; that block resets the
+// counter, so the next launch finds 0. Every thread publishes its partials before the count.
+__device__ __forceinline__ bool mul1_last_block(unsigned int* cnt, int idx, unsigned int total) {
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int prev = atomicAdd(cnt + idx, 1u);
+        last = prev == total - 1u;
+        if (last) cnt[idx] = 0u;
+    }
+    __syncthreads();
+    if (last) __threadfence();
+    return last != 0;
+}
+
+// grid (k/128, T, 2E), block 32. p: [0] k, [1] T, [2] suh_off gate, [3] suh_off up.
+// x: [E][T][k]; xh_g, xh_u: [E][T][k]. z < E: gate of slot z, else up of slot z - E.
+extern "C" __global__ void mul1_had_in2(const unsigned long long* __restrict__ ptrs, const float* __restrict__ x,
+                                        float* __restrict__ xh_g, float* __restrict__ xh_u, const int* __restrict__ p) {
+    const int k = p[0], T = p[1];
+    const int E = gridDim.z >> 1, m = blockIdx.z >= E, e = blockIdx.z - m * E;
+    const int t = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
+    if (ptrs[e] == 0ull) return;
+    const unsigned short* suh = (const unsigned short*)(ptrs[e] + (unsigned long long)p[2 + m]);
+    const size_t row = ((size_t)e * T + t) * k;
+    const int c0 = blk * 128 + 4 * lane;
+    float v[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = x[row + c0 + j];
+    mul1_in_block(v, suh, c0, lane);
+    float* xh = m ? xh_u : xh_g;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) xh[row + c0 + j] = v[j];
+}
+
+// grid (n/128, S, 2E), block 256; n = inter. p: [0] k, [1] n, [2] S, [3] tr_off gate, [4] tr_off up,
+// [5] n32, [6] bits, [7] half, [8] T, [9] svh_off gate, [10] svh_off up, [11] suh_off down,
+// [12] swiglu limit (f32 bits). xh_g, xh_u: [E][T][k]; part_g, part_u: [E][S][T][n];
+// cnt: [E][n/128] u32, zero between launches; g, u, h, xh_d: [E][T][n].
+extern "C" __global__ void __launch_bounds__(256) mul1_gemv_gu(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh_g,
+                                                               const float* __restrict__ xh_u, float* part_g, float* part_u,
+                                                               unsigned int* cnt, float* __restrict__ g_out, float* __restrict__ u_out,
+                                                               float* __restrict__ h_out, float* __restrict__ xh_d, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[5], bits = p[6], half = p[7], T = p[8];
+    const int E = gridDim.z >> 1, m = blockIdx.z >= E, e = blockIdx.z - m * E, sp = blockIdx.y;
+    const unsigned long long base = ptrs[e];
+    if (base == 0ull) return;
+    mul1_gemv_body(base + (unsigned long long)p[3 + m], m ? xh_u : xh_g, m ? part_u : part_g, k, n, S, n32, bits, half, T, e, sp);
+    if (!mul1_last_block(cnt, e * gridDim.x + blockIdx.x, 2u * S)) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, blk = blockIdx.x;
+    const float L = __int_as_float(p[12]);
+    const unsigned short* svh_g = (const unsigned short*)(base + (unsigned long long)p[9]);
+    const unsigned short* svh_u = (const unsigned short*)(base + (unsigned long long)p[10]);
+    const unsigned short* suh_d = (const unsigned short*)(base + (unsigned long long)p[11]);
+    for (int t = warp; t < T; t += 8) {
+        float g[4], u[4], v[4];
+        mul1_out_block_cg(g, part_g, svh_g, e, S, T, t, n, blk, lane);
+        mul1_out_block_cg(u, part_u, svh_u, e, S, T, t, n, blk, lane);
+        const size_t o = ((size_t)e * T + t) * n + blk * 128 + 4 * lane;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            g_out[o + j] = g[j];
+            u_out[o + j] = u[j];
+            v[j] = mul1_clamp_swiglu(g[j], u[j], L);
+            h_out[o + j] = v[j];
+        }
+        mul1_in_block(v, suh_d, blk * 128 + 4 * lane, lane);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) xh_d[o + j] = v[j];
+    }
+}
+
+// grid (n/128, S, E), block 256. p: [0] k, [1] n, [2] S, [3] tr_off, [4] n32, [5] bits, [6] half,
+// [7] T, [8] svh_off. xh: [E][T][k]; part: [E][S][T][n]; cnt: [E][n/128] u32, zero between
+// launches; y: [E][T][n].
+extern "C" __global__ void __launch_bounds__(256) mul1_gemv_o(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh,
+                                                              float* part, unsigned int* cnt, float* __restrict__ y,
+                                                              const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6], T = p[7];
+    const int e = blockIdx.z, sp = blockIdx.y;
+    const unsigned long long base = ptrs[e];
+    if (base == 0ull) return;
+    mul1_gemv_body(base + (unsigned long long)p[3], xh, part, k, n, S, n32, bits, half, T, e, sp);
+    if (!mul1_last_block(cnt, e * gridDim.x + blockIdx.x, (unsigned int)S)) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, blk = blockIdx.x;
+    const unsigned short* svh = (const unsigned short*)(base + (unsigned long long)p[8]);
+    for (int t = warp; t < T; t += 8) {
+        float v[4];
+        mul1_out_block_cg(v, part, svh, e, S, T, t, n, blk, lane);
+        const size_t o = ((size_t)e * T + t) * n + blk * 128 + 4 * lane;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) y[o + j] = v[j];
+    }
+}
+
+// #187 (CROW_GLM_GEMV2=1): the T = 1 GEMV for decode. Grid, block, k-split and the f32 order
+// are those of mul1_gemv (the fmaf chains of mul1_tile_fma at T = 1, then mul1_store_part), so
+// the bits are the same. What changes is how the bytes arrive and how the weights decode:
+// - the block loads its whole k-split at once (tps tile rows x 8 tiles, 16-byte loads from every
+//   thread issued before any store) and syncs once, instead of MUL1_U rows per stage with a sync
+//   each; 15 KB of shared memory and <= 40 registers, so six blocks run on an SM.
+// - shared layout: tile (u, w) at (8 u + w) * ts, ts = n32 + 4 (16-byte aligned), its words 0..3
+//   repeated at n32.. (the circular stream's wrap), so the stream never wraps inside a tile.
+// - a lane's 8 windows lie within 107 bits from its first window's start (32 i0 + o0): the lane
+//   reads 4 words per tile (not 2 per weight), shifts them by o0 once, and takes every state at
+//   a bit offset that is a constant of the bitrate (mul1_delta), one kernel arm per bitrate.
+// - the weights decode two at a time the way the codec defines them (exllamav3
+//   decode_mul1_product_2): dp4a byte sum + 0x6400 as fp16 bits, one fma.rn.f16x2 with k_inv,
+//   k_bias; that single fp16 rounding is the one mul1_w emulates in f32, so the weights are the
+//   same, without mul1_w's int-to-float and float-to-half conversions.
+// p as mul1_gemv (p[7] = T must be 1). xh: [E][1][k]; part: [E][S][1][n]
+// Shared words of one block: tps tile rows x 8 tiles of n32 + 4 words, then the tps * 16
+// activations (`mul1::gemv2_fits`).
+#define MUL1_G2_WORDS 3840
+#define MUL1_G2_PIECES ((MUL1_G2_WORDS / 4 + 255) / 256)
+
+__device__ __forceinline__ void mul1_w2(unsigned int st0, unsigned int st1, float& w0, float& w1) {
+    unsigned int x0 = st0 * 0x83DCD12Du, x1 = st1 * 0x83DCD12Du, s0, s1, r;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(s0) : "r"(x0), "r"(0x01010101u), "r"(0x6400u));
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(s1) : "r"(x1), "r"(0x01010101u), "r"(0x6400u));
+    unsigned int h = __byte_perm(s0, s1, 0x5410);
+    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(h), "r"(0x1eee1eeeu), "r"(0xc931c931u));
+    unsigned short lo, hi;
+    asm("mov.b32 {%0, %1}, %2;" : "=h"(lo), "=h"(hi) : "r"(r));
+    w0 = mul1_h2f(lo);
+    w1 = mul1_h2f(hi);
+}
+
+// window start of lane position 8 g + j minus that of 8 g (mul1_end_bit; the same for every g)
+template <int B, int H>
+__host__ __device__ constexpr int mul1_delta(int j) {
+    return H ? ((j & 1) ? (j / 2 + 1) * (2 * B + 1) - B : (j / 2) * (2 * B + 1)) : j * B;
+}
+
+// the 16 bits at offset D of the 96-bit value v0:v1:v2 (v0 most significant)
+template <int D>
+__device__ __forceinline__ unsigned int mul1_take(unsigned int v0, unsigned int v1, unsigned int v2) {
+    constexpr int d = D >> 5, o = D & 31;
+    const unsigned int a = d == 0 ? v0 : d == 1 ? v1 : v2;
+    const unsigned int b = d == 0 ? v1 : v2;
+    if (o <= 16) return (a >> (16 - o)) & 0xffffu;
+    return __funnelshift_l(b, a, o) >> 16;
+}
+
+template <int B, int H>
+__device__ __forceinline__ void mul1_g2_loop(const unsigned int* tw, int ts, int tps, int warp, int i0, int o0,
+                                             const float* xs, int rbase, float& a, float& b) {
+    for (int u = 0; u < tps; u++) {
+        const unsigned int* w = tw + (u * 8 + warp) * ts + i0;
+        const unsigned int w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+        const unsigned int v0 = __funnelshift_l(w1, w0, o0), v1 = __funnelshift_l(w2, w1, o0), v2 = __funnelshift_l(w3, w2, o0);
+        float wv[8];
+        mul1_w2(mul1_take<mul1_delta<B, H>(0)>(v0, v1, v2), mul1_take<mul1_delta<B, H>(1)>(v0, v1, v2), wv[0], wv[1]);
+        mul1_w2(mul1_take<mul1_delta<B, H>(2)>(v0, v1, v2), mul1_take<mul1_delta<B, H>(3)>(v0, v1, v2), wv[2], wv[3]);
+        mul1_w2(mul1_take<mul1_delta<B, H>(4)>(v0, v1, v2), mul1_take<mul1_delta<B, H>(5)>(v0, v1, v2), wv[4], wv[5]);
+        mul1_w2(mul1_take<mul1_delta<B, H>(6)>(v0, v1, v2), mul1_take<mul1_delta<B, H>(7)>(v0, v1, v2), wv[6], wv[7]);
+        const float* xq = xs + u * 16 + rbase;
+        float x0 = xq[0], x1 = xq[1], x8 = xq[8], x9 = xq[9];
+        a = fmaf(wv[0], x0, a);
+        a = fmaf(wv[1], x1, a);
+        a = fmaf(wv[2], x8, a);
+        a = fmaf(wv[3], x9, a);
+        b = fmaf(wv[4], x0, b);
+        b = fmaf(wv[5], x1, b);
+        b = fmaf(wv[6], x8, b);
+        b = fmaf(wv[7], x9, b);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 6) mul1_gemv2(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh,
+                                                                float* __restrict__ part, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6];
+    const int e = blockIdx.z, sp = blockIdx.y;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
+    const unsigned long long tbase = ptrs[e] + (unsigned long long)p[3];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S;
+    const int nb0 = blockIdx.x * 8, nb = nb0 + warp;
+    const int kb0 = sp * tps, rows = tps * 16;
+    __shared__ __align__(16) unsigned int tw[MUL1_G2_WORDS];
+    const int run4 = 2 * n32, tot4 = tps * run4, t4 = n32 >> 2, ts = n32 + 4;
+    float* xs = (float*)(tw + tps * 8 * ts);
+    uint4 rg[MUL1_G2_PIECES];
+    if ((tbase & 15ull) == 0) {
+        #pragma unroll
+        for (int q = 0; q < MUL1_G2_PIECES; q++) {
+            const int i = threadIdx.x + q * 256;
+            if (i < tot4) {
+                const int u = i / run4, c = i - u * run4;
+                rg[q] = ((const uint4*)tbase)[((((size_t)(kb0 + u) * tiles_n + nb0) * n32) >> 2) + c];
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int q = 0; q < MUL1_G2_PIECES; q++) {
+            const int i = threadIdx.x + q * 256;
+            if (i < tot4) {
+                const int u = i / run4, c = i - u * run4;
+                const unsigned int* s = (const unsigned int*)tbase + ((size_t)(kb0 + u) * tiles_n + nb0) * n32 + 4 * c;
+                rg[q] = make_uint4(s[0], s[1], s[2], s[3]);
+            }
+        }
+    }
+    for (int i = threadIdx.x; i < rows; i += blockDim.x) xs[i] = xh[(size_t)e * k + (size_t)kb0 * 16 + i];
+    #pragma unroll
+    for (int q = 0; q < MUL1_G2_PIECES; q++) {
+        const int i = threadIdx.x + q * 256;
+        if (i < tot4) {
+            const int tile = i / t4, c = i - tile * t4;
+            unsigned int* d = tw + tile * ts + 4 * c;
+            *(uint4*)d = rg[q];
+            if (c == 0) *(uint4*)(d + n32) = rg[q];
+        }
+    }
+    const int sbits = n32 * 32;
+    const int lo0 = (mul1_end_bit(8 * lane, bits, half) - 16 + sbits) % sbits;
+    const int i0 = lo0 >> 5, o0 = lo0 & 31, rbase = 2 * (lane & 3);
+    __syncthreads();
+    float a = 0.0f, b = 0.0f;
+    switch (bits * 2 + half) {
+#define MUL1_G2_ARM(B, H) \
+    case B * 2 + H: mul1_g2_loop<B, H>(tw, ts, tps, warp, i0, o0, xs, rbase, a, b); break;
+        MUL1_G2_ARM(1, 0) MUL1_G2_ARM(1, 1) MUL1_G2_ARM(2, 0) MUL1_G2_ARM(2, 1) MUL1_G2_ARM(3, 0) MUL1_G2_ARM(3, 1)
+        MUL1_G2_ARM(4, 0) MUL1_G2_ARM(4, 1) MUL1_G2_ARM(5, 0) MUL1_G2_ARM(5, 1) MUL1_G2_ARM(6, 0) MUL1_G2_ARM(6, 1)
+        MUL1_G2_ARM(7, 0) MUL1_G2_ARM(7, 1) MUL1_G2_ARM(8, 0)
+#undef MUL1_G2_ARM
+        default: __trap();
+    }
+    float acc0[MUL1_MAXT], acc1[MUL1_MAXT];
+    acc0[0] = a;
+    acc1[0] = b;
+    mul1_store_part(part, acc0, acc1, e, S, sp, 1, n, nb, lane);
+}
+
+// The first GEMV kernel of #180, kept as the reference arm of the bit-identity test and the
+// benchmark: grid and block as mul1_gemv, but warp w loads its own tile (lane i < n32 loads word
+// i, MUL1_U tiles, through warp-private shared memory, no prefetch). From pinned RAM that load
+// shape caps at about 8 GB/s on the RTX 5090 (rd_warp96, #183).
+extern "C" __global__ void mul1_gemv_warp(const unsigned long long* __restrict__ ptrs, const float* __restrict__ xh,
+                                          float* __restrict__ part, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[4], bits = p[5], half = p[6], T = p[7];
+    const int e = blockIdx.z, sp = blockIdx.y;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
+    const unsigned int* tr = (const unsigned int*)(ptrs[e] + (unsigned long long)p[3]);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S;
+    const int nb = blockIdx.x * 8 + warp;
+    const int kb0 = sp * tps, rows = tps * 16;
+    __shared__ float xs[MUL1_MAXT * MUL1_XROWS];
+    __shared__ unsigned int tw[8][MUL1_U][64];
+    mul1_stage_x(xs, xh, e, T, k, kb0, rows);
+    __syncthreads();
+    const int rbase = 2 * (lane & 3);
+    int lo[8];
+    mul1_lane_lo(lo, lane, bits, half, n32);
+    float acc0[MUL1_MAXT], acc1[MUL1_MAXT];
+    #pragma unroll
+    for (int t = 0; t < MUL1_MAXT; t++) {
+        acc0[t] = 0.0f;
+        acc1[t] = 0.0f;
+    }
+    for (int kt = 0; kt < tps; kt += MUL1_U) {
+        #pragma unroll
+        for (int u = 0; u < MUL1_U; u++) {
+            if (kt + u < tps) {
+                const unsigned int* tp = tr + ((size_t)(kb0 + kt + u) * tiles_n + nb) * n32;
+                unsigned int v0 = lane < n32 ? tp[lane] : 0u;
+                unsigned int v1 = lane + 32 < n32 ? tp[lane + 32] : 0u;
+                tw[warp][u][lane] = v0;
+                tw[warp][u][lane + 32] = v1;
+            }
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int u = 0; u < MUL1_U; u++) {
+            if (kt + u < tps) mul1_tile_fma(tw[warp][u], lo, n32, xs, rows, (kt + u) * 16 + rbase, T, acc0, acc1);
+        }
+        __syncwarp();
+    }
+    mul1_store_part(part, acc0, acc1, e, S, sp, T, n, nb, lane);
+}
+
+// grid (n/128, T, E), block 32. p: [0] n, [1] S, [2] T, [3] svh_off. y: [E][T][n]
+extern "C" __global__ void mul1_had_out(const unsigned long long* __restrict__ ptrs, const float* __restrict__ part,
+                                        float* __restrict__ y, const int* __restrict__ p) {
+    const int n = p[0], S = p[1], T = p[2];
+    const int e = blockIdx.z, t = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
+    // #202 lanes: a null record is a spare slot of the late pass: nothing to read or write
+    if (ptrs[e] == 0ull) return;
+    const unsigned short* svh = (const unsigned short*)(ptrs[e] + (unsigned long long)p[3]);
+    float v[4];
+    mul1_out_block(v, part, svh, e, S, T, t, n, blk, lane);
+    const size_t o = ((size_t)e * T + t) * n + blk * 128 + 4 * lane;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) y[o + j] = v[j];
+}
+
+// The FFN middle: gate and up finished (mul1_had_out), h = silu(g) * u with
+// silu(g) * u = g / (1 + exp(-g)) * u (the cpu_mul1 / silu_mul640 formula), h stored, then
+// xh_d = H (h * suh_down) (mul1_had_in). grid (inter/128, T, E), block 32.
+// p: [0] inter, [1] S (gate and up), [2] T, [3] svh_g_off, [4] svh_u_off, [5] suh_d_off.
+// part_g, part_u: [E][S][T][inter]; h, xh_d: [E][T][inter]
+extern "C" __global__ void mul1_act_had_in(const unsigned long long* __restrict__ ptrs, const float* __restrict__ part_g,
+                                           const float* __restrict__ part_u, float* __restrict__ h,
+                                           float* __restrict__ xh_d, const int* __restrict__ p) {
+    const int inter = p[0], S = p[1], T = p[2];
+    const int e = blockIdx.z, t = blockIdx.y, blk = blockIdx.x, lane = threadIdx.x;
+    const unsigned long long base = ptrs[e];
+    float g[4], u[4], v[4];
+    mul1_out_block(g, part_g, (const unsigned short*)(base + (unsigned long long)p[3]), e, S, T, t, inter, blk, lane);
+    mul1_out_block(u, part_u, (const unsigned short*)(base + (unsigned long long)p[4]), e, S, T, t, inter, blk, lane);
+    const size_t o = ((size_t)e * T + t) * inter + blk * 128 + 4 * lane;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        v[j] = __fmul_rn(__fdiv_rn(g[j], __fadd_rn(1.0f, expf(-g[j]))), u[j]);
+        h[o + j] = v[j];
+    }
+    mul1_in_block(v, (const unsigned short*)(base + (unsigned long long)p[5]), blk * 128 + 4 * lane, lane);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) xh_d[o + j] = v[j];
+}
+
+// test hook: the weight of every 16-bit state, out[65536]
+extern "C" __global__ void mul1_decode_states(float* __restrict__ out) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 65536u) out[i] = mul1_w(i);
+}
+
+// ---------------- prefill: the expert-major grouped GEMM (GLM-5.3-Flash prompt calls) ----------------
+// One launch runs every (expert, row tile) work item of a prompt call's sub-batch: the expert's
+// trellis is decoded once per tile of up to MUL1_GT rows routed to it, instead of once per
+// (row, pick) combo as the T = 1 slots of GemvPlan do. Each block is one work item x one 128-wide
+// output block and runs the three steps of the GemvPlan path in-block, per row in the same f32
+// order, so every output row has the bits of the T = 1 slot path:
+//   had_in   the k-split's 128-blocks of H (x * suh) staged straight into shared memory (the
+//            mul1_had_in arithmetic), x read through the row list (no gathered copy)
+//   gemv     the k-splits one after the other, each the tile loop of mul1_gemv (the fmaf chains
+//            of mul1_tile_fma from 0, the two xor-shuffle adds of mul1_store_part), the split's
+//            partial added to a running sum left to right: s = p_0, s = s + p_1, ... (the order
+//            mul1_out_block sums the partials in)
+//   had_out  the 128 sums of a row through mul1_fwht128, * 2^-7, * svh (mul1_out_block)
+// No [E][S][T][n] partial buffer exists: the scratch of a prompt call is its rows only.
+// mode 1 reads the input as glm5_swiglu_clamp(g, u) = silu(min(g, L)) * clamp(u, -L, L) (the
+// kernels_glm5_moe.cu formula and operation order), so the down GEMM needs no h buffer.
+// blockIdx.z picks one of two matrices of the record (gate and up share k, n and the input).
+//
+// grid (n / 128, W, Z), block 256. work [W][3] i32: expert id, first entry in list, rows (1..GT).
+// list: combo indices c, grouped by expert; the input row of entry i is list[i] / p[6] (row
+// stride k), its output row list[i] (row stride n). table [E] u64: record bases (VRAM, pinned
+// UVA or staging). p: [0] k, [1] n, [2] S, [3] n32, [4] bits, [5] half, [6] in_div, [7] mode,
+// [8] limit (f32 bits), [9 + 3 z ..] tr_off, suh_off, svh_off of matrix z, [15] loc. k / S <= MUL1_GXROWS.
+// #196 loc = 1: the gate / up activations live at the entry's position in this launch's piece of
+// the list (entry i -> row i - work[1], work[1] = the launch's first entry), so they hold the
+// combos of one piece only: mode 0 writes its output row there, mode 1 reads its input row there
+// (the output row stays list[i]). Positions only: every row's arithmetic is unchanged.
+#define MUL1_GT 16
+#define MUL1_GXROWS 256
+
+__device__ __forceinline__ float mul1_clamp_swiglu(float gv, float uv, float L) {
+    gv = gv > L ? L : gv;
+    uv = uv > L ? L : (uv < -L ? -L : uv);
+    const float silu = __fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv)));
+    return __fmul_rn(silu, uv);
+}
+
+// mul1_tile_fma for up to MUL1_GT rows (the same operations per row)
+__device__ __forceinline__ void mul1_tile_fma_g(const unsigned int* w, const int lo[8], int n32, const float* xs, int rows,
+                                                int r0, int T, float acc0[MUL1_GT], float acc1[MUL1_GT]) {
+    float wv[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int i = lo[j] >> 5, o = lo[j] & 31;
+        int i1 = (i + 1 == n32) ? 0 : i + 1;
+        unsigned long long pair = ((unsigned long long)w[i] << 32) | w[i1];
+        wv[j] = mul1_w((unsigned int)(pair >> (48 - o)) & 0xffffu);
+    }
+    #pragma unroll
+    for (int t = 0; t < MUL1_GT; t++) {
+        if (t < T) {
+            const float* xr = xs + t * rows + r0;
+            float x0 = xr[0], x1 = xr[1], x8 = xr[8], x9 = xr[9];
+            float a = acc0[t], b = acc1[t];
+            a = fmaf(wv[0], x0, a);
+            a = fmaf(wv[1], x1, a);
+            a = fmaf(wv[2], x8, a);
+            a = fmaf(wv[3], x9, a);
+            b = fmaf(wv[4], x0, b);
+            b = fmaf(wv[5], x1, b);
+            b = fmaf(wv[6], x8, b);
+            b = fmaf(wv[7], x9, b);
+            acc0[t] = a;
+            acc1[t] = b;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) mul1_gemm_grp(const unsigned long long* __restrict__ table, const int* __restrict__ work,
+                                                                const int* __restrict__ list, const float* __restrict__ xa,
+                                                                const float* __restrict__ xb, float* __restrict__ y0,
+                                                                float* __restrict__ y1, const int* __restrict__ p) {
+    const int k = p[0], n = p[1], S = p[2], n32 = p[3], bits = p[4], half = p[5], in_div = p[6], mode = p[7];
+    const float L = __int_as_float(p[8]);
+    const int z = blockIdx.z;
+    const int tr_off = p[9 + 3 * z], suh_off = p[10 + 3 * z], svh_off = p[11 + 3 * z];
+    float* __restrict__ y = z ? y1 : y0;
+    const int wi = blockIdx.y;
+    const int e = work[3 * wi], f = work[3 * wi + 1], T = work[3 * wi + 2];
+    const unsigned long long base = table[e];
+    const unsigned long long tbase = base + (unsigned long long)tr_off;
+    const unsigned short* suh = (const unsigned short*)(base + (unsigned long long)suh_off);
+    const unsigned short* svh = (const unsigned short*)(base + (unsigned long long)svh_off);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int tiles_n = n >> 4, tps = (k >> 4) / S, rows = tps * 16, nblk = rows >> 7;
+    const int nb0 = blockIdx.x * 8;
+    __shared__ float xs[MUL1_GT * MUL1_GXROWS];
+    __shared__ __align__(16) unsigned int ring[2][MUL1_U * 8 * MUL1_N32MAX];
+    __shared__ int in_row[MUL1_GT], out_row[MUL1_GT];
+    if (threadIdx.x < MUL1_GT) {
+        const int c = (int)threadIdx.x < T ? list[f + threadIdx.x] : 0;
+        const int lp = (int)threadIdx.x < T ? f + (int)threadIdx.x - work[1] : 0;
+        const bool loc = p[15] != 0;
+        in_row[threadIdx.x] = (loc && mode) ? lp : c / in_div;
+        out_row[threadIdx.x] = (loc && !mode) ? lp : c;
+    }
+    const int run4 = 2 * n32;
+    const int stage4 = MUL1_U * run4;
+    const bool vec = (tbase & 15ull) == 0;
+    uint4 rg[MUL1_PIECES];
+    int lo[8];
+    mul1_lane_lo(lo, lane, bits, half, n32);
+    const int rbase = 2 * (lane & 3);
+    float s0[MUL1_GT], s1[MUL1_GT];
+    #pragma unroll
+    for (int t = 0; t < MUL1_GT; t++) {
+        s0[t] = 0.0f;
+        s1[t] = 0.0f;
+    }
+    for (int sp = 0; sp < S; sp++) {
+        const int kb0 = sp * tps;
+        // every read of the previous split's xs and ring is done (its loop ended in a barrier);
+        // the first split waits for in_row
+        __syncthreads();
+        for (int task = warp; task < T * nblk; task += 8) {
+            const int t = task / nblk, b = task - t * nblk;
+            const int c0 = kb0 * 16 + b * 128 + 4 * lane;
+            const size_t ro = (size_t)in_row[t] * k + c0;
+            float v[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) v[j] = mode ? mul1_clamp_swiglu(xa[ro + j], xb[ro + j], L) : xa[ro + j];
+            mul1_in_block(v, suh, c0, lane);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) xs[t * rows + b * 128 + 4 * lane + j] = v[j];
+        }
+        float acc0[MUL1_GT], acc1[MUL1_GT];
+        #pragma unroll
+        for (int t = 0; t < MUL1_GT; t++) {
+            acc0[t] = 0.0f;
+            acc1[t] = 0.0f;
+        }
+        for (int kt = 0, buf = 0; kt < tps + MUL1_U; kt += MUL1_U, buf ^= 1) {
+            if (kt < tps) {
+                #pragma unroll
+                for (int q = 0; q < MUL1_PIECES; q++) {
+                    const int i = threadIdx.x + q * 256;
+                    const int u = i / run4, c = i - u * run4;
+                    if (i < stage4 && kt + u < tps) {
+                        const size_t w0 = ((size_t)(kb0 + kt + u) * tiles_n + nb0) * n32 + 4 * c;
+                        if (vec) {
+                            rg[q] = ((const uint4*)tbase)[w0 >> 2];
+                        } else {
+                            const unsigned int* s = (const unsigned int*)tbase + w0;
+                            rg[q] = make_uint4(s[0], s[1], s[2], s[3]);
+                        }
+                    }
+                }
+            }
+            if (kt > 0) {
+                const int kp = kt - MUL1_U;
+                #pragma unroll
+                for (int u = 0; u < MUL1_U; u++) {
+                    if (kp + u < tps)
+                        mul1_tile_fma_g(ring[buf ^ 1] + u * (8 * MUL1_N32MAX) + warp * n32, lo, n32, xs, rows, (kp + u) * 16 + rbase, T, acc0, acc1);
+                }
+            }
+            if (kt < tps) {
+                #pragma unroll
+                for (int q = 0; q < MUL1_PIECES; q++) {
+                    const int i = threadIdx.x + q * 256;
+                    const int u = i / run4, c = i - u * run4;
+                    if (i < stage4 && kt + u < tps) ((uint4*)ring[buf])[u * (2 * MUL1_N32MAX) + c] = rg[q];
+                }
+            }
+            __syncthreads();
+        }
+        // mul1_store_part's reduction, then the left-to-right sum of the partials
+        #pragma unroll
+        for (int t = 0; t < MUL1_GT; t++) {
+            if (t < T) {
+                float a = acc0[t], b = acc1[t];
+                a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 1));
+                b = __fadd_rn(b, __shfl_xor_sync(0xffffffffu, b, 1));
+                a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, 2));
+                b = __fadd_rn(b, __shfl_xor_sync(0xffffffffu, b, 2));
+                s0[t] = sp == 0 ? a : __fadd_rn(s0[t], a);
+                s1[t] = sp == 0 ? b : __fadd_rn(s1[t], b);
+            }
+        }
+    }
+    // the sums of this block's 128 outputs into shared memory (xs is free: the last split ended
+    // in a barrier), then mul1_out_block's FWHT and scaling, one warp per row
+    if ((lane & 3) == 0) {
+        #pragma unroll
+        for (int t = 0; t < MUL1_GT; t++) {
+            if (t < T) {
+                xs[t * 128 + warp * 16 + (lane >> 2)] = s0[t];
+                xs[t * 128 + warp * 16 + (lane >> 2) + 8] = s1[t];
+            }
+        }
+    }
+    __syncthreads();
+    const int c0 = blockIdx.x * 128 + 4 * lane;
+    for (int t = warp; t < T; t += 8) {
+        float v[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) v[j] = xs[t * 128 + 4 * lane + j];
+        mul1_fwht128(v, lane);
+        const size_t o = (size_t)out_row[t] * n + c0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) y[o + j] = __fmul_rn(__fmul_rn(v[j], 0.0078125f), mul1_h2f(svh[c0 + j]));
+    }
+}
+
+// #186 CROW_GLM_MOE_TC: an expert group of many rows (exllamav3 exl3.py 151539c7: above 144
+// rows) runs as FP16 reconstruction + tensor-core GEMM instead of mul1_gemm_grp. The weights are
+// the codec's FP16 values bit for bit (mul1_w), the activations are rounded to FP16 after the
+// input transform, FP32 accumulate; had_in / had_out are mul1_in_block / mul1_fwht128 as above.
+// Not bit-identical to mul1_gemm_grp. Scalars come as u64 kernel arguments.
+
+// xh [R][k] = H (x * suh) of rows f .. f + R of the expert's list. mode 0: row list[f + r] / in_div
+// of xa; mode 1: glm5_swiglu_clamp of rows r of xa / xb (the group's own gate / up outputs).
+// grid (k / 128, R), block 32.
+extern "C" __global__ void mul1_tc_in(const unsigned long long* __restrict__ table, const int* __restrict__ list,
+                                      const float* __restrict__ xa, const float* __restrict__ xb, float* __restrict__ xh,
+                                      unsigned long long e, unsigned long long f, unsigned long long k, unsigned long long in_div,
+                                      unsigned long long mode, unsigned long long suh_off, unsigned long long limit_bits) {
+    const int lane = threadIdx.x, r = blockIdx.y;
+    const int c0 = blockIdx.x * 128 + 4 * lane;
+    const unsigned short* suh = (const unsigned short*)(table[e] + suh_off);
+    float v[4];
+    if (mode) {
+        const float L = __int_as_float((int)limit_bits);
+        const size_t ro = (size_t)r * k + c0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) v[j] = mul1_clamp_swiglu(xa[ro + j], xb[ro + j], L);
+    } else {
+        const size_t ro = (size_t)(list[f + r] / (int)in_div) * k + c0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) v[j] = xa[ro + j];
+    }
+    mul1_in_block(v, suh, c0, lane);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) xh[(size_t)r * k + c0 + j] = v[j];
+}
+
+// one matrix of expert e decoded to FP16 w [n][k] (the transformed domain, no suh / svh): the
+// lane mapping of mul1_tile_fma_g. grid (n / 128, k / 16), block 256 (warp = one 16 x 16 tile).
+extern "C" __global__ void __launch_bounds__(256) mul1_tc_recon(const unsigned long long* __restrict__ table, unsigned short* __restrict__ w,
+                                                                unsigned long long e, unsigned long long k, unsigned long long n,
+                                                                unsigned long long n32, unsigned long long bits, unsigned long long half,
+                                                                unsigned long long tr_off) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nt = blockIdx.x * 8 + warp, kt = blockIdx.y, tiles_n = (int)(n >> 4);
+    const unsigned int* tw = (const unsigned int*)(table[e] + tr_off) + ((size_t)kt * tiles_n + nt) * n32;
+    int lo[8];
+    mul1_lane_lo(lo, lane, (int)bits, (int)half, (int)n32);
+    const int rbase = 2 * (lane & 3);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int i = lo[j] >> 5, o = lo[j] & 31;
+        int i1 = (i + 1 == (int)n32) ? 0 : i + 1;
+        unsigned long long pair = ((unsigned long long)tw[i] << 32) | tw[i1];
+        const float wv = mul1_w((unsigned int)(pair >> (48 - o)) & 0xffffu);
+        unsigned short hb;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hb) : "f"(wv));
+        const int col = nt * 16 + (lane >> 2) + (j >= 4 ? 8 : 0);
+        const int kk = kt * 16 + rbase + ((j & 3) == 0 ? 0 : (j & 3) == 1 ? 1 : (j & 3) == 2 ? 8 : 9);
+        w[(size_t)col * k + kk] = hb;
+    }
+}
+
+// y = (H part) / 128 * svh of the R rows; mode 0: row r of y, mode 1: row list[f + r].
+// grid (n / 128, R), block 32.
+extern "C" __global__ void mul1_tc_out(const unsigned long long* __restrict__ table, const int* __restrict__ list,
+                                       const float* __restrict__ part, float* __restrict__ y, unsigned long long e,
+                                       unsigned long long f, unsigned long long n, unsigned long long svh_off, unsigned long long mode) {
+    const int lane = threadIdx.x, r = blockIdx.y;
+    const int c0 = blockIdx.x * 128 + 4 * lane;
+    const unsigned short* svh = (const unsigned short*)(table[e] + svh_off);
+    float v[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = part[(size_t)r * n + c0 + j];
+    mul1_fwht128(v, lane);
+    const size_t o = (size_t)(mode ? list[f + r] : r) * n + c0;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) y[o + j] = __fmul_rn(__fmul_rn(v[j], 0.0078125f), mul1_h2f(svh[c0 + j]));
+}
+
+// the FP16 tensor-core GEMM of kernels_glm5_moe.cu glm5_gemm_fp4_tc (128 x 128 tiles, k-tiles of
+// 64, ldmatrix + mma.m16n8k16, FP32 accumulate) with FP16 weights w [n][k] in place of NVFP4:
+// y [T][n] = x [T][k] w^T. grid (n / 128, ceil(T / 128)), block 256.
+#define MUL1_TC_LDS 72
+__device__ __forceinline__ unsigned int mul1_h2(float lo, float hi) {
+    unsigned int r;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+__device__ __forceinline__ unsigned int mul1_smem(const void* p) {
+    unsigned int r;
+    asm("{ .reg .u64 a; cvta.to.shared.u64 a, %1; cvt.u32.u64 %0, a; }" : "=r"(r) : "l"(p));
+    return r;
+}
+__device__ __forceinline__ void mul1_ldsm4(unsigned int addr, unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ void mul1_mma(float* c, const unsigned int* a, unsigned int b0, unsigned int b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+extern "C" __global__ void __launch_bounds__(256) mul1_gemm_tc(const unsigned short* __restrict__ w, const float* __restrict__ x,
+                                                               float* __restrict__ y, unsigned long long k_dim, unsigned long long n_dim,
+                                                               unsigned long long t_dim) {
+    __shared__ __align__(16) unsigned short xs[128 * MUL1_TC_LDS];
+    __shared__ __align__(16) unsigned short ws[128 * MUL1_TC_LDS];
+    const int k = (int)k_dim, n = (int)n_dim, T = (int)t_dim;
+    const int bpr = k >> 6;
+    const int n0 = blockIdx.x * 128, t0 = blockIdx.y * 128;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp >> 2, wn = warp & 3;
+    float4 xr[8];
+    uint4 wr[4];
+    const int wrow = tid >> 1, wh = tid & 1;
+    const uint4* wbase = (const uint4*)(w + (size_t)min(n0 + wrow, n - 1) * k + wh * 32);
+    auto load = [&](int kt) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int q = tid + 256 * j, r = q >> 4, c4 = q & 15;
+            xr[j] = *(const float4*)(x + (size_t)min(t0 + r, T - 1) * k + kt * 64 + c4 * 4);
+        }
+#pragma unroll
+        for (int q = 0; q < 4; q++) wr[q] = wbase[kt * 8 + q];
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int q = tid + 256 * j, r = q >> 4, c4 = q & 15;
+            *(uint2*)(xs + r * MUL1_TC_LDS + c4 * 4) = make_uint2(mul1_h2(xr[j].x, xr[j].y), mul1_h2(xr[j].z, xr[j].w));
+        }
+        uint4* dst = (uint4*)(ws + wrow * MUL1_TC_LDS + wh * 32);
+#pragma unroll
+        for (int q = 0; q < 4; q++) dst[q] = wr[q];
+    };
+    float acc[4][4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int v = 0; v < 4; v++) acc[i][j][v] = 0.0f;
+    const unsigned int xs_a = mul1_smem(xs) + 2 * ((wm * 64 + (lane & 15)) * MUL1_TC_LDS + (lane >> 4) * 8);
+    const unsigned int ws_a = mul1_smem(ws) + 2 * ((wn * 32 + ((lane >> 4) << 3) + (lane & 7)) * MUL1_TC_LDS + ((lane >> 3) & 1) * 8);
+    load(0);
+    store();
+    __syncthreads();
+    for (int kt = 0; kt < bpr; kt++) {
+        if (kt + 1 < bpr) load(kt + 1);
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            unsigned int a[4][4], b[4][2];
+#pragma unroll
+            for (int mi = 0; mi < 4; mi++) mul1_ldsm4(xs_a + 2 * (mi * 16 * MUL1_TC_LDS + ks * 16), a[mi][0], a[mi][1], a[mi][2], a[mi][3]);
+#pragma unroll
+            for (int nj = 0; nj < 2; nj++) mul1_ldsm4(ws_a + 2 * (nj * 16 * MUL1_TC_LDS + ks * 16), b[2 * nj][0], b[2 * nj][1], b[2 * nj + 1][0], b[2 * nj + 1][1]);
+#pragma unroll
+            for (int mi = 0; mi < 4; mi++)
+#pragma unroll
+                for (int ni = 0; ni < 4; ni++) mul1_mma(acc[mi][ni], a[mi], b[ni][0], b[ni][1]);
+        }
+        __syncthreads();
+        if (kt + 1 < bpr) {
+            store();
+            __syncthreads();
+        }
+    }
+    const int g = lane >> 2, c = lane & 3;
+#pragma unroll
+    for (int mi = 0; mi < 4; mi++)
+#pragma unroll
+        for (int ni = 0; ni < 4; ni++)
+#pragma unroll
+            for (int v = 0; v < 4; v++) {
+                const int t = t0 + wm * 64 + mi * 16 + g + (v >> 1) * 8;
+                const int nn = n0 + wn * 32 + ni * 8 + 2 * c + (v & 1);
+                if (t < T && nn < n) y[(size_t)t * n + nn] = acc[mi][ni][v];
+            }
+}
+
+// #186 CROW_GLM_MOE_TC=2: the routed experts of a call in one grouped pass per batch of experts
+// (MoE grouped-mm style) instead of one recon + GEMM per expert per matrix. Per batch of `nexp`
+// experts (big_e[b0 ..], their rows packed in list_big[row_off[j] ..]):
+//   mul1_tc2_recon  gate and up of every expert of the batch to FP16, one launch (later down)
+//   mul1_tc2_in     xg / xu [rows][k] FP16 = H (x * suh) for gate and up, one launch
+//   mul1_tc2_gemm*  one grouped tensor-core GEMM over every expert's row tiles, gate and up in
+//                   one launch (z), epilogue H / 128 * svh into g / u [rows][n] f32
+//   mul1_tc2_act    xd = H (clamped SwiGLU(g, u) * suh_down) FP16
+//   mul1_tc2_gemm*  down, epilogue into ye[list_big[row]]
+// The FP16 weights are stored fragment-native: tile t (the trellis tile order kt * n/16 + nt) is
+// 32 lanes x 16 bytes, lane l holding exactly its mma.m16n8k16 B fragments of the tile's two n8
+// halves, which is the lane mapping of the trellis decode (mul1_tile_fma_g): the GEMM loads B
+// with one 16-byte shared load per lane and needs no ldmatrix / transpose. FP32 accumulate.
+
+__device__ __forceinline__ void mul1_cp16(unsigned int dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+}
+
+// one 16 x 16 trellis tile (n32 words at w) to lane's fragment-native FP16 quad: halves j = 0 .. 7
+// of mul1_tile_fma_g's lane mapping, packed (0, 1) (2, 3) (4, 5) (6, 7) = B fragments b0 b1 of n8
+// half 0, then b0 b1 of n8 half 1 (the codec's FP16 values bit for bit, mul1_w)
+__device__ __forceinline__ uint4 mul1_dec_tile(const unsigned int* w, const int lo[8], int n32) {
+    unsigned int hv[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int i = lo[j] >> 5, o = lo[j] & 31;
+        int i1 = (i + 1 == n32) ? 0 : i + 1;
+        unsigned long long pair = ((unsigned long long)w[i] << 32) | w[i1];
+        const float wv = mul1_w((unsigned int)(pair >> (48 - o)) & 0xffffu);
+        unsigned short hb;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hb) : "f"(wv));
+        hv[j] = hb;
+    }
+    return make_uint4(hv[0] | (hv[1] << 16), hv[2] | (hv[3] << 16), hv[4] | (hv[5] << 16), hv[6] | (hv[7] << 16));
+}
+
+// every tile of matrices m0 .. m0 + gridDim.y of the batch's experts to FP16, fragment-native,
+// matrix m of slot s at wsc + s * slot_bytes + (m - m0) * mat_bytes. grid (tiles / 8, mats,
+// nexp), block 256 (warp = one 16 x 16 tile).
+extern "C" __global__ void __launch_bounds__(256) mul1_tc2_recon(const unsigned long long* __restrict__ table, const int* __restrict__ big_e,
+                                                                 unsigned char* __restrict__ wsc, unsigned long long b0, unsigned long long n32_,
+                                                                 unsigned long long bits, unsigned long long half, unsigned long long m0,
+                                                                 unsigned long long tr0, unsigned long long tr1, unsigned long long tr2,
+                                                                 unsigned long long slot_bytes, unsigned long long mat_bytes) {
+    __shared__ unsigned int sw[8 * MUL1_N32MAX];
+    const int n32 = (int)n32_;
+    const int m = (int)m0 + blockIdx.y, slot = blockIdx.z;
+    const int e = big_e[b0 + slot];
+    const unsigned long long tro = m == 0 ? tr0 : m == 1 ? tr1 : tr2;
+    const unsigned int* tw = (const unsigned int*)(table[e] + tro) + (size_t)blockIdx.x * 8 * n32;
+    for (int i = threadIdx.x; i < 8 * n32; i += 256) sw[i] = tw[i];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const unsigned int* w = sw + warp * n32;
+    int lo[8];
+    mul1_lane_lo(lo, lane, (int)bits, (int)half, n32);
+    const uint4 q = mul1_dec_tile(w, lo, n32);
+    unsigned char* dst = wsc + (size_t)slot * slot_bytes + (size_t)blockIdx.y * mat_bytes + ((size_t)(blockIdx.x * 8 + warp) * 32 + lane) * 16;
+    *(uint4*)dst = q;
+}
+
+// xg / xu [p][k] FP16 = H (x[list_big[pbase + p] / in_div] * suh) of gate (z 0) / up (z 1).
+// grid (ceil(k / 1024), rows, 2), block 256 (warp = one 128-block).
+extern "C" __global__ void __launch_bounds__(256) mul1_tc2_in(const unsigned long long* __restrict__ table, const int* __restrict__ list_big,
+                                                              const int* __restrict__ row_e, const float* __restrict__ x,
+                                                              unsigned short* __restrict__ xg, unsigned short* __restrict__ xu,
+                                                              unsigned long long pbase, unsigned long long k_, unsigned long long in_div,
+                                                              unsigned long long suh0, unsigned long long suh1) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int k = (int)k_, blk = blockIdx.x * 8 + warp;
+    if (blk * 128 >= k) return;
+    const int p = blockIdx.y, z = blockIdx.z;
+    const int e = row_e[pbase + p], c = list_big[pbase + p];
+    const unsigned short* suh = (const unsigned short*)(table[e] + (z ? suh1 : suh0));
+    const int c0 = blk * 128 + 4 * lane;
+    const float4 xv = *(const float4*)(x + (size_t)(c / (int)in_div) * k + c0);
+    float v[4] = {xv.x, xv.y, xv.z, xv.w};
+    mul1_in_block(v, suh, c0, lane);
+    *(uint2*)((z ? xu : xg) + (size_t)p * k + c0) = make_uint2(mul1_h2(v[0], v[1]), mul1_h2(v[2], v[3]));
+}
+
+// xd [p][k] FP16 = H (glm5_swiglu_clamp(g, u) * suh_down) of rows p. grid (ceil(k / 1024), rows),
+// block 256.
+extern "C" __global__ void __launch_bounds__(256) mul1_tc2_act(const unsigned long long* __restrict__ table, const int* __restrict__ row_e,
+                                                               const float* __restrict__ g, const float* __restrict__ u,
+                                                               unsigned short* __restrict__ xd, unsigned long long pbase, unsigned long long k_,
+                                                               unsigned long long suh_off, unsigned long long limit_bits) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int k = (int)k_, blk = blockIdx.x * 8 + warp;
+    if (blk * 128 >= k) return;
+    const int p = blockIdx.y;
+    const unsigned short* suh = (const unsigned short*)(table[row_e[pbase + p]] + suh_off);
+    const float L = __int_as_float((int)limit_bits);
+    const int c0 = blk * 128 + 4 * lane;
+    const size_t ro = (size_t)p * k + c0;
+    const float4 gv = *(const float4*)(g + ro), uv = *(const float4*)(u + ro);
+    float v[4] = {mul1_clamp_swiglu(gv.x, uv.x, L), mul1_clamp_swiglu(gv.y, uv.y, L), mul1_clamp_swiglu(gv.z, uv.z, L), mul1_clamp_swiglu(gv.w, uv.w, L)};
+    mul1_in_block(v, suh, c0, lane);
+    *(uint2*)(xd + ro) = make_uint2(mul1_h2(v[0], v[1]), mul1_h2(v[2], v[3]));
+}
+
+// The grouped GEMM. 1-D grid over the batch's (expert j, matrix z, n-block nb, row tile mt) in that
+// order (an expert's tiles run together: its weights and rows stay in L2), mt fastest; mt_pre[j]
+// is the row-tile prefix of the big experts (BM rows per tile). Block 128 = 2 x 2 warps of
+// (BM / 2) x 64, tile BM x 128 x 32, ST cp.async stages, mma.m16n8k16 FP16 -> FP32. Epilogue per
+// 64 rows through shared memory: H (the 128 outputs of the row) / 128 * svh; mode 0 into y_z row
+// (row_off[j] - row_off[b0] + row), mode 1 into y0 row list_big[row_off[j] + row].
+#define MUL1_TC2_ALD 40
+#define MUL1_TC2_ELD 136
+#define MUL1_TC2_ARGS                                                                                                                       \
+    const unsigned char *__restrict__ wsc, const unsigned short *__restrict__ xa0, const unsigned short *__restrict__ xa1,                 \
+        const int *__restrict__ big_e, const int *__restrict__ row_off, const int *__restrict__ mt_pre, const int *__restrict__ list_big, \
+        const unsigned long long *__restrict__ table, float *__restrict__ y0, float *__restrict__ y1, unsigned long long b0,              \
+        unsigned long long nexp, unsigned long long k_dim, unsigned long long n_dim, unsigned long long zn, unsigned long long svh0,      \
+        unsigned long long svh1, unsigned long long mode, unsigned long long slot_bytes, unsigned long long mat_bytes,                      \
+        unsigned long long tro0, unsigned long long tro1, unsigned long long n32_, unsigned long long bits_, unsigned long long half_
+#define MUL1_TC2_PASS                                                                                                                  \
+    wsc, xa0, xa1, big_e, row_off, mt_pre, list_big, table, y0, y1, b0, nexp, k_dim, n_dim, zn, svh0, svh1, mode, slot_bytes, mat_bytes, \
+        tro0, tro1, n32_, bits_, half_
+
+// FUSED: B is not read from wsc but decoded per k-step from the expert's trellis (tro_z from its
+// record) into one shared FP16 buffer, fragment-native, the same FP16 values mul1_tc2_recon
+// writes (mul1_dec_tile): no weight scratch, no recon traffic, the same results bit for bit.
+template <int WM, int ST, bool FUSED>
+__device__ __forceinline__ void mul1_tc2_gemm_t(MUL1_TC2_ARGS) {
+    constexpr int BM = 32 * WM;
+    constexpr int ABYTES = BM * MUL1_TC2_ALD * 2, SBYTES = ABYTES + (FUSED ? 16 * MUL1_N32MAX * 4 : 8192);
+    constexpr int EBYTES = 64 * MUL1_TC2_ELD * 4;
+    constexpr int PBYTES = ST * SBYTES + (FUSED ? 8192 : 0);
+    constexpr int SMEM = PBYTES > EBYTES ? PBYTES : EBYTES;
+    __shared__ __align__(16) unsigned char sm[SMEM];
+    const int k = (int)k_dim, n = (int)n_dim, NB = n >> 7, Z = (int)zn;
+    const int idx = blockIdx.x;
+    const int B0 = (int)b0, base = mt_pre[B0];
+    const int q = idx / (NB * Z);
+    int lo = B0, hi = B0 + (int)nexp - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (mt_pre[mid] - base <= q) lo = mid;
+        else hi = mid - 1;
+    }
+    const int j = lo;
+    const int mj = mt_pre[j + 1] - mt_pre[j];
+    const int local = idx - (mt_pre[j] - base) * NB * Z;
+    const int mt = local % mj, rest = local / mj, nb = rest % NB, z = rest / NB;
+    const int r0 = mt * BM, tr = min(BM, row_off[j + 1] - row_off[j] - r0);
+    const int prow0 = row_off[j] - row_off[B0] + r0;
+    const unsigned short* A = (z ? xa1 : xa0) + (size_t)prow0 * k;
+    const unsigned char* W = wsc + (size_t)(j - B0) * slot_bytes + (size_t)z * mat_bytes;
+    const int tiles_n = n >> 4;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp >> 1, wn = warp & 1;
+    const unsigned int s0 = mul1_smem(sm);
+    const int n32 = (int)n32_;
+    const unsigned long long tb = FUSED ? table[big_e[j]] + (z ? tro1 : tro0) : 0ull;
+    const bool tb16 = (tb & 15ull) == 0;
+    int dlo[8];
+    if (FUSED) mul1_lane_lo(dlo, lane, (int)bits_, (int)half_, n32);
+    auto load = [&](int ks, int st) {
+        const unsigned int sa = s0 + st * SBYTES, sb = sa + ABYTES;
+#pragma unroll
+        for (int i = 0; i < BM * 4 / 128; i++) {
+            const int c = tid + 128 * i, r = c >> 2, cc = c & 3;
+            mul1_cp16(sa + r * (MUL1_TC2_ALD * 2) + cc * 16, A + (size_t)min(r, tr - 1) * k + ks * 32 + cc * 8);
+        }
+        if (FUSED) {
+            // the words of tiles (2 ks + ktl, 8 nb ..): 8 n32 words per ktl, contiguous
+            const int run = 8 * n32;
+            if (tb16) {
+                for (int c = tid; c < run / 2; c += 128) {
+                    const int ktl = c / (run / 4), cc = c - ktl * (run / 4);
+                    mul1_cp16(sb + ktl * run * 4 + cc * 16, (const void*)(tb + ((size_t)((ks * 2 + ktl) * tiles_n + nb * 8) * n32) * 4 + cc * 16));
+                }
+            } else {
+                for (int c = tid; c < 2 * run; c += 128) {
+                    const int ktl = c / run, cc = c - ktl * run;
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(sb + ktl * run * 4 + cc * 4),
+                                 "l"((const void*)(tb + ((size_t)((ks * 2 + ktl) * tiles_n + nb * 8) * n32 + cc) * 4)));
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int c = tid + 128 * i, ktl = c >> 8, rem = c & 255;
+                mul1_cp16(sb + c * 16, W + ((size_t)((ks * 2 + ktl) * tiles_n + nb * 8 + (rem >> 5)) * 32 + (rem & 31)) * 16);
+            }
+        }
+    };
+    float acc[WM][8][4];
+#pragma unroll
+    for (int a = 0; a < WM; a++)
+#pragma unroll
+        for (int b = 0; b < 8; b++)
+#pragma unroll
+            for (int v = 0; v < 4; v++) acc[a][b][v] = 0.0f;
+    const int nk = k >> 5;
+#pragma unroll
+    for (int s = 0; s < ST - 1; s++) {
+        if (s < nk) load(s, s);
+        asm volatile("cp.async.commit_group;");
+    }
+    for (int ks = 0; ks < nk; ks++) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(ST - 2));
+        __syncthreads();
+        {
+            const int nx = ks + ST - 1;
+            if (nx < nk) load(nx, nx % ST);
+            asm volatile("cp.async.commit_group;");
+        }
+        const unsigned int sa = s0 + (ks % ST) * SBYTES;
+        unsigned int sb = sa + ABYTES;
+        if (FUSED) {
+            // the 16 tiles of this k-step, 4 per warp, into the FP16 buffer behind the stages
+            const unsigned int* ws = (const unsigned int*)(sm + (ks % ST) * SBYTES + ABYTES);
+            sb = s0 + ST * SBYTES;
+#pragma unroll
+            for (int tt = 0; tt < 4; tt++) {
+                const int t = warp * 4 + tt;
+                const uint4 qd = mul1_dec_tile(ws + t * n32, dlo, n32);
+                asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(sb + (t * 32 + lane) * 16), "r"(qd.x), "r"(qd.y), "r"(qd.z), "r"(qd.w));
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            unsigned int a[WM][4];
+#pragma unroll
+            for (int mi = 0; mi < WM; mi++)
+                mul1_ldsm4(sa + 2 * ((wm * WM * 16 + mi * 16 + (lane & 15)) * MUL1_TC2_ALD + kk * 16 + (lane >> 4) * 8), a[mi][0], a[mi][1], a[mi][2], a[mi][3]);
+#pragma unroll
+            for (int ni = 0; ni < 4; ni++) {
+                unsigned int b[4];
+                asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(sb + ((kk * 8 + wn * 4 + ni) * 32 + lane) * 16));
+#pragma unroll
+                for (int mi = 0; mi < WM; mi++) {
+                    mul1_mma(acc[mi][2 * ni], a[mi], b[0], b[1]);
+                    mul1_mma(acc[mi][2 * ni + 1], a[mi], b[2], b[3]);
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+    float* E = (float*)sm;
+    const int g = lane >> 2, c = lane & 3, n0 = nb * 128;
+    const unsigned short* svh = (const unsigned short*)(table[big_e[j]] + (z ? svh1 : svh0));
+    float sv[4];
+#pragma unroll
+    for (int v = 0; v < 4; v++) sv[v] = mul1_h2f(svh[n0 + 4 * lane + v]);
+#pragma unroll
+    for (int p = 0; p < (BM + 63) / 64; p++) {
+        if (p) __syncthreads();
+#pragma unroll
+        for (int mi = 0; mi < WM; mi++)
+#pragma unroll
+            for (int nj = 0; nj < 8; nj++)
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int row = wm * WM * 16 + mi * 16 + g + 8 * h;
+                    if ((row >> 6) == p)
+                        *(float2*)(E + (row - 64 * p) * MUL1_TC2_ELD + wn * 64 + nj * 8 + 2 * c) = make_float2(acc[mi][nj][2 * h], acc[mi][nj][2 * h + 1]);
+                }
+        __syncthreads();
+        for (int r = warp; r < 64; r += 4) {
+            const int rr = p * 64 + r;
+            if (rr >= tr) break;
+            const float4 e4 = *(const float4*)(E + r * MUL1_TC2_ELD + 4 * lane);
+            float v[4] = {e4.x, e4.y, e4.z, e4.w};
+            mul1_fwht128(v, lane);
+#pragma unroll
+            for (int t = 0; t < 4; t++) v[t] = __fmul_rn(__fmul_rn(v[t], 0.0078125f), sv[t]);
+            float* dst = mode ? y0 + (size_t)list_big[row_off[j] + r0 + rr] * n : (z ? y1 : y0) + (size_t)(prow0 + rr) * n;
+            *(float4*)(dst + n0 + 4 * lane) = make_float4(v[0], v[1], v[2], v[3]);
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) mul1_tc2_gemm64(MUL1_TC2_ARGS) { mul1_tc2_gemm_t<2, 3, false>(MUL1_TC2_PASS); }
+extern "C" __global__ void __launch_bounds__(128) mul1_tc2_gemm128(MUL1_TC2_ARGS) { mul1_tc2_gemm_t<4, 2, false>(MUL1_TC2_PASS); }
+extern "C" __global__ void __launch_bounds__(128) mul1_tc2_gemm64f(MUL1_TC2_ARGS) { mul1_tc2_gemm_t<2, 3, true>(MUL1_TC2_PASS); }
+extern "C" __global__ void __launch_bounds__(128) mul1_tc2_gemm128f(MUL1_TC2_ARGS) { mul1_tc2_gemm_t<4, 2, true>(MUL1_TC2_PASS); }

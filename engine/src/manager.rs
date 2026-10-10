@@ -652,6 +652,10 @@ pub fn clamp_hot_n(c: &ClampInput) -> Result<(usize, Vec<String>), String> {
 }
 
 pub const SAFETY: u64 = 512 << 20; // launch pools, scratch, telemetry slack
+/// VRAM the planner leaves free for launch/param plumbing, booked as pending (`planner_pending`).
+/// Sibling of `SAFETY`: two reserves, two sums, two numbers. #159: one constant for
+/// `Engine::load` and the glm5_next plan (it was a local const of `Engine::load`).
+pub const LAUNCH_SLACK: u64 = 128 << 20;
 pub const N_MIN: usize = 32;
 
 /// #72: VRAM that must STILL be free once every boot allocation is resident.
@@ -712,6 +716,384 @@ pub fn render_reserve_bytes() -> u64 {
 /// including it here is what keeps it free after the load.
 pub fn planner_pending(launch_slack: u64, ring_reserve: u64, vit_reserve: u64, render_reserve: u64) -> u64 {
     launch_slack + ring_reserve + vit_reserve + render_reserve
+}
+
+/// #159: `planner_pending` plus the VRAM a family's stability policy keeps off the plan
+/// (`Stability::planner_reserve`: glm5_next 2 GiB of headroom on a 32,607 MiB card, capped at
+/// 31.9 GiB; Flash-Next and the 27B `OF_RECORD`, 0 B, so their pending is unchanged)
+pub fn planner_pending_for(
+    stability: &Stability,
+    vram_total: u64,
+    launch_slack: u64,
+    ring_reserve: u64,
+    vit_reserve: u64,
+    render_reserve: u64,
+) -> u64 {
+    planner_pending(launch_slack, ring_reserve, vit_reserve, render_reserve) + stability.planner_reserve(vram_total)
+}
+
+// ---------------- #159: the glm5_next plan (VRAM, pinned RAM, NVMe) ----------------
+
+/// #159: the state bytes of a glm5_next model at `context` tokens, from its `Glm5Geo`
+/// (`docs/glm5-next-recipe.md` section 13). The MTP block (checkpoint layer 45) is not
+/// executed (plan step 21), so it books nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glm5States {
+    pub context: usize,
+    /// MLA latent per token per DSA layer (BF16, 1,024 B) and the indexer row (HF layout, 514 B)
+    pub latent_per_token: u64,
+    pub indexer_per_token: u64,
+    /// the two caches over every DSA layer at `context` tokens
+    pub latent_bytes: u64,
+    pub indexer_bytes: u64,
+    /// per sequence, independent of the context: KDA state (4 MiB per layer) and conv window
+    pub kda_state_bytes: u64,
+    pub kda_conv_bytes: u64,
+}
+
+impl Glm5States {
+    pub fn plan(g: &Glm5Geo, context: usize) -> Glm5States {
+        let dsa = g.dsa_layers as u64;
+        let kda = g.kda_layers as u64;
+        Glm5States {
+            context,
+            latent_per_token: g.latent_bytes_per_token(),
+            indexer_per_token: g.indexer_bytes_per_token(),
+            latent_bytes: dsa * context as u64 * g.latent_bytes_per_token(),
+            indexer_bytes: dsa * context as u64 * g.indexer_bytes_per_token(),
+            kda_state_bytes: kda * g.kda_state_bytes(),
+            kda_conv_bytes: kda * g.kda_conv_bytes(),
+        }
+    }
+    /// the cache bytes of one token over every DSA layer
+    pub fn per_token(&self, g: &Glm5Geo) -> u64 {
+        g.dsa_layers as u64 * (self.latent_per_token + self.indexer_per_token)
+    }
+    pub fn total(&self) -> u64 {
+        self.latent_bytes + self.indexer_bytes + self.kda_state_bytes + self.kda_conv_bytes
+    }
+}
+
+/// #159: the inputs of the three-tier expert plan, every one of them named in the printout
+#[derive(Clone, Copy, Debug)]
+pub struct TierInput {
+    /// the card's VRAM (the boot replaces it by the measured free VRAM)
+    pub vram_total: u64,
+    /// the family's policy: headroom and cap (`Stability::planner_reserve`)
+    pub stability: Stability,
+    /// VRAM-resident bytes that are not routed experts (the container's dense part)
+    pub dense_bytes: u64,
+    /// #161: what the load adds on top of the container's dense part: `kv_b_proj` decoded from
+    /// NVFP4 to BF16 (`Glm5Geo::kv_b_decode_bytes`, 265,289,728 B on GLM-5.3-Flash)
+    pub decoded_bytes: u64,
+    /// `Glm5States::total` at the boot context
+    pub states_bytes: u64,
+    /// the cold staging slots (`Stability::stage_slots`) times one expert block
+    pub staging_bytes: u64,
+    /// #186: the prompt phase's device bytes at its chunk above a one-row pass
+    /// ([`glm5_chunk_scratch_bytes`]); 0 at chunk 1 (every row one decode call)
+    pub chunk_scratch_bytes: u64,
+    /// #186: the prompt chunk the plan books (1 = row by row)
+    pub chunk: usize,
+    /// `LAUNCH_SLACK`
+    pub launch_slack: u64,
+    /// one routed expert of one MoE layer
+    pub expert_block_bytes: u64,
+    pub moe_layers: usize,
+    /// routed experts per MoE layer
+    pub experts: usize,
+    /// the pinned host budget: `HOST_PINNED_CAP`, or what the boot derives below it
+    pub host_pinned_budget: u64,
+}
+
+/// #159: where the routed experts of every MoE layer live: N in VRAM, P in pinned host RAM,
+/// the rest read from NVMe (#149). One unit is one expert in every MoE layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierPlan {
+    /// `Stability::vram_ceiling(vram_total)`
+    pub vram_ceiling: u64,
+    /// dense + decoded + states + staging + pending (with the policy reserve) + `SAFETY`
+    pub fixed_bytes: u64,
+    /// `expert_block_bytes x moe_layers`
+    pub unit_bytes: u64,
+    pub hot: usize,
+    pub pinned: usize,
+    pub nvme: usize,
+}
+
+impl TierPlan {
+    pub fn hot_bytes(&self) -> u64 {
+        self.hot as u64 * self.unit_bytes
+    }
+    pub fn pinned_bytes(&self) -> u64 {
+        self.pinned as u64 * self.unit_bytes
+    }
+    pub fn nvme_bytes(&self) -> u64 {
+        self.nvme as u64 * self.unit_bytes
+    }
+}
+
+/// #159: the three-tier plan. VRAM takes the dense part, the states, the staging, the launch
+/// slack and `SAFETY`, then as many expert units as fit under the family's VRAM ceiling
+/// (`hot`, at most `experts`); pinned RAM takes as many of the rest as fit the host budget
+/// (`pinned`); NVMe holds what is left (`nvme`). `Err` when the dense part and the states do
+/// not fit the ceiling with no expert at all: no expert tier changes that.
+pub fn plan_three_tiers(i: &TierInput) -> Result<TierPlan, String> {
+    let gib = |b: u64| b as f64 / GIB;
+    let vram_ceiling = i.stability.vram_ceiling(i.vram_total);
+    // the clamp's own sum (`clamp_hot_n`): what must fit the card, the policy reserve inside pending
+    let pending = planner_pending_for(&i.stability, i.vram_total, i.launch_slack, 0, 0, 0);
+    let need = i.dense_bytes + i.decoded_bytes + i.states_bytes + i.staging_bytes + i.chunk_scratch_bytes + pending + SAFETY;
+    // the same sum without the reserve: what lands below the ceiling
+    let fixed_bytes = need - i.stability.planner_reserve(i.vram_total);
+    if need > i.vram_total {
+        return Err(format!(
+            "refusing config: family Glm5Next needs {:.2} GiB before any expert (dense part {:.2} + kv_b at BF16 {:.2} + states {:.2} + staging {:.2}{} + launch slack {:.2} + safety {:.2}) against a VRAM plan ceiling of {:.2} GiB (card {:.2} GiB - headroom {:.2} GiB, cap {}) - the dense part does not fit, no expert tier changes that (#159)",
+            gib(fixed_bytes), gib(i.dense_bytes), gib(i.decoded_bytes), gib(i.states_bytes), gib(i.staging_bytes),
+            if i.chunk > 1 { format!(" + prompt chunk {} (CROW_CHUNK, #186) {:.2}", i.chunk, gib(i.chunk_scratch_bytes)) } else { String::new() },
+            gib(i.launch_slack), gib(SAFETY),
+            gib(vram_ceiling), gib(i.vram_total), gib(i.stability.vram_headroom),
+            i.stability.vram_cap.map_or("none".to_string(), |c| format!("{:.2} GiB", gib(c)))
+        ));
+    }
+    let unit_bytes = i.expert_block_bytes * i.moe_layers as u64;
+    let unit = unit_bytes.max(1);
+    let hot = (((i.vram_total - need) / unit) as usize).min(i.experts);
+    let pinned = ((i.host_pinned_budget / unit) as usize).min(i.experts - hot);
+    Ok(TierPlan { vram_ceiling, fixed_bytes, unit_bytes, hot, pinned, nvme: i.experts - hot - pinned })
+}
+
+/// the records of the pinned NVMe landing ring of glm5_next prompt calls: prefill NVMe reads land
+/// there and the copy engine moves them into the staging slots (two `MAX_IN_FLIGHT` batches)
+pub const GLM5_PREFILL_RING: usize = 2 * crate::nvme_source::MAX_IN_FLIGHT;
+
+/// #186: the call sizes a glm5_next prompt phase at `chunk` rows per call rounds a borrowed
+/// scratch up to (`glm5_tiers::prompt_borrow_rows`) besides the one-row decode call: every power
+/// of two above 1 and below `chunk`, then `chunk`. Empty at chunk 1. (#196: a call's dense FFN
+/// and MoE run on the one expert-major plan of the pass's rows, `glm5_moe::GpuMoeGroupedPlan`.)
+pub fn glm5_prompt_call_sizes(chunk: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = (1..usize::BITS).map(|i| 1usize << i).take_while(|&p| p < chunk).collect();
+    if chunk > 1 {
+        v.push(chunk);
+    }
+    v
+}
+
+/// #186: the device bytes the glm5_next prompt phase holds at `chunk` rows per call over a cache
+/// of `cap` rows, above what a one-row pass holds ([`glm5_chunk_scratch_parts`], summed): the pass
+/// scratch at `max_t = chunk` minus at 1, the residual's `chunk - 1` more rows, the one
+/// expert-major plan of `chunk` rows with the dense FFN over its region, and with
+/// `CROW_GLM_DENSE_GEMM=1` the tensor-core path's row table (`kernels::glm5_moe::TC_ROWS_BYTES`,
+/// #186). The small parameter arrays are left out (the GPU test
+/// `glm5_tiers_gpu_186_chunk_bytes_are_what_the_prompt_phase_allocates` holds the sum to the
+/// bytes the allocations register). 0 at chunk 1.
+pub fn glm5_chunk_scratch_bytes(g: &Glm5Geo, chunk: usize, cap: usize) -> u64 {
+    glm5_chunk_scratch_bytes_tc(g, chunk, cap, crate::kernels::glm5_moe::dense_gemm_from_env())
+}
+
+/// [`glm5_chunk_scratch_bytes`] with `CROW_GLM_DENSE_GEMM` given (`tc`)
+pub fn glm5_chunk_scratch_bytes_tc(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool) -> u64 {
+    glm5_chunk_scratch_parts(g, chunk, cap, tc).iter().map(|p| p.1).sum()
+}
+
+/// #196: [`glm5_chunk_scratch_bytes_tc`] by buffer, above a one-row pass: (name, bytes) of
+/// - `mhc` the mHC plan (`glm5_mhc::Plan`: logits, pre, post, comb, done), `rows` the collapsed
+///   and sublayer rows, `residual` the residual's `chunk - 1` more rows;
+/// - `attention` the region the KDA and the MLA scratch share (`glm5_model::attn_region_bytes`:
+///   the larger of `KdaScratch` at `min(chunk, KDA_SUB_ROWS)` rows and `MlaScratch` at
+///   `min(chunk, MLA_SUB_ROWS)` rows with its pool scores, `cap / kpool` per row), `selection` the
+///   MLA selection of the call's rows (`MlaScratch::sel_bytes`);
+/// - `moe` the expert-major plan of `chunk` rows (`glm5_moe::grouped_plan_bytes`: router logits,
+///   ids, weights, combo list, work items, and its region: the experts' outputs, the shared
+///   expert, gate / up of one piece of at most `GROUP_PIECE_COMBOS` combos, over the same bytes
+///   the dense FFN of `chunk` rows);
+/// - `tc` the tensor-core row table;
+/// - `moe_tc` #186 the tensor-core expert scratch (`CROW_GLM_MOE_TC=1`, `glm5_moe::moe_tc_bytes`).
+pub fn glm5_chunk_scratch_parts(g: &Glm5Geo, chunk: usize, cap: usize, tc: bool) -> Vec<(&'static str, u64)> {
+    use crate::glm5_mhc::{HC, MIX};
+    use crate::glm5_mla::{MlaDims, MlaScratch};
+    use crate::glm5_model::{attn_region_bytes, attn_rows};
+    if chunk <= 1 {
+        return Vec::new();
+    }
+    let (md, h) = (MlaDims::of(g), g.hidden);
+    let above = |f: &dyn Fn(usize) -> usize| (f(chunk) - f(1)) as u64;
+    let moe = crate::glm5_moe::grouped_plan_bytes(h, g.experts, g.topk, g.expert_inter, g.expert_inter * g.shared_experts, g.dense_inter, chunk);
+    // #186: the tensor-core path's device row counts (`CROW_GLM_DENSE_GEMM=1`), held by a pass of `chunk` rows
+    let tc = if tc && chunk >= crate::kernels::glm5_moe::TC_MIN_ROWS { crate::kernels::glm5_moe::TC_ROWS_BYTES } else { 0 };
+    vec![
+        ("mhc", above(&|m| 4 * m * (MIX + HC + HC + HC * HC + 1))),
+        ("rows", above(&|m| 4 * 2 * m * h)),
+        ("residual", ((chunk - 1) * g.hc_streams * h * 4) as u64),
+        ("attention", above(&|m| attn_region_bytes(g, attn_rows(m), cap))),
+        ("selection", above(&|m| MlaScratch::sel_bytes(&md, m))),
+        ("moe", moe),
+        ("tc", tc),
+        ("moe_tc", crate::glm5_moe::moe_tc_mode_bytes(crate::glm5_moe::moe_tc_mode_from_env(), h, g.expert_inter, g.experts, g.topk, chunk)),
+    ]
+}
+
+/// #159: the glm5_next plan from its geometry: the states at `context`, the staging of its
+/// stability policy (`pf_tg` tiles per prefill group, `pf_async` = two group sets), the three
+/// tiers. `dense_bytes` and `expert_block_bytes` are the container's: the record of one routed
+/// expert of one MoE layer in the container's codec (`ExpertRecordSpec::bytes`; 14,155,776 B at
+/// NVFP4, the plan's 9,474,048 B at 3.05-bpw MUL1). A record that is not a whole number of
+/// 4096-B sectors is refused by name (`geo::expert_record_refusal`).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_glm5_next(
+    g: &Glm5Geo,
+    context: usize,
+    vram_total: u64,
+    host_pinned_budget: u64,
+    dense_bytes: u64,
+    expert_block_bytes: u64,
+    pf_tg: usize,
+    pf_async: bool,
+) -> Result<(Glm5States, TierInput, TierPlan), String> {
+    plan_glm5_next_chunk(g, context, vram_total, host_pinned_budget, dense_bytes, expert_block_bytes, pf_tg, pf_async, 1)
+}
+
+/// #186: [`plan_glm5_next`] for a prompt phase in calls of up to `chunk` rows (`CROW_CHUNK`,
+/// `glm5_tiers::prompt_chunk_from_env`). Above chunk 1 the plan also books the prompt phase's
+/// device bytes ([`glm5_chunk_scratch_bytes`], in VRAM before any expert) and takes the pinned
+/// NVMe landing ring of prompt calls ([`GLM5_PREFILL_RING`] records, the async H2D source of
+/// `glm5_tiers::PrefillMover`) off the pinned budget. Chunk 1 is `plan_glm5_next` byte for byte.
+/// A chunk whose bytes do not fit is refused by name (`plan_three_tiers`).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_glm5_next_chunk(
+    g: &Glm5Geo,
+    context: usize,
+    vram_total: u64,
+    host_pinned_budget: u64,
+    dense_bytes: u64,
+    expert_block_bytes: u64,
+    pf_tg: usize,
+    pf_async: bool,
+    chunk: usize,
+) -> Result<(Glm5States, TierInput, TierPlan), String> {
+    if let Some(why) = expert_record_refusal(expert_block_bytes) {
+        return Err(why);
+    }
+    let chunk = chunk.clamp(1, context.max(1));
+    let stability = Stability::of(Family::Glm5Next);
+    let states = Glm5States::plan(g, context);
+    let slots = stability.stage_slots(g.topk, pf_tg, pf_async);
+    let landing = if chunk > 1 { GLM5_PREFILL_RING as u64 * expert_block_bytes } else { 0 };
+    let input = TierInput {
+        vram_total,
+        stability,
+        dense_bytes,
+        // #161: kv_b is stored NVFP4 and decoded once to BF16 at load (the MLA kernels read BF16)
+        decoded_bytes: g.kv_b_decode_bytes(),
+        states_bytes: states.total(),
+        // decode and prefill sets apart (#176): both are held, one record per slot
+        staging_bytes: slots.bytes(expert_block_bytes),
+        chunk_scratch_bytes: glm5_chunk_scratch_bytes(g, chunk, context),
+        chunk,
+        launch_slack: LAUNCH_SLACK,
+        expert_block_bytes,
+        moe_layers: g.moe_layers(),
+        experts: g.experts,
+        host_pinned_budget: host_pinned_budget.saturating_sub(landing),
+    };
+    let plan = plan_three_tiers(&input)?;
+    Ok((states, input, plan))
+}
+
+/// #159: the expert record `states --plan` plans with, and where it came from
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanRecord {
+    /// the codec; `None` when `--expert-bytes` came without `--expert-codec` (the plan needs
+    /// the bytes only)
+    pub codec: Option<ExpertCodec>,
+    pub bytes: u64,
+    /// the printout's source line for the record
+    pub source: String,
+}
+
+/// #159: the expert record of `states --plan`, from exactly one of: a container (`--cnq PATH`:
+/// its index names codec and record, `nvme_source::glm5_record_of_container`) or an explicit
+/// override for planning without one (`--expert-bytes N [--expert-codec nvfp4|mul1]`). There is
+/// no default: neither, or both, is refused by name, so a 3-bit plan can never silently take
+/// the 4.5-bit 14,155,776 B. An NVFP4 record must equal what the config derives
+/// (`Glm5Geo::expert_block_bytes`).
+pub fn glm5_plan_record(g: &Glm5Geo, cnq: Option<&str>, expert_bytes: Option<&str>, expert_codec: Option<&str>) -> Result<PlanRecord, String> {
+    let nvfp4_check = |codec: Option<ExpertCodec>, bytes: u64, what: &str| -> Result<(), String> {
+        if codec == Some(ExpertCodec::Nvfp4) && bytes != g.expert_block_bytes() {
+            return Err(format!("{what}: an nvfp4 record of {bytes} B, the config derives {} B at nvfp4 - not this model's record", g.expert_block_bytes()));
+        }
+        Ok(())
+    };
+    match (cnq, expert_bytes) {
+        (Some(_), Some(_)) => Err("give the expert record once: --cnq <container> or --expert-bytes N, not both".into()),
+        (None, None) => Err(
+            "the glm5_next plan needs the routed-expert record: --cnq <container> (its index names codec and record) or --expert-bytes N [--expert-codec nvfp4|mul1] (planning without a container); there is no default (#159)"
+                .into(),
+        ),
+        (Some(path), None) => {
+            if expert_codec.is_some() {
+                return Err("--expert-codec goes with --expert-bytes; a container names its own codec".into());
+            }
+            let (spec, n) = crate::nvme_source::glm5_record_of_container(path)?;
+            nvfp4_check(Some(spec.codec), spec.bytes, path)?;
+            Ok(PlanRecord {
+                codec: Some(spec.codec),
+                bytes: spec.bytes,
+                source: format!("container index {path}: codec {}, {n} records of {} B", spec.codec.dtype(), spec.bytes),
+            })
+        }
+        (None, Some(b)) => {
+            let bytes: u64 = b.trim().parse().map_err(|_| format!("--expert-bytes {b:?} is not a whole number of bytes"))?;
+            if let Some(why) = expert_record_refusal(bytes) {
+                return Err(format!("--expert-bytes: {why}"));
+            }
+            let codec = expert_codec.map(ExpertCodec::from_dtype).transpose()?;
+            nvfp4_check(codec, bytes, "--expert-bytes")?;
+            let c = codec.map_or("not given (--expert-codec; the plan needs the bytes only)".to_string(), |c| c.dtype().to_string());
+            Ok(PlanRecord { codec, bytes, source: format!("--expert-bytes, no container read; codec {c}") })
+        }
+    }
+}
+
+/// #159: the plan as `states --plan` prints it: every input with its source, then the three
+/// tiers per MoE layer and in bytes. `sources` names where the dense part, the expert block,
+/// the card and the pinned budget came from.
+pub fn glm5_plan_table(g: &Glm5Geo, s: &Glm5States, i: &TierInput, p: &TierPlan, sources: &[(&str, String)]) -> String {
+    let gib = |b: u64| b as f64 / GIB;
+    let src = |k: &str| sources.iter().find(|(n, _)| *n == k).map_or(String::new(), |(_, v)| format!(" ({v})"));
+    let slots = i.staging_bytes / i.expert_block_bytes.max(1);
+    let mut o = Vec::new();
+    o.push(format!("--- glm5_next plan (#159): context {}, three expert tiers ---", s.context));
+    o.push("inputs".to_string());
+    o.push(format!("  dense part           {:>16} B  {:>7.2} GiB{}", i.dense_bytes, gib(i.dense_bytes), src("dense")));
+    o.push(format!("  expert block         {:>16} B  {:>7.2} MiB  one expert of one MoE layer{}", i.expert_block_bytes, i.expert_block_bytes as f64 / MIB, src("expert")));
+    o.push(format!("  MoE layers x experts {:>16}    {} x {} (top-{}), MTP layer 45 not executed (step 21): no cache, no experts", "", i.moe_layers, i.experts, g.topk));
+    o.push(format!("  KV per token         {:>16} B  {} DSA layers x (MLA latent {} B BF16 + indexer {} B HF layout)", s.per_token(g), g.dsa_layers, s.latent_per_token, s.indexer_per_token));
+    o.push(format!("  card VRAM            {:>16} B  {:>7.2} GiB{}", i.vram_total, gib(i.vram_total), src("vram")));
+    o.push(format!("  pinned budget        {:>16} B  {:>7.2} GiB{}", i.host_pinned_budget, gib(i.host_pinned_budget), src("pinned")));
+    o.push("VRAM".to_string());
+    o.push(format!("  plan ceiling         {:>16} B  {:>7.2} GiB  card - headroom {:.2} GiB, cap {} (Stability::GLM5_NEXT, #176)", p.vram_ceiling, gib(p.vram_ceiling), gib(i.stability.vram_headroom),
+        i.stability.vram_cap.map_or("none".to_string(), |c| format!("{:.2} GiB", gib(c)))));
+    o.push(format!("  dense part           {:>16} B  {:>7.2} GiB", i.dense_bytes, gib(i.dense_bytes)));
+    o.push(format!("  kv_b at BF16         {:>16} B  {:>7.2} GiB  {} DSA layers: kv_b decoded at load, BF16 {} B - container NVFP4 {} B (#161)", i.decoded_bytes, gib(i.decoded_bytes), g.dsa_layers, g.kv_b_bf16_bytes(), g.kv_b_nvfp4_bytes()));
+    o.push(format!("  MLA latent           {:>16} B  {:>7.2} GiB  {} x {} tokens x {} B", s.latent_bytes, gib(s.latent_bytes), g.dsa_layers, s.context, s.latent_per_token));
+    o.push(format!("  indexer cache        {:>16} B  {:>7.2} GiB  {} x {} tokens x {} B", s.indexer_bytes, gib(s.indexer_bytes), g.dsa_layers, s.context, s.indexer_per_token));
+    o.push(format!("  KDA state + conv     {:>16} B  {:>7.2} GiB  {} layers x ({} + {} B) per sequence", s.kda_state_bytes + s.kda_conv_bytes, gib(s.kda_state_bytes + s.kda_conv_bytes), g.kda_layers, g.kda_state_bytes(), g.kda_conv_bytes()));
+    o.push(format!("  cold staging         {:>16} B  {:>7.2} GiB  {} slots (decode and prefill sets apart, #176)", i.staging_bytes, gib(i.staging_bytes), slots));
+    if i.chunk > 1 {
+        o.push(format!("  prompt chunk         {:>16} B  {:>7.2} GiB  {} rows per prompt call (CROW_CHUNK, #186): pass scratch (KDA | MLA in one region at their sub-block rows, #196), residual rows, the expert-major MoE plan with the dense FFN over its region", i.chunk_scratch_bytes, gib(i.chunk_scratch_bytes), i.chunk));
+    }
+    o.push(format!("  launch slack + safety{:>16} B  {:>7.2} GiB", i.launch_slack + SAFETY, gib(i.launch_slack + SAFETY)));
+    o.push("  activations/scratch  not measured (GLM widths; the step-14 boot measures them against free VRAM)".to_string());
+    o.push(format!("  room for experts     {:>16} B  {:>7.2} GiB", p.vram_ceiling - p.fixed_bytes, gib(p.vram_ceiling - p.fixed_bytes)));
+    o.push(format!("expert tiers per MoE layer (unit = {} B = {} layers x one block)", p.unit_bytes, i.moe_layers));
+    let share = |n: usize| 100.0 * n as f64 / i.experts.max(1) as f64;
+    o.push(format!("  VRAM    N = {:>3}  {:>5.1} %  {:>16} B  {:>7.2} GiB", p.hot, share(p.hot), p.hot_bytes(), gib(p.hot_bytes())));
+    o.push(format!("  pinned  P = {:>3}  {:>5.1} %  {:>16} B  {:>7.2} GiB", p.pinned, share(p.pinned), p.pinned_bytes(), gib(p.pinned_bytes())));
+    o.push(format!("  NVMe        {:>3}  {:>5.1} %  {:>16} B  {:>7.2} GiB  (CROW_NVME_TIER, #149)", p.nvme, share(p.nvme), p.nvme_bytes(), gib(p.nvme_bytes())));
+    o.push(format!("  resident (N + P) / {} = {:.1} %; expert cache policy default lru (CROW_EXPERT_CACHE, #175)", i.experts, share(p.hot + p.pinned)));
+    o.push("  G1d capacities (plan step 3): not measured yet - these are the planner's own numbers".to_string());
+    o.join("\n")
 }
 
 /// #110: what must still be free once the load is done: the #72 floor for the
@@ -1588,5 +1970,348 @@ mod tests_ram_margin {
         if std::env::var_os("CROW_RAM_MARGIN_GB").is_none() {
             assert_eq!(ram_margin_bytes(), 1u64 << 30);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_159_record_plan {
+    //! #159: the plan of Flash-Next and the 27B, rendered as text and pinned. The text was
+    //! captured at 0c90901 (before the glm5_next family existed) with exactly this test body;
+    //! the family, its planner and its Stability wiring must leave every number unchanged.
+    use super::*;
+
+    /// one hot-set unit of Flash-Next: 48 layers x 2,764,800 B per expert (tests_110)
+    const UNIT: u64 = 48 * 2_764_800;
+
+    fn render(geo: &Geo) -> String {
+        let mut out = format!("family {:?} code {}\n", geo.family, geo.family.code());
+        for context in [geo.context_floor, 262_144] {
+            for kv in [KvDtype::Fp8E4m3, KvDtype::Bf16, KvDtype::Q8Block] {
+                for chunk in [512, 4096] {
+                    let s = StateSizes::plan(geo, context, kv, chunk);
+                    out += &format!(
+                        "ctx {context} {} chunk {chunk}: kv {} qsa_keys {} ring {} pooled {} gdn_s {} gdn_conv {} rope {} total {}\n",
+                        kv.name(), s.kv_bytes, s.qsa_keys_bytes, s.qsa_ring_rows, s.qsa_pooled_bytes,
+                        s.gdn_s_bytes, s.gdn_conv_bytes, s.rope_bytes, s.total()
+                    );
+                }
+            }
+        }
+        let card = 32_607u64 << 20;
+        let st = Stability::of(geo.family);
+        let slots = st.stage_slots(geo.dims().topk, 64, true);
+        out += &format!(
+            "stability {:?} ceiling {} reserve {} slots {:?} held {} pending {}\n",
+            st, st.vram_ceiling(card), st.planner_reserve(card), slots, slots.held(),
+            planner_pending(128 << 20, 0, 0, 0)
+        );
+        let states = StateSizes::plan(geo, geo.context_floor, geo.family.default_kv(), 2048).total();
+        match geo.ffn {
+            Ffn::Moe { experts, .. } => {
+                for (free0, budget) in [(30u64 << 30, 46u64 << 30), (31 << 30, 40 << 30), (28 << 30, 46 << 30)] {
+                    let c = ClampInput {
+                        n_hot: 160,
+                        experts,
+                        states_bytes: states,
+                        pending_bytes: planner_pending(128 << 20, 0, 0, 0),
+                        expert_bytes_per_n_unit: UNIT,
+                        cold_bytes_per_n_unit: UNIT,
+                        cold_fixed: false,
+                        spare: 7,
+                        free0,
+                        host_pinned_budget: budget,
+                    };
+                    out += &format!("clamp free0 {free0} budget {budget}: {:?}\n", clamp_hot_n(&c).map(|(n, _)| n));
+                }
+            }
+            Ffn::Dense { .. } => {
+                for free0 in [20u64 << 30, 30 << 30] {
+                    out += &format!("dense_fit free0 {free0}: {:?}\n", dense_fit(free0, states, 128 << 20, 0, geo.context_floor).map(|(g, _)| g));
+                }
+            }
+        }
+        out
+    }
+
+    const FLASH_NEXT_PLAN: &str = "family FlashNext code 1\nctx 200000 fp8_e4m3 chunk 512: kv 2457600000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 2936840192\nctx 200000 fp8_e4m3 chunk 4096: kv 2457600000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 2958860288\nctx 200000 bf16 chunk 512: kv 4915200000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 5394440192\nctx 200000 bf16 chunk 4096: kv 4915200000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 5416460288\nctx 200000 q8 chunk 512: kv 2611200000 qsa_keys 3170304 ring 516 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 3090440192\nctx 200000 q8 chunk 4096: kv 2611200000 qsa_keys 25190400 ring 4100 pooled 307200000 gdn_s 113246208 gdn_conv 4423680 rope 51200000 total 3112460288\nctx 262144 fp8_e4m3 chunk 512: kv 3221225472 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 3811827712\nctx 262144 fp8_e4m3 chunk 4096: kv 3221225472 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 3833847808\nctx 262144 bf16 chunk 512: kv 6442450944 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 7033053184\nctx 262144 bf16 chunk 4096: kv 6442450944 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 7055073280\nctx 262144 q8 chunk 512: kv 3422552064 qsa_keys 3170304 ring 516 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 4013154304\nctx 262144 q8 chunk 4096: kv 3422552064 qsa_keys 25190400 ring 4100 pooled 402653184 gdn_s 113246208 gdn_conv 4423680 rope 67108864 total 4035174400\nstability Stability { vram_headroom: 0, vram_cap: None, decode_stage_rows: None } ceiling 34190917632 reserve 0 slots StageSlots { decode: 20, prefill: 128, shared: true } held 128 pending 134217728\nclamp free0 32212254720 budget 49392123904: Ok(160)\nclamp free0 33285996544 budget 42949672960: Ok(196)\nclamp free0 30064771072 budget 49392123904: Ok(160)\n";
+    const DENSE_27B_PLAN: &str = "family Qwen35Dense code 2\nctx 65536 fp8_e4m3 chunk 512: kv 2147483648 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2321154048\nctx 65536 fp8_e4m3 chunk 4096: kv 2147483648 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2321154048\nctx 65536 bf16 chunk 512: kv 4294967296 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 4468637696\nctx 65536 bf16 chunk 4096: kv 4294967296 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 4468637696\nctx 65536 q8 chunk 512: kv 2281701376 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2455371776\nctx 65536 q8 chunk 4096: kv 2281701376 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 16777216 total 2455371776\nctx 262144 fp8_e4m3 chunk 512: kv 8589934592 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 8813936640\nctx 262144 fp8_e4m3 chunk 4096: kv 8589934592 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 8813936640\nctx 262144 bf16 chunk 512: kv 17179869184 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 17403871232\nctx 262144 bf16 chunk 4096: kv 17179869184 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 17403871232\nctx 262144 q8 chunk 512: kv 9126805504 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 9350807552\nctx 262144 q8 chunk 4096: kv 9126805504 qsa_keys 0 ring 0 pooled 0 gdn_s 150994944 gdn_conv 5898240 rope 67108864 total 9350807552\nstability Stability { vram_headroom: 0, vram_cap: None, decode_stage_rows: None } ceiling 34190917632 reserve 0 slots StageSlots { decode: 0, prefill: 128, shared: true } held 128 pending 134217728\ndense_fit free0 21474836480: Ok(0)\ndense_fit free0 32212254720: Ok(0)\n";
+
+    #[test]
+    fn flash_next_and_the_27b_plan_exactly_as_before_159() {
+        assert_eq!(render(&Geo::FLASH_NEXT), FLASH_NEXT_PLAN);
+        assert_eq!(render(&crate::meta::dense_fixture_geo()), DENSE_27B_PLAN);
+    }
+}
+
+
+#[cfg(test)]
+mod tests_159_glm_plan {
+    //! #159: the glm5_next plan: states from the recipe's per-token and per-layer bytes, the
+    //! #176 policy through `planner_pending_for`, three expert tiers. Pure arithmetic, no GPU.
+    use super::*;
+
+    const CARD: u64 = 32_607 << 20; // RTX 5090, docs/system-landscape.md:12
+
+    fn plan(card: u64, pinned: u64, context: usize) -> Result<(Glm5States, TierInput, TierPlan), String> {
+        plan_glm5_next(&Glm5Geo::GLM_5_3_FLASH, context, card, pinned, GLM5_NEXT_DENSE_BYTES, GLM5_NEXT_EXPERT_BLOCK_BYTES, 64, true)
+    }
+
+    /// the plan of record at the boot context 200,000 on the RTX 5090 with the 46 GiB cap:
+    /// N 32 in VRAM, P 83 pinned, 173 on NVMe per MoE layer; KV from the latent, not per head
+    #[test]
+    fn the_glm_plan_at_the_boot_context_is_n32_p83_nvme173() {
+        let (s, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!((s.latent_bytes, s.indexer_bytes), (2_252_800_000, 1_130_800_000));
+        assert_eq!((s.kda_state_bytes, s.kda_conv_bytes), (142_606_336, 10_027_008));
+        assert_eq!(s.per_token(&Glm5Geo::GLM_5_3_FLASH), 16_918);
+        // the per-head K/V form the ticket names as the failure mode: 11 x 2 x 64 x 200k x 256 B
+        assert_ne!(s.latent_bytes, 72_089_600_000);
+        assert_eq!(i.staging_bytes, 160 * GLM5_NEXT_EXPERT_BLOCK_BYTES, "32 decode + 128 prefill slots (#176)");
+        assert_eq!(p.vram_ceiling, 32_043_433_984);
+        assert_eq!(p.unit_bytes, 594_542_592);
+        assert_eq!((p.hot, p.pinned, p.nvme), (32, 83, 173));
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + Glm5Geo::GLM_5_3_FLASH.kv_b_decode_bytes() + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        assert!(p.fixed_bytes + p.hot_bytes() <= p.vram_ceiling && p.fixed_bytes + p.hot_bytes() + p.unit_bytes > p.vram_ceiling);
+        assert!(p.pinned_bytes() <= HOST_PINNED_CAP);
+        assert_eq!(p.hot_bytes() + p.pinned_bytes() + p.nvme_bytes(), GLM5_NEXT_EXPERT_BLOCKS * GLM5_NEXT_EXPERT_BLOCK_BYTES);
+    }
+
+    /// #161: the plan books kv_b decoded to BF16 at load (the MLA kernels read BF16; the container
+    /// stores it NVFP4, inside the dense part): 11 x 16,777,216 values, BF16 369,098,752 B minus
+    /// NVFP4 103,809,024 B = 265,289,728 B more VRAM before any expert, named in the printout
+    #[test]
+    fn the_glm_plan_books_kv_b_decoded_to_bf16() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        assert_eq!((g.kv_b_values(), g.kv_b_bf16_bytes(), g.kv_b_nvfp4_bytes(), g.kv_b_decode_bytes()), (16_777_216, 369_098_752, 103_809_024, 265_289_728));
+        let (s, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!(i.decoded_bytes, 265_289_728);
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + 265_289_728 + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        let t = glm5_plan_table(&g, &s, &i, &p, &[]);
+        let want = "  kv_b at BF16                265289728 B     0.25 GiB  11 DSA layers: kv_b decoded at load, BF16 369098752 B - container NVFP4 103809024 B (#161)";
+        assert!(t.contains(want), "{want:?} missing:
+{t}");
+    }
+
+    /// a card that cannot hold the dense part and the states is refused by name; the
+    /// smallest card that holds them plans N 0 and puts every other expert below VRAM
+    #[test]
+    fn a_budget_that_cannot_hold_the_dense_part_is_refused() {
+        let why = plan(8 << 30, HOST_PINNED_CAP, 200_000).unwrap_err();
+        assert!(why.starts_with("refusing config: family Glm5Next needs"), "{why}");
+        assert!(why.contains("the dense part does not fit, no expert tier changes that (#159)"), "{why}");
+        let (_, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        let tight = p.fixed_bytes + i.stability.vram_headroom;
+        let (_, _, q) = plan(tight, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!((q.hot, q.pinned, q.nvme), (0, 83, 205));
+        assert!(plan(tight - 1, HOST_PINNED_CAP, 200_000).is_err());
+    }
+
+    /// the tiers follow their inputs: no pinned budget sends the rest to NVMe, a long context
+    /// takes VRAM from N, the 31.9 GiB cap binds on a larger card
+    #[test]
+    fn the_glm_tiers_follow_the_budget_the_context_and_the_cap() {
+        let (_, _, p) = plan(CARD, 0, 200_000).unwrap();
+        assert_eq!((p.hot, p.pinned, p.nvme), (32, 0, 256));
+        let (s, _, p) = plan(CARD, HOST_PINNED_CAP, 1_048_576).unwrap();
+        assert_eq!(s.latent_bytes, 11 * 1_048_576 * 1_024);
+        assert!(p.hot < 32, "N {}", p.hot);
+        let (_, _, p) = plan(48 << 30, HOST_PINNED_CAP, 200_000).unwrap();
+        assert_eq!(p.vram_ceiling, GLM5_NEXT_VRAM_CAP);
+    }
+
+    /// `planner_pending_for` adds the policy reserve: 0 B for Flash-Next and the 27B (their
+    /// pending unchanged), 2 GiB for glm5_next on the RTX 5090
+    #[test]
+    fn planner_pending_for_adds_only_the_glm_reserve() {
+        for f in Family::ALL {
+            assert_eq!(planner_pending_for(&Stability::of(f), CARD, LAUNCH_SLACK, 7, 11, 13), planner_pending(LAUNCH_SLACK, 7, 11, 13), "{f:?}");
+        }
+        assert_eq!(planner_pending_for(&Stability::of(Family::Glm5Next), CARD, LAUNCH_SLACK, 0, 0, 0), LAUNCH_SLACK + (2 << 30));
+        assert_eq!(LAUNCH_SLACK, 128 << 20);
+    }
+
+    /// the printout names its inputs and the three tiers, and says step 3 is pending
+    #[test]
+    fn the_glm_plan_table_names_its_inputs_and_the_three_tiers() {
+        let (s, i, p) = plan(CARD, HOST_PINNED_CAP, 200_000).unwrap();
+        let t = glm5_plan_table(&Glm5Geo::GLM_5_3_FLASH, &s, &i, &p, &[("dense", "converter dry run".into())]);
+        for want in [
+            "context 200000",
+            "dense part                 5981546744 B     5.57 GiB (converter dry run)",
+            "expert block                 14155776 B",
+            "KV per token                    16918 B  11 DSA layers x (MLA latent 1024 B BF16 + indexer 514 B HF layout)",
+            "plan ceiling              32043433984 B",
+            "VRAM    N =  32",
+            "pinned  P =  83",
+            "NVMe        173",
+            "G1d capacities (plan step 3): not measured yet",
+        ] {
+            assert!(t.contains(want), "{want:?} missing:\n{t}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_rec_size {
+    //! #159 / #176 / #149: the glm5_next plan takes the routed-expert record as a parameter.
+    //! The 14,155,776-B plan of record stays golden in `tests_159_glm_plan` (unchanged); this
+    //! module plans the 3.05-bpw MUL1 figure of 9,474,048 B and the refusals.
+    use super::*;
+
+    const CARD: u64 = 32_607 << 20; // RTX 5090, docs/system-landscape.md:12
+    /// the plan's 3.05-bpw MUL1 record (2313 x 4096)
+    const MUL1_PLAN: u64 = 9_474_048;
+
+    fn plan(rec: u64, pinned: u64) -> Result<(Glm5States, TierInput, TierPlan), String> {
+        plan_glm5_next(&Glm5Geo::GLM_5_3_FLASH, 200_000, CARD, pinned, GLM5_NEXT_DENSE_BYTES, rec, 64, true)
+    }
+
+    /// at 9,474,048 B per record on the RTX 5090, 200,000 tokens, the 46 GiB cap: the unit is
+    /// 42 x 9,474,048 = 397,910,016 B, the staging 160 x 9,474,048 = 1,515,847,680 B, and the
+    /// tiers per MoE layer are N 50 in VRAM, P 124 pinned, 114 on NVMe (4.5 bit: 32 / 83 / 173).
+    /// #161: was N 51 / NVMe 113 before the plan booked kv_b's BF16 decode (265,289,728 B the
+    /// MLA path allocates on top of the container's dense part): one VRAM unit fewer.
+    #[test]
+    fn the_glm_plan_at_the_3bit_record_is_n50_p124_nvme114() {
+        let (s, i, p) = plan(MUL1_PLAN, HOST_PINNED_CAP).unwrap();
+        assert_eq!(i.expert_block_bytes, MUL1_PLAN);
+        assert_eq!(i.staging_bytes, 1_515_847_680, "32 decode + 128 prefill slots of 9,474,048 B (#176)");
+        assert_eq!(p.unit_bytes, 397_910_016);
+        assert_eq!((p.hot, p.pinned, p.nvme), (50, 124, 114));
+        assert_eq!(p.fixed_bytes, GLM5_NEXT_DENSE_BYTES + Glm5Geo::GLM_5_3_FLASH.kv_b_decode_bytes() + s.total() + i.staging_bytes + LAUNCH_SLACK + SAFETY);
+        assert!(p.fixed_bytes + p.hot_bytes() <= p.vram_ceiling && p.fixed_bytes + p.hot_bytes() + p.unit_bytes > p.vram_ceiling);
+        assert!(p.pinned_bytes() <= HOST_PINNED_CAP && p.pinned_bytes() + p.unit_bytes > HOST_PINNED_CAP);
+        let t = glm5_plan_table(&Glm5Geo::GLM_5_3_FLASH, &s, &i, &p, &[]);
+        for want in [
+            format!("  expert block         {:>16} B", MUL1_PLAN),
+            format!("  cold staging         {:>16} B", 1_515_847_680u64),
+            "unit = 397910016 B = 42 layers x one block".to_string(),
+            "VRAM    N =  50".to_string(),
+            "pinned  P = 124".to_string(),
+            "NVMe        114".to_string(),
+        ] {
+            assert!(t.contains(&want), "{want:?} missing:\n{t}");
+        }
+    }
+
+    /// the staging and the unit scale with the record; with the same inputs the 14,155,776-B
+    /// plan is the one of record
+    #[test]
+    fn staging_and_capacities_follow_the_record() {
+        let (_, i45, p45) = plan(GLM5_NEXT_EXPERT_BLOCK_BYTES, HOST_PINNED_CAP).unwrap();
+        let (_, i3, p3) = plan(MUL1_PLAN, HOST_PINNED_CAP).unwrap();
+        assert_eq!((p45.hot, p45.pinned, p45.nvme), (32, 83, 173));
+        assert_eq!(i45.staging_bytes / GLM5_NEXT_EXPERT_BLOCK_BYTES, i3.staging_bytes / MUL1_PLAN);
+        assert_eq!(p3.unit_bytes * GLM5_NEXT_EXPERT_BLOCK_BYTES, p45.unit_bytes * MUL1_PLAN);
+        assert!(p3.hot > p45.hot && p3.pinned > p45.pinned && p3.nvme < p45.nvme);
+    }
+
+    /// a record that is not a whole number of 4096-B sectors, or 0 B, is refused by name
+    #[test]
+    fn the_planner_refuses_a_record_off_the_sector_grid() {
+        let why = plan(MUL1_PLAN - 48, HOST_PINNED_CAP).unwrap_err();
+        assert!(why.starts_with("refusing expert record of 9474000 B: not a multiple of 4096 B"), "{why}");
+        assert!(plan(0, HOST_PINNED_CAP).unwrap_err().contains("0 B"));
+    }
+
+    /// `states --plan` takes the record from exactly one source; no default
+    #[test]
+    fn the_plan_record_has_one_source_and_no_default() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let why = glm5_plan_record(&g, None, None, None).unwrap_err();
+        assert!(why.contains("--cnq <container>") && why.contains("--expert-bytes N") && why.contains("there is no default"), "{why}");
+        assert!(glm5_plan_record(&g, Some("x.cnq"), Some("9474048"), None).unwrap_err().contains("not both"));
+        assert!(glm5_plan_record(&g, Some("x.cnq"), None, Some("mul1")).unwrap_err().contains("--expert-codec goes with --expert-bytes"));
+        let r = glm5_plan_record(&g, None, Some("9474048"), Some("mul1")).unwrap();
+        assert_eq!((r.codec, r.bytes), (Some(ExpertCodec::Mul1), MUL1_PLAN));
+        assert!(r.source.contains("codec mul1"), "{}", r.source);
+        let r = glm5_plan_record(&g, None, Some("9474048"), None).unwrap();
+        assert_eq!((r.codec, r.bytes), (None, MUL1_PLAN));
+        assert!(glm5_plan_record(&g, None, Some("9474000"), Some("mul1")).unwrap_err().contains("not a multiple of 4096 B"));
+        assert!(glm5_plan_record(&g, None, Some("9.4e6"), None).unwrap_err().contains("not a whole number of bytes"));
+        assert!(glm5_plan_record(&g, None, Some("9474048"), Some("q3k")).unwrap_err().starts_with("refusing expert codec \"q3k\""));
+        // nvfp4 is the config's own record or nothing
+        assert_eq!(glm5_plan_record(&g, None, Some("14155776"), Some("nvfp4")).unwrap().bytes, GLM5_NEXT_EXPERT_BLOCK_BYTES);
+        assert!(glm5_plan_record(&g, None, Some("9474048"), Some("nvfp4")).unwrap_err().contains("the config derives 14155776 B at nvfp4"));
+        // a container that is not there is a named error, not a fallback
+        assert!(glm5_plan_record(&g, Some("no-such-container.cnq"), None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_186_chunk_plan {
+    //! #186: the glm5_next plan with a prompt chunk (`CROW_CHUNK`): chunk 1 is the plan of
+    //! record byte for byte; a chunk books its prompt-phase bytes before any expert and the
+    //! prefill landing off the pinned budget; a chunk that does not fit is refused by name.
+    use super::*;
+
+    const CARD: u64 = 32_607 << 20; // RTX 5090, docs/system-landscape.md:12
+    const MUL1_PLAN: u64 = 9_474_048;
+
+    fn plan(chunk: usize) -> Result<(Glm5States, TierInput, TierPlan), String> {
+        plan_glm5_next_chunk(&Glm5Geo::GLM_5_3_FLASH, 200_000, CARD, HOST_PINNED_CAP, GLM5_NEXT_DENSE_BYTES, MUL1_PLAN, 64, true, chunk)
+    }
+
+    #[test]
+    fn chunk_one_is_the_plan_of_record_and_a_chunk_books_its_bytes() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (s0, i0, p0) = plan_glm5_next(&g, 200_000, CARD, HOST_PINNED_CAP, GLM5_NEXT_DENSE_BYTES, MUL1_PLAN, 64, true).unwrap();
+        let (s1, i1, p1) = plan(1).unwrap();
+        assert_eq!((s0.total(), p0), (s1.total(), p1));
+        assert_eq!((i1.chunk, i1.chunk_scratch_bytes, i1.host_pinned_budget), (1, 0, i0.host_pinned_budget));
+        assert_eq!(glm5_chunk_scratch_bytes(&g, 1, 200_000), 0);
+        let mut last = 0;
+        // the prompt phase books one expert-major MoE plan of `chunk` rows (about 0.3 MB per row),
+        // so chunk 8192 (glm53-flash-offload's chunk_size) plans on the card
+        for chunk in [2, 16, 32, 128, 1024, 2048, 4096, 8192] {
+            let (_, i, p) = plan(chunk).unwrap();
+            let b = glm5_chunk_scratch_bytes(&g, chunk, 200_000);
+            assert!(b > last, "chunk {chunk}: {b} B, not above {last}");
+            last = b;
+            assert_eq!((i.chunk, i.chunk_scratch_bytes), (chunk, b));
+            assert_eq!(i.host_pinned_budget, HOST_PINNED_CAP - GLM5_PREFILL_RING as u64 * MUL1_PLAN, "the pinned prefill landing ring comes off the pinned budget");
+            assert_eq!(p.fixed_bytes, p0.fixed_bytes + b, "the chunk's bytes are booked before any expert");
+            assert!(p.hot <= p0.hot && p.hot + p.pinned + p.nvme == g.experts);
+            let t = glm5_plan_table(&g, &s0, &i, &p, &[]);
+            assert!(t.contains(&format!("{chunk} rows per prompt call (CROW_CHUNK, #186)")), "{t}");
+            eprintln!("glm5 plan #186 chunk {chunk}: prompt-phase bytes {b} ({:.2} GiB), N {} P {} NVMe {} (chunk 1: {} / {} / {})", b as f64 / GIB, p.hot, p.pinned, p.nvme, p0.hot, p0.pinned, p0.nvme);
+        }
+        // #196: 65,536 rows fit since the scratch is about 0.37 MB per row; twice that does not
+        let e = plan(131_072).unwrap_err();
+        assert!(e.contains("prompt chunk 131072 (CROW_CHUNK, #186)"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod tests_196_scratch {
+    //! #196: the prompt-pass scratch the plan books at 8192 rows per call over a cache of
+    //! 200,000 rows (`CROW_CHUNK=8192`, the template's chunk) is at most 3.5 GiB: the KDA and MLA
+    //! scratch share one region at their sub-block rows, the indexer scores are one block of 256
+    //! rows, gate / up live per piece and the dense FFN shares the MoE plan's region. Printed per
+    //! row by buffer.
+    use super::*;
+
+    #[test]
+    fn glm5_prompt_scratch_at_8192_rows_is_at_most_3_5_gib() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (chunk, cap) = (8192usize, 200_000usize);
+        let parts = glm5_chunk_scratch_parts(&g, chunk, cap, false);
+        let total: u64 = parts.iter().map(|p| p.1).sum();
+        assert_eq!(total, glm5_chunk_scratch_bytes_tc(&g, chunk, cap, false));
+        for (name, b) in &parts {
+            eprintln!("#196 chunk {chunk} cap {cap}: {name:<10} {b:>13} B  {:>9.1} B/row", *b as f64 / chunk as f64);
+        }
+        eprintln!("#196 chunk {chunk} cap {cap}: total      {total:>13} B  {:>9.1} B/row  {:.3} GiB", total as f64 / chunk as f64, total as f64 / GIB);
+        assert!(total <= 7 << 29, "the prompt scratch at {chunk} rows books {total} B ({:.2} GiB), above 3.5 GiB", total as f64 / GIB);
+        // the attention region is the larger of the two scratch kinds, not their sum
+        let attn = parts.iter().find(|p| p.0 == "attention").unwrap().1;
+        let (kd, md) = (crate::glm5_kda::KdaDims::of(&g), crate::glm5_mla::MlaDims::of(&g));
+        let (k, m) = crate::glm5_model::attn_rows(chunk);
+        let (kb, mb) = (crate::glm5_kda::KdaScratch::region_bytes(&kd, k) as u64, crate::glm5_mla::MlaScratch::region_bytes(&md, m, cap) as u64);
+        let one = crate::glm5_model::attn_region_bytes(&g, crate::glm5_model::attn_rows(1), cap) as u64;
+        assert_eq!(attn + one, kb.max(mb));
+        // the indexer scores do not grow with the call: a 262,144-row cache adds one 256-row block
+        let big = glm5_chunk_scratch_bytes_tc(&g, chunk, 262_144, false);
+        assert!(big <= 7 << 29, "cap 262144: {big} B");
     }
 }

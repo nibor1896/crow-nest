@@ -135,3 +135,7 @@ path = "src/bin/rope_table_probe.rs"
 [[bin]]
 name = "gdn_chunk_probe"
 path = "src/bin/gdn_chunk_probe.rs"
+
+[[bin]]
+name = "glm5_run"
+path = "src/bin/glm5_run.rs"

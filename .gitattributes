@@ -8,3 +8,8 @@ engine/tests/fixtures/** -text
 # The engine package's licence texts (tools/engine_notices.py): THIRD-PARTY-NOTICES.txt is
 # compared to a fresh build byte for byte, so a Windows checkout must not turn it into CRLF
 THIRD-PARTY-NOTICES.txt -text
+# The GLM-5.3-Flash sidecar's sha256 (0f26db69...) is cited by #148, #157 and the measurement book:
+# a Windows checkout with core.autocrlf=true must not turn it into CRLF (2026-10-08)
+converter/GLM-5.3-Flash-CNQ4.5.cnq.sidecar.jsonl -text
+# #181: the exllamav3 MUL1 fixtures (raw little-endian records, digest tables) are read byte for byte
+converter/tests/fixtures/exl3-mul1-* -text

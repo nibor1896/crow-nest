@@ -56,6 +56,9 @@ is a pass/fail gate.
 - **Mean inter-token latency** is implied by the decode goal: 42 tok/s ⇔ ~23.8 ms.
 - "Minimal latency" as a design constraint is already decided and needs no number: no
   host in the hot loop, no kernel launch for synchronization (job ring, stream memops).
+  *Status (#167, 2026-10-08): the job ring and the stream memops are not built in the engine; only
+  `probes/src/bin/p9_job_ring.rs` (#7) exists. The decode path uses zero-copy/`CROW_STAGE` staging and the
+  residency counters are drained by the host between tokens (`residency.rs`).*
 
 ### 0.5 Measurement discipline (binding)
 
@@ -169,9 +172,9 @@ and which indexes the engine accepts.
 |---|---|
 | `format` | `crow-nest-quant`, as in v1 |
 | `format_version` | `2`. Replaces v1's `version: 1`; its presence is what makes an index v2 |
-| `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next` or `cnq4.5-qwen35-dense` |
+| `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next`, `cnq4.5-qwen35-dense` or (converter only, #155) `cnq4.5-glm5-next` |
 | `scales` | the sub-block scale policy, `ceil` or `mse` |
-| `model.family` | the engine's family name (`meta::Family`): `FlashNext` or `Qwen35Dense` |
+| `model.family` | the engine's family name (`meta::Family`): `FlashNext`, `Qwen35Dense` or `Glm5Next` (#159: the gate parses it, the boot refuses it at its first unbuilt arm) |
 | `model.model_type` | `text_config.model_type` of the config |
 | `model.config_json`, `model.generation_config_json` | the checkpoint's two files **verbatim**, as JSON strings: a string survives the round trip byte for byte, a re-serialized object would not (key order, number format, whitespace) |
 | `model.config_json_sha256`, `model.generation_config_json_sha256` | the sha256 of those bytes; the engine refuses a v2 whose stored config no longer hashes to it |
@@ -239,6 +242,27 @@ block to the metadata gate before the container is mapped (8.4, 8.11 "C7").
   the text layer count) before it writes anything.
 - `layer-rule-overlay` (#91) takes its arm kinds per family: on a dense base the `ffn_down`
   arms are `mlp.down_proj`; the base's family comes off its index (v1 = Flash-Next).
+
+**GLM-5.3-Flash (`glm5_next_text`), row `cnq4.5-glm5-next`** (#154/#155, 2026-10-08, converter
+only: the engine refuses this `model_type` by name). Its tensors (mHC, KDA, MLA, DSA indexer)
+have no counterpart in the table above, so the row stands on its own; the source is FP8 E4M3
+with 128×128 `weight_scale_inv`, dequantized to f32 before NVFP4 (`converter/src/fp8.rs`). Rule
+names are those of `recipe.rs` `decide_glm5_next`; the per-block tensors, shapes, FP8/BF16
+split and op order are in [glm5-next-recipe.md](glm5-next-recipe.md), the converter side in
+`converter/README.md`.
+
+| tensor | `cnq4.5-glm5-next` |
+|---|---|
+| token embedding | BF16, host RAM |
+| `lm_head`, final norm | BF16 |
+| routed experts, shared expert, dense MLP (layers 0-2) | NVFP4 (FP8 source) |
+| MLA `q_a/q_b/kv_a_proj_with_mqa`, `o_proj` | NVFP4 (FP8 source) |
+| MLA `kv_b_proj` | NVFP4 (BF16 source) |
+| KDA `q/k/v/o_proj`, `q/k/v_conv1d` | NVFP4 (BF16 source) |
+| KDA gates `f_a/f_b/g_a/g_b/b_proj`, router `mlp.gate`, DSA indexer, norms, mHC `hc_*_fn`, every 1-D tensor, anything not a whole 64-value block | BF16 |
+| `e_score_correction_bias`, KDA `A_log` / `dt_bias`, mHC `hc_*_base` / `hc_*_scale` | f32, as stored |
+| vision tower (`model.visual.*`), MTP block (layer 45) | omitted by name in v1 |
+| anything else | refused by name (a whitelist) |
 
 **`converter plan <model-dir>`**: the dry run. It reads `model.safetensors.index.json`, the
 shard headers and the two config files, never a payload, and prints the family, the recipe,
@@ -346,6 +370,50 @@ units, about 12 hot experts per layer), and the post-plan check below requires
   job at all** — the handoff count responds to this, measured per token (#7 acceptance).
 
 ### 2.3 Cold path (variant A; stager built for C from day 1)
+
+> **Status: not built in the engine. Only `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path
+> uses zero-copy/`CROW_STAGE` staging and the residency counters are drained by the host between
+> tokens (`residency.rs`). The text below is the approved design (2026-09-02), kept as design.**
+>
+> **Built since (#149, plan step 17b, 2026-10-08): the stager's source interface and its NVMe backend,
+> opt-in and wired nowhere.** `engine/src/nvme_source.rs` holds the `ColdSource` trait (`fetch` at most 8
+> expert records of one layer into caller-provided destinations, `wait`) and `NvmeSource`. One container
+> handle per reader thread (1.01× shared vs 2.22× per thread, llama.cpp fork `66f40bc`); on Windows
+> `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED` with one I/O completion port per reader, every read of a
+> fetch issued before the first completion is drained; on Linux `O_DIRECT` + `pread`. Offsets, lengths and
+> destinations must be multiples of 4096 B and are refused by name otherwise (no rounding out: an expert
+> slab at the format's default 12 mod 4096 is refused). `residency::sanitize_sf_slab` runs on both slabs of
+> an NVFP4 record in the destination before `wait` returns.
+>
+> **The glm5_next record is the container's (#159/#176/#149, 2026-10-08).** A glm5_next container stores
+> each routed expert of each layer as one unit (gate, up, down back to back on a 4096-B offset).
+> `nvme_source::glm5_record_of_container` reads only the index trailer: the codec is the expert tensors'
+> `dtype` (`nvfp4` or `mul1`; a mix or another dtype is refused by name), the record is the units' extent
+> in the index offsets (for NVFP4 also checked against the format's byte rule), every record the same size
+> and a whole number of 4096-B sectors, else refused by name. `ExpertRecord::locate_glm5` reads such a
+> record as one span; a MUL1 record is delivered as stored (no ue4m3 scales, no sanitize). Unit tests
+> read a 9,474,048-B MUL1 record and a 14,155,776-B NVFP4 record from synthetic containers, byte-identical
+> to `Cnq::read_range` (+ sanitize for NVFP4). Reader count (default 1, PREREG amendment 5) and per-reader CPU
+> affinity are `NvmeConfig` fields. Boot refuses `CROW_COLD_TIER` together with `CROW_NVME_TIER`. The RAM
+> tier is not behind the trait yet, no decode path calls the backend, and IoRing is not built. The
+> in-graph hand-off it needs is probe `p9_job_ring` stage C (`cuStreamWaitValue64_v2` captured as a
+> batch mem-op node): measured green on WDDM 2026-10-09, see 3.2.
+>
+> **Wired into the glm5_next path (#175 + #149, plan steps 16–17, 2026-10-09), not into the stager.**
+> `engine/src/glm5_tiers.rs` (bin `glm5_run`) runs all 45 glm5_next layers token by token (#186:
+> the prompt optionally in prompt calls, `CROW_CHUNK`, default off) with the
+> routed experts in three tiers: a per-layer VRAM arena and a per-layer pinned arena sized by the #159
+> plan (RTX 5090, 200,000 tokens, 3-bit record: 50 + 124 per MoE layer, 114 on NVMe), placed by
+> `ExpertCache` (LRU, G1d's choice), misses read by `NvmeSource` (1 reader) into a 4096-aligned landing
+> buffer or straight into a freed pinned slot. The hand-off is host-synchronous: after each MoE layer's
+> router the host reads the 8 ids, moves the records (staging, pinned entrants, VRAM entrants, in that
+> order) and writes the layer's `[288]` record table; the MUL1 kernels read VRAM records or pinned
+> records zero-copy. No job ring; `cuStreamWaitValue64` only with `CROW_GLM_STAGER=1` (#149 path B,
+> default off, see 3.2); with `CROW_GLM_GRAPH=1` (#190, default off)
+> the launches between two routers replay as one CUDA graph (`docs/glm5-model.md` 6.3). Flash-Next and the 27B do not reach
+> it (gate R). The A9 requirement for this path is that the cache size never changes the output:
+> `glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (ids and logits bit-identical at the plan's
+> sizes, 1 + 7 and 0 + 0), built, not run on the real container yet. `docs/glm5-model.md` section 6.
 
 - GPU publishes cold jobs (expert IDs per layer) into the pinned job ring via
   `cuStreamWriteValue32`; the stager gathers weights (RAM tier) into pinned staging
@@ -463,6 +531,43 @@ experts via the job ring → `shared_expert_gate` combine.
 
 ### 3.2 Job ring (the handoff)
 
+> **Status: not built in the engine. Only `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path
+> uses zero-copy/`CROW_STAGE` staging and the residency counters are drained by the host between
+> tokens (`residency.rs`). The text below is the approved design (2026-09-02), kept as design.**
+>
+> **Measured 2026-10-09 (#149 step 17a, `p9_job_ring` stage C at `cdf59da`, RTX 5090, driver 616.56,
+> WDDM, driver API 13040): a 64-bit wait replays from a CUDA graph.** `cuStreamWaitValue64_v2` (EQ 1)
+> captured by stream capture becomes a `BATCH_MEM_OP` node (graph nodes `[12, 0]`), and
+> `cuGraphAddBatchMemOpNode` → kernel node builds the same graph. Both instantiate and hold the stream
+> until the flag is raised; 1000 / 1000 replays per build ran after their flag and saw it at 1, for a
+> flag in device memory and one in mapped pinned host memory. A consumer without the wait fails both
+> checks (50 / 50 ran before the flag). Wait-to-start p50 (writer's flag store → consumer start marker
+> seen by the host, two runs): host-mapped flag 6.8–7.6 µs in all three forms; device flag raised
+> by an 8-B H2D 30–46 µs (uncaptured 31.6 / 32.7, captured 30.4 / 42.6, explicit 32.1 / 45.6). p99
+> 134–246 µs in every form. Attributes: `CAN_USE_64_BIT_STREAM_MEM_OPS` (v2) = 1,
+> `CAN_USE_STREAM_WAIT_VALUE_NOR` (v2) = 1, all V1 memop attributes 0. So the decode graph can stay on
+> with the ring (path B of #149); the stager should raise a flag in mapped host memory, not by H2D.
+> Not measured: many waits in one graph (a whole decode step), the stager's NVMe reads behind the flag,
+> and a flag that is never raised (the probe's 200 ms guard is not exercised).
+>
+> **Built 2026-10-09 for glm5_next only, the routing half (#149 path B, `CROW_GLM_FLAGS=1`, default
+> off, `engine/src/glm5_flags.rs`):** after the router a one-block kernel writes the selected ids into
+> mapped pinned host memory and raises a 64-bit sequence flag there (`__threadfence_system`, no memop);
+> the host spins on it instead of a stream sync + blocking copy.
+>
+> **The landed half, built 2026-10-09 (`CROW_GLM_STAGER=1`, default off, needs `CROW_GLM_FLAGS=1`,
+> `glm5_tiers::Stager`):** `serve`'s copies and the record table's upload go on a non-blocking stager
+> stream from persistent pinned sources (a pinned landing, one pinned table row per MoE layer). The
+> NVMe reader threads raise a per-expert landed flag (u64 in mapped pinned memory, the call's
+> sequence) after the bytes and their sanitize (`NvmeSource::fetch_landed`); the stager stream waits
+> on it with `cuStreamWaitValue64_v2` (GEQ); the compute stream waits for the stager's batch through
+> an event, not a memop, because the driver API asks for CUDA-visible dependencies between CUDA tasks
+> a memop orders. The host's one wait per MoE layer is the router flag; inside the call only a gate
+> (a stager-stream sync before an NVMe read into a pinned slot phase A still copies from). Synthetic
+> 8-layer model (5 MoE layers, V 3 + P 4): `cuStreamSynchronize` per decode row 24.75 → 5.50, with
+> `CROW_GLM_GRAPH=1` 22.75 → 3.50, ids and logits bit-identical. The waits are eager between the
+> graph segments, not captured. Not run on the real container. `docs/glm5-model.md` 6.2.
+
 - Pinned host-memory ring, job descriptors 64-byte aligned (exl3 `moe_handoff.h`
   pattern): layer id, job kind, cold expert ids (≤ 10), sequence number, flag slots.
 - The **descriptor is written by device-side mapped writes** from a small GPU kernel
@@ -500,6 +605,10 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   NVMe-tier staging (variant C), refresh, telemetry — off the decode critical path.
   Variant B (CPU compute) stays reserved; variant A (stream-weights) is retired from
   the primary path (kept behind the ring interface for tier transitions).
+  **Status (#167, 2026-10-08): the job ring and the stager are not built in the engine.** Only
+  `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path uses zero-copy/`CROW_STAGE` staging and the
+  residency counters are drained by the host between tokens (`residency.rs`). The bullet above is the
+  approved design for the control plane, not a description of the engine.
 - Policy is still per layer, chosen at load, fixed per session.
 - **Decode staging as built (`CROW_STAGE`, default on)**: after `router_top10` the
   staging kernel pulls every COLD combo of the layer into a VRAM staging slot and
@@ -2563,8 +2672,8 @@ Therefore:
 | `stop`, `logit_bias` | #86: OpenAI stop strings (generation ends BEFORE the sequence, `finish_reason` `stop`) and a token-id -> additive bias on the raw logits, applied first, outside the sampler chain | as above | not sent by Crow |
 | `crow_force_ids` | #91 (`d7f484a`, 2026-09-22), a crow-nest extension: an array of token ids that REPLACE the generated ids one per step from the first generated position on (teacher forcing through the #81 injection door); with `logprobs: true` each entry prices the forced id under the raw distribution and carries `crow_id`; `[]` forces nothing but adds `crow_id`; a 400 together with `reasoning_budget_tokens` or with an id >= V; after the list runs out generation continues as requested | `parse_chat` | `tools/teacher-forced-91.sh`, `tools/multisite-corruption-probe.py` (not Crow) |
 | `tools` | rendered as the template variable `tools` | `serve.rs:970`, `tokenizer::render_chat` | `crow_core.py:4672-4700`, `TOOLS` (25 builtin at `crow_core.py:579-838`, frozen at `:846`, plus the `mcp.json` tools added at import, `:841`) |
-| `chat_template_kwargs.enable_thinking` | template variable, default false; an EXPLICIT `false` beats a named level (7.11.20) | `serve.rs` (`parse_chat`) | `crow_core.py:2970` (digest path) |
-| `reasoning_effort` | **read since #74 (2026-09-18)**, top level and in `chat_template_kwargs`, top level first. `none` and an absent field render the prompt of record; `low` and `medium` pass through; `high` and `xhigh` both render `xhigh`; anything else is a 400 naming the five words (7.11.20) | `serve.rs` (`map_reasoning_effort`, `parse_chat`) | `crow_core.py:5017` (`stream_reply`, top level, since Crow #176) |
+| `chat_template_kwargs.enable_thinking` | template variable, default false; an EXPLICIT `false` beats a named level (7.11.20); #185 GLM-5.3-Flash: thinking is always on, `false` is a 400 by name (its template cannot render off), `true` is accepted | `serve.rs` (`parse_chat`) | `crow_core.py:2970` (digest path) |
+| `reasoning_effort` | **read since #74 (2026-09-18)**, top level and in `chat_template_kwargs`, top level first. `none` and an absent field render the prompt of record; `low` and `medium` pass through; `high` and `xhigh` both render `xhigh`; anything else is a 400 naming the five words (7.11.20); #185 GLM-5.3-Flash (`glm5_template::reasoning_level`): absent and `max` render max, `low` low, `high` and `xhigh` high; `none`, `medium` and every other word are 400s by name | `serve.rs` (`map_reasoning_effort`, `parse_chat_as`, `glm_thinking`) | `crow_core.py:5017` (`stream_reply`, top level, since Crow #176) |
 | `chat_template_kwargs.reasoning_effort` | the second door of the same field, read when the top-level one is absent | `serve.rs` (`parse_chat`) | not sent by Crow — it sends the top-level field |
 | `messages[].role = "tool"` | `content` rendered as `<tool_response>...</tool_response>` | `serve.rs:1481` (`normalize_messages`) | `crow_core.py` tool turns |
 | `messages[].tool_calls[].function.arguments` | a JSON STRING from Crow is parsed into the MAPPING the template needs; **nothing that is not a mapping reaches the template** (7.11.14) | `serve.rs:1481` (`normalize_messages`) | `crow_core.py:5068`, stored `:3756-3761`, re-sent `:3783-3785` |
@@ -2767,7 +2876,7 @@ C:/x/y.md
 | item | as built | evidence |
 |---|---|---|
 | tokenizer | in-engine (`crow_nest_engine::tokenizer`), no Python process is started | A3 #25 |
-| template | minijinja, the model's own `tokenizer_config.json` chat template | A3 #25 |
+| template | minijinja, the model's own chat template: `chat_template.jinja` beside `tokenizer_config.json` when that file exists, else the config's `chat_template` field (#160, 2026-10-08, as transformers 5.16.1; the Qwen directories carry both, byte-equal) | A3 #25, `tokenizer.rs` (`sibling_template`), [glm5-tokenizer.md](glm5-tokenizer.md) |
 | template variables | `messages`, `tools`, `documents`, `add_generation_prompt`, `enable_thinking`, and since #74 `reasoning_effort` — all of them variables, never string surgery | `tokenizer.rs` (`render_chat_effort`) |
 | gate | ids identical to the Python oracle on **10 of 10** prompts, plus a 6 of 6 docs file | `decode_out/srv-a3-tok.log`, `srv-a3-rust-ids.json`, `srv-a3-oracle-ids.json` |
 | tools render | byte-identical to the oracle at **322 ids**, but ONLY with `preserve_order` on serde_json AND on minijinja | A3 #25 |
@@ -4008,6 +4117,40 @@ and move no module edge, so the graph and the layering below are the ones of rec
 Nothing in this section is a proposal. Where a number appears it carries its date, its machine
 and its artefact, like every other number in this document.
 
+### 8.0 The tree at v0.11.0 (line counts, 2026-10-10)
+
+Counted with `wc -l` at `d3e0d87` (v0.11.0). `engine/src` grew from 53 files and 56,666 lines at
+v0.10.1 to 79 files and 115,461 lines; almost all of it is the GLM-5.3-Flash family (glm5_next,
+#145-#209). The Qwen modules of 8.1 changed where the family dispatch reaches them: `kernels.rs`
+6,189 -> 7,718 (the GLM kernel tables, `mul1`), `bin/serve.rs` 9,631 -> 11,836 (#185 family
+dispatch, batched slots), `manager.rs` 1,592 -> 2,317 (GLM prompt-call scratch), `meta.rs`
+1,956 -> 2,597 (the glm5_next ledger, #159), `boot.rs` 474 -> 698 (`open_glm5`); `gen.rs` 7,099 -> 7,107.
+
+| module (glm5_next and its tiers) | lines | role |
+|---|---|---|
+| `glm5_tiers.rs` | 15,173 | `glm5_run`'s driver: expert tiers, per-layer cache and global arena, stager, prompt calls, NVPF, CPU lane plan |
+| `glm5_moe.rs` | 4,343 | router, MUL1 experts (GPU, CPU lane, tensor-core paths), RT2, combine |
+| `glm5_flags.rs` | 4,125 | mapped flags, controller ring, prefetch / guesses, lanes |
+| `cpu_mul1.rs` | 3,906 | AVX2 MUL1 expert FFN and the persistent pool (#180, #183) |
+| `glm5_model.rs` | 3,077 | one layer in HF order, `Glm5Pass` |
+| `nvme_source.rs` | 3,066 | NVMe expert reads: IOCP, IoRing, piece pool (#149, #209) |
+| `glm5_engine.rs` | 1,846 | `serve`'s `Glm5Engine` (#185) |
+| `glm5_mtp.rs` | 1,755 | MTP block (#182, #192) |
+| `glm5_mla.rs` | 1,713 | MLA latent cache, DSA indexer, `gm_attn2` (#163, #186) |
+| `glm5_int_tests.rs` | 1,312 | integration tests of the switch sets |
+| `glm5_kda.rs` | 1,205 | KDA sub-block (#162) |
+| `glm5_mhc.rs` | 1,141 | mHC residual and its fusions (#161) |
+| `expert_cache.rs` | 876 | dynamic expert-cache policies (#175) |
+| `cpu_nvfp4.rs` | 778 | CPU NVFP4 expert FFN (#173) |
+| `glm5_graph.rs` | 631 | decode rows as CUDA graphs (#190) |
+| `glm5_head.rs`, `glm5_embed.rs`, `glm5_template.rs` | 474, 456, 316 | head, embedding gather, GLM chat template |
+| `kernels_mul1.cu`, `kernels_glm5_*.cu` (6) | 1,373, 2,102 | CUDA sources compiled into the shared `KERNEL_SRC` build |
+| `bin/glm5_run.rs` | 1,245 | the GLM measurement bin (#187) |
+
+The graph of 8.1 is not regenerated for these modules: `crate::` paths (code and doc comments,
+by `grep`) run both ways between `glm5_tiers`, `glm5_flags`, `glm5_model` and `glm5_moe`, so the
+"acyclic" statement below holds for the Qwen modules only.
+
 ### 8.1 The module graph
 
 ```mermaid
@@ -4706,6 +4849,7 @@ refuses the parse by name.
 |---|---|---|---|---|---|---|---|---|
 | `FlashNext` | `qwen4_exp_text` | `Hc` (4 streams, low rank 320) | `Moe` (512 experts, top 10, 640, shared 640) | `Qsa` (4 heads, 1 kv, 128, ratio 4, 512 blocks) | layer 1 | sigmoid | `HcMixer` | runs; `Geo` must equal `Geo::FLASH_NEXT` |
 | `Qwen35Dense` | `qwen3_5_text` | `Plain` | `Dense` (17408) | `Full` (uncapped) | none | swish (= silu) | `Rms` | runs since phase 2 (8.12); until then it was refused at its first unbuilt block (C5) |
+| `Glm5Next` (#159) | `glm5_next_text` | mHC (4 streams, Sinkhorn 20) | 3 dense (12288), then `Moe` (288 experts, top 8, 2048, 1 shared) | MLA without RoPE (64 heads, latent 512) + DSA indexer (32 x 128, k-pool 4, top 2048) | none | - | stream mean + RMSNorm | gate and planner only: `Glm5Geo`, not a `Geo`; the boot refuses at the mHC residual (step 13a) |
 
 **Expected values per family** (`meta::Expected`). The Flash-Next row is today's pins, read out of
 `geo` and `sample`, and gives the same 21 checks as before (the 20 of #94 phase 1 plus #96's
@@ -4722,6 +4866,32 @@ family, or an unknown `rope_parameters` key refuses the parse and names every su
 flat config (no `text_config`) may also carry the multimodal wrapper keys. Formula facts with one
 implemented value refuse any other value by name: `hidden_act` silu, `mamba_ssm_dtype` float32,
 `output_gate_type` sigmoid/swish/silu. The top-level and text `tie_word_embeddings` must agree.
+
+**glm5_next (#159).** Its config shares almost no key with the Qwen families (no RoPE keys, no GDN
+keys, KDA in `linear_attn_config`), so `ModelMeta::from_glm5_next` parses it through its own ledger
+(`GLM5_NEXT_*_KEYS`): every key is required with its type and one error names every missing key,
+the Qwen `COMMON_KEYS` count as unknown, unknown `linear_attn_config` keys refuse by name, four keys
+are ignored with their reason (MTP sharing, indexer RoPE interleave, two router-loss terms). One-form
+facts refuse any other value by name: sigmoid `noaux_tc` router in float32, `n_group` = `topk_group`
+= 1, `norm_topk_prob`, `mhc`, `mla_use_nope`, `qk_rope_head_dim` 0, k-pool compress and tail,
+`index_topk` a multiple of `index_kpool`, every `indexer_types` entry `full`, `layer_types` equal to
+`linear_attn_config`'s two lists, the dense MLP layers exactly the first `first_k_dense_replace`.
+The result is a `geo::Glm5Geo` (37 fields), checked row by row against `Glm5Geo::GLM_5_3_FLASH`
+(zai-org/GLM-5.3-Flash @ eb9eb208) plus the stop ids in the vocab: 38 checks. `verdict` then refuses
+the boot with `meta::glm5_not_built`, before the container is mapped, naming what the boot lacks
+(#175, #149 / step 14, step 20). `Glm5Geo` is not a `Geo`: the family's layers run in
+`glm5_model` (#161, `decode glmgolden`, [glm5-model.md](glm5-model.md)), never in `gen.rs`. `states --plan` prints the family's three-tier plan from it
+(`manager::plan_glm5_next`: VRAM holds the dense part, the latent and indexer caches at the boot
+context, the KDA state, the 32 + 128 staging slots of `Stability::GLM5_NEXT` and the reserves, then N
+experts per MoE layer under the 2 GiB headroom; pinned RAM P under `HOST_PINNED_CAP`; NVMe the rest).
+The routed-expert record is a parameter (`geo::ExpertRecordSpec`: codec + bytes, refused by name unless a
+whole number of 4096-B sectors): `states --plan --cnq <container>` takes it from the container index,
+`states --plan --expert-bytes N [--expert-codec nvfp4|mul1]` plans without a container; one of the two is
+required, there is no default. The staging slots and the unit (42 x record) scale with it.
+The plan also books `kv_b` decoded to BF16 at load (#161: 265,289,728 B over its NVFP4 bytes).
+On the RTX 5090 at 200,000 tokens: N 32, P 83, NVMe 173 of 288 at the 14,155,776-B NVFP4 record; N 50,
+P 124, NVMe 114 at the plan's 9,474,048-B 3.05-bpw MUL1 record (unit 397,910,016 B, staging
+1,515,847,680 B; N 51 / NVMe 113 before the kv_b booking). Planner numbers, not measured.
 
 **`geo::Geo`**, 35 fields, derived by `ModelMeta::geo`:
 
@@ -5219,8 +5389,10 @@ both were already in the tree.
 
 `log.rs` is an L0 leaf with no in-crate dependency, and the one module every other module reaches
 (8.1). The 23 targets are listed in the module doc of `engine/src/log.rs`; the spec's names map to
-them as `scheduler`/`stager` → `residency` + `adapt`, `ring`/`kv` → `prefill` + `decode`,
-`loader` → `load` + `budget`, and `converter` is a separate crate with no engine log site.
+them as `scheduler` → the `residency` module (targets `residency` + `adapt`; `adapt` is a target only, there is no `adapt` module),
+`kv` → `prefill` + `decode`, `loader` → `load` + `budget`;
+`converter` is a separate crate with no engine log site, and `ring` and `stager` have no code in this tree
+(#167: the job ring exists only as the probe `probes/src/bin/p9_job_ring.rs`).
 
 **Levels.** Everything that printed unconditionally before prints unconditionally now, so the
 default `info` is the behaviour of record. Failure lines became `warn!` / `error!` — the bind

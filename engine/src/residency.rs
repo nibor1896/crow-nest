@@ -10,7 +10,7 @@
 //!   at all; the counters respond to exactly that (§3.3/§3.6 reporting).
 //! - No host in the decode hot loop: pointers/ids/weights never leave the GPU;
 //!   per-layer u64 counters [selections, cold] are drained by the control
-//!   plane BETWEEN tokens (the job ring's control-plane role, spec 3.4).
+//!   plane BETWEEN tokens (the control-plane role spec 3.4 gives the job ring, which is not built).
 //!
 //! The expert FFN math itself lives in gen.rs (gate_up → silu·up → down), the
 //! p5-verified chain over per-combo device pointer tables.
@@ -18,6 +18,7 @@
 use crate::cuda::{self, Pinned};
 use crate::geo::{Geo, GIB, MIB};
 use crate::cnq::Cnq;
+use crate::expert_cache::{self, ExpertCache, Policy, Scope};
 use cudarc::driver::sys::CUdeviceptr;
 use std::collections::HashMap;
 
@@ -68,6 +69,9 @@ pub struct Residency {
     pub bounce_dn: CUdeviceptr,
     /// every expert has a pinned record (low-bit full tier)
     pub full: bool,
+    /// #175: the dynamic expert cache policy; `None` (every family but `Glm5Next` unless
+    /// `CROW_EXPERT_CACHE` opts in) keeps `plan_swaps` on its frequency ranking
+    pub cache: Option<ExpertCache>,
 }
 
 pub struct LowBit {
@@ -166,6 +170,13 @@ impl Residency {
             let s = expert_slab_info(cnq, l, section, experts);
             assert_eq!((s.gu_bytes, s.dn_bytes), (slabs.gu_bytes, slabs.dn_bytes));
         }
+        // #175: the cache policy is decided before anything is pinned, so a refusal is cheap
+        let cache_policy = expert_cache::policy_for(
+            cnq.family(),
+            std::env::var(expert_cache::ENV).ok().as_deref(),
+            std::env::var("CROW_ADAPT_WINDOW").as_deref() == Ok("1"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         progress(&format!(
             "expert slabs per layer: gate_up {:.2} MB + down {:.2} MB per expert ({} experts, {} layers)",
             slabs.gu_bytes as f64 / MIB,
@@ -455,7 +466,7 @@ file, so the overlay would reach the hot experts only",
             s.resize(n_slots, EMPTY);
             spare_free.push((n..n_slots).collect::<Vec<usize>>());
         }
-        Residency {
+        let mut res = Residency {
             layers,
             experts,
             n,
@@ -478,7 +489,36 @@ file, so the overlay would reach the hot experts only",
             bounce_gu,
             bounce_dn,
             full: full_tier,
+            cache: None,
+        };
+        if let Some(p) = cache_policy {
+            res.attach_cache(p).unwrap_or_else(|e| panic!("{e}"));
+            progress(&format!(
+                "expert cache (#175): {p:?} per layer, VRAM {} + pinned {} slots of {experts}, NVMe the miss tier ({})",
+                res.n,
+                experts - res.n,
+                expert_cache::ENV
+            ));
         }
+        res
+    }
+
+    /// #175: attach the dynamic expert cache: VRAM capacity = the logical hot set `n`, pinned =
+    /// the rest of the layer (today's `Residency` has no NVMe tier, #149), seeded from the
+    /// current hot sets in slot order (the sidecar's frequency order, hottest = most recent)
+    pub fn attach_cache(&mut self, p: Policy) -> Result<(), String> {
+        let mut c = ExpertCache::new(p, Scope::PerLayer, self.layers, self.experts, self.n, self.experts - self.n)?;
+        for l in 0..self.layers {
+            let hot: Vec<u32> = self.sets[l].iter().copied().filter(|&e| e != EMPTY).collect();
+            let mut is_hot = vec![false; self.experts];
+            for &e in &hot {
+                is_hot[e as usize] = true;
+            }
+            let rest: Vec<u32> = (0..self.experts as u32).filter(|&e| !is_hot[e as usize]).collect();
+            c.seed(l, &hot, &rest)?;
+        }
+        self.cache = Some(c);
+        Ok(())
     }
 
     /// #17 bundled variant of `swap_in` (exact NVFP4 tier only): does the
@@ -613,7 +653,13 @@ file, so the overlay would reach the hot experts only",
     /// against the coldest residents. Residents win ties (a short prompt must
     /// not evict the static prior for zero-count experts in id order); slots
     /// in `excl` (swaps in flight) are left alone.
-    pub fn plan_swaps(&self, l: usize, c: &[u64], k: usize, excl: &std::collections::HashSet<usize>) -> Vec<(usize, u32, u32)> {
+    ///
+    /// #175: with `cache` attached the plan comes from `plan_swaps_cached` instead; without it
+    /// this body is the one of `e6f901a`, unchanged.
+    pub fn plan_swaps(&mut self, l: usize, c: &[u64], k: usize, excl: &std::collections::HashSet<usize>) -> Vec<(usize, u32, u32)> {
+        if self.cache.is_some() {
+            return self.plan_swaps_cached(l, c, k, excl);
+        }
         let n = self.n;
         // resident flag per expert (array, not a hash set: the comparator runs
         // ~5k times per layer and 48 layers per tick)
@@ -632,6 +678,38 @@ file, so the overlay would reach the hot experts only",
             .filter(|(s, e)| **e != EMPTY && !want_set[**e as usize] && !excl.contains(s))
             .map(|(s, &e)| (s, e)).collect();
         out_slots.sort_by(|a, b| c[a.1 as usize].cmp(&c[b.1 as usize]).then(a.1.cmp(&b.1)));
+        let k = if k == 0 { incoming.len() } else { incoming.len().min(k) };
+        let k = k.min(out_slots.len());
+        (0..k).map(|i| (out_slots[i].0, out_slots[i].1, incoming[i])).collect()
+    }
+
+    /// #175: the cache's plan in `plan_swaps`' own form. `c` must be CUMULATIVE counts (the
+    /// rises since the previous call for layer `l` are the accesses; `expert_cache::policy_for`
+    /// refuses the decayed window). Incoming: the cache's VRAM members not resident and held in
+    /// the pinned tier (what the three-way swap can execute), most valuable first; out: the
+    /// residents the cache demoted, least valuable first; `k` and `excl` as above. The same
+    /// `(slot, evicted, incoming)` triples, executed by `swap_stream_a` / `swap_in` unchanged.
+    fn plan_swaps_cached(&mut self, l: usize, c: &[u64], k: usize, excl: &std::collections::HashSet<usize>) -> Vec<(usize, u32, u32)> {
+        self.cache.as_mut().expect("plan_swaps_cached without a cache").observe_counts(l, c);
+        let cache = self.cache.as_ref().unwrap();
+        let mut have = vec![false; self.experts];
+        for &e in &self.sets[l] {
+            if e != EMPTY {
+                have[e as usize] = true;
+            }
+        }
+        let want = cache.vram_set(l);
+        let mut want_set = vec![false; self.experts];
+        for &e in &want {
+            want_set[e as usize] = true;
+        }
+        let mut incoming: Vec<u32> =
+            want.into_iter().filter(|&e| !have[e as usize] && self.cold_index[l].contains_key(&e)).collect();
+        incoming.sort_by(|&a, &b| cache.keep_order(l, b, a));
+        let mut out_slots: Vec<(usize, u32)> = self.sets[l].iter().enumerate()
+            .filter(|(s, e)| **e != EMPTY && !want_set[**e as usize] && !excl.contains(s))
+            .map(|(s, &e)| (s, e)).collect();
+        out_slots.sort_by(|a, b| cache.keep_order(l, a.1, b.1));
         let k = if k == 0 { incoming.len() } else { incoming.len().min(k) };
         let k = k.min(out_slots.len());
         (0..k).map(|i| (out_slots[i].0, out_slots[i].1, incoming[i])).collect()
@@ -881,6 +959,7 @@ impl Residency {
             bounce_gu: 0,
             bounce_dn: 0,
             full: false,
+            cache: None,
         }
     }
 }
@@ -1064,5 +1143,150 @@ mod tests {
         let e = sidecar_sets(&file, 300, LAYERS, 256).unwrap_err();
         assert_eq!(e, "N=300 is not a hot-set size (1..=256 experts per layer)");
         assert_eq!((bitmap_words(E), bitmap_words(256), bitmap_words(33)), (16, 8, 2));
+    }
+
+    // ---- #175: the expert cache behind `plan_swaps` ----
+
+    /// `plan_swaps` exactly as it was at `e6f901a` (frozen copy; the policy-off path must
+    /// return what this returns)
+    fn plan_swaps_e6f901a(sets: &[u32], experts: usize, n: usize, c: &[u64], k: usize, excl: &std::collections::HashSet<usize>) -> Vec<(usize, u32, u32)> {
+        let mut have = vec![false; experts];
+        for &e in sets { if e != EMPTY { have[e as usize] = true; } }
+        let mut want: Vec<u32> = (0..experts as u32).collect();
+        want.sort_unstable_by(|&a, &b| c[b as usize].cmp(&c[a as usize])
+            .then(have[b as usize].cmp(&have[a as usize])).then(a.cmp(&b)));
+        want.truncate(n);
+        let mut want_set = vec![false; experts];
+        for &e in &want { want_set[e as usize] = true; }
+        let incoming: Vec<u32> = want.iter().copied().filter(|&e| !have[e as usize]).collect();
+        let mut out_slots: Vec<(usize, u32)> = sets.iter().enumerate()
+            .filter(|(s, e)| **e != EMPTY && !want_set[**e as usize] && !excl.contains(s))
+            .map(|(s, &e)| (s, e)).collect();
+        out_slots.sort_by(|a, b| c[a.1 as usize].cmp(&c[b.1 as usize]).then(a.1.cmp(&b.1)));
+        let k = if k == 0 { incoming.len() } else { incoming.len().min(k) };
+        let k = k.min(out_slots.len());
+        (0..k).map(|i| (out_slots[i].0, out_slots[i].1, incoming[i])).collect()
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// a host-only `Residency` (no device memory, every pointer 0): `layers` x `experts`, hot
+    /// set `n` + `spare` empty slots, hot ids drawn from `rng`, every other id in the cold index
+    fn host_residency(rng: &mut Rng, layers: usize, experts: usize, n: usize, spare: usize) -> Residency {
+        let mut r = Residency::none(&crate::geo::Geo::FLASH_NEXT);
+        r.layers = layers;
+        r.experts = experts;
+        r.n = n;
+        r.stride = n + spare;
+        for _ in 0..layers {
+            let mut ids: Vec<u32> = (0..experts as u32).collect();
+            for i in (1..ids.len()).rev() {
+                ids.swap(i, rng.next() as usize % (i + 1));
+            }
+            let mut set = ids[..n].to_vec();
+            set.resize(n + spare, EMPTY);
+            let cold: HashMap<u32, usize> = ids[n..].iter().enumerate().map(|(cs, &e)| (e, cs)).collect();
+            r.sets.push(set);
+            r.spare_free.push((n..n + spare).collect());
+            r.cold_index.push(cold);
+        }
+        r
+    }
+
+    /// the host bookkeeping of the exact three-way swap (`swap_in_bundled` without the
+    /// pointer pairs): what `swap_stream_a` + both commits leave in `sets` / `cold_index`
+    fn commit(r: &mut Residency, l: usize, slot: usize, evict: u32, new_id: u32) {
+        let cs = r.cold_index[l].remove(&new_id).expect("incoming expert must be cold");
+        r.cold_index[l].insert(evict, cs);
+        assert_eq!(r.sets[l][slot], evict);
+        r.sets[l][slot] = new_id;
+    }
+
+    /// policy off (`cache` None, the state of every Flash-Next and 27B boot without
+    /// `CROW_EXPERT_CACHE`): `plan_swaps` returns exactly what the `e6f901a` body returns, over
+    /// randomized layers, counts with ties, swap caps and in-flight exclusions
+    #[test]
+    fn with_the_policy_off_plan_swaps_is_unchanged() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut nonempty = 0;
+        for case in 0..400 {
+            let (experts, n, spare) = (64, 4 + case % 13, case % 3);
+            let mut r = host_residency(&mut rng, 2, experts, n, spare);
+            assert!(r.cache.is_none());
+            let c: Vec<u64> = (0..experts).map(|_| rng.next() % 6).collect();
+            let k = [0, 1, 3, 100][case % 4];
+            let excl: std::collections::HashSet<usize> = (0..n).filter(|_| rng.next().is_multiple_of(5)).collect();
+            for l in 0..2 {
+                let want = plan_swaps_e6f901a(&r.sets[l], experts, n, &c, k, &excl);
+                nonempty += !want.is_empty() as usize;
+                assert_eq!(r.plan_swaps(l, &c, k, &excl), want, "case {case} layer {l}");
+            }
+        }
+        assert!(nonempty > 300, "the cases must exercise real swaps ({nonempty})");
+    }
+
+    /// cache on: the plan is the cache's (it differs from the frequency ranking on the same
+    /// counts), and executing every triple with the existing three-way bookkeeping makes the
+    /// resident set equal the cache's VRAM set, with the cold index the exact complement
+    #[test]
+    fn with_the_cache_on_the_swaps_execute_to_the_cache_vram_set() {
+        for p in [Policy::Lru, Policy::Clock { admit: None }, Policy::Clock { admit: Some(2) }, Policy::Lfu { decay: 0.5 }] {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+            let (layers, experts, n) = (3, 48, 8);
+            let mut r = host_residency(&mut rng, layers, experts, n, 0);
+            r.attach_cache(p).unwrap();
+            let none = std::collections::HashSet::new();
+            let mut cum = vec![vec![0u64; experts]; layers];
+            let mut differs = 0;
+            for _tok in 0..60 {
+                for (l, cl) in cum.iter_mut().enumerate() {
+                    for _ in 0..6 {
+                        cl[(rng.next() % experts as u64) as usize] += 1;
+                    }
+                    let freq = plan_swaps_e6f901a(&r.sets[l], experts, n, cl, 0, &none);
+                    let plan = r.plan_swaps(l, cl, 0, &none);
+                    differs += (plan != freq) as usize;
+                    for (slot, evict, new_id) in plan {
+                        commit(&mut r, l, slot, evict, new_id);
+                    }
+                    let cache = r.cache.as_ref().unwrap();
+                    let mut have: Vec<u32> = r.sets[l].iter().copied().filter(|&e| e != EMPTY).collect();
+                    have.sort_unstable();
+                    assert_eq!(have, cache.vram_set(l), "{p:?} layer {l}");
+                    assert_eq!(have.len() + r.cold_index[l].len(), experts);
+                    assert!(have.iter().all(|e| !r.cold_index[l].contains_key(e)), "{p:?}: a resident is also cold");
+                }
+                r.cache.as_ref().unwrap().check_exclusive().unwrap();
+            }
+            assert!(differs > 0, "{p:?}: the cache plan never differed from the frequency plan");
+            let served: u64 = r.cache.as_ref().unwrap().counters().iter().flatten().sum();
+            assert!(served > 0);
+        }
+    }
+
+    /// cache on: the swap cap `k` and the in-flight exclusions hold as on the old path
+    #[test]
+    fn with_the_cache_on_k_and_excl_still_bound_the_plan() {
+        let mut rng = Rng(7);
+        let mut r = host_residency(&mut rng, 1, 32, 6, 1);
+        r.attach_cache(Policy::Lru).unwrap();
+        // six fresh experts, all cold: the cache wants every one of them in VRAM
+        let cold: Vec<u32> = (0..32u32).filter(|e| r.cold_index[0].contains_key(e)).take(6).collect();
+        let mut c = vec![0u64; 32];
+        for &e in &cold {
+            c[e as usize] = 1;
+        }
+        let excl: std::collections::HashSet<usize> = [0usize, 1].into_iter().collect();
+        let plan = r.plan_swaps(0, &c, 3, &excl);
+        assert_eq!(plan.len(), 3);
+        assert!(plan.iter().all(|(s, _, new_id)| !excl.contains(s) && cold.contains(new_id)));
     }
 }

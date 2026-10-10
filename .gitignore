@@ -3,6 +3,11 @@ models/
 converter/*.cnq
 converter/*.safetensors
 converter/*.hotsets.json
+# the converter's resume journal of a staged run (crow-nest #155/#157); the converter removes it
+# once the index trailer is written. The <out>.cnq.sidecar.jsonl beside it is NOT ignored: like the
+# Flash-Next sidecars it is the per-tensor error record of its container, committed once the
+# conversion has finished (GLM-5.3-Flash's on 2026-10-08, #157; .gitattributes keeps its bytes).
+converter/*.cnq.journal.jsonl
 # build trees (every Cargo target directory, present and future)
 **/target*/
 # python
@@ -68,6 +73,10 @@ decode_out/quality-probe/*/*
 !decode_out/quality-probe/*/records.jsonl
 !decode_out/quality-probe/*/run.json
 !decode_out/quality-probe/*/summary.md
+# Nsight Systems reports and their SQLite exports beside the GLM profiles stay local (24 files,
+# 491 MB on 2026-10-10); the stats CSVs, JSON, budgets and analysis scripts beside them are committed
+runs/**/*.nsys-rep
+runs/**/*.sqlite
 oracle/golden/
 oracle/routing-selections.npz
 *.log

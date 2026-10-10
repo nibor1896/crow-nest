@@ -30,6 +30,11 @@ pub unsafe fn open_model(
         Err(why) => panic!("[boot] refused: {why}"),
     };
     warn_unknown_crow_env();
+    // #149: the NVMe expert tier and the lossy low-bit cold tier fill the same cold experts from
+    // two different sources; the pair dies here, by name, before the container is mapped
+    if let Some(why) = nvme_tier_refusal(std::env::var("CROW_COLD_TIER").ok().as_deref(), std::env::var("CROW_NVME_TIER").ok().as_deref()) {
+        panic!("[boot] refused: {why}");
+    }
     let cnq_path = std::env::var("CROW_CNQ").unwrap_or(cnq_default);
     // #94 phase 1 — the metadata gate, FIRST: the checkpoint's config.json is
     // parsed and every formula constant asserted equal to the pinned value
@@ -104,6 +109,111 @@ pub unsafe fn open_model(
     tracing::info!(target: "boot", "[boot] kv cache dtype {} ({})", cfg.kv.name(),
         if kv.is_some() { "CROW_KV".to_string() } else { format!("default of family {:?}, CROW_KV unset", geo.family) });
     (cnq, ctx, cfg, cnq_path, sidecar, geo)
+}
+
+/// #185 part 2: glm5_next's front door, without the process: the container opened and checked
+/// the way `decode glmgolden` and `glm5_run` check it (`glm5_tiers::open_container`: index v2,
+/// the config passes the glm5_next family row, MUL1 expert records), then the context
+/// (`CROW_CONTEXT`, else the family floor 200,000, up to `max_position_embeddings`). No CUDA
+/// call; a refusal names the container.
+///
+/// [`model_geo`] stays the door of the `Engine` families: glm5_next has no `Geo` (`meta::verdict`),
+/// so `serve` takes this door for it (`bin/serve.rs` `engine_kind`).
+pub fn glm5_door(cnq_path: &str) -> Result<(crate::glm5_tiers::Opened, usize), String> {
+    // #185: a malformed tier option is refused here, before the container and the CUDA context;
+    // its range against the #159 plan is checked in `Glm5Device::load`, which has the plan
+    glm5_tier_ask_from_env()?;
+    let o = crate::glm5_tiers::open_container(cnq_path).map_err(|e| format!("glm5_next container {cnq_path}: {e}"))?;
+    let context = context_from_env(std::env::var("CROW_CONTEXT").ok().as_deref(), o.g.context_floor, o.g.context_max)?;
+    Ok((o, context))
+}
+
+/// #185: serve's glm5_next tier sizes, `glm5_run --vram-slots N` as an env (slots per MoE layer)
+pub const GLM_VRAM_SLOTS_ENV: &str = "CROW_GLM_VRAM_SLOTS";
+/// #185: `glm5_run --pinned-slots N` as an env (slots per MoE layer)
+pub const GLM_PINNED_SLOTS_ENV: &str = "CROW_GLM_PINNED_SLOTS";
+/// #185: `glm5_run --readers N` as an env (NVMe reader threads of the expert tier)
+pub const GLM_NVME_READERS_ENV: &str = "CROW_GLM_NVME_READERS";
+
+/// #185: what the environment asks of serve's glm5_next expert tiers; `None` = the default
+/// (the #159 plan's VRAM and pinned slots, [`crate::glm5_engine::READERS`] readers)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Glm5TierAsk {
+    pub vram: Option<usize>,
+    pub pinned: Option<usize>,
+    pub readers: Option<usize>,
+}
+
+/// #185: the three tier options, parsed (pure). Unset or empty = default; a value that is not
+/// a whole number, or readers outside `1..=nvme_source::MAX_IN_FLIGHT`, is refused by name.
+pub fn glm5_tier_ask(vram: Option<&str>, pinned: Option<&str>, readers: Option<&str>) -> Result<Glm5TierAsk, String> {
+    let num = |name: &str, v: Option<&str>| -> Result<Option<usize>, String> {
+        let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(None) };
+        v.parse::<usize>().map(Some).map_err(|_| format!("{name}={v:?} is not a whole number"))
+    };
+    let ask = Glm5TierAsk {
+        vram: num(GLM_VRAM_SLOTS_ENV, vram)?,
+        pinned: num(GLM_PINNED_SLOTS_ENV, pinned)?,
+        readers: num(GLM_NVME_READERS_ENV, readers)?,
+    };
+    let max = crate::nvme_source::MAX_IN_FLIGHT;
+    if let Some(r) = ask.readers.filter(|r| !(1..=max).contains(r)) {
+        return Err(format!("{GLM_NVME_READERS_ENV}={r} is outside 1..={max} (the NVMe tier's reader threads, nvme_source::MAX_IN_FLIGHT)"));
+    }
+    Ok(ask)
+}
+
+/// #185: [`glm5_tier_ask`] on this process's environment
+pub fn glm5_tier_ask_from_env() -> Result<Glm5TierAsk, String> {
+    let v = |n: &str| std::env::var(n).ok();
+    glm5_tier_ask(v(GLM_VRAM_SLOTS_ENV).as_deref(), v(GLM_PINNED_SLOTS_ENV).as_deref(), v(GLM_NVME_READERS_ENV).as_deref())
+}
+
+impl Glm5TierAsk {
+    /// The tier sizes and the reader count serve runs: the plan's (and `default_readers`) where
+    /// nothing is asked. The slot range is `glm5_run`'s (`glm5_tiers::tier_sizes`): at most the
+    /// plan; above it is refused by the env name.
+    pub fn resolve(&self, plan: &crate::manager::TierPlan, default_readers: usize) -> Result<(crate::glm5_tiers::TierSizes, usize), String> {
+        let sizes = crate::glm5_tiers::tier_sizes(plan, self.vram, self.pinned).map_err(|e| {
+            e.replacen("--vram-slots ", &format!("{GLM_VRAM_SLOTS_ENV}="), 1).replacen("--pinned-slots ", &format!("{GLM_PINNED_SLOTS_ENV}="), 1)
+        })?;
+        Ok((sizes, self.readers.unwrap_or(default_readers)))
+    }
+
+    /// where each figure came from, for the `[budget]` line: `plan` / `default` or `NAME=value`
+    pub fn sources(&self) -> String {
+        let one = |name: &str, v: Option<usize>, dflt: &str| v.map_or(dflt.to_string(), |n| format!("{name}={n}"));
+        format!(
+            "VRAM {}, pinned {}, readers {}",
+            one(GLM_VRAM_SLOTS_ENV, self.vram, "plan"),
+            one(GLM_PINNED_SLOTS_ENV, self.pinned, "plan"),
+            one(GLM_NVME_READERS_ENV, self.readers, "default")
+        )
+    }
+}
+
+/// #185 part 2: [`glm5_door`], then the process's CUDA context. Returned in drop order like
+/// [`open_model`]: the engine loaded from these must drop before the context.
+///
+/// - `CROW_KV` is not read: the MLA latent cache of glm5_next is BF16 by construction
+///   (`docs/glm5-mla.md`); a set value is named and ignored
+/// - unknown `CROW_*` names are warned about as at [`open_model`]
+///
+/// # Safety
+///
+/// - creates the process's CUDA primary context, so no kernel may have run yet
+/// - the caller keeps the context alive for as long as any device allocation lives
+pub unsafe fn open_glm5(cnq_path: &str) -> Result<(crate::glm5_tiers::Opened, cuda::Ctx, usize), String> {
+    warn_unknown_crow_env();
+    if let Some(kv) = std::env::var("CROW_KV").ok().filter(|v| !v.trim().is_empty()) {
+        tracing::warn!(target: "boot", "[boot] CROW_KV={kv} is ignored for glm5_next: its MLA latent cache is BF16 (docs/glm5-mla.md)");
+    }
+    if let Ok(peek) = Cnq::peek_index(cnq_path) {
+        tracing::info!(target: "boot", "{}", index_line(&peek, std::env::var("CROW_MODEL_DIR").ok().as_deref()));
+    }
+    let (o, context) = glm5_door(cnq_path)?;
+    let ctx = cuda::Ctx::init();
+    Ok((o, ctx, context))
 }
 
 /// Crow #300 phase 2: the context the boot allocates. Unset (or empty) is the family's floor
@@ -235,6 +345,18 @@ pub fn unknown_crow_names<'a>(
     v
 }
 
+/// #149: `CROW_NVME_TIER` (opt-in; unset, empty or `0` is off) together with `CROW_COLD_TIER`
+/// (any non-empty path) is refused by name. The low-bit cold tier is lossy and kept off for
+/// `serve` (`docs/architecture.md` 7.5 condition 2); the NVMe tier exists to keep the exact NVFP4
+/// bytes, and the two would fill the same cold experts from different files. `None` = boot on.
+pub fn nvme_tier_refusal(cold_tier: Option<&str>, nvme_tier: Option<&str>) -> Option<String> {
+    let cold = cold_tier.map(str::trim).filter(|v| !v.is_empty())?;
+    let nvme = nvme_tier.map(str::trim).filter(|v| !v.is_empty() && *v != "0")?;
+    Some(format!(
+        "CROW_COLD_TIER={cold} and CROW_NVME_TIER={nvme} together: the NVMe expert tier reads the exact NVFP4 slabs from the container, the low-bit cold tier replaces them with a lossy copy - set one of the two"
+    ))
+}
+
 /// #102: one WARN per `CROW_*` variable in the environment that no engine code
 /// reads, so a misspelt or wrong-binary switch (the MEAS-0923 `CROW_KV` arm) is
 /// on the boot log instead of silently ignored. Names only, never values: a
@@ -254,6 +376,19 @@ fn warn_unknown_crow_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #149: CROW_COLD_TIER and CROW_NVME_TIER together are refused by both names; either one
+    /// alone, an empty value and CROW_NVME_TIER=0 boot
+    #[test]
+    fn the_nvme_tier_and_the_low_bit_cold_tier_are_refused_together() {
+        let why = nvme_tier_refusal(Some("x.cold3.bin"), Some("1")).expect("the pair booted");
+        assert!(why.contains("CROW_COLD_TIER=x.cold3.bin") && why.contains("CROW_NVME_TIER=1"), "{why}");
+        assert_eq!(nvme_tier_refusal(Some("x.cold3.bin"), None), None);
+        assert_eq!(nvme_tier_refusal(None, Some("1")), None);
+        assert_eq!(nvme_tier_refusal(Some(""), Some("1")), None);
+        assert_eq!(nvme_tier_refusal(Some("x.cold3.bin"), Some("0")), None);
+        assert_eq!(nvme_tier_refusal(Some("x.cold3.bin"), Some(" ")), None);
+    }
 
     #[test]
     fn the_env_doc_rows_are_the_names_the_engine_reads() {
@@ -470,5 +605,94 @@ mod tests_300_c7 {
         assert_eq!(geo, Geo::FLASH_NEXT);
         let line = index_line(&v1, Some(&dir));
         assert!(line.starts_with("[boot] container index v1 (the Flash-Next CNQ4.5-M container of record, index sha256 a21afc43203d…): config from CROW_MODEL_DIR="), "{line}");
+    }
+
+    /// #159: an index v2 container that carries the GLM-5.3-Flash config passes the gate's
+    /// family row and is refused at the boot door naming what its boot lacks (#161): before
+    /// `Cnq::open` maps it and before any CUDA call (`geo_for` touches neither)
+    #[test]
+    fn a_glm_v2_container_is_refused_at_the_boot_door_by_its_first_unbuilt_arm() {
+        const GLM: &str = "GLM-5.3-Flash";
+        let path = v2("glm5-next", &read(GLM, "config.json"), &read(GLM, "generation_config.json"), "Glm5Next", "glm5_next_text", &tensors(4096, 45));
+        let peek = Cnq::peek_index(&path).unwrap();
+        let why = geo_for(&path, &peek, None).unwrap_err();
+        assert!(why.contains("the dynamic expert cache (#175), the NVMe expert tier and the 200k boot (#149, plan step 14) and the vision tower (plan step 20) for family Glm5Next not built yet"), "{why}");
+        assert!(why.contains(&format!("[{}]", meta::v2_config_label(&path, "config_json"))), "{why}");
+        assert!(matches!(meta::gate(&path, &peek, None), Err(GateRefusal::Refused(_))));
+    }
+
+    /// #185 part 2: the same GLM container takes glm5_next's own door (`glm5_door`), which the
+    /// `Engine` door above refuses: its config passes the family row and the door goes on to the
+    /// expert records, where this synthetic file (no MUL1 records) is refused naming the
+    /// container. A Flash-Next container is refused there too. No CUDA call either way.
+    #[test]
+    fn a_glm_v2_container_takes_the_glm5_door_and_a_flash_next_one_is_refused_there() {
+        const GLM: &str = "GLM-5.3-Flash";
+        let path = v2("glm5-door", &read(GLM, "config.json"), &read(GLM, "generation_config.json"), "Glm5Next", "glm5_next_text", &tensors(4096, 45));
+        let why = match crate::boot::glm5_door(&path) {
+            Err(w) => w,
+            Ok(_) => panic!("a container without expert records opened"),
+        };
+        assert!(why.starts_with(&format!("glm5_next container {path}: ")), "{why}");
+        assert!(why.contains("the index carries no glm5_next routed-expert tensor"), "the family row passed, the records refused: {why}");
+        let fnx = flash_next_v2("glm5-door-fnx");
+        let why = match crate::boot::glm5_door(&fnx) {
+            Err(w) => w,
+            Ok(_) => panic!("a Flash-Next container opened as glm5_next"),
+        };
+        assert!(why.starts_with(&format!("glm5_next container {fnx}: ")) && why.ends_with("family FlashNext has no Glm5Geo"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod tests_185_tiers {
+    //! #185: serve's glm5_next tier options (`CROW_GLM_VRAM_SLOTS`, `CROW_GLM_PINNED_SLOTS`,
+    //! `CROW_GLM_NVME_READERS`), pure: no env is set, no CUDA call.
+    use super::{glm5_tier_ask, Glm5TierAsk};
+    use crate::geo::{Glm5Geo, GLM5_NEXT_DENSE_BYTES, HOST_PINNED_CAP};
+    use crate::glm5_tiers::TierSizes;
+    use crate::manager::{plan_glm5_next, TierPlan};
+
+    /// the #159 plan at 200,000 tokens on the 5090 of record (32,607 MiB) with the 3.05-bpw
+    /// MUL1 record, as `glm5_tiers`' own tier test plans it
+    fn plan() -> TierPlan {
+        plan_glm5_next(&Glm5Geo::GLM_5_3_FLASH, 200_000, 32_607 << 20, HOST_PINNED_CAP, GLM5_NEXT_DENSE_BYTES, 9_474_048, 64, true).unwrap().2
+    }
+
+    #[test]
+    fn unset_or_empty_is_todays_plan_and_one_reader() {
+        let p = plan();
+        for (v, q, r) in [(None, None, None), (Some(""), Some("  "), Some(""))] {
+            let ask = glm5_tier_ask(v, q, r).unwrap();
+            assert_eq!(ask, Glm5TierAsk::default());
+            assert_eq!(ask.resolve(&p, crate::glm5_engine::READERS).unwrap(), (TierSizes { vram: p.hot, pinned: p.pinned }, 1));
+            assert_eq!(ask.sources(), "VRAM plan, pinned plan, readers default");
+        }
+    }
+
+    #[test]
+    fn asks_at_or_below_the_plan_are_taken() {
+        let p = plan();
+        let ask = glm5_tier_ask(Some("40"), Some(" 0 "), Some("2")).unwrap();
+        assert_eq!(ask.resolve(&p, 1).unwrap(), (TierSizes { vram: 40, pinned: 0 }, 2));
+        assert_eq!(ask.sources(), "VRAM CROW_GLM_VRAM_SLOTS=40, pinned CROW_GLM_PINNED_SLOTS=0, readers CROW_GLM_NVME_READERS=2");
+        let at = glm5_tier_ask(Some(&p.hot.to_string()), Some(&p.pinned.to_string()), Some("8")).unwrap();
+        assert_eq!(at.resolve(&p, 1).unwrap(), (TierSizes { vram: p.hot, pinned: p.pinned }, 8));
+    }
+
+    #[test]
+    fn out_of_range_and_malformed_values_are_refused_by_name() {
+        let p = plan();
+        let e = glm5_tier_ask(Some(&(p.hot + 1).to_string()), None, None).unwrap().resolve(&p, 1).unwrap_err();
+        assert!(e.starts_with(&format!("CROW_GLM_VRAM_SLOTS={} per MoE layer is above the #159 plan's {}", p.hot + 1, p.hot)), "{e}");
+        let e = glm5_tier_ask(None, Some(&(p.pinned + 1).to_string()), None).unwrap().resolve(&p, 1).unwrap_err();
+        assert!(e.starts_with(&format!("CROW_GLM_PINNED_SLOTS={} per MoE layer is above the #159 plan's {}", p.pinned + 1, p.pinned)), "{e}");
+        assert_eq!(glm5_tier_ask(Some("4x"), None, None).unwrap_err(), "CROW_GLM_VRAM_SLOTS=\"4x\" is not a whole number");
+        assert_eq!(glm5_tier_ask(None, Some("-1"), None).unwrap_err(), "CROW_GLM_PINNED_SLOTS=\"-1\" is not a whole number");
+        assert_eq!(glm5_tier_ask(None, None, Some("two")).unwrap_err(), "CROW_GLM_NVME_READERS=\"two\" is not a whole number");
+        for r in ["0", "9"] {
+            let e = glm5_tier_ask(None, None, Some(r)).unwrap_err();
+            assert!(e.starts_with(&format!("CROW_GLM_NVME_READERS={r} is outside 1..=8")), "{e}");
+        }
     }
 }

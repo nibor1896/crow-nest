@@ -1,0 +1,5056 @@
+{
+  "tool": "glm5_run",
+  "ticket": 187,
+  "args": [
+    "C:\\Users\\robin\\dev\\crow-nest-wt-int\\engine\\target\\release\\glm5_run.exe",
+    "--cold",
+    "--reps",
+    "1",
+    "--tokenizer",
+    "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json",
+    "--prompt",
+    "Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus write-through, and how false sharing hurts multithreaded code. Give concrete examples.",
+    "-n",
+    "128",
+    "--json",
+    "C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/quick/q1-ovl-tc-attn-gemv/decode.json"
+  ],
+  "env": {
+    "CROW_CHUNK": "8192",
+    "CROW_CNQ": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+    "CROW_GLM_ARENA": "global",
+    "CROW_GLM_ARENA_ELASTIC_GB": "10",
+    "CROW_GLM_ARENA_STAGE_GB": "2.6",
+    "CROW_GLM_ARENA_WARM": "C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json",
+    "CROW_GLM_ATTN2": "1",
+    "CROW_GLM_CONTROLLER": "1",
+    "CROW_GLM_CPU_LANE": "split",
+    "CROW_GLM_DENSE_GEMM": "1",
+    "CROW_GLM_FLAGS": "1",
+    "CROW_GLM_GEMV2": "1",
+    "CROW_GLM_HCFUSE": "1",
+    "CROW_GLM_LA": "1",
+    "CROW_GLM_MOE_TC": "1",
+    "CROW_GLM_PREFETCH": "1",
+    "CROW_GLM_PREFETCH_SIDE": "1",
+    "CROW_GLM_SHARED_OVERLAP": "1",
+    "CROW_GLM_STAGER": "1",
+    "CROW_GLM_STAGE_OVERLAP": "1",
+    "CROW_IMAGE_MODEL_DIR": "C:\\Users\\robin\\dev\\crow-lab\\models\\qwen-image-2.1",
+    "CROW_LLAMA_SERVER_FLASH_NEXT_Q2_K_XL": "C:\\Users\\robin\\dev\\crow-lab\\wt-27880\\build-27880\\bin\\Release\\llama-server.exe",
+    "CROW_MODELS": "C:\\Users\\robin\\dev\\crow-lab\\models",
+    "CROW_NVME_POOL": "1",
+    "CROW_NVME_POOL_THREADS": "16",
+    "CROW_PINNED_ALLOC": "host",
+    "CROW_STAGE_PAR": "0",
+    "CROW_TOKENIZER": "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json"
+  },
+  "commit": "4d4f3785f1feff6a378652962cc0f0a6e34c0555",
+  "binary": {
+    "path": "C:\\Users\\robin\\dev\\crow-nest-wt-int\\engine\\target\\release\\glm5_run.exe",
+    "mtime_unix_s": 1791638371
+  },
+  "container": {
+    "path": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+    "bytes": 124591634567,
+    "record_bytes": 9474048,
+    "experts": 288,
+    "codec": "mul1"
+  },
+  "prompt": {
+    "source": "--prompt",
+    "base_ids": 57,
+    "ids": 57,
+    "prompt_tokens_flag": null
+  },
+  "generate": 128,
+  "reps": 1,
+  "cold": true,
+  "stop_eos": false,
+  "random_ids_seed": null,
+  "context": 200000,
+  "tiers": {
+    "plan": {
+      "vram": 45,
+      "pinned": 115,
+      "nvme": 128
+    },
+    "vram_slots": 45,
+    "pinned_slots": 115,
+    "nvme": 128,
+    "moe_layers": 42,
+    "first_moe_layer": 3,
+    "readers": 1,
+    "nvme_pool": {
+      "threads": 16,
+      "piece_bytes": 1048576
+    },
+    "policy": "Lru",
+    "pinned_use": "PinnedUse { stay: true, cpu_lane: true }",
+    "arena": "Global",
+    "arena_config": "ArenaConfig { admit_max: 64, noadmit: false, warm: Some(\"C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json\"), vring: 24, elastic_bytes: 10737418240, stage_bytes: 2791728742, stage_min: 512 }",
+    "staging_slots": 8,
+    "pinned_budget_bytes": 49392123904,
+    "free_vram_at_plan_bytes": 32496418816,
+    "prefill_staging_slots": 128
+  },
+  "prompt_chunk": {
+    "chunk": 185,
+    "calls": [
+      57
+    ],
+    "plan_chunk_scratch_bytes": 271755292
+  },
+  "setup": {
+    "open_s": 0.3052102,
+    "load_s": 5.7641173,
+    "tiers_s": 24.2389881
+  },
+  "mtp": {
+    "drafts_per_step": 0,
+    "planner_vram_reserved_bytes": 0,
+    "overlay": null
+  },
+  "machine_after_setup": {
+    "vram_used_bytes": 32599457792,
+    "vram_free_bytes": 1562558464,
+    "vram_total_bytes": 34162016256,
+    "working_set_bytes": 49586774016,
+    "peak_working_set_bytes": 49586774016,
+    "private_commit_bytes": 81192632320,
+    "free_ram_bytes": 4899930112,
+    "system_commit_free_bytes": 12216123392,
+    "system_commit_limit_bytes": 111003004928,
+    "tiers_pinned_bytes": 47806251008,
+    "tiers_vram_bytes": 23884171776
+  },
+  "clocks": "row seconds: TokenReport::secs, row start to after the row's closing cuda::sync + greedy-id dtoh; ttft and phase wall: on entry of the report callback, after that sync; no sync added",
+  "reps_detail": [
+    {
+      "rep": 1,
+      "cache": "cold",
+      "wall_s": 24.9680325,
+      "ids": [
+        785,
+        1196,
+        6801,
+        264,
+        11676,
+        16134,
+        315,
+        6481,
+        13931,
+        6500,
+        12406,
+        1113,
+        550,
+        13,
+        1096,
+        374,
+        264,
+        10911,
+        16215,
+        3405,
+        1959,
+        279,
+        1697,
+        4977,
+        31421,
+        41794,
+        320,
+        20030,
+        1414,
+        3793,
+        1075,
+        330,
+        1015,
+        51023,
+        31652,
+        1335,
+        330,
+        4934,
+        15449,
+        6165,
+        3270,
+        42503,
+        1335,
+        330,
+        3849,
+        11555,
+        1827,
+        2379,
+        1366,
+        7989,
+        323,
+        14166,
+        10290,
+        382,
+        10056,
+        752,
+        3119,
+        700,
+        1128,
+        311,
+        3421,
+        1447,
+        16,
+        13,
+        3070,
+        10229,
+        53231,
+        3000,
+        334,
+        1959,
+        279,
+        4938,
+        7002,
+        11,
+        39058,
+        5109,
+        11,
+        67592,
+        320,
+        3888,
+        9814,
+        323,
+        27884,
+        340,
+        17,
+        13,
+        3070,
+        8232,
+        7321,
+        334,
+        1959,
+        5128,
+        11,
+        7289,
+        11,
+        5510,
+        11,
+        4097,
+        43166,
+        11,
+        13714,
+        10181,
+        198,
+        18,
+        13,
+        3070,
+        785,
+        28819,
+        334,
+        1959,
+        444,
+        16,
+        320,
+        6960,
+        358,
+        14941,
+        701,
+        444,
+        17,
+        11,
+        444,
+        18,
+        320,
+        6100,
+        11,
+        28210,
+        25734,
+        8335
+      ],
+      "controller": {
+        "requests": 5334,
+        "plan_us_per_layer": 61.38693288338958,
+        "reply_us_per_layer": 96.80965504311962,
+        "serve_us_per_layer": 103.16805399325085,
+        "serve_max_us": 1784.4,
+        "cpu_jobs": 5334,
+        "cpu_busy_us_per_layer": 1564.5766779152607,
+        "cpu_wait_land_us_per_layer": 875.6112110986127,
+        "plan_ns": 327437900,
+        "reply_ns": 516382700,
+        "serve_ns": 550298400,
+        "cpu_busy_ns": 8345452000,
+        "cpu_wait_land_ns": 4670510200
+      },
+      "prompt_seed": null,
+      "eos_at": null,
+      "sweep_aggregate_tok_s": 6.431681821484451,
+      "prefill": {
+        "timing": {
+          "tokens": 57,
+          "wall_s": 5.0665015,
+          "ttft_s": 5.0665015,
+          "wall_tok_s": 11.250366747152842,
+          "tok_s_median_over_tokens": 0.2004853670542236,
+          "tok_s_min": 0.2004853670542236,
+          "tok_s_max": 0.2004853670542236,
+          "latency_p50_s": 4.9878952,
+          "latency_p99_s": 4.9878952,
+          "latency_s": [
+            4.9878952
+          ]
+        },
+        "counters": {
+          "tokens": 57,
+          "visits": 5992,
+          "visits_per_token": 105.12280701754386,
+          "hits": {
+            "vram": 1180,
+            "pinned": 2678,
+            "nvme": 2134
+          },
+          "hit_rate": {
+            "vram": 0.19692923898531375,
+            "pinned": 0.4469292389853137,
+            "nvme": 0.3561415220293725
+          },
+          "tier_sum_equals_visits": true,
+          "nvme_reads": 2134,
+          "r_nvme_reads_per_token": 37.43859649122807,
+          "nvme_gb_per_token": 0.35469506021052627,
+          "m_nvme_share": 0.3561415220293725,
+          "h2d_gb_per_token": 0.7998091048421053,
+          "zero_copy_gb_per_token": 0.0,
+          "host_dram_to_gpu_gb_per_token": 0.7998091048421053,
+          "d2h_gb_per_token": 0.0,
+          "d2d_gb_per_token": 0.0,
+          "promotions_per_token": 0.0,
+          "evictions_per_token": 0.0,
+          "cpu_lane_per_token": 0.0,
+          "cpu_lane_s_per_token": 0.0,
+          "moves": {
+            "visits": 5992,
+            "zero_copy": 0,
+            "cpu_lane": 0,
+            "nvme_to_landing": 2134,
+            "nvme_to_pinned": 0,
+            "landing_to_stage": 2134,
+            "pinned_to_stage": 2678,
+            "vram_to_stage": 0,
+            "vram_to_pinned": 0,
+            "stage_to_vram": 0,
+            "n2v": 0,
+            "p2v": 0,
+            "n2p": 0,
+            "v2p": 0,
+            "v2n": 0,
+            "p2n": 0
+          },
+          "prefetch": {
+            "mode": "next-layer",
+            "hints": 0,
+            "resident": 0,
+            "issued": 0,
+            "issued_bytes": 0,
+            "used": 0,
+            "wasted": 0,
+            "joins": 0,
+            "covered": 0,
+            "issued_per_token": 0.0,
+            "used_per_token": 0.0,
+            "wasted_per_token": 0.0,
+            "joins_per_token": 0.0,
+            "demand_misses_uncovered": 2134,
+            "demand_misses_uncovered_per_token": 37.43859649122807
+          }
+        },
+        "layers": [
+          {
+            "layer": 3,
+            "hits": {
+              "vram": 32,
+              "pinned": 0,
+              "nvme": 163
+            },
+            "hit_rate": {
+              "vram": 0.1641025641025641,
+              "pinned": 0.0,
+              "nvme": 0.8358974358974359
+            },
+            "nvme_reads_per_token": 2.8596491228070176,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 195,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 163,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 163,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 4,
+            "hits": {
+              "vram": 39,
+              "pinned": 83,
+              "nvme": 82
+            },
+            "hit_rate": {
+              "vram": 0.19117647058823528,
+              "pinned": 0.4068627450980392,
+              "nvme": 0.4019607843137255
+            },
+            "nvme_reads_per_token": 1.4385964912280702,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 204,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 82,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 82,
+              "pinned_to_stage": 83,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 5,
+            "hits": {
+              "vram": 41,
+              "pinned": 81,
+              "nvme": 77
+            },
+            "hit_rate": {
+              "vram": 0.20603015075376885,
+              "pinned": 0.40703517587939697,
+              "nvme": 0.3869346733668342
+            },
+            "nvme_reads_per_token": 1.3508771929824561,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 199,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 77,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 77,
+              "pinned_to_stage": 81,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 6,
+            "hits": {
+              "vram": 37,
+              "pinned": 78,
+              "nvme": 69
+            },
+            "hit_rate": {
+              "vram": 0.20108695652173914,
+              "pinned": 0.42391304347826086,
+              "nvme": 0.375
+            },
+            "nvme_reads_per_token": 1.2105263157894737,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 184,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 69,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 69,
+              "pinned_to_stage": 78,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 7,
+            "hits": {
+              "vram": 26,
+              "pinned": 67,
+              "nvme": 44
+            },
+            "hit_rate": {
+              "vram": 0.1897810218978102,
+              "pinned": 0.48905109489051096,
+              "nvme": 0.32116788321167883
+            },
+            "nvme_reads_per_token": 0.7719298245614035,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 137,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 44,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 44,
+              "pinned_to_stage": 67,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 8,
+            "hits": {
+              "vram": 41,
+              "pinned": 73,
+              "nvme": 50
+            },
+            "hit_rate": {
+              "vram": 0.25,
+              "pinned": 0.4451219512195122,
+              "nvme": 0.3048780487804878
+            },
+            "nvme_reads_per_token": 0.8771929824561403,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 164,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 50,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 50,
+              "pinned_to_stage": 73,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 9,
+            "hits": {
+              "vram": 36,
+              "pinned": 70,
+              "nvme": 56
+            },
+            "hit_rate": {
+              "vram": 0.2222222222222222,
+              "pinned": 0.43209876543209874,
+              "nvme": 0.345679012345679
+            },
+            "nvme_reads_per_token": 0.9824561403508771,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 162,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 56,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 56,
+              "pinned_to_stage": 70,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 10,
+            "hits": {
+              "vram": 35,
+              "pinned": 78,
+              "nvme": 62
+            },
+            "hit_rate": {
+              "vram": 0.2,
+              "pinned": 0.44571428571428573,
+              "nvme": 0.35428571428571426
+            },
+            "nvme_reads_per_token": 1.087719298245614,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 175,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 62,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 62,
+              "pinned_to_stage": 78,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 11,
+            "hits": {
+              "vram": 36,
+              "pinned": 65,
+              "nvme": 56
+            },
+            "hit_rate": {
+              "vram": 0.22929936305732485,
+              "pinned": 0.4140127388535032,
+              "nvme": 0.35668789808917195
+            },
+            "nvme_reads_per_token": 0.9824561403508771,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 157,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 56,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 56,
+              "pinned_to_stage": 65,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 12,
+            "hits": {
+              "vram": 31,
+              "pinned": 70,
+              "nvme": 46
+            },
+            "hit_rate": {
+              "vram": 0.2108843537414966,
+              "pinned": 0.47619047619047616,
+              "nvme": 0.3129251700680272
+            },
+            "nvme_reads_per_token": 0.8070175438596491,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 147,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 46,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 46,
+              "pinned_to_stage": 70,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 13,
+            "hits": {
+              "vram": 31,
+              "pinned": 58,
+              "nvme": 47
+            },
+            "hit_rate": {
+              "vram": 0.22794117647058823,
+              "pinned": 0.4264705882352941,
+              "nvme": 0.34558823529411764
+            },
+            "nvme_reads_per_token": 0.8245614035087719,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 136,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 47,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 47,
+              "pinned_to_stage": 58,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 14,
+            "hits": {
+              "vram": 33,
+              "pinned": 58,
+              "nvme": 36
+            },
+            "hit_rate": {
+              "vram": 0.25984251968503935,
+              "pinned": 0.4566929133858268,
+              "nvme": 0.28346456692913385
+            },
+            "nvme_reads_per_token": 0.631578947368421,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 127,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 36,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 36,
+              "pinned_to_stage": 58,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 15,
+            "hits": {
+              "vram": 34,
+              "pinned": 64,
+              "nvme": 46
+            },
+            "hit_rate": {
+              "vram": 0.2361111111111111,
+              "pinned": 0.4444444444444444,
+              "nvme": 0.3194444444444444
+            },
+            "nvme_reads_per_token": 0.8070175438596491,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 144,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 46,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 46,
+              "pinned_to_stage": 64,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 16,
+            "hits": {
+              "vram": 26,
+              "pinned": 60,
+              "nvme": 41
+            },
+            "hit_rate": {
+              "vram": 0.2047244094488189,
+              "pinned": 0.47244094488188976,
+              "nvme": 0.3228346456692913
+            },
+            "nvme_reads_per_token": 0.7192982456140351,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 127,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 41,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 41,
+              "pinned_to_stage": 60,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 17,
+            "hits": {
+              "vram": 26,
+              "pinned": 65,
+              "nvme": 34
+            },
+            "hit_rate": {
+              "vram": 0.208,
+              "pinned": 0.52,
+              "nvme": 0.272
+            },
+            "nvme_reads_per_token": 0.5964912280701754,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 125,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 34,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 34,
+              "pinned_to_stage": 65,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 18,
+            "hits": {
+              "vram": 23,
+              "pinned": 48,
+              "nvme": 37
+            },
+            "hit_rate": {
+              "vram": 0.21296296296296297,
+              "pinned": 0.4444444444444444,
+              "nvme": 0.3425925925925926
+            },
+            "nvme_reads_per_token": 0.6491228070175439,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 108,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 37,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 37,
+              "pinned_to_stage": 48,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 19,
+            "hits": {
+              "vram": 24,
+              "pinned": 65,
+              "nvme": 38
+            },
+            "hit_rate": {
+              "vram": 0.1889763779527559,
+              "pinned": 0.5118110236220472,
+              "nvme": 0.2992125984251969
+            },
+            "nvme_reads_per_token": 0.6666666666666666,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 127,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 38,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 38,
+              "pinned_to_stage": 65,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 20,
+            "hits": {
+              "vram": 21,
+              "pinned": 50,
+              "nvme": 31
+            },
+            "hit_rate": {
+              "vram": 0.20588235294117646,
+              "pinned": 0.49019607843137253,
+              "nvme": 0.30392156862745096
+            },
+            "nvme_reads_per_token": 0.543859649122807,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 102,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 31,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 31,
+              "pinned_to_stage": 50,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 21,
+            "hits": {
+              "vram": 19,
+              "pinned": 58,
+              "nvme": 43
+            },
+            "hit_rate": {
+              "vram": 0.15833333333333333,
+              "pinned": 0.48333333333333334,
+              "nvme": 0.35833333333333334
+            },
+            "nvme_reads_per_token": 0.7543859649122807,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 120,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 43,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 43,
+              "pinned_to_stage": 58,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 22,
+            "hits": {
+              "vram": 26,
+              "pinned": 55,
+              "nvme": 34
+            },
+            "hit_rate": {
+              "vram": 0.22608695652173913,
+              "pinned": 0.4782608695652174,
+              "nvme": 0.2956521739130435
+            },
+            "nvme_reads_per_token": 0.5964912280701754,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 115,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 34,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 34,
+              "pinned_to_stage": 55,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 23,
+            "hits": {
+              "vram": 28,
+              "pinned": 53,
+              "nvme": 45
+            },
+            "hit_rate": {
+              "vram": 0.2222222222222222,
+              "pinned": 0.42063492063492064,
+              "nvme": 0.35714285714285715
+            },
+            "nvme_reads_per_token": 0.7894736842105263,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 126,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 45,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 45,
+              "pinned_to_stage": 53,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 24,
+            "hits": {
+              "vram": 35,
+              "pinned": 52,
+              "nvme": 46
+            },
+            "hit_rate": {
+              "vram": 0.2631578947368421,
+              "pinned": 0.39097744360902253,
+              "nvme": 0.3458646616541353
+            },
+            "nvme_reads_per_token": 0.8070175438596491,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 133,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 46,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 46,
+              "pinned_to_stage": 52,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 25,
+            "hits": {
+              "vram": 26,
+              "pinned": 57,
+              "nvme": 41
+            },
+            "hit_rate": {
+              "vram": 0.20967741935483872,
+              "pinned": 0.4596774193548387,
+              "nvme": 0.33064516129032256
+            },
+            "nvme_reads_per_token": 0.7192982456140351,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 124,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 41,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 41,
+              "pinned_to_stage": 57,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 26,
+            "hits": {
+              "vram": 26,
+              "pinned": 58,
+              "nvme": 51
+            },
+            "hit_rate": {
+              "vram": 0.1925925925925926,
+              "pinned": 0.42962962962962964,
+              "nvme": 0.37777777777777777
+            },
+            "nvme_reads_per_token": 0.8947368421052632,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 135,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 51,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 51,
+              "pinned_to_stage": 58,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 27,
+            "hits": {
+              "vram": 23,
+              "pinned": 64,
+              "nvme": 42
+            },
+            "hit_rate": {
+              "vram": 0.17829457364341086,
+              "pinned": 0.49612403100775193,
+              "nvme": 0.32558139534883723
+            },
+            "nvme_reads_per_token": 0.7368421052631579,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 129,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 42,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 42,
+              "pinned_to_stage": 64,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 28,
+            "hits": {
+              "vram": 23,
+              "pinned": 58,
+              "nvme": 51
+            },
+            "hit_rate": {
+              "vram": 0.17424242424242425,
+              "pinned": 0.4393939393939394,
+              "nvme": 0.38636363636363635
+            },
+            "nvme_reads_per_token": 0.8947368421052632,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 132,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 51,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 51,
+              "pinned_to_stage": 58,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 29,
+            "hits": {
+              "vram": 31,
+              "pinned": 62,
+              "nvme": 48
+            },
+            "hit_rate": {
+              "vram": 0.2198581560283688,
+              "pinned": 0.4397163120567376,
+              "nvme": 0.3404255319148936
+            },
+            "nvme_reads_per_token": 0.8421052631578947,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 141,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 48,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 48,
+              "pinned_to_stage": 62,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 30,
+            "hits": {
+              "vram": 25,
+              "pinned": 58,
+              "nvme": 56
+            },
+            "hit_rate": {
+              "vram": 0.17985611510791366,
+              "pinned": 0.4172661870503597,
+              "nvme": 0.4028776978417266
+            },
+            "nvme_reads_per_token": 0.9824561403508771,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 139,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 56,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 56,
+              "pinned_to_stage": 58,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 31,
+            "hits": {
+              "vram": 27,
+              "pinned": 62,
+              "nvme": 53
+            },
+            "hit_rate": {
+              "vram": 0.19014084507042253,
+              "pinned": 0.43661971830985913,
+              "nvme": 0.3732394366197183
+            },
+            "nvme_reads_per_token": 0.9298245614035088,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 142,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 53,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 53,
+              "pinned_to_stage": 62,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 32,
+            "hits": {
+              "vram": 31,
+              "pinned": 67,
+              "nvme": 55
+            },
+            "hit_rate": {
+              "vram": 0.20261437908496732,
+              "pinned": 0.43790849673202614,
+              "nvme": 0.35947712418300654
+            },
+            "nvme_reads_per_token": 0.9649122807017544,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 153,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 55,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 55,
+              "pinned_to_stage": 67,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 33,
+            "hits": {
+              "vram": 31,
+              "pinned": 49,
+              "nvme": 34
+            },
+            "hit_rate": {
+              "vram": 0.2719298245614035,
+              "pinned": 0.4298245614035088,
+              "nvme": 0.2982456140350877
+            },
+            "nvme_reads_per_token": 0.5964912280701754,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 114,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 34,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 34,
+              "pinned_to_stage": 49,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 34,
+            "hits": {
+              "vram": 26,
+              "pinned": 68,
+              "nvme": 41
+            },
+            "hit_rate": {
+              "vram": 0.1925925925925926,
+              "pinned": 0.5037037037037037,
+              "nvme": 0.3037037037037037
+            },
+            "nvme_reads_per_token": 0.7192982456140351,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 135,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 41,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 41,
+              "pinned_to_stage": 68,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 35,
+            "hits": {
+              "vram": 26,
+              "pinned": 68,
+              "nvme": 43
+            },
+            "hit_rate": {
+              "vram": 0.1897810218978102,
+              "pinned": 0.49635036496350365,
+              "nvme": 0.31386861313868614
+            },
+            "nvme_reads_per_token": 0.7543859649122807,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 137,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 43,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 43,
+              "pinned_to_stage": 68,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 36,
+            "hits": {
+              "vram": 28,
+              "pinned": 57,
+              "nvme": 45
+            },
+            "hit_rate": {
+              "vram": 0.2153846153846154,
+              "pinned": 0.43846153846153846,
+              "nvme": 0.34615384615384615
+            },
+            "nvme_reads_per_token": 0.7894736842105263,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 130,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 45,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 45,
+              "pinned_to_stage": 57,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 37,
+            "hits": {
+              "vram": 28,
+              "pinned": 67,
+              "nvme": 42
+            },
+            "hit_rate": {
+              "vram": 0.20437956204379562,
+              "pinned": 0.48905109489051096,
+              "nvme": 0.30656934306569344
+            },
+            "nvme_reads_per_token": 0.7368421052631579,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 137,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 42,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 42,
+              "pinned_to_stage": 67,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 38,
+            "hits": {
+              "vram": 29,
+              "pinned": 63,
+              "nvme": 46
+            },
+            "hit_rate": {
+              "vram": 0.21014492753623187,
+              "pinned": 0.45652173913043476,
+              "nvme": 0.3333333333333333
+            },
+            "nvme_reads_per_token": 0.8070175438596491,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 138,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 46,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 46,
+              "pinned_to_stage": 63,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 39,
+            "hits": {
+              "vram": 24,
+              "pinned": 63,
+              "nvme": 45
+            },
+            "hit_rate": {
+              "vram": 0.18181818181818182,
+              "pinned": 0.4772727272727273,
+              "nvme": 0.3409090909090909
+            },
+            "nvme_reads_per_token": 0.7894736842105263,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 132,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 45,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 45,
+              "pinned_to_stage": 63,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 40,
+            "hits": {
+              "vram": 39,
+              "pinned": 62,
+              "nvme": 55
+            },
+            "hit_rate": {
+              "vram": 0.25,
+              "pinned": 0.3974358974358974,
+              "nvme": 0.3525641025641026
+            },
+            "nvme_reads_per_token": 0.9649122807017544,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 156,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 55,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 55,
+              "pinned_to_stage": 62,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 41,
+            "hits": {
+              "vram": 32,
+              "pinned": 64,
+              "nvme": 42
+            },
+            "hit_rate": {
+              "vram": 0.2318840579710145,
+              "pinned": 0.463768115942029,
+              "nvme": 0.30434782608695654
+            },
+            "nvme_reads_per_token": 0.7368421052631579,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 138,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 42,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 42,
+              "pinned_to_stage": 64,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 42,
+            "hits": {
+              "vram": 25,
+              "pinned": 77,
+              "nvme": 48
+            },
+            "hit_rate": {
+              "vram": 0.16666666666666666,
+              "pinned": 0.5133333333333333,
+              "nvme": 0.32
+            },
+            "nvme_reads_per_token": 0.8421052631578947,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 150,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 48,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 48,
+              "pinned_to_stage": 77,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 43,
+            "hits": {
+              "vram": 0,
+              "pinned": 105,
+              "nvme": 47
+            },
+            "hit_rate": {
+              "vram": 0.0,
+              "pinned": 0.6907894736842105,
+              "nvme": 0.3092105263157895
+            },
+            "nvme_reads_per_token": 0.8245614035087719,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 152,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 47,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 47,
+              "pinned_to_stage": 105,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          },
+          {
+            "layer": 44,
+            "hits": {
+              "vram": 0,
+              "pinned": 98,
+              "nvme": 66
+            },
+            "hit_rate": {
+              "vram": 0.0,
+              "pinned": 0.5975609756097561,
+              "nvme": 0.4024390243902439
+            },
+            "nvme_reads_per_token": 1.1578947368421053,
+            "promotions_per_token": 0.0,
+            "evictions_per_token": 0.0,
+            "moves": {
+              "visits": 164,
+              "zero_copy": 0,
+              "cpu_lane": 0,
+              "nvme_to_landing": 66,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 66,
+              "pinned_to_stage": 98,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 0,
+              "stage_to_vram": 0,
+              "n2v": 0,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 0,
+              "v2n": 0,
+              "p2n": 0
+            }
+          }
+        ],
+        "reports": 1,
+        "routing_syncs": 42,
+        "sub_batches": 97
+      },
+      "decode": {
+        "timing": {
+          "tokens": 127,
+          "wall_s": 19.901481999999998,
+          "ttft_s": null,
+          "wall_tok_s": 6.3814343072541035,
+          "tok_s_median_over_tokens": 3.326183148292221,
+          "tok_s_min": 2.0559240114037993,
+          "tok_s_max": 6.486670217037498,
+          "latency_p50_s": 0.3006449,
+          "latency_p99_s": 0.4756707,
+          "latency_s": [
+            0.4756707,
+            0.4096179,
+            0.3601161,
+            0.3853741,
+            0.3976865,
+            0.4142679,
+            0.4065626,
+            0.4446842,
+            0.4863993,
+            0.4550415,
+            0.4194772,
+            0.4225185,
+            0.4177083,
+            0.4005252,
+            0.3856022,
+            0.3555044,
+            0.3250457,
+            0.3267008,
+            0.3117766,
+            0.312212,
+            0.3314338,
+            0.3114462,
+            0.3235247,
+            0.3185722,
+            0.2902527,
+            0.3125295,
+            0.3473486,
+            0.311334,
+            0.3025639,
+            0.372171,
+            0.3846981,
+            0.4066238,
+            0.4215022,
+            0.3441189,
+            0.3900598,
+            0.4235446,
+            0.3925643,
+            0.3990722,
+            0.4431183,
+            0.4505193,
+            0.3649857,
+            0.3413787,
+            0.3531879,
+            0.3432069,
+            0.337432,
+            0.3037055,
+            0.240589,
+            0.2392306,
+            0.2508811,
+            0.3034214,
+            0.3150586,
+            0.2495662,
+            0.2479708,
+            0.2994353,
+            0.3089571,
+            0.260141,
+            0.2526446,
+            0.2794219,
+            0.2869747,
+            0.2515089,
+            0.2479299,
+            0.3208309,
+            0.3034717,
+            0.2777411,
+            0.3126392,
+            0.2800003,
+            0.2878771,
+            0.324295,
+            0.2707115,
+            0.255235,
+            0.2940092,
+            0.3000572,
+            0.281799,
+            0.2768368,
+            0.298338,
+            0.2724791,
+            0.2367316,
+            0.2437932,
+            0.3179271,
+            0.3391853,
+            0.3220481,
+            0.3124067,
+            0.3384966,
+            0.3449791,
+            0.2964352,
+            0.2945649,
+            0.2795933,
+            0.2650604,
+            0.2400827,
+            0.2321423,
+            0.26442,
+            0.2600101,
+            0.2531903,
+            0.2828029,
+            0.2678838,
+            0.2498716,
+            0.2571295,
+            0.231838,
+            0.2049094,
+            0.2685354,
+            0.3006449,
+            0.2467825,
+            0.2437925,
+            0.3025826,
+            0.2816055,
+            0.2434317,
+            0.2512712,
+            0.2076386,
+            0.2117737,
+            0.3150337,
+            0.3698815,
+            0.297441,
+            0.2678201,
+            0.3293926,
+            0.3183984,
+            0.2755449,
+            0.2793359,
+            0.2831868,
+            0.267689,
+            0.2599421,
+            0.2387878,
+            0.2401162,
+            0.2859829,
+            0.2820947,
+            0.2736559,
+            0.2752136,
+            0.1541623
+          ]
+        },
+        "counters": {
+          "tokens": 127,
+          "visits": 42672,
+          "visits_per_token": 336.0,
+          "hits": {
+            "vram": 13842,
+            "pinned": 27018,
+            "nvme": 1812
+          },
+          "hit_rate": {
+            "vram": 0.32438132733408326,
+            "pinned": 0.6331552305961755,
+            "nvme": 0.04246344206974128
+          },
+          "tier_sum_equals_visits": true,
+          "nvme_reads": 1812,
+          "r_nvme_reads_per_token": 14.26771653543307,
+          "nvme_gb_per_token": 0.1351730313070866,
+          "m_nvme_share": 0.04246344206974128,
+          "h2d_gb_per_token": 0.1351730313070866,
+          "zero_copy_gb_per_token": 0.6791475038740158,
+          "host_dram_to_gpu_gb_per_token": 0.8143205351811024,
+          "d2h_gb_per_token": 0.1351730313070866,
+          "d2d_gb_per_token": 0.1351730313070866,
+          "promotions_per_token": 14.26771653543307,
+          "evictions_per_token": 28.53543307086614,
+          "cpu_lane_per_token": 141.0551181102362,
+          "cpu_lane_s_per_token": 0.028743081102362202,
+          "moves": {
+            "visits": 42672,
+            "zero_copy": 9104,
+            "cpu_lane": 17914,
+            "nvme_to_landing": 1812,
+            "nvme_to_pinned": 0,
+            "landing_to_stage": 1812,
+            "pinned_to_stage": 0,
+            "vram_to_stage": 0,
+            "vram_to_pinned": 1812,
+            "stage_to_vram": 1812,
+            "n2v": 1812,
+            "p2v": 0,
+            "n2p": 0,
+            "v2p": 1812,
+            "v2n": 0,
+            "p2n": 1812
+          },
+          "prefetch": {
+            "mode": "next-layer",
+            "hints": 5207,
+            "resident": 36371,
+            "issued": 5285,
+            "issued_bytes": 50070343680,
+            "used": 2527,
+            "wasted": 2757,
+            "joins": 2516,
+            "covered": 0,
+            "issued_per_token": 41.61417322834646,
+            "used_per_token": 19.89763779527559,
+            "wasted_per_token": 21.708661417322833,
+            "joins_per_token": 19.811023622047244,
+            "demand_misses_uncovered": 1812,
+            "demand_misses_uncovered_per_token": 14.26771653543307
+          }
+        },
+        "layers": [
+          {
+            "layer": 3,
+            "hits": {
+              "vram": 580,
+              "pinned": 221,
+              "nvme": 215
+            },
+            "hit_rate": {
+              "vram": 0.5708661417322834,
+              "pinned": 0.21751968503937008,
+              "nvme": 0.21161417322834647
+            },
+            "nvme_reads_per_token": 1.6929133858267718,
+            "promotions_per_token": 1.6929133858267718,
+            "evictions_per_token": 3.3858267716535435,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 70,
+              "cpu_lane": 151,
+              "nvme_to_landing": 215,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 215,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 215,
+              "stage_to_vram": 215,
+              "n2v": 215,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 215,
+              "v2n": 0,
+              "p2n": 215
+            }
+          },
+          {
+            "layer": 4,
+            "hits": {
+              "vram": 318,
+              "pinned": 601,
+              "nvme": 97
+            },
+            "hit_rate": {
+              "vram": 0.31299212598425197,
+              "pinned": 0.5915354330708661,
+              "nvme": 0.09547244094488189
+            },
+            "nvme_reads_per_token": 0.7637795275590551,
+            "promotions_per_token": 0.7637795275590551,
+            "evictions_per_token": 1.5275590551181102,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 183,
+              "cpu_lane": 418,
+              "nvme_to_landing": 97,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 97,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 97,
+              "stage_to_vram": 97,
+              "n2v": 97,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 97,
+              "v2n": 0,
+              "p2n": 97
+            }
+          },
+          {
+            "layer": 5,
+            "hits": {
+              "vram": 244,
+              "pinned": 684,
+              "nvme": 88
+            },
+            "hit_rate": {
+              "vram": 0.24015748031496062,
+              "pinned": 0.6732283464566929,
+              "nvme": 0.08661417322834646
+            },
+            "nvme_reads_per_token": 0.6929133858267716,
+            "promotions_per_token": 0.6929133858267716,
+            "evictions_per_token": 1.3858267716535433,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 210,
+              "cpu_lane": 474,
+              "nvme_to_landing": 88,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 88,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 88,
+              "stage_to_vram": 88,
+              "n2v": 88,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 88,
+              "v2n": 0,
+              "p2n": 88
+            }
+          },
+          {
+            "layer": 6,
+            "hits": {
+              "vram": 162,
+              "pinned": 808,
+              "nvme": 46
+            },
+            "hit_rate": {
+              "vram": 0.1594488188976378,
+              "pinned": 0.7952755905511811,
+              "nvme": 0.045275590551181105
+            },
+            "nvme_reads_per_token": 0.36220472440944884,
+            "promotions_per_token": 0.36220472440944884,
+            "evictions_per_token": 0.7244094488188977,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 262,
+              "cpu_lane": 546,
+              "nvme_to_landing": 46,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 46,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 46,
+              "stage_to_vram": 46,
+              "n2v": 46,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 46,
+              "v2n": 0,
+              "p2n": 46
+            }
+          },
+          {
+            "layer": 7,
+            "hits": {
+              "vram": 235,
+              "pinned": 732,
+              "nvme": 49
+            },
+            "hit_rate": {
+              "vram": 0.2312992125984252,
+              "pinned": 0.7204724409448819,
+              "nvme": 0.04822834645669291
+            },
+            "nvme_reads_per_token": 0.3858267716535433,
+            "promotions_per_token": 0.3858267716535433,
+            "evictions_per_token": 0.7716535433070866,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 235,
+              "cpu_lane": 497,
+              "nvme_to_landing": 49,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 49,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 49,
+              "stage_to_vram": 49,
+              "n2v": 49,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 49,
+              "v2n": 0,
+              "p2n": 49
+            }
+          },
+          {
+            "layer": 8,
+            "hits": {
+              "vram": 310,
+              "pinned": 636,
+              "nvme": 70
+            },
+            "hit_rate": {
+              "vram": 0.3051181102362205,
+              "pinned": 0.6259842519685039,
+              "nvme": 0.0688976377952756
+            },
+            "nvme_reads_per_token": 0.5511811023622047,
+            "promotions_per_token": 0.5511811023622047,
+            "evictions_per_token": 1.1023622047244095,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 200,
+              "cpu_lane": 436,
+              "nvme_to_landing": 70,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 70,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 70,
+              "stage_to_vram": 70,
+              "n2v": 70,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 70,
+              "v2n": 0,
+              "p2n": 70
+            }
+          },
+          {
+            "layer": 9,
+            "hits": {
+              "vram": 323,
+              "pinned": 629,
+              "nvme": 64
+            },
+            "hit_rate": {
+              "vram": 0.31791338582677164,
+              "pinned": 0.6190944881889764,
+              "nvme": 0.06299212598425197
+            },
+            "nvme_reads_per_token": 0.5039370078740157,
+            "promotions_per_token": 0.5039370078740157,
+            "evictions_per_token": 1.0078740157480315,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 205,
+              "cpu_lane": 424,
+              "nvme_to_landing": 64,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 64,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 64,
+              "stage_to_vram": 64,
+              "n2v": 64,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 64,
+              "v2n": 0,
+              "p2n": 64
+            }
+          },
+          {
+            "layer": 10,
+            "hits": {
+              "vram": 249,
+              "pinned": 701,
+              "nvme": 66
+            },
+            "hit_rate": {
+              "vram": 0.24507874015748032,
+              "pinned": 0.6899606299212598,
+              "nvme": 0.06496062992125984
+            },
+            "nvme_reads_per_token": 0.5196850393700787,
+            "promotions_per_token": 0.5196850393700787,
+            "evictions_per_token": 1.0393700787401574,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 225,
+              "cpu_lane": 476,
+              "nvme_to_landing": 66,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 66,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 66,
+              "stage_to_vram": 66,
+              "n2v": 66,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 66,
+              "v2n": 0,
+              "p2n": 66
+            }
+          },
+          {
+            "layer": 11,
+            "hits": {
+              "vram": 307,
+              "pinned": 664,
+              "nvme": 45
+            },
+            "hit_rate": {
+              "vram": 0.3021653543307087,
+              "pinned": 0.6535433070866141,
+              "nvme": 0.04429133858267716
+            },
+            "nvme_reads_per_token": 0.3543307086614173,
+            "promotions_per_token": 0.3543307086614173,
+            "evictions_per_token": 0.7086614173228346,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 216,
+              "cpu_lane": 448,
+              "nvme_to_landing": 45,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 45,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 45,
+              "stage_to_vram": 45,
+              "n2v": 45,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 45,
+              "v2n": 0,
+              "p2n": 45
+            }
+          },
+          {
+            "layer": 12,
+            "hits": {
+              "vram": 361,
+              "pinned": 609,
+              "nvme": 46
+            },
+            "hit_rate": {
+              "vram": 0.35531496062992124,
+              "pinned": 0.5994094488188977,
+              "nvme": 0.045275590551181105
+            },
+            "nvme_reads_per_token": 0.36220472440944884,
+            "promotions_per_token": 0.36220472440944884,
+            "evictions_per_token": 0.7244094488188977,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 200,
+              "cpu_lane": 409,
+              "nvme_to_landing": 46,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 46,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 46,
+              "stage_to_vram": 46,
+              "n2v": 46,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 46,
+              "v2n": 0,
+              "p2n": 46
+            }
+          },
+          {
+            "layer": 13,
+            "hits": {
+              "vram": 349,
+              "pinned": 618,
+              "nvme": 49
+            },
+            "hit_rate": {
+              "vram": 0.343503937007874,
+              "pinned": 0.6082677165354331,
+              "nvme": 0.04822834645669291
+            },
+            "nvme_reads_per_token": 0.3858267716535433,
+            "promotions_per_token": 0.3858267716535433,
+            "evictions_per_token": 0.7716535433070866,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 202,
+              "cpu_lane": 416,
+              "nvme_to_landing": 49,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 49,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 49,
+              "stage_to_vram": 49,
+              "n2v": 49,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 49,
+              "v2n": 0,
+              "p2n": 49
+            }
+          },
+          {
+            "layer": 14,
+            "hits": {
+              "vram": 429,
+              "pinned": 533,
+              "nvme": 54
+            },
+            "hit_rate": {
+              "vram": 0.422244094488189,
+              "pinned": 0.5246062992125984,
+              "nvme": 0.0531496062992126
+            },
+            "nvme_reads_per_token": 0.4251968503937008,
+            "promotions_per_token": 0.4251968503937008,
+            "evictions_per_token": 0.8503937007874016,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 168,
+              "cpu_lane": 365,
+              "nvme_to_landing": 54,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 54,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 54,
+              "stage_to_vram": 54,
+              "n2v": 54,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 54,
+              "v2n": 0,
+              "p2n": 54
+            }
+          },
+          {
+            "layer": 15,
+            "hits": {
+              "vram": 351,
+              "pinned": 624,
+              "nvme": 41
+            },
+            "hit_rate": {
+              "vram": 0.3454724409448819,
+              "pinned": 0.6141732283464567,
+              "nvme": 0.040354330708661415
+            },
+            "nvme_reads_per_token": 0.3228346456692913,
+            "promotions_per_token": 0.3228346456692913,
+            "evictions_per_token": 0.6456692913385826,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 206,
+              "cpu_lane": 418,
+              "nvme_to_landing": 41,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 41,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 41,
+              "stage_to_vram": 41,
+              "n2v": 41,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 41,
+              "v2n": 0,
+              "p2n": 41
+            }
+          },
+          {
+            "layer": 16,
+            "hits": {
+              "vram": 319,
+              "pinned": 656,
+              "nvme": 41
+            },
+            "hit_rate": {
+              "vram": 0.3139763779527559,
+              "pinned": 0.6456692913385826,
+              "nvme": 0.040354330708661415
+            },
+            "nvme_reads_per_token": 0.3228346456692913,
+            "promotions_per_token": 0.3228346456692913,
+            "evictions_per_token": 0.6456692913385826,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 215,
+              "cpu_lane": 441,
+              "nvme_to_landing": 41,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 41,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 41,
+              "stage_to_vram": 41,
+              "n2v": 41,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 41,
+              "v2n": 0,
+              "p2n": 41
+            }
+          },
+          {
+            "layer": 17,
+            "hits": {
+              "vram": 221,
+              "pinned": 770,
+              "nvme": 25
+            },
+            "hit_rate": {
+              "vram": 0.21751968503937008,
+              "pinned": 0.7578740157480315,
+              "nvme": 0.024606299212598427
+            },
+            "nvme_reads_per_token": 0.1968503937007874,
+            "promotions_per_token": 0.1968503937007874,
+            "evictions_per_token": 0.3937007874015748,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 263,
+              "cpu_lane": 507,
+              "nvme_to_landing": 25,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 25,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 25,
+              "stage_to_vram": 25,
+              "n2v": 25,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 25,
+              "v2n": 0,
+              "p2n": 25
+            }
+          },
+          {
+            "layer": 18,
+            "hits": {
+              "vram": 338,
+              "pinned": 635,
+              "nvme": 43
+            },
+            "hit_rate": {
+              "vram": 0.33267716535433073,
+              "pinned": 0.625,
+              "nvme": 0.04232283464566929
+            },
+            "nvme_reads_per_token": 0.33858267716535434,
+            "promotions_per_token": 0.33858267716535434,
+            "evictions_per_token": 0.6771653543307087,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 218,
+              "cpu_lane": 417,
+              "nvme_to_landing": 43,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 43,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 43,
+              "stage_to_vram": 43,
+              "n2v": 43,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 43,
+              "v2n": 0,
+              "p2n": 43
+            }
+          },
+          {
+            "layer": 19,
+            "hits": {
+              "vram": 451,
+              "pinned": 526,
+              "nvme": 39
+            },
+            "hit_rate": {
+              "vram": 0.4438976377952756,
+              "pinned": 0.5177165354330708,
+              "nvme": 0.038385826771653545
+            },
+            "nvme_reads_per_token": 0.30708661417322836,
+            "promotions_per_token": 0.30708661417322836,
+            "evictions_per_token": 0.6141732283464567,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 169,
+              "cpu_lane": 357,
+              "nvme_to_landing": 39,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 39,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 39,
+              "stage_to_vram": 39,
+              "n2v": 39,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 39,
+              "v2n": 0,
+              "p2n": 39
+            }
+          },
+          {
+            "layer": 20,
+            "hits": {
+              "vram": 321,
+              "pinned": 664,
+              "nvme": 31
+            },
+            "hit_rate": {
+              "vram": 0.3159448818897638,
+              "pinned": 0.6535433070866141,
+              "nvme": 0.03051181102362205
+            },
+            "nvme_reads_per_token": 0.2440944881889764,
+            "promotions_per_token": 0.2440944881889764,
+            "evictions_per_token": 0.4881889763779528,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 226,
+              "cpu_lane": 438,
+              "nvme_to_landing": 31,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 31,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 31,
+              "stage_to_vram": 31,
+              "n2v": 31,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 31,
+              "v2n": 0,
+              "p2n": 31
+            }
+          },
+          {
+            "layer": 21,
+            "hits": {
+              "vram": 377,
+              "pinned": 604,
+              "nvme": 35
+            },
+            "hit_rate": {
+              "vram": 0.37106299212598426,
+              "pinned": 0.594488188976378,
+              "nvme": 0.0344488188976378
+            },
+            "nvme_reads_per_token": 0.2755905511811024,
+            "promotions_per_token": 0.2755905511811024,
+            "evictions_per_token": 0.5511811023622047,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 208,
+              "cpu_lane": 396,
+              "nvme_to_landing": 35,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 35,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 35,
+              "stage_to_vram": 35,
+              "n2v": 35,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 35,
+              "v2n": 0,
+              "p2n": 35
+            }
+          },
+          {
+            "layer": 22,
+            "hits": {
+              "vram": 344,
+              "pinned": 650,
+              "nvme": 22
+            },
+            "hit_rate": {
+              "vram": 0.33858267716535434,
+              "pinned": 0.639763779527559,
+              "nvme": 0.021653543307086614
+            },
+            "nvme_reads_per_token": 0.1732283464566929,
+            "promotions_per_token": 0.1732283464566929,
+            "evictions_per_token": 0.3464566929133858,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 222,
+              "cpu_lane": 428,
+              "nvme_to_landing": 22,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 22,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 22,
+              "stage_to_vram": 22,
+              "n2v": 22,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 22,
+              "v2n": 0,
+              "p2n": 22
+            }
+          },
+          {
+            "layer": 23,
+            "hits": {
+              "vram": 298,
+              "pinned": 678,
+              "nvme": 40
+            },
+            "hit_rate": {
+              "vram": 0.2933070866141732,
+              "pinned": 0.6673228346456693,
+              "nvme": 0.03937007874015748
+            },
+            "nvme_reads_per_token": 0.31496062992125984,
+            "promotions_per_token": 0.31496062992125984,
+            "evictions_per_token": 0.6299212598425197,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 233,
+              "cpu_lane": 445,
+              "nvme_to_landing": 40,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 40,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 40,
+              "stage_to_vram": 40,
+              "n2v": 40,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 40,
+              "v2n": 0,
+              "p2n": 40
+            }
+          },
+          {
+            "layer": 24,
+            "hits": {
+              "vram": 325,
+              "pinned": 665,
+              "nvme": 26
+            },
+            "hit_rate": {
+              "vram": 0.3198818897637795,
+              "pinned": 0.6545275590551181,
+              "nvme": 0.025590551181102362
+            },
+            "nvme_reads_per_token": 0.2047244094488189,
+            "promotions_per_token": 0.2047244094488189,
+            "evictions_per_token": 0.4094488188976378,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 227,
+              "cpu_lane": 438,
+              "nvme_to_landing": 26,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 26,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 26,
+              "stage_to_vram": 26,
+              "n2v": 26,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 26,
+              "v2n": 0,
+              "p2n": 26
+            }
+          },
+          {
+            "layer": 25,
+            "hits": {
+              "vram": 299,
+              "pinned": 679,
+              "nvme": 38
+            },
+            "hit_rate": {
+              "vram": 0.29429133858267714,
+              "pinned": 0.6683070866141733,
+              "nvme": 0.03740157480314961
+            },
+            "nvme_reads_per_token": 0.2992125984251969,
+            "promotions_per_token": 0.2992125984251969,
+            "evictions_per_token": 0.5984251968503937,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 232,
+              "cpu_lane": 447,
+              "nvme_to_landing": 38,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 38,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 38,
+              "stage_to_vram": 38,
+              "n2v": 38,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 38,
+              "v2n": 0,
+              "p2n": 38
+            }
+          },
+          {
+            "layer": 26,
+            "hits": {
+              "vram": 381,
+              "pinned": 591,
+              "nvme": 44
+            },
+            "hit_rate": {
+              "vram": 0.375,
+              "pinned": 0.5816929133858267,
+              "nvme": 0.04330708661417323
+            },
+            "nvme_reads_per_token": 0.3464566929133858,
+            "promotions_per_token": 0.3464566929133858,
+            "evictions_per_token": 0.6929133858267716,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 201,
+              "cpu_lane": 390,
+              "nvme_to_landing": 44,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 44,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 44,
+              "stage_to_vram": 44,
+              "n2v": 44,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 44,
+              "v2n": 0,
+              "p2n": 44
+            }
+          },
+          {
+            "layer": 27,
+            "hits": {
+              "vram": 281,
+              "pinned": 713,
+              "nvme": 22
+            },
+            "hit_rate": {
+              "vram": 0.2765748031496063,
+              "pinned": 0.7017716535433071,
+              "nvme": 0.021653543307086614
+            },
+            "nvme_reads_per_token": 0.1732283464566929,
+            "promotions_per_token": 0.1732283464566929,
+            "evictions_per_token": 0.3464566929133858,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 256,
+              "cpu_lane": 457,
+              "nvme_to_landing": 22,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 22,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 22,
+              "stage_to_vram": 22,
+              "n2v": 22,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 22,
+              "v2n": 0,
+              "p2n": 22
+            }
+          },
+          {
+            "layer": 28,
+            "hits": {
+              "vram": 387,
+              "pinned": 590,
+              "nvme": 39
+            },
+            "hit_rate": {
+              "vram": 0.3809055118110236,
+              "pinned": 0.5807086614173228,
+              "nvme": 0.038385826771653545
+            },
+            "nvme_reads_per_token": 0.30708661417322836,
+            "promotions_per_token": 0.30708661417322836,
+            "evictions_per_token": 0.6141732283464567,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 199,
+              "cpu_lane": 391,
+              "nvme_to_landing": 39,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 39,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 39,
+              "stage_to_vram": 39,
+              "n2v": 39,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 39,
+              "v2n": 0,
+              "p2n": 39
+            }
+          },
+          {
+            "layer": 29,
+            "hits": {
+              "vram": 424,
+              "pinned": 558,
+              "nvme": 34
+            },
+            "hit_rate": {
+              "vram": 0.41732283464566927,
+              "pinned": 0.5492125984251969,
+              "nvme": 0.03346456692913386
+            },
+            "nvme_reads_per_token": 0.2677165354330709,
+            "promotions_per_token": 0.2677165354330709,
+            "evictions_per_token": 0.5354330708661418,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 189,
+              "cpu_lane": 369,
+              "nvme_to_landing": 34,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 34,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 34,
+              "stage_to_vram": 34,
+              "n2v": 34,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 34,
+              "v2n": 0,
+              "p2n": 34
+            }
+          },
+          {
+            "layer": 30,
+            "hits": {
+              "vram": 346,
+              "pinned": 634,
+              "nvme": 36
+            },
+            "hit_rate": {
+              "vram": 0.3405511811023622,
+              "pinned": 0.6240157480314961,
+              "nvme": 0.03543307086614173
+            },
+            "nvme_reads_per_token": 0.28346456692913385,
+            "promotions_per_token": 0.28346456692913385,
+            "evictions_per_token": 0.5669291338582677,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 216,
+              "cpu_lane": 418,
+              "nvme_to_landing": 36,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 36,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 36,
+              "stage_to_vram": 36,
+              "n2v": 36,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 36,
+              "v2n": 0,
+              "p2n": 36
+            }
+          },
+          {
+            "layer": 31,
+            "hits": {
+              "vram": 370,
+              "pinned": 615,
+              "nvme": 31
+            },
+            "hit_rate": {
+              "vram": 0.3641732283464567,
+              "pinned": 0.6053149606299213,
+              "nvme": 0.03051181102362205
+            },
+            "nvme_reads_per_token": 0.2440944881889764,
+            "promotions_per_token": 0.2440944881889764,
+            "evictions_per_token": 0.4881889763779528,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 206,
+              "cpu_lane": 409,
+              "nvme_to_landing": 31,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 31,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 31,
+              "stage_to_vram": 31,
+              "n2v": 31,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 31,
+              "v2n": 0,
+              "p2n": 31
+            }
+          },
+          {
+            "layer": 32,
+            "hits": {
+              "vram": 385,
+              "pinned": 604,
+              "nvme": 27
+            },
+            "hit_rate": {
+              "vram": 0.37893700787401574,
+              "pinned": 0.594488188976378,
+              "nvme": 0.0265748031496063
+            },
+            "nvme_reads_per_token": 0.2125984251968504,
+            "promotions_per_token": 0.2125984251968504,
+            "evictions_per_token": 0.4251968503937008,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 202,
+              "cpu_lane": 402,
+              "nvme_to_landing": 27,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 27,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 27,
+              "stage_to_vram": 27,
+              "n2v": 27,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 27,
+              "v2n": 0,
+              "p2n": 27
+            }
+          },
+          {
+            "layer": 33,
+            "hits": {
+              "vram": 399,
+              "pinned": 586,
+              "nvme": 31
+            },
+            "hit_rate": {
+              "vram": 0.3927165354330709,
+              "pinned": 0.5767716535433071,
+              "nvme": 0.03051181102362205
+            },
+            "nvme_reads_per_token": 0.2440944881889764,
+            "promotions_per_token": 0.2440944881889764,
+            "evictions_per_token": 0.4881889763779528,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 201,
+              "cpu_lane": 385,
+              "nvme_to_landing": 31,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 31,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 31,
+              "stage_to_vram": 31,
+              "n2v": 31,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 31,
+              "v2n": 0,
+              "p2n": 31
+            }
+          },
+          {
+            "layer": 34,
+            "hits": {
+              "vram": 384,
+              "pinned": 616,
+              "nvme": 16
+            },
+            "hit_rate": {
+              "vram": 0.3779527559055118,
+              "pinned": 0.6062992125984252,
+              "nvme": 0.015748031496062992
+            },
+            "nvme_reads_per_token": 0.12598425196850394,
+            "promotions_per_token": 0.12598425196850394,
+            "evictions_per_token": 0.25196850393700787,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 210,
+              "cpu_lane": 406,
+              "nvme_to_landing": 16,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 16,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 16,
+              "stage_to_vram": 16,
+              "n2v": 16,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 16,
+              "v2n": 0,
+              "p2n": 16
+            }
+          },
+          {
+            "layer": 35,
+            "hits": {
+              "vram": 416,
+              "pinned": 574,
+              "nvme": 26
+            },
+            "hit_rate": {
+              "vram": 0.4094488188976378,
+              "pinned": 0.5649606299212598,
+              "nvme": 0.025590551181102362
+            },
+            "nvme_reads_per_token": 0.2047244094488189,
+            "promotions_per_token": 0.2047244094488189,
+            "evictions_per_token": 0.4094488188976378,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 187,
+              "cpu_lane": 387,
+              "nvme_to_landing": 26,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 26,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 26,
+              "stage_to_vram": 26,
+              "n2v": 26,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 26,
+              "v2n": 0,
+              "p2n": 26
+            }
+          },
+          {
+            "layer": 36,
+            "hits": {
+              "vram": 287,
+              "pinned": 708,
+              "nvme": 21
+            },
+            "hit_rate": {
+              "vram": 0.2824803149606299,
+              "pinned": 0.6968503937007874,
+              "nvme": 0.02066929133858268
+            },
+            "nvme_reads_per_token": 0.16535433070866143,
+            "promotions_per_token": 0.16535433070866143,
+            "evictions_per_token": 0.33070866141732286,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 252,
+              "cpu_lane": 456,
+              "nvme_to_landing": 21,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 21,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 21,
+              "stage_to_vram": 21,
+              "n2v": 21,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 21,
+              "v2n": 0,
+              "p2n": 21
+            }
+          },
+          {
+            "layer": 37,
+            "hits": {
+              "vram": 415,
+              "pinned": 569,
+              "nvme": 32
+            },
+            "hit_rate": {
+              "vram": 0.40846456692913385,
+              "pinned": 0.5600393700787402,
+              "nvme": 0.031496062992125984
+            },
+            "nvme_reads_per_token": 0.25196850393700787,
+            "promotions_per_token": 0.25196850393700787,
+            "evictions_per_token": 0.5039370078740157,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 188,
+              "cpu_lane": 381,
+              "nvme_to_landing": 32,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 32,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 32,
+              "stage_to_vram": 32,
+              "n2v": 32,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 32,
+              "v2n": 0,
+              "p2n": 32
+            }
+          },
+          {
+            "layer": 38,
+            "hits": {
+              "vram": 408,
+              "pinned": 586,
+              "nvme": 22
+            },
+            "hit_rate": {
+              "vram": 0.4015748031496063,
+              "pinned": 0.5767716535433071,
+              "nvme": 0.021653543307086614
+            },
+            "nvme_reads_per_token": 0.1732283464566929,
+            "promotions_per_token": 0.1732283464566929,
+            "evictions_per_token": 0.3464566929133858,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 195,
+              "cpu_lane": 391,
+              "nvme_to_landing": 22,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 22,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 22,
+              "stage_to_vram": 22,
+              "n2v": 22,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 22,
+              "v2n": 0,
+              "p2n": 22
+            }
+          },
+          {
+            "layer": 39,
+            "hits": {
+              "vram": 295,
+              "pinned": 703,
+              "nvme": 18
+            },
+            "hit_rate": {
+              "vram": 0.2903543307086614,
+              "pinned": 0.6919291338582677,
+              "nvme": 0.017716535433070866
+            },
+            "nvme_reads_per_token": 0.14173228346456693,
+            "promotions_per_token": 0.14173228346456693,
+            "evictions_per_token": 0.28346456692913385,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 247,
+              "cpu_lane": 456,
+              "nvme_to_landing": 18,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 18,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 18,
+              "stage_to_vram": 18,
+              "n2v": 18,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 18,
+              "v2n": 0,
+              "p2n": 18
+            }
+          },
+          {
+            "layer": 40,
+            "hits": {
+              "vram": 462,
+              "pinned": 534,
+              "nvme": 20
+            },
+            "hit_rate": {
+              "vram": 0.4547244094488189,
+              "pinned": 0.5255905511811023,
+              "nvme": 0.01968503937007874
+            },
+            "nvme_reads_per_token": 0.15748031496062992,
+            "promotions_per_token": 0.15748031496062992,
+            "evictions_per_token": 0.31496062992125984,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 179,
+              "cpu_lane": 355,
+              "nvme_to_landing": 20,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 20,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 20,
+              "stage_to_vram": 20,
+              "n2v": 20,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 20,
+              "v2n": 0,
+              "p2n": 20
+            }
+          },
+          {
+            "layer": 41,
+            "hits": {
+              "vram": 316,
+              "pinned": 676,
+              "nvme": 24
+            },
+            "hit_rate": {
+              "vram": 0.3110236220472441,
+              "pinned": 0.6653543307086615,
+              "nvme": 0.023622047244094488
+            },
+            "nvme_reads_per_token": 0.1889763779527559,
+            "promotions_per_token": 0.1889763779527559,
+            "evictions_per_token": 0.3779527559055118,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 233,
+              "cpu_lane": 443,
+              "nvme_to_landing": 24,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 24,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 24,
+              "stage_to_vram": 24,
+              "n2v": 24,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 24,
+              "v2n": 0,
+              "p2n": 24
+            }
+          },
+          {
+            "layer": 42,
+            "hits": {
+              "vram": 223,
+              "pinned": 758,
+              "nvme": 35
+            },
+            "hit_rate": {
+              "vram": 0.21948818897637795,
+              "pinned": 0.7460629921259843,
+              "nvme": 0.0344488188976378
+            },
+            "nvme_reads_per_token": 0.2755905511811024,
+            "promotions_per_token": 0.2755905511811024,
+            "evictions_per_token": 0.5511811023622047,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 269,
+              "cpu_lane": 489,
+              "nvme_to_landing": 35,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 35,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 35,
+              "stage_to_vram": 35,
+              "n2v": 35,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 35,
+              "v2n": 0,
+              "p2n": 35
+            }
+          },
+          {
+            "layer": 43,
+            "hits": {
+              "vram": 70,
+              "pinned": 914,
+              "nvme": 32
+            },
+            "hit_rate": {
+              "vram": 0.0688976377952756,
+              "pinned": 0.8996062992125984,
+              "nvme": 0.031496062992125984
+            },
+            "nvme_reads_per_token": 0.25196850393700787,
+            "promotions_per_token": 0.25196850393700787,
+            "evictions_per_token": 0.5039370078740157,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 344,
+              "cpu_lane": 570,
+              "nvme_to_landing": 32,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 32,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 32,
+              "stage_to_vram": 32,
+              "n2v": 32,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 32,
+              "v2n": 0,
+              "p2n": 32
+            }
+          },
+          {
+            "layer": 44,
+            "hits": {
+              "vram": 82,
+              "pinned": 902,
+              "nvme": 32
+            },
+            "hit_rate": {
+              "vram": 0.08070866141732283,
+              "pinned": 0.8877952755905512,
+              "nvme": 0.031496062992125984
+            },
+            "nvme_reads_per_token": 0.25196850393700787,
+            "promotions_per_token": 0.25196850393700787,
+            "evictions_per_token": 0.5039370078740157,
+            "moves": {
+              "visits": 1016,
+              "zero_copy": 335,
+              "cpu_lane": 567,
+              "nvme_to_landing": 32,
+              "nvme_to_pinned": 0,
+              "landing_to_stage": 32,
+              "pinned_to_stage": 0,
+              "vram_to_stage": 0,
+              "vram_to_pinned": 32,
+              "stage_to_vram": 32,
+              "n2v": 32,
+              "p2v": 0,
+              "n2p": 0,
+              "v2p": 32,
+              "v2n": 0,
+              "p2n": 32
+            }
+          }
+        ],
+        "mtp": null
+      },
+      "rows": [
+        {
+          "pos": 56,
+          "prompt": true,
+          "next": 785,
+          "secs": 4.9878952,
+          "at_s": 5.0665015,
+          "nvme_reads": 2134,
+          "nvme_bytes": 20217618432,
+          "rows": 57,
+          "routing_syncs": 42,
+          "sub_batches": 97
+        },
+        {
+          "pos": 57,
+          "prompt": false,
+          "next": 1196,
+          "secs": 0.4756707,
+          "at_s": 5.5434534,
+          "nvme_reads": 31,
+          "nvme_bytes": 293695488,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 58,
+          "prompt": false,
+          "next": 6801,
+          "secs": 0.4096179,
+          "at_s": 5.7095383,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 59,
+          "prompt": false,
+          "next": 264,
+          "secs": 0.3601161,
+          "at_s": 5.9036891,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 60,
+          "prompt": false,
+          "next": 11676,
+          "secs": 0.3853741,
+          "at_s": 6.0951192,
+          "nvme_reads": 25,
+          "nvme_bytes": 236851200,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 61,
+          "prompt": false,
+          "next": 16134,
+          "secs": 0.3976865,
+          "at_s": 6.3014564,
+          "nvme_reads": 25,
+          "nvme_bytes": 236851200,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 62,
+          "prompt": false,
+          "next": 315,
+          "secs": 0.4142679,
+          "at_s": 6.509575,
+          "nvme_reads": 20,
+          "nvme_bytes": 189480960,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 63,
+          "prompt": false,
+          "next": 6481,
+          "secs": 0.4065626,
+          "at_s": 6.7081387,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 64,
+          "prompt": false,
+          "next": 13931,
+          "secs": 0.4446842,
+          "at_s": 6.9543646,
+          "nvme_reads": 20,
+          "nvme_bytes": 189480960,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 65,
+          "prompt": false,
+          "next": 6500,
+          "secs": 0.4863993,
+          "at_s": 7.1947075,
+          "nvme_reads": 27,
+          "nvme_bytes": 255799296,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 66,
+          "prompt": false,
+          "next": 12406,
+          "secs": 0.4550415,
+          "at_s": 7.4094673,
+          "nvme_reads": 20,
+          "nvme_bytes": 189480960,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 67,
+          "prompt": false,
+          "next": 1113,
+          "secs": 0.4194772,
+          "at_s": 7.6142852,
+          "nvme_reads": 25,
+          "nvme_bytes": 236851200,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 68,
+          "prompt": false,
+          "next": 550,
+          "secs": 0.4225185,
+          "at_s": 7.8322064000000005,
+          "nvme_reads": 26,
+          "nvme_bytes": 246325248,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 69,
+          "prompt": false,
+          "next": 13,
+          "secs": 0.4177083,
+          "at_s": 8.0320925,
+          "nvme_reads": 21,
+          "nvme_bytes": 198955008,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 70,
+          "prompt": false,
+          "next": 1096,
+          "secs": 0.4005252,
+          "at_s": 8.2328411,
+          "nvme_reads": 29,
+          "nvme_bytes": 274747392,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 71,
+          "prompt": false,
+          "next": 374,
+          "secs": 0.3856022,
+          "at_s": 8.4177966,
+          "nvme_reads": 21,
+          "nvme_bytes": 198955008,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 72,
+          "prompt": false,
+          "next": 264,
+          "secs": 0.3555044,
+          "at_s": 8.5885147,
+          "nvme_reads": 17,
+          "nvme_bytes": 161058816,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 73,
+          "prompt": false,
+          "next": 10911,
+          "secs": 0.3250457,
+          "at_s": 8.7429589,
+          "nvme_reads": 17,
+          "nvme_bytes": 161058816,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 74,
+          "prompt": false,
+          "next": 16215,
+          "secs": 0.3267008,
+          "at_s": 8.9153052,
+          "nvme_reads": 11,
+          "nvme_bytes": 104214528,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 75,
+          "prompt": false,
+          "next": 3405,
+          "secs": 0.3117766,
+          "at_s": 9.0548316,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 76,
+          "prompt": false,
+          "next": 1959,
+          "secs": 0.312212,
+          "at_s": 9.2276239,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 77,
+          "prompt": false,
+          "next": 279,
+          "secs": 0.3314338,
+          "at_s": 9.386395,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 78,
+          "prompt": false,
+          "next": 1697,
+          "secs": 0.3114462,
+          "at_s": 9.5391563,
+          "nvme_reads": 17,
+          "nvme_bytes": 161058816,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 79,
+          "prompt": false,
+          "next": 4977,
+          "secs": 0.3235247,
+          "at_s": 9.7100813,
+          "nvme_reads": 17,
+          "nvme_bytes": 161058816,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 80,
+          "prompt": false,
+          "next": 31421,
+          "secs": 0.3185722,
+          "at_s": 9.8578466,
+          "nvme_reads": 17,
+          "nvme_bytes": 161058816,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 81,
+          "prompt": false,
+          "next": 41794,
+          "secs": 0.2902527,
+          "at_s": 10.0004866,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 82,
+          "prompt": false,
+          "next": 320,
+          "secs": 0.3125295,
+          "at_s": 10.1705347,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 83,
+          "prompt": false,
+          "next": 20030,
+          "secs": 0.3473486,
+          "at_s": 10.3479957,
+          "nvme_reads": 18,
+          "nvme_bytes": 170532864,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 84,
+          "prompt": false,
+          "next": 1414,
+          "secs": 0.311334,
+          "at_s": 10.4821708,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 85,
+          "prompt": false,
+          "next": 3793,
+          "secs": 0.3025639,
+          "at_s": 10.6506611,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 86,
+          "prompt": false,
+          "next": 1075,
+          "secs": 0.372171,
+          "at_s": 10.8545983,
+          "nvme_reads": 19,
+          "nvme_bytes": 180006912,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 87,
+          "prompt": false,
+          "next": 330,
+          "secs": 0.3846981,
+          "at_s": 11.0355002,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 88,
+          "prompt": false,
+          "next": 1015,
+          "secs": 0.4066238,
+          "at_s": 11.2613576,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 89,
+          "prompt": false,
+          "next": 51023,
+          "secs": 0.4215022,
+          "at_s": 11.4570932,
+          "nvme_reads": 22,
+          "nvme_bytes": 208429056,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 90,
+          "prompt": false,
+          "next": 31652,
+          "secs": 0.3441189,
+          "at_s": 11.6056171,
+          "nvme_reads": 24,
+          "nvme_bytes": 227377152,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 91,
+          "prompt": false,
+          "next": 1335,
+          "secs": 0.3900598,
+          "at_s": 11.8472627,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 92,
+          "prompt": false,
+          "next": 330,
+          "secs": 0.4235446,
+          "at_s": 12.0293114,
+          "nvme_reads": 22,
+          "nvme_bytes": 208429056,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 93,
+          "prompt": false,
+          "next": 4934,
+          "secs": 0.3925643,
+          "at_s": 12.2399097,
+          "nvme_reads": 18,
+          "nvme_bytes": 170532864,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 94,
+          "prompt": false,
+          "next": 15449,
+          "secs": 0.3990722,
+          "at_s": 12.4285064,
+          "nvme_reads": 19,
+          "nvme_bytes": 180006912,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 95,
+          "prompt": false,
+          "next": 6165,
+          "secs": 0.4431183,
+          "at_s": 12.6831375,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 96,
+          "prompt": false,
+          "next": 3270,
+          "secs": 0.4505193,
+          "at_s": 12.8791127,
+          "nvme_reads": 33,
+          "nvme_bytes": 312643584,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 97,
+          "prompt": false,
+          "next": 42503,
+          "secs": 0.3649857,
+          "at_s": 13.0482111,
+          "nvme_reads": 24,
+          "nvme_bytes": 227377152,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 98,
+          "prompt": false,
+          "next": 1335,
+          "secs": 0.3413787,
+          "at_s": 13.2205821,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 99,
+          "prompt": false,
+          "next": 330,
+          "secs": 0.3531879,
+          "at_s": 13.4014999,
+          "nvme_reads": 21,
+          "nvme_bytes": 198955008,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 100,
+          "prompt": false,
+          "next": 3849,
+          "secs": 0.3432069,
+          "at_s": 13.5638627,
+          "nvme_reads": 19,
+          "nvme_bytes": 180006912,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 101,
+          "prompt": false,
+          "next": 11555,
+          "secs": 0.337432,
+          "at_s": 13.7389983,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 102,
+          "prompt": false,
+          "next": 1827,
+          "secs": 0.3037055,
+          "at_s": 13.867708799999999,
+          "nvme_reads": 18,
+          "nvme_bytes": 170532864,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 103,
+          "prompt": false,
+          "next": 2379,
+          "secs": 0.240589,
+          "at_s": 13.979720799999999,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 104,
+          "prompt": false,
+          "next": 1366,
+          "secs": 0.2392306,
+          "at_s": 14.1070747,
+          "nvme_reads": 10,
+          "nvme_bytes": 94740480,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 105,
+          "prompt": false,
+          "next": 7989,
+          "secs": 0.2508811,
+          "at_s": 14.230742,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 106,
+          "prompt": false,
+          "next": 323,
+          "secs": 0.3034214,
+          "at_s": 14.4106039,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 107,
+          "prompt": false,
+          "next": 14166,
+          "secs": 0.3150586,
+          "at_s": 14.546099,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 108,
+          "prompt": false,
+          "next": 10290,
+          "secs": 0.2495662,
+          "at_s": 14.6603182,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 109,
+          "prompt": false,
+          "next": 382,
+          "secs": 0.2479708,
+          "at_s": 14.7942169,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 110,
+          "prompt": false,
+          "next": 10056,
+          "secs": 0.2994353,
+          "at_s": 14.959873,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 111,
+          "prompt": false,
+          "next": 752,
+          "secs": 0.3089571,
+          "at_s": 15.1033182,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 112,
+          "prompt": false,
+          "next": 3119,
+          "secs": 0.260141,
+          "at_s": 15.2201938,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 113,
+          "prompt": false,
+          "next": 700,
+          "secs": 0.2526446,
+          "at_s": 15.3560897,
+          "nvme_reads": 2,
+          "nvme_bytes": 18948096,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 114,
+          "prompt": false,
+          "next": 1128,
+          "secs": 0.2794219,
+          "at_s": 15.4997286,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 115,
+          "prompt": false,
+          "next": 311,
+          "secs": 0.2869747,
+          "at_s": 15.6431938,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 116,
+          "prompt": false,
+          "next": 3421,
+          "secs": 0.2515089,
+          "at_s": 15.7513898,
+          "nvme_reads": 5,
+          "nvme_bytes": 47370240,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 117,
+          "prompt": false,
+          "next": 1447,
+          "secs": 0.2479299,
+          "at_s": 15.891267,
+          "nvme_reads": 5,
+          "nvme_bytes": 47370240,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 118,
+          "prompt": false,
+          "next": 16,
+          "secs": 0.3208309,
+          "at_s": 16.0723741,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 119,
+          "prompt": false,
+          "next": 13,
+          "secs": 0.3034717,
+          "at_s": 16.1948985,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 120,
+          "prompt": false,
+          "next": 3070,
+          "secs": 0.2777411,
+          "at_s": 16.3502367,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 121,
+          "prompt": false,
+          "next": 10229,
+          "secs": 0.3126392,
+          "at_s": 16.5076622,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 122,
+          "prompt": false,
+          "next": 53231,
+          "secs": 0.2800003,
+          "at_s": 16.6303719,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 123,
+          "prompt": false,
+          "next": 3000,
+          "secs": 0.2878771,
+          "at_s": 16.7956829,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 124,
+          "prompt": false,
+          "next": 334,
+          "secs": 0.324295,
+          "at_s": 16.9547559,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 125,
+          "prompt": false,
+          "next": 1959,
+          "secs": 0.2707115,
+          "at_s": 17.0664787,
+          "nvme_reads": 18,
+          "nvme_bytes": 170532864,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 126,
+          "prompt": false,
+          "next": 279,
+          "secs": 0.255235,
+          "at_s": 17.2100804,
+          "nvme_reads": 5,
+          "nvme_bytes": 47370240,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 127,
+          "prompt": false,
+          "next": 4938,
+          "secs": 0.2940092,
+          "at_s": 17.360644,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 128,
+          "prompt": false,
+          "next": 7002,
+          "secs": 0.3000572,
+          "at_s": 17.5102258,
+          "nvme_reads": 11,
+          "nvme_bytes": 104214528,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 129,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.281799,
+          "at_s": 17.6425087,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 130,
+          "prompt": false,
+          "next": 39058,
+          "secs": 0.2768368,
+          "at_s": 17.7871685,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 131,
+          "prompt": false,
+          "next": 5109,
+          "secs": 0.298338,
+          "at_s": 17.9409901,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 132,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.2724791,
+          "at_s": 18.059746,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 133,
+          "prompt": false,
+          "next": 67592,
+          "secs": 0.2367316,
+          "at_s": 18.1777939,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 134,
+          "prompt": false,
+          "next": 320,
+          "secs": 0.2437932,
+          "at_s": 18.3035989,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 135,
+          "prompt": false,
+          "next": 3888,
+          "secs": 0.3179271,
+          "at_s": 18.495867,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 136,
+          "prompt": false,
+          "next": 9814,
+          "secs": 0.3391853,
+          "at_s": 18.6429708,
+          "nvme_reads": 23,
+          "nvme_bytes": 217903104,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 137,
+          "prompt": false,
+          "next": 323,
+          "secs": 0.3220481,
+          "at_s": 18.8180685,
+          "nvme_reads": 17,
+          "nvme_bytes": 161058816,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 138,
+          "prompt": false,
+          "next": 27884,
+          "secs": 0.3124067,
+          "at_s": 18.9555204,
+          "nvme_reads": 18,
+          "nvme_bytes": 170532864,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 139,
+          "prompt": false,
+          "next": 340,
+          "secs": 0.3384966,
+          "at_s": 19.1567686,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 140,
+          "prompt": false,
+          "next": 17,
+          "secs": 0.3449791,
+          "at_s": 19.3006141,
+          "nvme_reads": 27,
+          "nvme_bytes": 255799296,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 141,
+          "prompt": false,
+          "next": 13,
+          "secs": 0.2964352,
+          "at_s": 19.4532645,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 142,
+          "prompt": false,
+          "next": 3070,
+          "secs": 0.2945649,
+          "at_s": 19.5953322,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 143,
+          "prompt": false,
+          "next": 8232,
+          "secs": 0.2795933,
+          "at_s": 19.73292,
+          "nvme_reads": 10,
+          "nvme_bytes": 94740480,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 144,
+          "prompt": false,
+          "next": 7321,
+          "secs": 0.2650604,
+          "at_s": 19.860546,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 145,
+          "prompt": false,
+          "next": 334,
+          "secs": 0.2400827,
+          "at_s": 19.9730888,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 146,
+          "prompt": false,
+          "next": 1959,
+          "secs": 0.2321423,
+          "at_s": 20.092753,
+          "nvme_reads": 6,
+          "nvme_bytes": 56844288,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 147,
+          "prompt": false,
+          "next": 5128,
+          "secs": 0.26442,
+          "at_s": 20.2375792,
+          "nvme_reads": 5,
+          "nvme_bytes": 47370240,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 148,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.2600101,
+          "at_s": 20.3528301,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 149,
+          "prompt": false,
+          "next": 7289,
+          "secs": 0.2531903,
+          "at_s": 20.4908568,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 150,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.2828029,
+          "at_s": 20.6357226,
+          "nvme_reads": 11,
+          "nvme_bytes": 104214528,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 151,
+          "prompt": false,
+          "next": 5510,
+          "secs": 0.2678838,
+          "at_s": 20.7589112,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 152,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.2498716,
+          "at_s": 20.8857653,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 153,
+          "prompt": false,
+          "next": 4097,
+          "secs": 0.2571295,
+          "at_s": 21.0161781,
+          "nvme_reads": 7,
+          "nvme_bytes": 66318336,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 154,
+          "prompt": false,
+          "next": 43166,
+          "secs": 0.231838,
+          "at_s": 21.1177013,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 155,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.2049094,
+          "at_s": 21.2212118,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 156,
+          "prompt": false,
+          "next": 13714,
+          "secs": 0.2685354,
+          "at_s": 21.3863897,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 157,
+          "prompt": false,
+          "next": 10181,
+          "secs": 0.3006449,
+          "at_s": 21.5219708,
+          "nvme_reads": 12,
+          "nvme_bytes": 113688576,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 158,
+          "prompt": false,
+          "next": 198,
+          "secs": 0.2467825,
+          "at_s": 21.6332833,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 159,
+          "prompt": false,
+          "next": 18,
+          "secs": 0.2437925,
+          "at_s": 21.7658473,
+          "nvme_reads": 7,
+          "nvme_bytes": 66318336,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 160,
+          "prompt": false,
+          "next": 13,
+          "secs": 0.3025826,
+          "at_s": 21.9360085,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 161,
+          "prompt": false,
+          "next": 3070,
+          "secs": 0.2816055,
+          "at_s": 22.0475893,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 162,
+          "prompt": false,
+          "next": 785,
+          "secs": 0.2434317,
+          "at_s": 22.1795644,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 163,
+          "prompt": false,
+          "next": 28819,
+          "secs": 0.2512712,
+          "at_s": 22.2990518,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 164,
+          "prompt": false,
+          "next": 334,
+          "secs": 0.2076386,
+          "at_s": 22.3872958,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 165,
+          "prompt": false,
+          "next": 1959,
+          "secs": 0.2117737,
+          "at_s": 22.5109717,
+          "nvme_reads": 6,
+          "nvme_bytes": 56844288,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 166,
+          "prompt": false,
+          "next": 444,
+          "secs": 0.3150337,
+          "at_s": 22.7025453,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 167,
+          "prompt": false,
+          "next": 16,
+          "secs": 0.3698815,
+          "at_s": 22.8809669,
+          "nvme_reads": 16,
+          "nvme_bytes": 151584768,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 168,
+          "prompt": false,
+          "next": 320,
+          "secs": 0.297441,
+          "at_s": 23.0000747,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 169,
+          "prompt": false,
+          "next": 6960,
+          "secs": 0.2678201,
+          "at_s": 23.1488548,
+          "nvme_reads": 7,
+          "nvme_bytes": 66318336,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 170,
+          "prompt": false,
+          "next": 358,
+          "secs": 0.3293926,
+          "at_s": 23.329627,
+          "nvme_reads": 14,
+          "nvme_bytes": 132636672,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 171,
+          "prompt": false,
+          "next": 14941,
+          "secs": 0.3183984,
+          "at_s": 23.4674299,
+          "nvme_reads": 21,
+          "nvme_bytes": 198955008,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 172,
+          "prompt": false,
+          "next": 701,
+          "secs": 0.2755449,
+          "at_s": 23.605267,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 173,
+          "prompt": false,
+          "next": 444,
+          "secs": 0.2793359,
+          "at_s": 23.7469763,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 174,
+          "prompt": false,
+          "next": 17,
+          "secs": 0.2831868,
+          "at_s": 23.8886245,
+          "nvme_reads": 15,
+          "nvme_bytes": 142110720,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 175,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.267689,
+          "at_s": 24.0147363,
+          "nvme_reads": 10,
+          "nvme_bytes": 94740480,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 176,
+          "prompt": false,
+          "next": 444,
+          "secs": 0.2599421,
+          "at_s": 24.1486335,
+          "nvme_reads": 11,
+          "nvme_bytes": 104214528,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 177,
+          "prompt": false,
+          "next": 18,
+          "secs": 0.2387878,
+          "at_s": 24.2538571,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 178,
+          "prompt": false,
+          "next": 320,
+          "secs": 0.2401162,
+          "at_s": 24.3888802,
+          "nvme_reads": 8,
+          "nvme_bytes": 75792384,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 179,
+          "prompt": false,
+          "next": 6100,
+          "secs": 0.2859829,
+          "at_s": 24.5399308,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 180,
+          "prompt": false,
+          "next": 11,
+          "secs": 0.2820947,
+          "at_s": 24.6710887,
+          "nvme_reads": 13,
+          "nvme_bytes": 123162624,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 181,
+          "prompt": false,
+          "next": 28210,
+          "secs": 0.2736559,
+          "at_s": 24.8137159,
+          "nvme_reads": 10,
+          "nvme_bytes": 94740480,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 182,
+          "prompt": false,
+          "next": 25734,
+          "secs": 0.2752136,
+          "at_s": 24.9463882,
+          "nvme_reads": 9,
+          "nvme_bytes": 85266432,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        },
+        {
+          "pos": 183,
+          "prompt": false,
+          "next": 8335,
+          "secs": 0.1541623,
+          "at_s": 24.9679835,
+          "nvme_reads": 6,
+          "nvme_bytes": 56844288,
+          "rows": 1,
+          "routing_syncs": 42,
+          "sub_batches": 42
+        }
+      ],
+      "machine": {
+        "vram_used_bytes": 31358795776,
+        "vram_free_bytes": 2803220480,
+        "vram_total_bytes": 34162016256,
+        "working_set_bytes": 49592283136,
+        "peak_working_set_bytes": 49592283136,
+        "private_commit_bytes": 81132158976,
+        "free_ram_bytes": 4921884672,
+        "system_commit_free_bytes": 12290605056,
+        "system_commit_limit_bytes": 111003004928,
+        "tiers_pinned_bytes": 47806251008,
+        "tiers_vram_bytes": 22605175296
+      }
+    }
+  ],
+  "summary": {
+    "ttft_s": {
+      "values": [
+        5.0665015
+      ],
+      "median": 5.0665015,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "prefill_tok_s": {
+      "values": [
+        11.250366747152842
+      ],
+      "median": 11.250366747152842,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "decode_tok_s_median": {
+      "values": [
+        3.326183148292221
+      ],
+      "median": 3.326183148292221,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "decode_wall_tok_s": {
+      "values": [
+        6.3814343072541035
+      ],
+      "median": 6.3814343072541035,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "decode_latency_p50_s": {
+      "values": [
+        0.3006449
+      ],
+      "median": 0.3006449,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "decode_latency_p99_s": {
+      "values": [
+        0.4756707
+      ],
+      "median": 0.4756707,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "rep_wall_s": {
+      "values": [
+        24.9680325
+      ],
+      "median": 24.9680325,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "decode_r_nvme_reads_per_token": {
+      "values": [
+        14.26771653543307
+      ],
+      "median": 14.26771653543307,
+      "spread_max_over_min": null,
+      "within_spread_rule": null
+    },
+    "ids_identical_across_reps": true,
+    "spread_rule": 1.15,
+    "above_spread_rule": [],
+    "cache_per_rep": [
+      "cold"
+    ]
+  }
+}

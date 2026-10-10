@@ -1,0 +1,16 @@
+#!/bin/bash
+# profile-20261010k-decode: the quick.sh decode command (ARM2 + CROW_GLM_RT2=1 + the four switches
+# CROW_GLM_ARENA_FREQ=1 CROW_GLM_ARENA_REGROW=1 CROW_GLM_EMBED_GATHER=1 CROW_GLM_RT2_TABLE_SM=1),
+# glm-integration 3836cea, once unprofiled (plain) and once under nsys (CUDA trace, no CPU sampling, no context switches).
+W=/c/Users/robin/dev/crow-nest-wt-int; Q=$W/runs/glm53-flash/quick; D=$W/runs/glm53-flash/profile-20261010k-decode
+export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
+ARM="$(cat $Q/arm2.env) CROW_GLM_RT2=1 CROW_GLM_ARENA_FREQ=1 CROW_GLM_ARENA_REGROW=1 CROW_GLM_EMBED_GATHER=1 CROW_GLM_RT2_TABLE_SM=1"
+NSYS="/c/Program Files/NVIDIA Corporation/Nsight Systems 2026.5.1/target-windows-x64/nsys.exe"
+P="Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus write-through, and how false sharing hurts multithreaded code. Give concrete examples."
+cd $W/engine
+case "$1" in
+plain) env $ARM "${@:2}" timeout 120 target/release/glm5_run --cold --reps 1 --tokenizer "$TOK" --prompt "$P" -n 128 --json $D/plain${TAG}.json > $D/plain${TAG}.log 2>&1; echo "plain rc=$?";;
+nsys) env $ARM "${@:2}" "$NSYS" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --force-overwrite=true -o $D/decode \
+        target/release/glm5_run --cold --reps 1 --tokenizer "$TOK" --prompt "$P" -n 128 --json $D/decode.json > $D/decode.log 2>&1; echo "nsys rc=$?";;
+esac

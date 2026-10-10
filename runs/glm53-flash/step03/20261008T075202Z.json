@@ -1,0 +1,313 @@
+{
+ "env": {
+  "date_utc": "2026-10-08T07:52:07+00:00",
+  "commit": "2334252",
+  "python": "3.13.3",
+  "drive": "Phison 2000GB ESO2K0GMLCA0-EP8-420MS",
+  "firmware": "EQFM22.3",
+  "physical_disk": 0,
+  "volume": "C:\\",
+  "free_bytes": 144410427392,
+  "sector_logical": 512,
+  "sector_physical": 4096,
+  "block": 14155776,
+  "align": 4096,
+  "readers": [
+   1,
+   2,
+   4
+  ],
+  "reps": 3,
+  "secs": 20.0,
+  "warmup": 2.0,
+  "seed": 1,
+  "seq_passes": 3,
+  "seq_chunk": 16777216,
+  "foreign_max_mbps": 4.0,
+  "disk_busy_flag": false,
+  "files": [
+   {
+    "path": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-CNQ4.5.cnq",
+    "size": 178490593097
+   }
+  ]
+ },
+ "idle": {
+  "foreign_read_bytes": 1157632,
+  "write_bytes": 1097728,
+  "foreign_read_mbps": 0.3858773333333333,
+  "write_mbps": 0.3659093333333333,
+  "void_reasons": []
+ },
+ "cells": [
+  {
+   "readers": 1,
+   "bytes": 171185799168,
+   "gbps": 8.559289958399999,
+   "blocks": 12093,
+   "short_reads": 0,
+   "own_bytes": 188257665024,
+   "lat_p50_ms": 1.621500006876886,
+   "lat_p99_ms": 2.275599996210076,
+   "rep": 0,
+   "foreign": {
+    "foreign_read_bytes": 105193472,
+    "write_bytes": 4825088,
+    "foreign_read_mbps": 4.7809309661087225,
+    "write_mbps": 0.21929509688015247,
+    "void_reasons": [
+     "foreign reads 4.8 MB/s > 4.0 MB/s"
+    ]
+   }
+  },
+  {
+   "readers": 2,
+   "bytes": 230753304576,
+   "gbps": 11.5376652288,
+   "blocks": 16301,
+   "short_reads": 0,
+   "own_bytes": 253883842560,
+   "lat_p50_ms": 2.41430000460241,
+   "lat_p99_ms": 3.5954999912064523,
+   "rep": 0,
+   "foreign": {
+    "foreign_read_bytes": 2215936,
+    "write_bytes": 9138176,
+    "foreign_read_mbps": 0.10070670151195192,
+    "write_mbps": 0.41529880050492557,
+    "void_reasons": []
+   }
+  },
+  {
+   "readers": 4,
+   "bytes": 208273932288,
+   "gbps": 10.4136966144,
+   "blocks": 14713,
+   "short_reads": 0,
+   "own_bytes": 230441877504,
+   "lat_p50_ms": 5.1041999977314845,
+   "lat_p99_ms": 13.280800005304627,
+   "rep": 0,
+   "foreign": {
+    "foreign_read_bytes": 289792,
+    "write_bytes": 4562944,
+    "foreign_read_mbps": 0.013169123313716717,
+    "write_mbps": 0.20735552468523563,
+    "void_reasons": []
+   }
+  },
+  {
+   "readers": 1,
+   "bytes": 170619568128,
+   "gbps": 8.5309784064,
+   "blocks": 12053,
+   "short_reads": 0,
+   "own_bytes": 187691433984,
+   "lat_p50_ms": 1.6253000067081302,
+   "lat_p99_ms": 2.296799997566268,
+   "rep": 1,
+   "foreign": {
+    "foreign_read_bytes": 651264,
+    "write_bytes": 2433024,
+    "foreign_read_mbps": 0.029599142600015636,
+    "write_mbps": 0.11057792895854897,
+    "void_reasons": []
+   }
+  },
+  {
+   "readers": 2,
+   "bytes": 159266635776,
+   "gbps": 7.963331788800001,
+   "blocks": 11251,
+   "short_reads": 0,
+   "own_bytes": 181547827200,
+   "lat_p50_ms": 2.5162999954773113,
+   "lat_p99_ms": 6.548999997903593,
+   "rep": 1,
+   "foreign": {
+    "foreign_read_bytes": 57344,
+    "write_bytes": 3584000,
+    "foreign_read_mbps": 0.002605924119320018,
+    "write_mbps": 0.16287025745750114,
+    "void_reasons": []
+   }
+  },
+  {
+   "readers": 4,
+   "bytes": 160271695872,
+   "gbps": 8.0135847936,
+   "blocks": 11322,
+   "short_reads": 0,
+   "own_bytes": 173549813760,
+   "lat_p50_ms": 5.296299990732223,
+   "lat_p99_ms": 15.993799999705516,
+   "rep": 1,
+   "foreign": {
+    "foreign_read_bytes": 163840,
+    "write_bytes": 2797568,
+    "foreign_read_mbps": 0.0074452209935794555,
+    "write_mbps": 0.1271271484653692,
+    "void_reasons": []
+   }
+  },
+  {
+   "readers": 1,
+   "bytes": 171115020288,
+   "gbps": 8.5557510144,
+   "blocks": 12088,
+   "short_reads": 0,
+   "own_bytes": 188215197696,
+   "lat_p50_ms": 1.625200005946681,
+   "lat_p99_ms": 2.2807999921496958,
+   "rep": 2,
+   "foreign": {
+    "foreign_read_bytes": 3063296,
+    "write_bytes": 2301952,
+    "foreign_read_mbps": 0.13922207467882886,
+    "write_mbps": 0.10462016509376808,
+    "void_reasons": []
+   }
+  },
+  {
+   "readers": 2,
+   "bytes": 143072428032,
+   "gbps": 7.153621401600001,
+   "blocks": 10107,
+   "short_reads": 0,
+   "own_bytes": 155925872640,
+   "lat_p50_ms": 2.8949999978067353,
+   "lat_p99_ms": 6.9823000085307285,
+   "rep": 2,
+   "foreign": {
+    "foreign_read_bytes": 1435136,
+    "write_bytes": 2207744,
+    "foreign_read_mbps": 0.06521686218996034,
+    "write_mbps": 0.10032647512062397,
+    "void_reasons": []
+   }
+  },
+  {
+   "readers": 4,
+   "bytes": 148692271104,
+   "gbps": 7.4346135551999994,
+   "blocks": 10504,
+   "short_reads": 0,
+   "own_bytes": 157610409984,
+   "lat_p50_ms": 5.772199991042726,
+   "lat_p99_ms": 17.697399991448037,
+   "rep": 2,
+   "foreign": {
+    "foreign_read_bytes": 1672192,
+    "write_bytes": 2797568,
+    "foreign_read_mbps": 0.07598529824215189,
+    "write_mbps": 0.12712298517915427,
+    "void_reasons": []
+   }
+  }
+ ],
+ "sequential": [
+  {
+   "bytes": 178490593097,
+   "secs": 22.668136499996763,
+   "gbps": 7.874074390588987,
+   "rep": 0,
+   "foreign": {
+    "foreign_read_bytes": 4945079,
+    "write_bytes": 2260992,
+    "foreign_read_mbps": 0.21815110386337694,
+    "write_mbps": 0.09974317915371309,
+    "void_reasons": []
+   }
+  },
+  {
+   "bytes": 178490593097,
+   "secs": 22.648050200004946,
+   "gbps": 7.881057818255853,
+   "rep": 1,
+   "foreign": {
+    "foreign_read_bytes": 5113527,
+    "write_bytes": 5222400,
+    "foreign_read_mbps": 0.2257822176674124,
+    "write_mbps": 0.2305893864540648,
+    "void_reasons": []
+   }
+  },
+  {
+   "bytes": 178490593097,
+   "secs": 24.22479100000055,
+   "gbps": 7.368096306671787,
+   "rep": 2,
+   "foreign": {
+    "foreign_read_bytes": 31657655,
+    "write_bytes": 5640192,
+    "foreign_read_mbps": 1.3068288184611905,
+    "write_mbps": 0.23282727186376437,
+    "void_reasons": []
+   }
+  }
+ ],
+ "verdict": {
+  "valid": false,
+  "void_reasons": [
+   "rep 0 readers 1: foreign reads 4.8 MB/s > 4.0 MB/s"
+  ],
+  "per_readers": {
+   "1": {
+    "rates_gbps": [
+     8.559289958399999,
+     8.5309784064,
+     8.5557510144
+    ],
+    "median_gbps": 8.5557510144,
+    "min_gbps": 8.5309784064,
+    "max_gbps": 8.559289958399999,
+    "spread": 1.0033186758483366,
+    "spread_ok": true,
+    "m_star": 0.04495928015974777,
+    "prefill_bound_tok_s": 341.37446547456,
+    "prefill_line_ok": true
+   },
+   "2": {
+    "rates_gbps": [
+     11.5376652288,
+     7.963331788800001,
+     7.153621401600001
+    ],
+    "median_gbps": 7.963331788800001,
+    "min_gbps": 7.153621401600001,
+    "max_gbps": 11.5376652288,
+    "spread": 1.6128425843474818,
+    "spread_ok": false,
+    "m_star": 0.04184619962585392,
+    "prefill_bound_tok_s": 317.73693837312004,
+    "prefill_line_ok": true
+   },
+   "4": {
+    "rates_gbps": [
+     10.4136966144,
+     8.0135847936,
+     7.4346135551999994
+    ],
+    "median_gbps": 8.0135847936,
+    "min_gbps": 7.4346135551999994,
+    "max_gbps": 10.4136966144,
+    "spread": 1.4007044935262758,
+    "spread_ok": false,
+    "m_star": 0.04211027216815554,
+    "prefill_bound_tok_s": 319.74203326464,
+    "prefill_line_ok": true
+   }
+  },
+  "best_readers": 1,
+  "b_for_g1": null,
+  "g1_input": "VOID: rep 0 readers 1: foreign reads 4.8 MB/s > 4.0 MB/s",
+  "sequential": {
+   "rates_gbps": [
+    7.874074390588987,
+    7.881057818255853,
+    7.368096306671787
+   ],
+   "median_gbps": 7.874074390588987
+  }
+ }
+}

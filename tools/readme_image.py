@@ -127,6 +127,7 @@ FEATURES = [
  ("Sampling", "the model card's row, never greedy (#111)", "sub"),
  ("Output integrity", "#91 fixed 2026-09-23: 60 to 0 corrupt tokens", "ok"),
  ("Linux + Windows", "both models run on both; 27B speed measured on Linux", "gold"),
+ ("GLM-5.3-Flash, measuring", "3-bit MUL1 experts in VRAM, RAM and NVMe", "sub"),
 ]
 for i, (ti, d, acc) in enumerate(FEATURES):
     fx, fy = X0 + (i % 2) * 405, y + (i // 2) * 80
@@ -145,7 +146,8 @@ MEAS = [("60 → 0", C["ok"], "corrupt tokens, live agent|run 2026-09-23 (#91)")
         ("0.290 → 0.223", C["ok"], "27B KLD vs BF16, calibrated|scales, 2026-09-26"),
         ("120 / 123.05", C["gold"], "27B MTP decode vs llama.cpp|MTP, 2026-09-27 (#95)"),
         ("byte-identical", C["sub"], "27B MTP output against|plain decode, 2026-09-27"),
-        ("11 / 11", C["mark"], "27B colour probe, own F16|projector, 2026-09-27 (#122)")]
+        ("11 / 11", C["mark"], "27B colour probe, own F16|projector, 2026-09-27 (#122)"),
+        ("1137 / 16.8", C["ok"], "GLM-5.3-Flash tok/s prefill /|decode, cold, 2026-10-10")]
 MROWS = (len(MEAS) + 3) // 4
 card(X0, y, 800, 60 + MROWS * 100)
 for i, (v, col, d) in enumerate(MEAS):

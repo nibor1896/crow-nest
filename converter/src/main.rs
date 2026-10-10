@@ -70,15 +70,27 @@
 //! with what a container already stores. The conversion path below is untouched by it: a
 //! run without the word `requant-check` parses, reads and writes exactly what it did before.
 //! See `src/requant_check.rs` and `docs/dense-originals.md`.
+//!
+//! crow-nest #154/#155 (2026-10-08, GLM-5.3-Flash steps 4 and 5): FP8 E4M3 input with 128x128
+//! block scales (`src/fp8.rs`), the `cnq4.5-glm5-next` row (`recipe::decide_glm5_next`), a code
+//! histogram per NVFP4 tensor and the exact static order-0 coder sizes in the sidecar
+//! (`src/entropy.rs`), header caches (`--headers`), the shard-window mode (`--consume`), and a
+//! journal every conversion resumes from. Every family but GLM keeps its write order and bytes.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 mod dense_overlay;
+mod entropy;
 mod expert_overlay;
 mod expert_requant;
+mod fp8;
 mod imatrix;
+mod dequant;
 mod layer_rule_overlay;
+mod mul1;
+mod mul1_store;
+mod partial;
 mod recipe;
 mod requant_check;
 
@@ -166,6 +178,39 @@ fn decode_ue4m3(byte: u32) -> f32 {
     }
 }
 
+/// The f32 scale of one NVFP4 sub-block: its ue4m3 byte times the tensor's global scale.
+/// crow-nest #156: gate 0 (the sidecar, `quantize_nvfp4_w`) and `converter dequant`
+/// (`dequant_nvfp4`) share this and [`nvfp4_value`], so both see the same f32 per value.
+#[inline]
+fn nvfp4_scale(byte: u32, global: f32) -> f32 {
+    decode_ue4m3(byte) * global
+}
+
+/// One decoded NVFP4 value: the E2M1 code times its sub-block scale.
+#[inline]
+fn nvfp4_value(nib: u32, dec: f32) -> f32 {
+    decode_e2m1(nib) * dec
+}
+
+/// Decode whole 36-byte NVFP4 blocks (4 ue4m3 sub-block scales, then 32 bytes of E2M1 codes,
+/// value 2k in the low nibble of byte k, 2k+1 in the high one) to f32, exactly as gate 0
+/// decodes the written encoding.
+fn dequant_nvfp4(blocks: &[u8], global: f32) -> Vec<f32> {
+    assert!(blocks.len() % 36 == 0, "{} B is not whole 36-byte NVFP4 blocks", blocks.len());
+    let mut out = Vec::with_capacity(blocks.len() / 36 * 64);
+    for b in blocks.chunks_exact(36) {
+        for sb in 0..4 {
+            let dec = nvfp4_scale(b[sb] as u32, global);
+            for j in 0..16 {
+                let byte_idx = sb * 16 + j;
+                let nib = (b[4 + byte_idx / 2] as u32 >> (4 * (byte_idx % 2))) & 0xF;
+                out.push(nvfp4_value(nib, dec));
+            }
+        }
+    }
+    out
+}
+
 // ---------------- manifest ----------------
 
 struct TensorEntry {
@@ -179,6 +224,8 @@ struct TensorEntry {
     shard: String,
     data_begin: u64, // byte offset inside the shard file (incl. header)
     data_end: u64,
+    /// #155: the 128x128 block scale of an F8_E4M3 weight (`X.weight_scale_inv`)
+    scale: Option<ScaleSrc>,
 }
 
 // The BF16 keep set and the section patterns moved to `recipe.rs` with Crow #300 C6: they are
@@ -201,6 +248,8 @@ fn elem_size_of(dt: &str) -> Option<usize> {
         "F32" => Some(4),
         "BF16" | "F16" => Some(2),
         "I64" => Some(8),
+        // #154/#155: the GLM-5.3-Flash originals; read only through their weight_scale_inv
+        "F8_E4M3" => Some(1),
         _ => None,
     }
 }
@@ -489,6 +538,16 @@ fn quantize_nvfp4(values: &[f32], mode: ScalesMode) -> (Vec<u8>, f32, QuantStats
 /// `quantize_nvfp4` with the `--scales diag` weights: `diag` = (d over the input columns, the
 /// row length); a sub-block is 16 consecutive columns of one row (row length % 16 == 0)
 fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usize)>) -> (Vec<u8>, f32, QuantStats, f64) {
+    quantize_nvfp4_cap(values, mode, diag, 0x7F)
+}
+
+/// #177: `quantize_nvfp4_w` with every sub-block scale byte capped at `max_byte`
+/// (`recipe::Family::scale_byte_max`). The cap is applied BEFORE the E2M1 codes are chosen, so
+/// the codes round against the scale that is written and the statistics describe the written
+/// bytes. `0x7F` is no cap (the families of record, byte-identical to before); `0x7E` keeps the
+/// E4M3 NaN code out of a container. In `ceil` mode the "ceiling reference" is then the capped
+/// ceiling, the encoding that is written.
+fn quantize_nvfp4_cap(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usize)>, max_byte: u32) -> (Vec<u8>, f32, QuantStats, f64) {
     assert!(values.len() % 64 == 0);
     assert_eq!(mode == ScalesMode::Diag, diag.is_some(), "--scales diag needs its weights, and only it");
     if let Some((d, cols)) = diag {
@@ -550,8 +609,9 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
                     diag_bytes[b * 4 + sb]
                 }
             };
+            let stored = stored.min(max_byte);
             scales[sb] = stored;
-            let dec = decode_ue4m3(stored) * global;
+            let dec = nvfp4_scale(stored, global);
             let inv = 1.0 / dec;
             for (j, v) in sub.iter().enumerate() {
                 let nib = e2m1_index(v.abs() * inv) as u32 | (((*v < 0.0) as u32) << 3);
@@ -564,7 +624,7 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
             for (j, v) in sub.iter().enumerate() {
                 let byte_idx = sb * 16 + j;
                 let nib = (nibbles[byte_idx / 2] >> (4 * (byte_idx % 2))) & 0xF;
-                let d = decode_e2m1(nib) * dec;
+                let d = nvfp4_value(nib, dec);
                 let err = (d - *v).abs();
                 sb_stats.sum_abs_err += err as f64;
                 sb_stats.sum_sq_err += (err as f64) * (err as f64);
@@ -603,7 +663,8 @@ fn quantize_nvfp4_w(values: &[f32], mode: ScalesMode, diag: Option<(&[f32], usiz
     (out, global, stats, sse_ceil)
 }
 
-const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
+const HELP: &str = "usage: converter [--scales ceil|mse] --source-repo <org/name> [--revision <sha>] <model-dir | file.safetensors> <out.cnq>\n  writes an index v2 container: config.json + generation_config.json verbatim, the family's recipe, source repo/revision/shard sha256\n  (--revision defaults to the Hugging Face cache in the model dir; Crow #300 C6)\n  --scales ceil  ceiling sub-block scales: stored >= raw always, max_rel <= 1.0 (default)\n  --scales mse   per-sub-block SSE-minimizing scales: clipping allowed, quality via MSE report\n  --scales diag --diag-stats <f.json>  all 126 ue4m3 steps scored by the activation-weighted error (Crow #300 p2-lh)\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) (crow-nest #154)\n  --consume <shard-dir>  convert while shards come and go: wait for <shard>.verified, write <shard>.done, never delete; needs --headers (crow-nest #155)\n  an interrupted conversion resumes from <out>.cnq.journal.jsonl (crow-nest #155)\n  --layers <spec> [--with-embed-head]  a partial container: text layers <spec> only (0-3, 0,3) [+ token embedding, lm_head, final norm]; the rest is filtered and the index says so (crow-nest #156)\n  --experts-mul1 <store> [--mul1-wait] [--disk-reserve-gib N]  GLM-5.3-Flash: the routed experts (MTP layer 45 incl.) as MUL1 K=3 trellis records from a tools/glm_mul1_quantize.py store, after the dense part; --mul1-wait waits for store.json and for records still being quantized; refused when free disk < bytes to write + N GiB (default 16) (crow-nest #182)\n  --mtp-overlay  GLM-5.3-Flash: only the MTP block's (layer 45) non-expert tensors, section mtp, with the trunk's DSA + MoE codecs (eh_proj BF16): the overlay glm5_mtp::load_mtp opens beside the 3-bit container (crow-nest #182)\n       converter [--scales ceil|mse] requant-check <dense.safetensors> <container.cnq>\n  re-quantizes fetched originals and compares them with the container's own bytes (#76)\n       converter dequant <container.cnq> (<name>[:<r0>:<r1>] ... | --names -)\n  writes the named tensors (rows r0..r1) to stdout as f32 little endian, decoded as gate 0 decodes them (crow-nest #156);
+  MUL1 K=3 expert records as their original-basis weight diag(suh) H W_hat H diag(svh) / 128 (#181 decoder, f64, one f32 rounding)\n       converter dense-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) [--kinds ...]\n  builds a bf16 overlay container over the dense text tensors (#77)\n       converter expert-overlay --base <container.cnq> --out <overlay.cnq> --originals <dir> --layers 1,7,... --rule mse|mse46|imatrix|imatrix46 [--imatrix <f.gguf>]\n  builds an nvfp4 overlay container over the routed experts of those layers (#79)\n       converter layer-rule-overlay --base <container.cnq> --out <overlay.cnq> (--from-originals <f.safetensors> | --from-container <base.cnq>) --arm attn-v-out|ffn-down-rule|ffn-down-all\n  builds a bf16 overlay container for one llama.cpp-shaped layer-rule arm (#91 phase 1)\n       converter imatrix-show <imatrix.gguf> [tensor ...]\n  prints the importance matrix header and named tensors (#79)\n       converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  the dry run: family, recipe, per-tensor dtype/section table, GPU / host byte totals (Crow #300 C6)";
 
 /// `converter imatrix-show <imatrix.gguf> [tensor ...]` — #79. Read-only: the kv block, the
 /// tensor count, and for every named tensor its dims, its data offset, its first eight values,
@@ -736,6 +797,17 @@ fn main() {
         std::process::exit(imatrix_show(&all[1..]));
     }
 
+    // crow-nest #156: the read-only decoder of a written container (the oracle's `--weights
+    // container` back end reads its weights through it). Same additive rule: its own word as
+    // argument zero, and it never reaches the conversion path.
+    if let Some(at) = all.iter().position(|a| a == "dequant") {
+        if at != 0 {
+            eprintln!("unexpected argument {} before dequant\n{}", all[0], dequant::HELP);
+            std::process::exit(2);
+        }
+        std::process::exit(dequant::run(&all[1..]));
+    }
+
     // Crow #300 C6: the read-only plan. Same additive rule as every subcommand above: its own
     // word as argument zero, and it reads the index, the shard headers and the config only.
     if let Some(at) = all.iter().position(|a| a == "plan") {
@@ -750,6 +822,9 @@ fn main() {
     let mut mode = ScalesMode::Ceil;
     let mut prov = Provenance::default();
     let mut diag_path: Option<String> = None;
+    let mut opts = ConvertOpts::default();
+    let mut layers_spec: Option<String> = None;
+    let mut with_embed_head = false;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -765,6 +840,20 @@ fn main() {
             "--diag-stats" => diag_path = argv.next(),
             "--source-repo" => prov.repo = argv.next(),
             "--revision" => prov.revision = argv.next(),
+            "--headers" => opts.headers = argv.next().map(std::path::PathBuf::from),
+            "--consume" => opts.consume = argv.next().map(std::path::PathBuf::from),
+            "--layers" => layers_spec = argv.next(),
+            "--with-embed-head" => with_embed_head = true,
+            "--experts-mul1" => opts.mul1 = argv.next().map(std::path::PathBuf::from),
+            "--mul1-wait" => opts.mul1_wait = true,
+            "--mtp-overlay" => opts.mtp_overlay = true,
+            "--disk-reserve-gib" => match argv.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(g) => opts.disk_reserve = g << 30,
+                None => {
+                    eprintln!("--disk-reserve-gib needs a whole number of GiB\n{HELP}");
+                    std::process::exit(2);
+                }
+            },
             a if a.starts_with("--") => {
                 eprintln!("unknown flag {a}\n{HELP}");
                 std::process::exit(2);
@@ -775,6 +864,20 @@ fn main() {
     if positional.len() != 2 {
         eprintln!("{HELP}");
         std::process::exit(2);
+    }
+    match (layers_spec, with_embed_head) {
+        (Some(spec), e) => match partial::LayerFilter::parse(&spec, e) {
+            Ok(f) => opts.filter = Some(f),
+            Err(e) => {
+                eprintln!("conversion refused: {e}\n{HELP}");
+                std::process::exit(2);
+            }
+        },
+        (None, true) => {
+            eprintln!("conversion refused: --with-embed-head belongs to a partial container and needs --layers <spec>\n{HELP}");
+            std::process::exit(2);
+        }
+        (None, false) => {}
     }
     let input = std::path::PathBuf::from(&positional[0]);
     let out_path = std::path::PathBuf::from(&positional[1]);
@@ -789,40 +892,99 @@ fn main() {
             std::process::exit(2);
         }
     };
-    std::process::exit(convert(&input, &out_path, mode, &prov, diag.as_ref()));
+    std::process::exit(convert_with(&input, &out_path, mode, &prov, diag.as_ref(), &opts));
 }
 
 /// `--source-repo` / `--revision`: where the checkpoint came from, for the index v2 `model`
-/// block. The revision defaults to the Hugging Face local-dir cache's (`recipe::read_hf_tree`).
+/// block. The revision defaults to the Hugging Face local-dir cache's (`recipe::read_hf_tree`)
+/// or to `sha` of `hf-revision.json` (`recipe::read_hf_api_info`, crow-nest #155).
 #[derive(Default, Clone)]
 struct Provenance {
     repo: Option<String>,
     revision: Option<String>,
 }
 
+/// One FP8 weight's `weight_scale_inv` (crow-nest #155): where its bytes are.
+#[derive(Clone)]
+struct ScaleSrc {
+    name: String,
+    dtype: String,
+    shard: String,
+    data_begin: u64,
+    data_end: u64,
+}
+
 /// The header scan of a conversion (and of `plan`): the config, the family, and every tensor
-/// with its recipe decision. Reads the model index, the shard headers and the two config files,
-/// never a tensor's payload.
+/// with its recipe decision. Reads the model index, the shard headers (from the shard files, or
+/// from a header cache, `--headers`) and the two config files, never a tensor's payload.
 struct Manifest {
     family: recipe::Family,
     config_json: String,
     generation_config_json: String,
     config: serde_json::Value,
     tensors: Vec<TensorEntry>,
-    /// tensors the recipe does not write (`recipe::omitted`): reason -> (count, source bytes)
+    /// tensors the recipe does not write (`recipe::omitted`): reason -> (count, source bytes);
+    /// an omitted FP8 weight's `weight_scale_inv` counts under the same reason
     omitted: BTreeMap<&'static str, (usize, u64)>,
     shard_files: Vec<std::path::PathBuf>,
     weight_map: Option<BTreeMap<String, String>>,
     single_file: bool,
     /// the directory the configs (and the HF cache) are read from
     model_dir: std::path::PathBuf,
+    /// #155: the header cache the manifest was built from (`--headers`): shard files need not
+    /// exist for the plan, and a conversion reads each shard only when it gets to it
+    headers: Option<std::path::PathBuf>,
+    /// #155: the shard sizes the header cache recorded (`size`), file name -> bytes
+    shard_size: BTreeMap<String, u64>,
 }
 
+/// The `(header, data_start, size)` of one shard: from the file itself, or from the header
+/// cache `<headers>/<shard>.json` (`{"header", "data_start"[, "shard", "size"]}`, the format of
+/// `tools/fetch-dense-originals.py` `RangeFetcher.read_header`).
+fn shard_header(path: &std::path::Path, headers: Option<&std::path::Path>) -> Result<(serde_json::Value, u64, Option<u64>), String> {
+    let file = path.file_name().and_then(|f| f.to_str()).unwrap_or_default().to_string();
+    let Some(dir) = headers else {
+        let (h, s) = read_safetensors_header(path).map_err(|e| format!("{}: shard header: {e}", path.display()))?;
+        return Ok((h, s, None));
+    };
+    let p = dir.join(format!("{file}.json"));
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).map_err(|e| format!("{}: header cache: {e}", p.display()))?)
+        .map_err(|e| format!("{}: {e}", p.display()))?;
+    if let Some(s) = v["shard"].as_str() {
+        if s != file {
+            return Err(format!("{}: the header cache is for {s}, not {file}", p.display()));
+        }
+    }
+    let start = v["data_start"].as_u64().ok_or(format!("{}: no data_start", p.display()))?;
+    if !v["header"].is_object() {
+        return Err(format!("{}: no header object", p.display()));
+    }
+    Ok((v["header"].clone(), start, v["size"].as_u64()))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
+    build_manifest_from(input, None)
+}
+
+fn build_manifest_from(input: &std::path::Path, headers: Option<&std::path::Path>) -> Result<Manifest, String> {
+    build_manifest_with(input, headers, false, false)
+}
+
+/// `mul1` (#182, `--experts-mul1`): every GLM routed-expert weight gets
+/// [`recipe::mul1_expert_decision`], and the MTP block's routed experts (layer 45, with their
+/// block scales) stay in the manifest instead of being omitted; the rest of the MTP block is
+/// omitted as before. Without it the manifest is the one of record.
+///
+/// `mtp` (#182, `--mtp-overlay`): the MTP block's non-expert tensors (layer 45, with their block
+/// scales) stay in the manifest with [`recipe::mtp_overlay_decision`] (section `mtp`); its routed
+/// experts stay omitted (they are the 3-bit container's MUL1 records).
+fn build_manifest_with(input: &std::path::Path, headers: Option<&std::path::Path>, mul1: bool, mtp: bool) -> Result<Manifest, String> {
     let single_file = input.is_file();
     let model_dir = if single_file { input.parent().map(|p| p.to_path_buf()).unwrap_or_default() } else { input.to_path_buf() };
     let model_dir = if model_dir.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { model_dir };
     let (family, config_json, generation_config_json, config) = recipe::read_model_configs(&model_dir)?;
+    recipe::check_family_config(family, &config)?;
     let mut tensors: Vec<TensorEntry> = Vec::new();
     let mut weight_map: Option<BTreeMap<String, String>> = None;
     let shard_files: Vec<std::path::PathBuf> = if single_file {
@@ -843,17 +1005,26 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
     };
     let mut refusals: Vec<String> = Vec::new();
     let mut omitted: BTreeMap<&'static str, (usize, u64)> = BTreeMap::new();
+    let mut scales: BTreeMap<String, ScaleSrc> = BTreeMap::new();
+    let mut scale_shape: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut shard_size: BTreeMap<String, u64> = BTreeMap::new();
     for path in &shard_files {
         let shard_name = path.file_name().unwrap().to_str().unwrap().to_string();
-        let (header, data_start) = read_safetensors_header(path).map_err(|e| format!("{}: shard header: {e}", path.display()))?;
+        let (header, data_start, size) = shard_header(path, headers)?;
+        if let Some(s) = size {
+            shard_size.insert(shard_name.clone(), s);
+        }
         if let Some(entries) = header.as_object() {
             for (name, info) in entries {
                 if name == "__metadata__" {
                     continue;
                 }
                 let dt = info["dtype"].as_str().unwrap_or("F32");
+                // crow-nest #154: an unknown dtype used to be skipped with a line on stderr
+                // (`eprintln!("skip ...")`), which would have dropped every F8_E4M3 tensor of
+                // GLM-5.3-Flash from the plan; it is a refusal by name now
                 let Some(es) = elem_size_of(dt) else {
-                    eprintln!("skip {name}: unsupported dtype {dt}");
+                    refusals.push(format!("{name}: dtype {dt} - this converter reads F32, BF16, F16, I64 and F8_E4M3 only (refused, not skipped)"));
                     continue;
                 };
                 let shape: Vec<usize> = info["shape"]
@@ -867,13 +1038,31 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
                 let begin = info["data_offsets"][0].as_u64().unwrap();
                 let end = info["data_offsets"][1].as_u64().unwrap();
                 assert_eq!(end - begin, (n * es) as u64, "{name}: length mismatch");
-                if let Some(why) = recipe::omitted(family, name) {
+                let mul1_expert = mul1 && family == recipe::Family::Glm5Next && recipe::glm_expert(name.strip_suffix("_scale_inv").unwrap_or(name)).is_some();
+                // #182: a non-expert tensor of the MTP block (or its block scale) in an MTP overlay
+                let mtp_rest = mtp
+                    && family == recipe::Family::Glm5Next
+                    && recipe::mtp_overlay_decision(name.strip_suffix("_scale_inv").unwrap_or(name), &shape, dt).is_some();
+                if let Some(why) = recipe::omitted(family, name).filter(|_| !mul1_expert && !mtp_rest) {
                     let e = omitted.entry(why).or_default();
                     e.0 += 1;
                     e.1 += end - begin;
                     continue;
                 }
-                let decision = match recipe::decide(family, name, &shape, dt) {
+                if name.ends_with(".weight_scale_inv") {
+                    scale_shape.insert(name.clone(), shape);
+                    scales.insert(
+                        name.clone(),
+                        ScaleSrc { name: name.clone(), dtype: dt.to_string(), shard: shard_name.clone(), data_begin: data_start + begin, data_end: data_start + end },
+                    );
+                    continue;
+                }
+                let decided = match recipe::mul1_expert_decision(name).filter(|_| mul1_expert) {
+                    Some(d) => Ok(d),
+                    None if mtp_rest => recipe::mtp_overlay_decision(name, &shape, dt).expect("an MTP-block tensor"),
+                    None => recipe::decide(family, name, &shape, dt),
+                };
+                let decision = match decided {
                     Ok(d) => d,
                     Err(why) => {
                         refusals.push(why);
@@ -889,9 +1078,35 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
                     shard: shard_name.clone(),
                     data_begin: data_start + begin,
                     data_end: data_start + end,
+                    scale: None,
                 });
             }
         }
+    }
+    // #155: pair every FP8 weight with its `weight_scale_inv` (128x128 grid), by name
+    for t in tensors.iter_mut() {
+        let key = format!("{}_scale_inv", t.name);
+        match scales.remove(&key) {
+            Some(s) => {
+                let shp = &scale_shape[&key];
+                if t.src_dtype != "F8_E4M3" {
+                    refusals.push(format!("{key}: a block scale beside a {} weight - only F8_E4M3 weights are read through their scale", t.src_dtype));
+                } else if t.shape.len() != 2 {
+                    refusals.push(format!("{}: an F8_E4M3 tensor of shape {:?} - only 2-D FP8 weights with 128x128 block scales are read", t.name, t.shape));
+                } else if shp.as_slice() != fp8::scale_grid(t.shape[0], t.shape[1]) {
+                    refusals.push(format!("{key}: shape {shp:?}, the 128x128 grid of {:?} is {:?}", t.shape, fp8::scale_grid(t.shape[0], t.shape[1])));
+                } else if s.dtype != "F32" && s.dtype != "BF16" {
+                    refusals.push(format!("{key}: dtype {} - block scales are read as F32 or BF16 only", s.dtype));
+                } else {
+                    t.scale = Some(s);
+                }
+            }
+            None if t.src_dtype == "F8_E4M3" => refusals.push(format!("{}: an F8_E4M3 weight without its {key}", t.name)),
+            None => {}
+        }
+    }
+    for k in scales.keys() {
+        refusals.push(format!("{k}: a weight_scale_inv without its F8_E4M3 weight"));
     }
     if !refusals.is_empty() {
         refusals.sort();
@@ -899,27 +1114,73 @@ fn build_manifest(input: &std::path::Path) -> Result<Manifest, String> {
     }
     tensors.sort_by(|a, b| a.shard.cmp(&b.shard).then(a.data_begin.cmp(&b.data_begin)));
     let geo = recipe::derive_geo(family, &config);
-    let named: Vec<(String, Vec<usize>)> = tensors.iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
+    // #182: the MTP block's experts and, in an MTP overlay, its other tensors (decision section
+    // `mtp`) are no text layer of the config
+    let named: Vec<(String, Vec<usize>)> =
+        tensors.iter().filter(|t| !(mul1 || mtp) || t.decision.section != recipe::MTP_SECTION).map(|t| (t.name.clone(), t.shape.clone())).collect();
     recipe::check_geo_against_tensors(&geo, &named)?;
-    Ok(Manifest { family, config_json, generation_config_json, config, tensors, omitted, shard_files, weight_map, single_file, model_dir })
+    Ok(Manifest {
+        family,
+        config_json,
+        generation_config_json,
+        config,
+        tensors,
+        omitted,
+        shard_files,
+        weight_map,
+        single_file,
+        model_dir,
+        headers: headers.map(|p| p.to_path_buf()),
+        shard_size,
+    })
 }
 
 /// The index v2 `model` block's provenance: repo from `--source-repo`, revision from
-/// `--revision` or the HF cache (both, when given, must agree), and one record per shard.
-/// `compute` hashes a shard the HF cache has no LFS record for (the conversion); the plan
-/// passes `false` and reports those shards as "computed at conversion".
+/// `--revision`, the HF cache or `hf-revision.json` (all that are given must agree), and one
+/// record per shard. `compute` hashes a shard that has no LFS record (the conversion); the plan
+/// passes `false` and reports those shards as "computed at conversion". #155: a shard the
+/// model-info JSON has an LFS record for is recorded from it (`sha256_from: hf-lfs`) without
+/// reading it; under `--headers` it need not be on disk, and when it is, its size must match.
 fn provenance(m: &Manifest, prov: &Provenance, compute: bool) -> Result<(String, String, Vec<recipe::ShardRecord>, usize), String> {
     let tree = recipe::read_hf_tree(&m.model_dir)?;
-    let revision = match (&prov.revision, tree.as_ref().map(|t| t.revision.clone())) {
-        (Some(a), Some(b)) if *a != b => return Err(format!("--revision {a}, but the Hugging Face cache in this directory is revision {b}")),
-        (Some(a), _) => a.clone(),
-        (None, Some(b)) => b,
-        (None, None) => return Err("no --revision given and no Hugging Face cache (.cache/huggingface/trees) to read it from".into()),
+    let api = recipe::read_hf_api_info(&m.model_dir)?;
+    let mut revision = prov.revision.clone();
+    for (src, rev) in [
+        ("the Hugging Face cache in this directory", tree.as_ref().map(|t| t.revision.clone())),
+        ("hf-revision.json in this directory", api.as_ref().and_then(|a| a.revision.clone())),
+    ] {
+        match (&revision, rev) {
+            (Some(a), Some(b)) if *a != b => return Err(format!("--revision {a}, but {src} is revision {b}")),
+            (None, Some(b)) => revision = Some(b),
+            _ => {}
+        }
+    }
+    let Some(revision) = revision else {
+        return Err("no --revision given and no Hugging Face cache (.cache/huggingface/trees) or hf-revision.json to read it from".into());
     };
     let repo = prov.repo.clone().ok_or("--source-repo <org/name> is required: the index v2 names the checkpoint it was converted from")?;
     let mut shards = Vec::new();
     let mut pending = 0usize;
     for p in &m.shard_files {
+        let file = p.file_name().unwrap().to_string_lossy().to_string();
+        let in_tree = tree.as_ref().is_some_and(|t| t.lfs.contains_key(&file));
+        if let (false, Some((sha, size))) = (in_tree, api.as_ref().and_then(|a| a.lfs.get(&file))) {
+            match std::fs::metadata(p) {
+                Ok(md) if md.len() != *size => {
+                    return Err(format!("{file}: {} B on disk, but Hugging Face recorded {size} B - an incomplete or foreign file", md.len()))
+                }
+                Ok(_) => {}
+                Err(_) if m.headers.is_some() => {}
+                Err(e) => return Err(format!("{}: {e}", p.display())),
+            }
+            if let Some(hs) = m.shard_size.get(&file) {
+                if hs != size {
+                    return Err(format!("{file}: the header cache says {hs} B, Hugging Face recorded {size} B"));
+                }
+            }
+            shards.push(recipe::ShardRecord { file, size: *size, sha256: sha.clone(), sha256_from: "hf-lfs" });
+            continue;
+        }
         match recipe::shard_record(p, tree.as_ref(), compute)? {
             Some(r) => shards.push(r),
             None => pending += 1,
@@ -932,18 +1193,113 @@ fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
 
-const PLAN_HELP: &str = "usage: converter plan [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  reads the model index, the shard headers and config.json only; prints the family, the recipe,\n  the per-tensor dtype/section decision table, the per-row summary and the GPU / host byte totals";
+/// #155: the write order of a conversion, in units. A unit is written back to back; a unit with
+/// `align` starts at an absolute file offset that is a multiple of it (zeros before it). Every
+/// family but GLM: one tensor per unit, no alignment (the order and the bytes of record). GLM:
+/// the gate, up and down projections of one routed expert of one layer form one unit (in that
+/// order), aligned to 4096 so an expert is one aligned read for the NVMe tier; the unit sits
+/// where its first projection appears in (shard, offset) order.
+struct Unit {
+    tensors: Vec<usize>,
+    align: u64,
+}
+
+const EXPERT_ALIGN: u64 = 4096;
+
+fn write_units(m: &Manifest) -> Vec<Unit> {
+    if m.family != recipe::Family::Glm5Next {
+        return (0..m.tensors.len()).map(|i| Unit { tensors: vec![i], align: 0 }).collect();
+    }
+    let mut groups: BTreeMap<(u64, u64), [Option<usize>; 3]> = BTreeMap::new();
+    for (i, t) in m.tensors.iter().enumerate() {
+        if let Some((l, e, p)) = recipe::glm_expert(&t.name) {
+            let slot = match p {
+                "gate" => 0,
+                "up" => 1,
+                _ => 2,
+            };
+            groups.entry((l, e)).or_default()[slot] = Some(i);
+        }
+    }
+    // #182: MUL1 experts (records from the store, no shard read) come after the whole dense part,
+    // one 4096-aligned record per expert in (layer, expert) order, so the converter can write each
+    // record as the quantizer journals it and record i of a layer follows record i - 1
+    if m.tensors.iter().any(|t| t.decision.dtype == recipe::DtypeOut::Mul1) {
+        let mut units: Vec<Unit> = (0..m.tensors.len()).filter(|&i| recipe::glm_expert(&m.tensors[i].name).is_none()).map(|i| Unit { tensors: vec![i], align: 0 }).collect();
+        units.extend(groups.values().map(|g| Unit { tensors: g.iter().flatten().copied().collect(), align: EXPERT_ALIGN }));
+        return units;
+    }
+    let mut emitted = vec![false; m.tensors.len()];
+    let mut units = Vec::new();
+    for (i, t) in m.tensors.iter().enumerate() {
+        if emitted[i] {
+            continue;
+        }
+        match recipe::glm_expert(&t.name) {
+            Some((l, e, _)) => {
+                let g: Vec<usize> = groups[&(l, e)].iter().flatten().copied().collect();
+                for &k in &g {
+                    emitted[k] = true;
+                }
+                units.push(Unit { tensors: g, align: EXPERT_ALIGN });
+            }
+            None => {
+                emitted[i] = true;
+                units.push(Unit { tensors: vec![i], align: 0 });
+            }
+        }
+    }
+    units
+}
+
+/// zeros before a unit that starts at blob offset `blob_len` with alignment `align`
+fn pad_for(blob_len: u64, align: u64) -> u64 {
+    if align == 0 {
+        0
+    } else {
+        (align - (12 + blob_len) % align) % align
+    }
+}
+
+/// The blob length a conversion of `m` writes (payload incl. alignment zeros) and the zeros.
+fn layout(m: &Manifest, units: &[Unit]) -> (u64, u64) {
+    let (mut blob, mut pads) = (0u64, 0u64);
+    for u in units {
+        let p = pad_for(blob, u.align);
+        pads += p;
+        blob += p;
+        for &i in &u.tensors {
+            blob += m.tensors[i].decision.dtype.bytes(m.tensors[i].n_values);
+        }
+    }
+    (blob, pads)
+}
+
+/// The shards one tensor reads (its own and its scale's).
+fn shards_of(t: &TensorEntry) -> Vec<&str> {
+    let mut v = vec![t.shard.as_str()];
+    if let Some(s) = &t.scale {
+        if s.shard != t.shard {
+            v.push(s.shard.as_str());
+        }
+    }
+    v
+}
+
+const PLAN_HELP: &str = "usage: converter plan [--headers <dir>] [--source-repo <org/name>] [--revision <sha>] <model-dir | file.safetensors>\n  reads the model index, the shard headers and config.json only; prints the family, the recipe,\n  the per-tensor dtype/section decision table, the per-row summary and the GPU / host byte totals\n  --headers <dir>  read the shard headers from a header cache (<dir>/<shard>.json) instead of the shard files (crow-nest #154)";
 
 /// `converter plan <model-dir>` (Crow #300 C6): the dry run. Nothing is quantized and no
 /// tensor payload is read.
 fn plan(args: &[String]) -> i32 {
     let mut prov = Provenance::default();
     let mut input: Option<std::path::PathBuf> = None;
+    let mut headers: Option<std::path::PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--source-repo" => prov.repo = it.next().cloned(),
             "--revision" => prov.revision = it.next().cloned(),
+            "--headers" => headers = it.next().map(std::path::PathBuf::from),
             s if s.starts_with("--") || input.is_some() => {
                 eprintln!("unexpected argument {s}\n{PLAN_HELP}");
                 return 2;
@@ -955,7 +1311,7 @@ fn plan(args: &[String]) -> i32 {
         eprintln!("{PLAN_HELP}");
         return 2;
     };
-    let m = match build_manifest(&input) {
+    let m = match build_manifest_from(&input, headers.as_deref()) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("plan refused: {e}");
@@ -963,13 +1319,17 @@ fn plan(args: &[String]) -> i32 {
         }
     };
     println!(
-        "plan      {}: family {} ({}), recipe {}, {} tensors from {} shard file(s)",
+        "plan      {}: family {} ({}), recipe {}, {} tensors from {} shard file(s){}",
         input.display(),
         m.family.name(),
         m.family.model_type(),
         m.family.recipe(),
         m.tensors.len(),
-        m.shard_files.len()
+        m.shard_files.len(),
+        match &m.headers {
+            Some(h) => format!(", headers from the cache {}", h.display()),
+            None => String::new(),
+        }
     );
     println!(
         "config    config.json {} B sha256 {}, generation_config.json {} B sha256 {} (stored verbatim in the index v2)",
@@ -982,19 +1342,23 @@ fn plan(args: &[String]) -> i32 {
     match provenance(&m, &Provenance { repo: prov_repo.or(Some("<--source-repo required at conversion>".into())), ..prov }, false) {
         Ok((repo, rev, shards, pending)) => {
             let lfs = shards.iter().filter(|s| s.sha256_from == "hf-lfs").count();
-            println!("source    repo {repo}, revision {rev}; shard sha256: {lfs} from the HF LFS record, {pending} computed at conversion");
+            let from = match recipe::read_hf_api_info(&m.model_dir) {
+                Ok(Some(a)) => format!(" ({})", a.source),
+                _ => String::new(),
+            };
+            println!("source    repo {repo}, revision {rev}; shard sha256: {lfs} from the HF LFS record{from}, {pending} computed at conversion");
         }
         Err(e) => println!("source    NOT READY for a conversion: {e}"),
     }
     println!("geo       {}", recipe::derive_geo(m.family, &m.config));
     println!();
-    println!("{:<72} {:>22} {:>5} -> {:<5} {:<4} {:>13}  rule", "tensor", "shape", "src", "out", "sect", "bytes");
+    println!("{:<72} {:>22} {:>7} -> {:<5} {:<4} {:>13}  rule", "tensor", "shape", "src", "out", "sect", "bytes");
     let mut sorted: Vec<&TensorEntry> = m.tensors.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     for t in &sorted {
         let d = t.decision;
         println!(
-            "{:<72} {:>22} {:>5} -> {:<5} {:<4} {:>13}  {}",
+            "{:<72} {:>22} {:>7} -> {:<5} {:<4} {:>13}  {}",
             t.name,
             format!("{:?}", t.shape),
             t.src_dtype,
@@ -1014,27 +1378,51 @@ fn plan(args: &[String]) -> i32 {
         e.2 += d.dtype.bytes(t.n_values);
     }
     println!();
-    println!("{:<4} {:<5} {:<64} {:>7} {:>15} {:>15} {:>10}", "sect", "dtype", "rule", "tensors", "values", "bytes", "GiB");
+    println!("{:<4} {:<5} {:<72} {:>7} {:>15} {:>15} {:>10}", "sect", "dtype", "rule", "tensors", "values", "bytes", "GiB");
     for ((s, dt, rule), (c, v, b)) in &rows {
-        println!("{s:<4} {dt:<5} {rule:<64} {c:>7} {v:>15} {b:>15} {:>10.4}", gib(*b));
+        println!("{s:<4} {dt:<5} {rule:<72} {c:>7} {v:>15} {b:>15} {:>10.4}", gib(*b));
+    }
+    // per histogram class (#155): the classes the code summary of a conversion reports
+    let mut classes: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+    for t in m.tensors.iter().filter(|t| t.decision.dtype == recipe::DtypeOut::Nvfp4) {
+        let e = classes.entry(recipe::tensor_class(m.family, &t.name, &m.config).0).or_default();
+        e.0 += 1;
+        e.1 += t.decision.dtype.bytes(t.n_values);
+    }
+    println!();
+    println!("{:<16} {:>7} {:>15} {:>10}   (nvfp4 tensors per code-histogram class)", "class", "tensors", "bytes", "GiB");
+    for (c, (n, b)) in &classes {
+        println!("{c:<16} {n:>7} {b:>15} {:>10.4}", gib(*b));
     }
     // totals: the token embedding is the one text tensor that lives in host RAM (a table
     // lookup, no GEMM); `vit` and `mtp` are optional to load; `ple` is Flash-Next's own tier
     let is_embed = |t: &TensorEntry| t.name.ends_with("language_model.embed_tokens.weight");
+    let is_routed = |t: &TensorEntry| {
+        let c = recipe::tensor_class(m.family, &t.name, &m.config).0;
+        c == "expert" || c.starts_with("expert_")
+    };
     let sum = |f: &dyn Fn(&TensorEntry) -> bool| -> u64 { m.tensors.iter().filter(|t| f(t)).map(|t| t.decision.dtype.bytes(t.n_values)).sum() };
     let text_nvfp4 = sum(&|t| t.decision.section == "text" && t.decision.dtype == recipe::DtypeOut::Nvfp4);
     let text_keep = sum(&|t| t.decision.section == "text" && t.decision.dtype != recipe::DtypeOut::Nvfp4 && !is_embed(t));
     let host_embed = sum(&|t| is_embed(t));
+    let routed = sum(&|t| t.decision.section == "text" && is_routed(t));
+    let dense = sum(&|t| t.decision.section == "text" && !is_routed(t) && !is_embed(t));
     let mtp = sum(&|t| t.decision.section == "mtp");
     let vit = sum(&|t| t.decision.section == "vit");
     let ple = sum(&|t| t.decision.section == "ple");
     let total = sum(&|_| true);
+    let units = write_units(&m);
+    let (blob, pads) = layout(&m, &units);
     println!();
-    println!("totals    (GiB = 2^30 B; nvfp4 = 36 B per 64 values, plus one f32 global scale per tensor in the index, not counted)");
+    println!("totals    (GiB = 2^30 B, GB = 10^9 B; nvfp4 = 36 B per 64 values, plus one f32 global scale per tensor in the index, not counted)");
     println!("  GPU, text weights NVFP4          {:>15} B  {:>8.3} GiB", text_nvfp4, gib(text_nvfp4));
     println!("  GPU, text keeps (bf16/f32/i64)   {:>15} B  {:>8.3} GiB  (without the token embedding)", text_keep, gib(text_keep));
     println!("  GPU, text subtotal               {:>15} B  {:>8.3} GiB", text_nvfp4 + text_keep, gib(text_nvfp4 + text_keep));
     println!("  host RAM, token embedding        {:>15} B  {:>8.3} GiB", host_embed, gib(host_embed));
+    if routed > 0 {
+        println!("  routed experts (tiered)          {:>15} B  {:>8.3} GiB", routed, gib(routed));
+        println!("  dense resident part              {:>15} B  {:>8.3} GiB  {:>7.3} GB  (text without routed experts and the token embedding)", dense, gib(dense), dense as f64 / 1e9);
+    }
     println!("  optional section mtp             {:>15} B  {:>8.3} GiB", mtp, gib(mtp));
     println!("  optional section vit             {:>15} B  {:>8.3} GiB", vit, gib(vit));
     if ple > 0 {
@@ -1044,14 +1432,364 @@ fn plan(args: &[String]) -> i32 {
     for (why, (c, b)) in &m.omitted {
         println!("  omitted, not written             {c:>7} tensors, {b:>15} B source  {:>8.3} GiB  ({why})", gib(*b));
     }
+    // #155: FP8 pairs, the write layout and the container size as one number
+    let fp8: Vec<&TensorEntry> = m.tensors.iter().filter(|t| t.scale.is_some()).collect();
+    if !fp8.is_empty() {
+        let sb: u64 = fp8.iter().map(|t| t.scale.as_ref().map(|s| s.data_end - s.data_begin).unwrap_or(0)).sum();
+        let straddle = fp8.iter().filter(|t| t.scale.as_ref().is_some_and(|s| s.shard != t.shard)).count();
+        println!("  FP8 E4M3 weights read            {:>7} tensors with their weight_scale_inv ({sb} B of scales, read and not written); pairs across two shards: {straddle}", fp8.len());
+    }
+    let span = units
+        .iter()
+        .map(|u| {
+            let mut s: Vec<&str> = u.tensors.iter().flat_map(|&i| shards_of(&m.tensors[i])).collect();
+            s.sort();
+            s.dedup();
+            s.len()
+        })
+        .max()
+        .unwrap_or(0);
+    let aligned = units.iter().filter(|u| u.align > 0).count();
+    println!("  write units                      {:>7} ({aligned} aligned to {EXPERT_ALIGN} B), alignment zeros {pads} B; most shards one unit reads: {span}", units.len());
+    println!("  container without index trailer  {:>15} B  {:>8.3} GiB  {:>8.3} GB  (12 B head + payload + alignment zeros)", 12 + blob, gib(12 + blob), (12 + blob) as f64 / 1e9);
+    // which shards each layer reads (the partial container of step 6 and the window of step 9)
+    if m.family == recipe::Family::Glm5Next {
+        let mut per: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+        for t in &m.tensors {
+            let key = match recipe::glm_parts(&t.name).and_then(|p| p.0) {
+                Some(l) => format!("layer {l:>2}"),
+                None => "model".to_string(),
+            };
+            for s in shards_of(t) {
+                per.entry(key.clone()).or_default().insert(s.to_string());
+            }
+        }
+        println!();
+        println!("shards per layer (written tensors and their scales):");
+        for (k, s) in &per {
+            println!("  {k:<9} {}", s.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(" "));
+        }
+    }
     0
+}
+
+/// #155: the options of a conversion beyond the scale policy.
+#[derive(Clone)]
+struct ConvertOpts {
+    /// the header cache (`--headers`)
+    headers: Option<std::path::PathBuf>,
+    /// `--consume <shard-dir>`: shards appear there one by one, each with `<shard>.verified`
+    /// (size and sha256 checked by the downloader); the converter writes `<shard>.done` when
+    /// every tensor that reads from it is written and synced; it never deletes a shard
+    consume: Option<std::path::PathBuf>,
+    /// tests only: stop after this many tensors are journalled, as a kill would (no trailer)
+    stop_after: Option<usize>,
+    poll: std::time::Duration,
+    /// #156: `--layers <spec> [--with-embed-head]`, a partial container (`partial.rs`)
+    filter: Option<partial::LayerFilter>,
+    /// #182: `--experts-mul1 <store>`: GLM routed experts as MUL1 K = 3 records from the store
+    /// (`mul1_store.rs`), written after the dense part in (layer, expert) order
+    mul1: Option<std::path::PathBuf>,
+    /// #182: `--mul1-wait`: wait for a record the quantizer has not journalled yet (else refused)
+    mul1_wait: bool,
+    /// #182: `--disk-reserve-gib`: free bytes that must remain after a MUL1 conversion
+    disk_reserve: u64,
+    /// tests only: the free bytes the disk check sees
+    disk_free: Option<u64>,
+    /// #182: `--mtp-overlay`: write only the MTP block's non-expert tensors (section `mtp`), the
+    /// overlay the engine's `glm5_mtp::load_mtp` opens beside the 3-bit container
+    mtp_overlay: bool,
+}
+
+/// #182: the default `--disk-reserve-gib` of a MUL1 conversion.
+const MUL1_DISK_RESERVE: u64 = 16 << 30;
+
+impl Default for ConvertOpts {
+    fn default() -> Self {
+        ConvertOpts {
+            headers: None,
+            consume: None,
+            stop_after: None,
+            poll: std::time::Duration::from_secs(2),
+            filter: None,
+            mul1: None,
+            mul1_wait: false,
+            disk_reserve: MUL1_DISK_RESERVE,
+            disk_free: None,
+            mtp_overlay: false,
+        }
+    }
 }
 
 /// The conversion: the manifest, the streamed payload, the index v2 trailer. Returns the exit
 /// code (0, 1 on a bound violation under `--scales ceil`, 2 on a refusal, 3 on a coverage gap).
+#[cfg_attr(not(test), allow(dead_code))]
 fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode, prov: &Provenance, diag: Option<&DiagStats>) -> i32 {
+    convert_with(input, out_path, mode, prov, diag, &ConvertOpts::default())
+}
+
+/// What one tensor turned into: the bytes, its index record, its sidecar line and the numbers
+/// the section summary sums.
+struct Encoded {
+    bytes: Vec<u8>,
+    entry: serde_json::Value,
+    sidecar: serde_json::Value,
+    acc: serde_json::Value,
+}
+
+/// Read one tensor's source bytes (and its scale's) from `dir/<shard>`.
+fn read_source(dir: &std::path::Path, single_file: Option<&std::path::Path>, shard: &str, begin: u64, end: u64) -> Result<Vec<u8>, String> {
+    let p = match single_file {
+        Some(f) => f.to_path_buf(),
+        None => dir.join(shard),
+    };
+    let mut f = std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    f.seek(SeekFrom::Start(begin)).map_err(|e| format!("{}: seek: {e}", p.display()))?;
+    let mut raw = vec![0u8; (end - begin) as usize];
+    f.read_exact(&mut raw).map_err(|e| format!("{}: read [{begin}, {end}): {e}", p.display()))?;
+    Ok(raw)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_tensor(
+    m: &Manifest,
+    t: &TensorEntry,
+    raw: Vec<u8>,
+    scale_raw: Option<Vec<u8>>,
+    offset: u64,
+    mode: ScalesMode,
+    scales_mode_str: &str,
+    diag: Option<&DiagStats>,
+) -> Result<Encoded, String> {
+    // C6: the source dtype comes from the shard header. It used to be guessed from the
+    // byte length, which read an F16 tensor as BF16; for the BF16/F32/I64 sources both
+    // checkpoints of record carry, the two agree.
+    let dt_in = t.src_dtype.as_str();
+    let section = t.decision.section;
+    let mut entry_json = serde_json::json!({
+        "name": t.name, "shape": t.shape, "section": section,
+        "n_values": t.n_values, "offset": offset,
+    });
+    if t.decision.dtype == recipe::DtypeOut::Nvfp4 {
+        let values = if dt_in == "F8_E4M3" {
+            // #155: FP8 E4M3 with 128x128 block scales, one f32 multiply per value (`fp8.rs`)
+            let s = t.scale.as_ref().ok_or(format!("{}: FP8 without a scale", t.name))?;
+            let sc = fp8::scales_to_f32(&scale_raw.ok_or(format!("{}: scale bytes not read", t.name))?, &s.dtype)?;
+            fp8::dequant_fp8_block(&t.name, &raw, t.shape[0], t.shape[1], &sc)?
+        } else {
+            bytes_to_f32(&raw, dt_in)
+        };
+        let w = match (mode, diag) {
+            (ScalesMode::Diag, Some(ds)) => {
+                let cols = *t.shape.last().expect("an nvfp4 tensor has a shape");
+                Some((ds.weights_for(&t.name, cols)?, cols))
+            }
+            _ => None,
+        };
+        // #177: the family's scale cap (0x7E for glm5_next: no E4M3 NaN code in its containers)
+        let (blocks, global, stats, sse_ceil) = quantize_nvfp4_cap(&values, mode, w, m.family.scale_byte_max());
+        let mse = stats.sum_sq_err / t.n_values as f64;
+        let mse_ceil = sse_ceil / t.n_values as f64;
+        let mse_ratio = if mse_ceil > 0.0 { mse / mse_ceil } else { 1.0 };
+        entry_json["dtype"] = serde_json::Value::from("nvfp4");
+        entry_json["global_scale"] = serde_json::Value::from(global);
+        entry_json["len"] = serde_json::Value::from(blocks.len() as u64);
+        // #155 (b): the code histograms of the WRITTEN bytes (`entropy.rs`)
+        let h = entropy::Hist::of_blocks(&blocks);
+        let (hc, hs) = h.to_json();
+        let (class, layer, expert) = recipe::tensor_class(m.family, &t.name, &m.config);
+        let sidecar = serde_json::json!({
+            "name": t.name, "section": section, "dtype": "nvfp4",
+            "n": t.n_values, "global_scale": global,
+            "max_abs_err": stats.max_abs_err,
+            "mean_abs_err": stats.sum_abs_err / t.n_values as f64,
+            "max_rel_err": stats.max_rel_err,
+            "violations": stats.violations,
+            "scales_mode": scales_mode_str,
+            "mse": mse,
+            "mse_ceil": mse_ceil,
+            "mse_ratio": mse_ratio,
+            "max_abs_clipped": stats.clipped,
+            "class": class, "layer": layer, "expert": expert,
+            "h_codes": hc, "h_scales": hs,
+        });
+        let acc = serde_json::json!({
+            "nvfp4": true, "section": section, "n": t.n_values, "sse": stats.sum_sq_err, "sse_ceil": sse_ceil,
+            "clipped": stats.clipped, "violations": stats.violations,
+        });
+        Ok(Encoded { bytes: blocks, entry: entry_json, sidecar, acc })
+    } else {
+        // bf16 and i64: the source's raw bytes (`recipe::decide` guarantees a bf16 keep
+        // has a BF16 source). f32 (C6, the dense row's A_log): an F32 source is carried,
+        // a BF16 source is widened exactly (bf16 is the top half of an f32).
+        let out_dtype = t.decision.dtype;
+        let payload: Vec<u8> = if out_dtype == recipe::DtypeOut::F32 && dt_in == "BF16" {
+            bytes_to_f32(&raw, "BF16").iter().flat_map(|v| v.to_le_bytes()).collect()
+        } else {
+            raw
+        };
+        assert_eq!(payload.len() as u64, out_dtype.bytes(t.n_values), "{}: payload length", t.name);
+        entry_json["dtype"] = serde_json::Value::from(out_dtype.as_str());
+        entry_json["len"] = serde_json::Value::from(payload.len() as u64);
+        let sidecar = serde_json::json!({
+            "name": t.name, "section": section, "dtype": out_dtype.as_str(), "n": t.n_values,
+        });
+        Ok(Encoded { bytes: payload, entry: entry_json, sidecar, acc: serde_json::json!({ "nvfp4": false }) })
+    }
+}
+
+/// The running totals of a conversion, rebuilt from the journal on a resume.
+struct Totals {
+    nvfp4_count: usize,
+    bf16_count: usize,
+    /// #182: MUL1 expert projections (three per record)
+    mul1_count: usize,
+    total_violations: u64,
+    section_agg: BTreeMap<String, SectAgg>,
+    hists: Vec<entropy::TensorHist>,
+}
+
+impl Totals {
+    fn absorb(&mut self, acc: &serde_json::Value, sidecar: &serde_json::Value) {
+        if acc["nvfp4"] == true {
+            self.nvfp4_count += 1;
+            self.total_violations += acc["violations"].as_u64().unwrap_or(0);
+            let agg = self.section_agg.entry(acc["section"].as_str().unwrap_or("").to_string()).or_insert(SectAgg {
+                tensors: 0,
+                n: 0,
+                sse_new: 0.0,
+                sse_ceil: 0.0,
+                clipped: 0,
+            });
+            agg.tensors += 1;
+            agg.n += acc["n"].as_u64().unwrap_or(0);
+            agg.sse_new += acc["sse"].as_f64().unwrap_or(0.0);
+            agg.sse_ceil += acc["sse_ceil"].as_f64().unwrap_or(0.0);
+            agg.clipped += acc["clipped"].as_u64().unwrap_or(0);
+            if let Some(h) = entropy::Hist::from_json(&sidecar["h_codes"], &sidecar["h_scales"]) {
+                self.hists.push(entropy::TensorHist {
+                    class: sidecar["class"].as_str().unwrap_or("rest").to_string(),
+                    layer: sidecar["layer"].as_u64(),
+                    expert: sidecar["expert"].as_u64(),
+                    hist: h,
+                });
+            }
+        } else if acc["mul1"] == true {
+            self.mul1_count += 1;
+        } else {
+            self.bf16_count += 1;
+        }
+    }
+}
+
+fn write_line(w: &mut impl Write, v: &serde_json::Value) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *w, v)?;
+    writeln!(w)
+}
+
+/// #155 (d): the journal of a conversion, `<out>.cnq.journal.jsonl`. Line 1 names the plan (the
+/// recipe, the scale policy and the sha256 of the write order); then one record per written
+/// tensor, appended only after the container bytes are synced, and synced itself. A resume
+/// keeps the records whose bytes re-hash correctly (in order, up to the first that does not),
+/// truncates the container behind the last one, and rewrites the sidecar from them.
+struct Resumed {
+    records: Vec<serde_json::Value>,
+    journal_len: u64,
+}
+
+fn read_journal(journal: &std::path::Path, out: &std::path::Path, head: &serde_json::Value, order: &[&TensorEntry], unit_pad_at: &[bool]) -> Result<Resumed, String> {
+    use sha2::Digest;
+    let text = std::fs::read(journal).map_err(|e| format!("{}: {e}", journal.display()))?;
+    let mut pos = 0usize;
+    let mut lines = Vec::new();
+    while let Some(nl) = text[pos..].iter().position(|b| *b == b'\n') {
+        lines.push((pos, pos + nl + 1));
+        pos += nl + 1;
+    }
+    let Some(&(h0, h1)) = lines.first() else {
+        return Ok(Resumed { records: vec![], journal_len: 0 });
+    };
+    let got: serde_json::Value = serde_json::from_slice(&text[h0..h1]).map_err(|e| format!("{}: line 1: {e}", journal.display()))?;
+    if got != *head {
+        return Err(format!(
+            "{} belongs to another conversion ({} vs {}); remove it and {} to start over",
+            journal.display(),
+            got,
+            head,
+            out.display()
+        ));
+    }
+    let mut f = std::fs::File::open(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let flen = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut records = Vec::new();
+    let mut journal_len = h1 as u64;
+    let mut blob = 0u64;
+    for &(a, b) in &lines[1..] {
+        let Ok(r) = serde_json::from_slice::<serde_json::Value>(&text[a..b]) else { break };
+        let k = records.len();
+        let (Some(off), Some(len), Some(pad), Some(sha)) = (r["entry"]["offset"].as_u64(), r["entry"]["len"].as_u64(), r["pad"].as_u64(), r["sha256"].as_str()) else { break };
+        if k >= order.len() || r["entry"]["name"] != order[k].name.as_str() || r["seq"] != k as u64 || off != blob + pad || (pad > 0 && !unit_pad_at[k]) {
+            break;
+        }
+        if 12 + off + len > flen {
+            break;
+        }
+        let mut buf = vec![0u8; (pad + len) as usize];
+        f.seek(SeekFrom::Start(12 + blob)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        if buf[..pad as usize].iter().any(|x| *x != 0) {
+            break;
+        }
+        let h: String = sha2::Sha256::digest(&buf[pad as usize..]).iter().map(|x| format!("{x:02x}")).collect();
+        if h != sha {
+            break;
+        }
+        blob = off + len;
+        journal_len = b as u64;
+        records.push(r);
+    }
+    Ok(Resumed { records, journal_len })
+}
+
+/// Wait for `<dir>/<shard>.verified` (written by the downloader after size + sha256), then check
+/// the file's size against the recorded one and the marker's sha256 against the HF LFS record.
+fn wait_verified(dir: &std::path::Path, shard: &str, want: Option<&(String, u64)>, header_size: Option<u64>, poll: std::time::Duration) -> Result<(), String> {
+    let marker = dir.join(format!("{shard}.verified"));
+    let mut said = false;
+    while !marker.exists() {
+        if !said {
+            eprintln!("consume: waiting for {}", marker.display());
+            said = true;
+        }
+        std::thread::sleep(poll);
+    }
+    let v: serde_json::Value = std::fs::read(&marker).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null);
+    if let (Some(a), Some((b, _))) = (v["sha256"].as_str(), want) {
+        if a != b {
+            return Err(format!("{}: sha256 {a}, Hugging Face recorded {b} - not converting this shard", marker.display()));
+        }
+    }
+    let p = dir.join(shard);
+    let size = std::fs::metadata(&p).map_err(|e| format!("{}: {e} (it has a .verified marker)", p.display()))?.len();
+    for want_size in [want.map(|w| w.1), header_size].into_iter().flatten() {
+        if size != want_size {
+            return Err(format!("{}: {size} B, the record says {want_size} B - not converting this shard", p.display()));
+        }
+    }
+    Ok(())
+}
+
+fn convert_with(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode, prov: &Provenance, diag: Option<&DiagStats>, opts: &ConvertOpts) -> i32 {
     if (mode == ScalesMode::Diag) != diag.is_some() {
         eprintln!("conversion refused: --scales diag and --diag-stats go together\n{HELP}");
+        return 2;
+    }
+    if opts.consume.is_some() && opts.headers.is_none() {
+        eprintln!("conversion refused: --consume reads the shard headers from --headers <dir>; the shards are not all there to read them from\n{HELP}");
+        return 2;
+    }
+    if opts.mul1.is_some() && opts.consume.is_some() {
+        eprintln!("conversion refused: --experts-mul1 takes the experts from its store and the quantizer reads the shards; it does not run beside --consume\n{HELP}");
         return 2;
     }
     let scales_mode_str = match mode {
@@ -1062,16 +1800,62 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
     let t_start = std::time::Instant::now();
 
     // ---- manifest: scan headers only (fast), collect every tensor's location ----
-    let m = match build_manifest(input) {
+    if opts.mtp_overlay && (opts.mul1.is_some() || opts.consume.is_some() || opts.filter.is_some()) {
+        eprintln!("conversion refused: --mtp-overlay writes the MTP block's non-expert tensors only; it takes no --experts-mul1 (the block's experts are the container's records), --consume or --layers\n{HELP}");
+        return 2;
+    }
+    let mut m = match build_manifest_with(input, opts.headers.as_deref(), opts.mul1.is_some(), opts.mtp_overlay) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("conversion refused: {e}");
             return 2;
         }
     };
+    // ---- #156: a partial container keeps the filtered tensors only. The manifest above saw
+    // every tensor (recipe whitelist, FP8 pairing, geometry); what the filter drops is named
+    // as filtered, weight and block scale, never as missing ----
+    let mut filtered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // #182: an MTP overlay is the partial container of layer 45 (whose experts the manifest omits)
+    let mtp_filter = match opts.mtp_overlay {
+        true if m.family != recipe::Family::Glm5Next => {
+            eprintln!("conversion refused: --mtp-overlay is GLM-5.3-Flash's (glm5_next), this checkpoint is {}", m.family.name());
+            return 2;
+        }
+        true => Some(partial::LayerFilter::parse(&recipe::GLM5_NEXT_TEXT_LAYERS.to_string(), false).expect("the MTP layer")),
+        false => None,
+    };
+    let filter = opts.filter.as_ref().or(mtp_filter.as_ref());
+    if let Some(f) = filter {
+        let before = m.tensors.len();
+        for t in m.tensors.iter().filter(|t| !f.keeps(&t.name)) {
+            filtered.insert(t.name.clone());
+            if let Some(s) = &t.scale {
+                filtered.insert(s.name.clone());
+            }
+        }
+        m.tensors.retain(|t| f.keeps(&t.name));
+        for l in &f.layers {
+            if !m.tensors.iter().any(|t| partial::LayerFilter::layer_of(&t.name) == Some(*l)) {
+                eprintln!("conversion refused: {}: layer {l} has no tensor the {} recipe writes", f.describe(), m.family.recipe());
+                return 2;
+            }
+        }
+        if f.embed_head_norm && !m.tensors.iter().any(|t| partial::LayerFilter::is_embed_head_norm(&t.name)) {
+            eprintln!("conversion refused: {}: no token embedding, lm_head or final norm among the tensors", f.describe());
+            return 2;
+        }
+        eprintln!("partial container {}: {} of {before} tensors kept, {} weight_map names filtered (block scales included)", f.describe(), m.tensors.len(), filtered.len());
+    }
     // ---- the index v2 `model` block: provenance first, so a missing flag costs nothing ----
     let (repo, revision, shards, _) = match provenance(&m, prov, true) {
         Ok(p) => p,
+        Err(e) => {
+            eprintln!("conversion refused: {e}");
+            return 2;
+        }
+    };
+    let api = match recipe::read_hf_api_info(&m.model_dir) {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("conversion refused: {e}");
             return 2;
@@ -1087,151 +1871,246 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
         shards,
     };
     let tensors = &m.tensors;
-    let single_file = m.single_file;
     eprintln!(
         "manifest: {} tensors from {} shard file(s), {:.1} GB to read — family {}, recipe {}",
         tensors.len(),
         m.shard_files.len(),
-        tensors.iter().map(|t| (t.data_end - t.data_begin) as u64).sum::<u64>() as f64 / 1e9,
+        tensors.iter().map(|t| t.data_end - t.data_begin).sum::<u64>() as f64 / 1e9,
         m.family.name(),
         m.family.recipe()
     );
 
-    // ---- write container: magic, streamed blob, index trailer ----
-    let mut out = std::fs::File::create(out_path).expect("create output");
-    out.write_all(MAGIC).expect("magic");
-    out.write_all(&0u64.to_le_bytes()).expect("reserved");
+    // ---- the write order (#155): units, and per tensor whether a unit starts there ----
+    let units = write_units(&m);
+    let mut order: Vec<&TensorEntry> = Vec::with_capacity(tensors.len());
+    let mut unit_start: Vec<Option<u64>> = Vec::with_capacity(tensors.len()); // Some(align) at a unit's first tensor
+    for u in &units {
+        for (k, &i) in u.tensors.iter().enumerate() {
+            order.push(&tensors[i]);
+            unit_start.push(if k == 0 { Some(u.align) } else { None });
+        }
+    }
+    let unit_pad_at: Vec<bool> = unit_start.iter().map(|a| a.is_some_and(|x| x > 0)).collect();
+    // ---- #182: the MUL1 store, and every expert unit checked against it before a byte is written ----
+    let mut mul1 = match &opts.mul1 {
+        None => None,
+        Some(dir) => match mul1_open(&m, &units, dir, opts.mul1_wait, opts.poll) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("conversion refused: {e}");
+                return 2;
+            }
+        },
+    };
+    // the last write position that reads each shard: `<shard>.done` once it is journalled
+    let mut last_reader: BTreeMap<&str, usize> = BTreeMap::new();
+    for (k, t) in order.iter().enumerate() {
+        for s in shards_of(t) {
+            last_reader.insert(s, k);
+        }
+    }
+    let plan_sha = {
+        let mut s = String::new();
+        for t in &order {
+            s.push_str(&format!("{}\t{}\t{}\t{}\n", t.name, t.shard, t.data_begin, t.data_end));
+        }
+        if let Some(d) = diag {
+            s.push_str(&format!("diag {}\n", d.stats_sha256));
+        }
+        recipe::sha256_hex(s.as_bytes())
+    };
+    let mut head = serde_json::json!({
+        "journal": "crow-nest converter", "version": 1, "recipe": m.family.recipe(), "scales": scales_mode_str,
+        "tensors": order.len(), "order_sha256": plan_sha,
+    });
+    if let Some(f) = filter {
+        head["partial"] = serde_json::Value::from(f.describe());
+    }
+    if opts.mtp_overlay {
+        head["mtp_overlay"] = serde_json::Value::from(true);
+    }
+    if let Some(s) = &mul1 {
+        head["experts"] = serde_json::json!({ "codec": mul1::DTYPE, "k": mul1_store::K, "record_bytes": s.layout.size, "store_sha256": s.head_sha256 });
+    }
+
+    // ---- write container: magic, streamed blob, index trailer; resume from the journal ----
+    let journal_path = out_path.with_extension("cnq.journal.jsonl");
+    let sidecar_path = out_path.with_extension("cnq.sidecar.jsonl");
     let blob_start: u64 = 12;
+    let resumed = if journal_path.exists() && out_path.exists() {
+        match read_journal(&journal_path, out_path, &head, &order, &unit_pad_at) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("conversion refused: {e}");
+                return 2;
+            }
+        }
+    } else {
+        Resumed { records: vec![], journal_len: 0 }
+    };
+    let mut blob_len: u64 = resumed.records.last().map(|r| r["entry"]["offset"].as_u64().unwrap() + r["entry"]["len"].as_u64().unwrap()).unwrap_or(0);
+    // ---- #182: the disk check of a MUL1 conversion, before the output is created or grown ----
+    if let Some(s) = &mul1 {
+        if let Err(e) = mul1_disk_check(&m, &units, &s.layout, blob_len, out_path, opts) {
+            eprintln!("conversion refused: {e}");
+            return 2;
+        }
+    }
+    let (mut out, mut journal) = if resumed.journal_len > 0 {
+        eprintln!("resume: {} of {} tensors journalled and re-hashed, container truncated to {} B", resumed.records.len(), order.len(), blob_start + blob_len);
+        let mut out = std::fs::OpenOptions::new().read(true).write(true).open(out_path).expect("open output");
+        out.set_len(blob_start + blob_len).expect("truncate output");
+        out.seek(SeekFrom::End(0)).expect("seek output");
+        let mut journal = std::fs::OpenOptions::new().read(true).write(true).open(&journal_path).expect("open journal");
+        journal.set_len(resumed.journal_len).expect("truncate journal");
+        journal.seek(SeekFrom::End(0)).expect("seek journal");
+        (out, journal)
+    } else {
+        let mut out = std::fs::File::create(out_path).expect("create output");
+        out.write_all(MAGIC).expect("magic");
+        out.write_all(&0u64.to_le_bytes()).expect("reserved");
+        let mut journal = std::fs::File::create(&journal_path).expect("create journal");
+        write_line(&mut journal, &head).expect("journal head");
+        journal.sync_data().expect("sync journal");
+        (out, journal)
+    };
 
     let mut index_tensors: Vec<serde_json::Value> = Vec::new();
-    let mut sidecar = std::io::BufWriter::new(
-        std::fs::File::create(out_path.with_extension("cnq.sidecar.jsonl")).expect("sidecar"),
-    );
-    let mut blob_len: u64 = 0;
-    let mut nvfp4_count = 0usize;
-    let mut bf16_count = 0usize;
-    let mut total_violations: u64 = 0;
-    let mut section_agg: BTreeMap<&'static str, SectAgg> = BTreeMap::new();
+    let mut sidecar = std::io::BufWriter::new(std::fs::File::create(&sidecar_path).expect("sidecar"));
+    let mut tot = Totals { nvfp4_count: 0, bf16_count: 0, mul1_count: 0, total_violations: 0, section_agg: BTreeMap::new(), hists: Vec::new() };
+    for r in &resumed.records {
+        tot.absorb(&r["acc"], &r["sidecar"]);
+        write_line(&mut sidecar, &r["sidecar"]).expect("sidecar line");
+        index_tensors.push(r["entry"].clone());
+    }
+    let mut pad_total: u64 = resumed.records.iter().map(|r| r["pad"].as_u64().unwrap_or(0)).sum();
 
-    for (i, t) in tensors.iter().enumerate() {
-        let shard_path = if single_file {
-            input.to_path_buf()
-        } else {
-            input.join(&t.shard)
-        };
-        let mut f = std::fs::File::open(&shard_path).expect("open shard");
-        f.seek(SeekFrom::Start(t.data_begin)).expect("seek tensor");
-        let mut raw = vec![0u8; (t.data_end - t.data_begin) as usize];
-        f.read_exact(&mut raw).expect("read tensor");
-        drop(f);
-
-        // C6: the source dtype comes from the shard header. It used to be guessed from the
-        // byte length, which read an F16 tensor as BF16; for the BF16/F32/I64 sources both
-        // checkpoints of record carry, the two agree.
-        let dt_in = t.src_dtype.as_str();
-        let section = t.decision.section;
-        let mut entry_json = serde_json::json!({
-            "name": t.name, "shape": t.shape, "section": section,
-            "n_values": t.n_values, "offset": blob_len,
-        });
-
-        if t.decision.dtype == recipe::DtypeOut::Nvfp4 {
-            let values = bytes_to_f32(&raw, dt_in);
-            let w = match (mode, diag) {
-                (ScalesMode::Diag, Some(ds)) => {
-                    let cols = *t.shape.last().expect("an nvfp4 tensor has a shape") as usize;
-                    match ds.weights_for(&t.name, cols) {
-                        Ok(d) => Some((d, cols)),
-                        Err(e) => {
-                            eprintln!("conversion refused: {e}");
-                            return 2;
-                        }
-                    }
-                }
-                _ => None,
+    // ---- consume mode: which shards are verified, which are done ----
+    let mut verified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut done: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let shard_names: Vec<String> = m.shard_files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+    let mark_done = |k_written: Option<usize>, done: &mut std::collections::BTreeSet<String>| -> Result<(), String> {
+        let Some(dir) = &opts.consume else { return Ok(()) };
+        for s in &shard_names {
+            if done.contains(s) {
+                continue;
+            }
+            let ready = match last_reader.get(s.as_str()) {
+                Some(&last) => k_written.is_some_and(|k| k >= last),
+                None => dir.join(format!("{s}.verified")).exists(), // nothing of it is written
             };
-            let (blocks, global, stats, sse_ceil) = quantize_nvfp4_w(&values, mode, w);
-            total_violations += stats.violations;
-            let mse = stats.sum_sq_err / t.n_values as f64;
-            let mse_ceil = sse_ceil / t.n_values as f64;
-            let mse_ratio = if mse_ceil > 0.0 { mse / mse_ceil } else { 1.0 };
-            let agg = section_agg.entry(section).or_insert(SectAgg {
-                tensors: 0,
-                n: 0,
-                sse_new: 0.0,
-                sse_ceil: 0.0,
-                clipped: 0,
-            });
-            agg.tensors += 1;
-            agg.n += t.n_values as u64;
-            agg.sse_new += stats.sum_sq_err;
-            agg.sse_ceil += sse_ceil;
-            agg.clipped += stats.clipped;
-            out.write_all(&blocks).expect("write blocks");
-            entry_json["dtype"] = serde_json::Value::from("nvfp4");
-            entry_json["global_scale"] = serde_json::Value::from(global);
-            entry_json["len"] = serde_json::Value::from(blocks.len() as u64);
-            blob_len += blocks.len() as u64;
-            nvfp4_count += 1;
-            serde_json::to_writer(
-                &mut sidecar,
-                &serde_json::json!({
-                    "name": t.name, "section": section, "dtype": "nvfp4",
-                    "n": t.n_values, "global_scale": global,
-                    "max_abs_err": stats.max_abs_err,
-                    "mean_abs_err": stats.sum_abs_err / t.n_values as f64,
-                    "max_rel_err": stats.max_rel_err,
-                    "violations": stats.violations,
-                    "scales_mode": scales_mode_str,
-                    "mse": mse,
-                    "mse_ceil": mse_ceil,
-                    "mse_ratio": mse_ratio,
-                    "max_abs_clipped": stats.clipped,
-                }),
-            )
-            .expect("sidecar line");
-            writeln!(sidecar).expect("sidecar newline");
-        } else {
-            // bf16 and i64: the source's raw bytes (`recipe::decide` guarantees a bf16 keep
-            // has a BF16 source). f32 (C6, the dense row's A_log): an F32 source is carried,
-            // a BF16 source is widened exactly (bf16 is the top half of an f32).
-            let out_dtype = t.decision.dtype;
-            let payload: Vec<u8> = if out_dtype == recipe::DtypeOut::F32 && dt_in == "BF16" {
-                bytes_to_f32(&raw, "BF16").iter().flat_map(|v| v.to_le_bytes()).collect()
-            } else {
-                raw
-            };
-            assert_eq!(payload.len() as u64, out_dtype.bytes(t.n_values), "{}: payload length", t.name);
-            out.write_all(&payload).expect("write keep");
-            entry_json["dtype"] = serde_json::Value::from(out_dtype.as_str());
-            entry_json["len"] = serde_json::Value::from(payload.len() as u64);
-            blob_len += payload.len() as u64;
-            bf16_count += 1;
-            serde_json::to_writer(
-                &mut sidecar,
-                &serde_json::json!({
-                    "name": t.name, "section": section, "dtype": out_dtype.as_str(), "n": t.n_values,
-                }),
-            )
-            .expect("sidecar line");
-            writeln!(sidecar).expect("sidecar newline");
+            if ready {
+                let p = dir.join(format!("{s}.done"));
+                std::fs::write(&p, serde_json::to_vec(&serde_json::json!({ "shard": s, "out": out_path.display().to_string() })).unwrap())
+                    .map_err(|e| format!("{}: {e}", p.display()))?;
+                done.insert(s.clone());
+            }
         }
-        index_tensors.push(entry_json);
-        if i % 100 == 0 {
+        Ok(())
+    };
+    if let Err(e) = mark_done(resumed.records.len().checked_sub(1), &mut done) {
+        eprintln!("conversion refused: {e}");
+        return 2;
+    }
+
+    let src_dir = opts.consume.clone().unwrap_or_else(|| input.to_path_buf());
+    let single = if m.single_file { Some(input) } else { None };
+    // #182: the record of the expert unit being written: (layer, expert), its sha256, its bytes
+    let mut cur_record: Option<((u64, u64), String, Vec<u8>)> = None;
+    for k in resumed.records.len()..order.len() {
+        let t = order[k];
+        let fail = |e: String| -> i32 {
+            eprintln!("conversion stopped at {} ({}/{}): {e} - the journal keeps what is written; run again to resume", t.name, k + 1, order.len());
+            2
+        };
+        if let Some(dir) = &opts.consume {
+            for s in shards_of(t) {
+                if verified.contains(s) {
+                    continue;
+                }
+                if let Err(e) = wait_verified(dir, s, api.as_ref().and_then(|a| a.lfs.get(s)), m.shard_size.get(s).copied(), opts.poll) {
+                    return fail(e);
+                }
+                verified.insert(s.to_string());
+            }
+        }
+        let pad = pad_for(blob_len, unit_start[k].unwrap_or(0));
+        // #182: a MUL1 expert projection is its slice of the expert's record from the store; the
+        // FP8 shard is not read (the quantizer read it)
+        let mul1_part = recipe::glm_expert(&t.name).filter(|_| t.decision.dtype == recipe::DtypeOut::Mul1);
+        let enc = if let (Some((l, e, p)), Some(store)) = (mul1_part, mul1.as_mut()) {
+            if cur_record.as_ref().map(|c| c.0) != Some((l, e)) {
+                match mul1_fetch(store, l, e, opts) {
+                    Ok(r) => cur_record = Some(((l, e), recipe::sha256_hex(&r), r)),
+                    Err(e) => return fail(e),
+                }
+            }
+            let (_, sha, rec) = cur_record.as_ref().unwrap();
+            mul1_encode(&m, t, &store.layout, rec, sha, p, blob_len + pad)
+        } else {
+            let raw = match read_source(&src_dir, single, &t.shard, t.data_begin, t.data_end) {
+                Ok(r) => r,
+                Err(e) => return fail(e),
+            };
+            let scale_raw = match &t.scale {
+                Some(s) => match read_source(&src_dir, single, &s.shard, s.data_begin, s.data_end) {
+                    Ok(r) => Some(r),
+                    Err(e) => return fail(e),
+                },
+                None => None,
+            };
+            match encode_tensor(&m, t, raw, scale_raw, blob_len + pad, mode, scales_mode_str, diag) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("conversion refused: {e}");
+                    return 2;
+                }
+            }
+        };
+        if pad > 0 {
+            out.write_all(&vec![0u8; pad as usize]).expect("write alignment zeros");
+        }
+        out.write_all(&enc.bytes).expect("write tensor");
+        out.sync_data().expect("sync output");
+        blob_len += pad + enc.bytes.len() as u64;
+        pad_total += pad;
+        let rec = serde_json::json!({
+            "seq": k, "pad": pad, "sha256": recipe::sha256_hex(&enc.bytes),
+            "entry": enc.entry, "sidecar": enc.sidecar, "acc": enc.acc,
+        });
+        write_line(&mut journal, &rec).expect("journal line");
+        journal.sync_data().expect("sync journal");
+        tot.absorb(&rec["acc"], &rec["sidecar"]);
+        write_line(&mut sidecar, &rec["sidecar"]).expect("sidecar line");
+        index_tensors.push(rec["entry"].clone());
+        if let Err(e) = mark_done(Some(k), &mut done) {
+            return fail(e);
+        }
+        // #182: the record's last projection is journalled: the store may let its file go
+        if let (Some((l, e, "down")), Some(store)) = (mul1_part, mul1.as_ref()) {
+            if let Err(e) = store.mark_done(l, e, out_path) {
+                return fail(e);
+            }
+        }
+        if k % 100 == 0 {
             eprintln!(
                 "[{:>5}/{}] {} ({}) — {:.2} GB written, {:.0} s",
-                i + 1,
-                tensors.len(),
+                k + 1,
+                order.len(),
                 t.name,
-                section,
+                t.decision.section,
                 blob_len as f64 / 1e9,
                 t_start.elapsed().as_secs_f64()
             );
         }
+        if opts.stop_after == Some(k + 1) {
+            sidecar.flush().ok();
+            return 4;
+        }
     }
     // per-section verification report (nvfp4 only): aggregate MSE of the written
     // encoding vs the ceiling-scale reference on the SAME weights + clipped counts
-    for (section, a) in &section_agg {
+    for (section, a) in &tot.section_agg {
         let mse = a.sse_new / a.n as f64;
         let mse_ceil = a.sse_ceil / a.n as f64;
         let mse_ratio = if mse_ceil > 0.0 { mse / mse_ceil } else { 1.0 };
@@ -1239,7 +2118,7 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
             "section {section}: {} nvfp4 tensors — MSE {mse:.4e} vs ceil {mse_ceil:.4e} (ratio {mse_ratio:.4}), clipped {}",
             a.tensors, a.clipped
         );
-        serde_json::to_writer(
+        write_line(
             &mut sidecar,
             &serde_json::json!({
                 "record": "section_summary", "section": section, "dtype": "nvfp4",
@@ -1250,18 +2129,40 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
             }),
         )
         .expect("sidecar summary line");
-        writeln!(sidecar).expect("sidecar summary newline");
+    }
+    // #155 (c): the exact static order-0 coder sizes, tables included, from the histograms
+    for r in entropy::code_summary(&tot.hists) {
+        if r["scope"] == "class" || r["scope"] == "expert_blocks" {
+            println!(
+                "code {:<13} {:<14} raw {:>15} B, coded {:>15} B incl. {} B tables: saving {:>7.3} % (order-0 entropy bound {:.3} %)",
+                r["scope"].as_str().unwrap_or(""),
+                r["class"].as_str().unwrap_or("all routed"),
+                r["raw_bytes"],
+                r["coded_bytes"],
+                r["table_bytes"],
+                100.0 * r["saving"].as_f64().unwrap_or(0.0),
+                100.0 * r["saving_entropy"].as_f64().unwrap_or(0.0)
+            );
+        }
+        write_line(&mut sidecar, &r).expect("sidecar code summary line");
     }
     sidecar.flush().ok();
 
     // coverage check in dir mode: every tensor the model index knows must be in the output,
-    // or be one the recipe omits by name (`recipe::omitted`, Crow #300: the dense vision tower)
+    // be the block scale of one that is (#155), or be one the recipe omits by name
+    // (`recipe::omitted`, Crow #300: the dense vision tower)
     if let Some(wm) = &m.weight_map {
-        let (mut missing, mut omitted) = (0usize, 0usize);
+        let mut covered: std::collections::HashSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
+        covered.extend(tensors.iter().filter_map(|t| t.scale.as_ref().map(|s| s.name.as_str())));
+        let (mut missing, mut omitted, mut n_filtered) = (0usize, 0usize, 0usize);
         for name in wm.keys() {
-            if !tensors.iter().any(|t| &t.name == name) {
+            if !covered.contains(name.as_str()) {
                 if recipe::omitted(m.family, name).is_some() {
                     omitted += 1;
+                    continue;
+                }
+                if filtered.contains(name) {
+                    n_filtered += 1;
                     continue;
                 }
                 eprintln!("MISSING from output: {name}");
@@ -1272,25 +2173,49 @@ fn convert(input: &std::path::Path, out_path: &std::path::Path, mode: ScalesMode
             eprintln!("coverage check FAILED: {missing} tensors missing");
             return 3;
         }
-        eprintln!("coverage check: all {} weight_map tensors present ({omitted} omitted by the {} recipe)", wm.len(), m.family.recipe());
+        match filter {
+            None => eprintln!("coverage check: all {} weight_map tensors present ({omitted} omitted by the {} recipe)", wm.len(), m.family.recipe()),
+            Some(f) => eprintln!(
+                "coverage check (PARTIAL container, {}): {} of {} weight_map tensors present, {n_filtered} filtered by the flags, {omitted} omitted by the {} recipe, 0 missing",
+                f.describe(),
+                wm.len() - n_filtered - omitted,
+                wm.len(),
+                m.family.recipe()
+            ),
+        }
     }
 
-    let index = index_v2(&model, scales_mode_str, blob_start, index_tensors);
+    let mut index = index_v2(&model, scales_mode_str, blob_start, index_tensors);
+    if let Some(f) = filter {
+        index["partial"] = f.index_block(tensors.len(), filtered.len());
+    }
+    if opts.mtp_overlay {
+        index["mtp_overlay"] = mtp_overlay_block(&m);
+    }
+    if let Some(s) = &mul1 {
+        index["expert_codec"] = mul1_index_block(s, &m, &units);
+    }
     let index_json = serde_json::to_vec_pretty(&index).expect("index json");
     out.write_all(&index_json).expect("index");
     out.write_all(&(index_json.len() as u64).to_le_bytes()).expect("index len");
     out.flush().ok();
+    out.sync_all().expect("sync output");
+    drop(journal);
+    std::fs::remove_file(&journal_path).ok();
 
     println!(
-        "wrote {}: {} tensors ({} nvfp4, {} bf16-keep), payload {:.2} GB, scales {scales_mode_str}, \
-violations {total_violations}, elapsed {:.0} s",
+        "wrote {}: {} tensors ({} nvfp4, {} bf16-keep{}), payload {:.2} GB, alignment zeros {pad_total} B, scales {scales_mode_str}, \
+violations {}, elapsed {:.0} s",
         out_path.display(),
         tensors.len(),
-        nvfp4_count,
-        bf16_count,
+        tot.nvfp4_count,
+        tot.bf16_count,
+        if tot.mul1_count > 0 { format!(", {} mul1 in {} records", tot.mul1_count, tot.mul1_count / 3) } else { String::new() },
         blob_len as f64 / 1e9,
+        tot.total_violations,
         t_start.elapsed().as_secs_f64()
     );
+    let total_violations = tot.total_violations;
     if total_violations > 0 {
         if mode != ScalesMode::Ceil {
             // the old per-element relative bound is void BY DESIGN here (clipping
@@ -1305,6 +2230,174 @@ expected under --scales mse, see the MSE report"
         }
     }
     0
+}
+
+/// #182: the `mtp_overlay` block of an MTP overlay's index: which layer, the tensors it holds, and
+/// where the block's routed experts are (not here: the 3-bit container's section `mtp`).
+fn mtp_overlay_block(m: &Manifest) -> serde_json::Value {
+    let ts: Vec<&TensorEntry> = m.tensors.iter().filter(|t| t.decision.section == recipe::MTP_SECTION).collect();
+    let count = |d: recipe::DtypeOut| ts.iter().filter(|t| t.decision.dtype == d).count();
+    serde_json::json!({
+        "layer": recipe::GLM5_NEXT_TEXT_LAYERS,
+        "section": recipe::MTP_SECTION,
+        "tensors": ts.len(),
+        "nvfp4": count(recipe::DtypeOut::Nvfp4),
+        "bf16": count(recipe::DtypeOut::Bf16),
+        "f32": count(recipe::DtypeOut::F32),
+        "experts": "not in this file: the base container's MUL1 records of section mtp (--experts-mul1)",
+        "issue": "crow-nest #182",
+    })
+}
+
+/// #182: a write unit of MUL1 expert projections (one record).
+fn is_mul1_unit(m: &Manifest, u: &Unit) -> bool {
+    u.tensors.first().is_some_and(|&i| m.tensors[i].decision.dtype == recipe::DtypeOut::Mul1)
+}
+
+/// #182: open the MUL1 store of a conversion and check every expert unit against it before a byte
+/// is written: GLM only; gate, up and down present with the shapes of the store's record (torch
+/// `[out, in]`: gate/up `[inter, hidden]`, down `[hidden, inter]`); without `--mul1-wait` every
+/// record journalled by the quantizer. Under `--mul1-wait` a `store.json` the quantizer has not
+/// written yet is waited for as well (polling every `poll`, no timeout: the quantizer waits for the
+/// capture, which runs for hours); without it a missing `store.json` is refused.
+fn mul1_open(m: &Manifest, units: &[Unit], dir: &std::path::Path, wait: bool, poll: std::time::Duration) -> Result<mul1_store::Store, String> {
+    if m.family != recipe::Family::Glm5Next {
+        return Err(format!("--experts-mul1: MUL1 expert records are GLM-5.3-Flash's (glm5_next), this checkpoint is {}", m.family.name()));
+    }
+    let tc = &m.config["text_config"];
+    let (Some(hidden), Some(inter)) = (tc["hidden_size"].as_u64(), tc["moe_intermediate_size"].as_u64()) else {
+        return Err("config.json: text_config lacks hidden_size or moe_intermediate_size".into());
+    };
+    let (hidden, inter) = (hidden as usize, inter as usize);
+    if wait {
+        // #182: started together with the quantizer, the converter is ready before store.json exists
+        let head = dir.join(mul1_store::STORE_FILE);
+        if !head.exists() {
+            eprintln!("mul1: waiting for {}", head.display());
+            while !head.exists() {
+                std::thread::sleep(poll);
+            }
+        }
+    }
+    let store = mul1_store::Store::open(dir, hidden, inter)?;
+    let want = [("gate", vec![inter, hidden]), ("up", vec![inter, hidden]), ("down", vec![hidden, inter])];
+    let (mut records, mut missing) = (0usize, Vec::new());
+    for u in units.iter().filter(|u| is_mul1_unit(m, u)) {
+        let ts: Vec<&TensorEntry> = u.tensors.iter().map(|&i| &m.tensors[i]).collect();
+        let (l, e, _) = recipe::glm_expert(&ts[0].name).expect("a MUL1 unit holds routed-expert projections");
+        let fits = ts.len() == 3 && ts.iter().zip(&want).all(|(t, (p, s))| recipe::glm_expert(&t.name).map(|x| x.2) == Some(*p) && t.shape == *s);
+        if !fits {
+            let got: Vec<(&str, &Vec<usize>)> = ts.iter().map(|t| (t.name.as_str(), &t.shape)).collect();
+            return Err(format!("layer {l} expert {e}: {got:?}; a MUL1 record needs gate and up {:?} and down {:?}", want[0].1, want[2].1));
+        }
+        records += 1;
+        if !store.has(l, e) {
+            missing.push((l, e));
+        }
+    }
+    if let (Some(&(l, e)), false) = (missing.first(), wait) {
+        return Err(format!(
+            "MUL1 store {}: {} of {records} expert records are not journalled (first: layer {l} expert {e}); run tools/glm_mul1_quantize.py quantize first, or pass --mul1-wait to convert while it runs",
+            dir.display(),
+            missing.len()
+        ));
+    }
+    eprintln!(
+        "mul1 store {}: {records} records of {} B (K = {}, hidden {hidden}, inter {inter}), {} journalled, {} to wait for",
+        dir.display(),
+        store.layout.size,
+        mul1_store::K,
+        records - missing.len(),
+        missing.len()
+    );
+    Ok(store)
+}
+
+/// #182: the record of one expert, waiting for the quantizer's journal line under `--mul1-wait`.
+fn mul1_fetch(store: &mut mul1_store::Store, l: u64, e: u64, opts: &ConvertOpts) -> Result<Vec<u8>, String> {
+    let mut said = false;
+    while !store.has(l, e) {
+        if !opts.mul1_wait {
+            return Err(format!("MUL1 store {}: no record for layer {l} expert {e}", store.dir.display()));
+        }
+        if !said {
+            eprintln!("mul1: waiting for layer {l} expert {e} in {}", store.dir.display());
+            said = true;
+        }
+        std::thread::sleep(opts.poll);
+        store.refresh()?;
+    }
+    store.record(l, e)
+}
+
+/// #182: one projection of a MUL1 record. The record `[gate.trellis][up.trellis][down.trellis]
+/// [six scale vectors][zeros]` is split at the trellis starts (`RecordLayout::tensor_offsets`):
+/// gate `[0, T)`, up `[T, 2T)`, down `[2T, size)`, so the entries are back to back, each index
+/// offset is a trellis start, and the engine's "next offset - gate offset" is the record size.
+fn mul1_encode(m: &Manifest, t: &TensorEntry, lay: &mul1::RecordLayout, rec: &[u8], rec_sha: &str, proj: &str, offset: u64) -> Encoded {
+    let tb = lay.trellis_bytes;
+    let [g, u, d] = lay.tensor_offsets();
+    let (a, b) = match proj {
+        "gate" => (g, u),
+        "up" => (u, d),
+        _ => (d, lay.size),
+    };
+    debug_assert_eq!((g, u, d), (0, tb, 2 * tb));
+    let entry = serde_json::json!({
+        "name": t.name, "shape": t.shape, "section": t.decision.section,
+        "n_values": t.n_values, "offset": offset, "dtype": mul1::DTYPE, "len": b - a,
+        "mul1": { "k": mul1_store::K, "record_offset": offset - a, "record_bytes": lay.size },
+    });
+    let (class, layer, expert) = recipe::tensor_class(m.family, &t.name, &m.config);
+    let sidecar = serde_json::json!({
+        "name": t.name, "section": t.decision.section, "dtype": mul1::DTYPE, "n": t.n_values,
+        "class": class, "layer": layer, "expert": expert, "record_sha256": rec_sha,
+    });
+    Encoded { bytes: rec[a as usize..b as usize].to_vec(), entry, sidecar, acc: serde_json::json!({ "nvfp4": false, "mul1": true }) }
+}
+
+/// #182: refuse a MUL1 conversion that would leave less than `opts.disk_reserve` free: the bytes
+/// still to write (the container's blob as the units lay it out, minus what a resume keeps, plus
+/// an over-estimate of the index trailer: 1 KiB per tensor + 1 MiB) against the free space of the
+/// output's volume.
+fn mul1_disk_check(m: &Manifest, units: &[Unit], lay: &mul1::RecordLayout, written: u64, out_path: &std::path::Path, opts: &ConvertOpts) -> Result<(), String> {
+    let mut blob = 0u64;
+    for u in units {
+        blob += pad_for(blob, u.align);
+        blob += if is_mul1_unit(m, u) { lay.size } else { u.tensors.iter().map(|&i| m.tensors[i].decision.dtype.bytes(m.tensors[i].n_values)).sum() };
+    }
+    let total = 12 + blob + 1024 * m.tensors.len() as u64 + (1 << 20);
+    let need = total.saturating_sub(written);
+    let dir = out_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let free = match opts.disk_free {
+        Some(f) => f,
+        None => mul1_store::free_bytes(dir)?,
+    };
+    let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let line = format!(
+        "disk check: the container is {total} B ({:.1} GiB) with its index, {need} B ({:.1} GiB) still to write, reserve {:.1} GiB (--disk-reserve-gib), {} has {free} B ({:.1} GiB) free",
+        g(total),
+        g(need),
+        g(opts.disk_reserve),
+        dir.display(),
+        g(free)
+    );
+    if free < need + opts.disk_reserve {
+        return Err(line);
+    }
+    eprintln!("{line}: ok");
+    Ok(())
+}
+
+/// #182: the index's `expert_codec` block of a MUL1 container.
+fn mul1_index_block(s: &mul1_store::Store, m: &Manifest, units: &[Unit]) -> serde_json::Value {
+    serde_json::json!({
+        "dtype": mul1::DTYPE, "k": mul1_store::K, "hidden": s.layout.hidden, "inter": s.layout.inter,
+        "trellis_bytes": s.layout.trellis_bytes, "record_bytes": s.layout.size,
+        "records": units.iter().filter(|u| is_mul1_unit(m, u)).count(),
+        "layout": "[gate.trellis][up.trellis][down.trellis][gate.suh][gate.svh][up.suh][up.svh][down.suh][down.svh][zeros to 4096 B] (converter/src/mul1.rs, #181)",
+        "store_sha256": s.head_sha256, "quantizer": s.head["quantizer"], "calibration": s.head["calibration"],
+    })
 }
 
 /// The index v2 trailer (Crow #300 C6). What changed against v1 (`64c242b`):
@@ -1721,5 +2814,1251 @@ mod tests {
         assert!(ds.weights_for("lm_head.weight", 32).is_ok());
         assert!(ds.weights_for("lm_head.weight", 48).is_err());
         assert!(ds.weights_for("model.language_model.layers.1.mlp.up_proj.weight", 32).is_err());
+    }
+
+    // ---- crow-nest #155: FP8 input, the GLM row, histograms, journal and --consume ----
+
+    /// One synthetic tensor: name, safetensors dtype, shape, raw bytes.
+    type SynthTensor = (String, &'static str, Vec<usize>, Vec<u8>);
+
+    fn lcg_bytes(n: usize, seed: u32, f: impl Fn(u32) -> Vec<u8>) -> Vec<u8> {
+        let mut x = seed;
+        let mut v = Vec::new();
+        while v.len() < n {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.extend(f(x));
+        }
+        v.truncate(n);
+        v
+    }
+
+    fn synth_tensor(name: &str, dtype: &'static str, shape: &[usize], seed: u32) -> SynthTensor {
+        let n: usize = shape.iter().product();
+        let bytes = match dtype {
+            // FP8: any byte but the two NaN codes
+            "F8_E4M3" => lcg_bytes(n, seed, |x| {
+                let b = (x >> 13) as u8;
+                vec![if b & 0x7F == 0x7F { b ^ 1 } else { b }]
+            }),
+            "BF16" => lcg_bytes(2 * n, seed, |x| {
+                let v = (((x >> 8) % 2001) as f32 - 1000.0) / 4000.0;
+                ((v.to_bits() >> 16) as u16).to_le_bytes().to_vec()
+            }),
+            "F32" => lcg_bytes(4 * n, seed, |x| ((((x >> 8) % 1000) as f32 + 1.0) * 1e-5).to_le_bytes().to_vec()),
+            other => lcg_bytes(n * elem_size_of(other).unwrap_or(1), seed, |x| vec![(x >> 9) as u8]),
+        };
+        (name.to_string(), dtype, shape.to_vec(), bytes)
+    }
+
+    /// FP8 weight + its F32 128x128 block scale (scales around 2^-7)
+    fn fp8_pair(name: &str, shape: &[usize], seed: u32) -> (SynthTensor, SynthTensor) {
+        let g = fp8::scale_grid(shape[0], shape[1]);
+        let s: Vec<u8> = (0..g[0] * g[1]).flat_map(|j| (0.0078125f32 * (1.0 + j as f32 / 8.0)).to_le_bytes()).collect();
+        (synth_tensor(name, "F8_E4M3", shape, seed), (format!("{name}_scale_inv"), "F32", g.to_vec(), s))
+    }
+
+    /// Write one safetensors file; returns (data_start, size).
+    fn write_st(path: &std::path::Path, ts: &[SynthTensor]) -> (u64, u64) {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dt, shape, b) in ts {
+            header.insert(name.clone(), serde_json::json!({ "dtype": dt, "shape": shape, "data_offsets": [data.len(), data.len() + b.len()] }));
+            data.extend_from_slice(b);
+        }
+        let h = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&(h.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(&h).unwrap();
+        f.write_all(&data).unwrap();
+        (8 + h.len() as u64, 8 + (h.len() + data.len()) as u64)
+    }
+
+    fn glm_config() -> serde_json::Value {
+        let lt: Vec<&str> = (0..45).map(|i| if i % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect();
+        serde_json::json!({
+            "text_config": {
+                "model_type": "glm5_next_text", "num_hidden_layers": 45, "num_nextn_predict_layers": 1,
+                "hidden_size": 128, "vocab_size": 64, "layer_types": lt, "n_routed_experts": 2,
+                "num_experts_per_tok": 1, "moe_intermediate_size": 256, "first_k_dense_replace": 3,
+                "num_attention_heads": 2, "num_key_value_heads": 2,
+            },
+            "quantization_config": { "quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128] },
+        })
+    }
+
+    const GLM_SHARDS: [&str; 3] = ["model-00001-of-00003.safetensors", "model-00002-of-00003.safetensors", "model-00003-of-00003.safetensors"];
+
+    /// A 3-shard GLM-5.3-Flash miniature: every kind of row once, FP8 weights with block scales
+    /// (one with partial 128-tiles on both axes), the MTP layer 45 and a vision tensor (omitted),
+    /// and expert 1 of layer 3 straddling shards 2 and 3 (its down_proj weight in shard 2, the
+    /// scale in shard 3). Writes the shards into `shard_dir`, and into `dir` the configs, the
+    /// model index, `hf-revision.json` (sha256 and size per shard) and the header cache
+    /// `headers/<shard>.json`.
+    fn write_glm_synth(dir: &std::path::Path, shard_dir: &std::path::Path) {
+        write_glm_synth_with(dir, shard_dir, false)
+    }
+
+    /// The miniature; `mtp_expert` (#182) adds gate and down of the MTP block's expert 0 to shard
+    /// 1, so layer 45 holds one whole routed expert (the miniature of record has its up only).
+    fn write_glm_synth_with(dir: &std::path::Path, shard_dir: &std::path::Path, mtp_expert: bool) {
+        write_glm_synth_full(dir, shard_dir, mtp_expert, false)
+    }
+
+    /// The non-expert tensors of the miniature's MTP block (#182 overlay), one per row of the
+    /// overlay recipe: (name below `layers.45.`, source dtype, shape, the dtype the overlay writes).
+    const MINI_MTP_REST: [(&str, &str, &[usize], &str); 11] = [
+        ("eh_proj.weight", "BF16", &[128, 256], "bf16"),
+        ("enorm.weight", "BF16", &[128], "bf16"),
+        ("hnorm.weight", "BF16", &[128], "bf16"),
+        ("shared_head.norm.weight", "BF16", &[128], "bf16"),
+        ("self_attn.q_a_proj.weight", "F8_E4M3", &[192, 200], "nvfp4"),
+        ("self_attn.kv_b_proj.weight", "BF16", &[128, 64], "nvfp4"),
+        ("self_attn.o_proj.weight", "F8_E4M3", &[128, 128], "nvfp4"),
+        ("self_attn.indexer.wk.weight", "BF16", &[64, 128], "bf16"),
+        ("mlp.gate.weight", "BF16", &[2, 128], "bf16"),
+        ("mlp.gate.e_score_correction_bias", "F32", &[2], "f32"),
+        ("mlp.shared_experts.down_proj.weight", "F8_E4M3", &[128, 256], "nvfp4"),
+    ];
+
+    /// The miniature; `mtp_rest` (#182) adds [`MINI_MTP_REST`] to shard 1, the MTP block's
+    /// non-expert tensors (the miniature of record has none: the 4.5 row omits them anyway).
+    fn write_glm_synth_full(dir: &std::path::Path, shard_dir: &std::path::Path, mtp_expert: bool, mtp_rest: bool) {
+        std::fs::create_dir_all(dir.join("headers")).unwrap();
+        std::fs::create_dir_all(shard_dir).unwrap();
+        let l = |n: &str| format!("model.language_model.layers.{n}");
+        let mut s1 = vec![
+            synth_tensor("lm_head.weight", "BF16", &[64, 128], 1),
+            synth_tensor("model.language_model.embed_tokens.weight", "BF16", &[64, 128], 2),
+        ];
+        let (w, s) = fp8_pair(&l("45.mlp.experts.0.up_proj.weight"), &[256, 128], 3);
+        s1.extend([s, w]);
+        if mtp_expert {
+            let (w, s) = fp8_pair(&l("45.mlp.experts.0.gate_proj.weight"), &[256, 128], 14);
+            s1.extend([w, s]);
+            let (w, s) = fp8_pair(&l("45.mlp.experts.0.down_proj.weight"), &[128, 256], 15);
+            s1.extend([w, s]);
+        }
+        if mtp_rest {
+            for (k, (n, dt, shape, _)) in MINI_MTP_REST.iter().enumerate() {
+                let name = l(&format!("45.{n}"));
+                if *dt == "F8_E4M3" {
+                    let (w, s) = fp8_pair(&name, shape, 300 + k as u32);
+                    s1.extend([w, s]);
+                } else {
+                    s1.push(synth_tensor(&name, dt, shape, 300 + k as u32));
+                }
+            }
+        }
+        let mut s2 = vec![
+            synth_tensor(&l("0.input_layernorm.weight"), "BF16", &[128], 4),
+            synth_tensor(&l("0.self_attn.q_proj.weight"), "BF16", &[128, 128], 5),
+            synth_tensor(&l("0.self_attn.A_log"), "F32", &[4], 6),
+            synth_tensor(&l("0.hc_attn_fn"), "BF16", &[24, 512], 7),
+            synth_tensor(&l("0.hc_attn_base"), "F32", &[24], 8),
+        ];
+        let mut seed = 20;
+        let mut pair = |name: String, shape: &[usize], v: &mut Vec<SynthTensor>| {
+            seed += 1;
+            let (w, s) = fp8_pair(&name, shape, seed);
+            v.extend([s, w]);
+        };
+        pair(l("0.mlp.gate_proj.weight"), &[256, 128], &mut s2);
+        pair(l("3.mlp.experts.0.gate_proj.weight"), &[256, 128], &mut s2);
+        pair(l("3.mlp.experts.0.up_proj.weight"), &[256, 128], &mut s2);
+        pair(l("3.mlp.experts.0.down_proj.weight"), &[128, 256], &mut s2);
+        pair(l("3.mlp.experts.1.gate_proj.weight"), &[256, 128], &mut s2);
+        let (dw, ds) = fp8_pair(&l("3.mlp.experts.1.down_proj.weight"), &[128, 256], 90);
+        s2.push(dw);
+        s2.push(synth_tensor(&l("3.mlp.gate.weight"), "BF16", &[2, 128], 9));
+        s2.push(synth_tensor(&l("3.mlp.gate.e_score_correction_bias"), "F32", &[2], 10));
+        let mut s3 = vec![ds];
+        pair(l("3.mlp.experts.1.up_proj.weight"), &[256, 128], &mut s3);
+        pair(l("3.self_attn.q_a_proj.weight"), &[192, 200], &mut s3);
+        pair(l("3.mlp.shared_experts.down_proj.weight"), &[128, 256], &mut s3);
+        s3.push(synth_tensor(&l("44.post_attention_layernorm.weight"), "BF16", &[128], 11));
+        s3.push(synth_tensor("model.language_model.norm.weight", "BF16", &[128], 12));
+        s3.push(synth_tensor("model.visual.blocks.0.norm1.weight", "BF16", &[16], 13));
+        let mut wm = serde_json::Map::new();
+        let mut siblings = Vec::new();
+        for (shard, ts) in GLM_SHARDS.iter().zip([&s1, &s2, &s3]) {
+            let p = shard_dir.join(shard);
+            let (start, size) = write_st(&p, ts);
+            let (hdr, _) = read_safetensors_header(&p).unwrap();
+            std::fs::write(
+                dir.join("headers").join(format!("{shard}.json")),
+                serde_json::to_vec(&serde_json::json!({ "shard": shard, "size": size, "data_start": start, "header": hdr })).unwrap(),
+            )
+            .unwrap();
+            for t in ts.iter() {
+                wm.insert(t.0.clone(), serde_json::json!(shard));
+            }
+            siblings.push(serde_json::json!({ "rfilename": shard, "size": size, "lfs": { "sha256": recipe::sha256_file(&p).unwrap(), "size": size } }));
+        }
+        std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&glm_config()).unwrap()).unwrap();
+        std::fs::write(dir.join("generation_config.json"), b"{}").unwrap();
+        std::fs::write(dir.join("model.safetensors.index.json"), serde_json::to_vec(&serde_json::json!({ "weight_map": wm })).unwrap()).unwrap();
+        std::fs::write(dir.join("hf-revision.json"), serde_json::to_vec(&serde_json::json!({ "sha": "glm-synth", "siblings": siblings })).unwrap()).unwrap();
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("cnq-155-{tag}-{}-{k}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn glm_prov() -> Provenance {
+        Provenance { repo: Some("crow-nest/glm-synth".into()), revision: None }
+    }
+
+    /// The uninterrupted reference conversion of the miniature: (container, sidecar) bytes.
+    fn glm_reference(mode: ScalesMode) -> (Vec<u8>, Vec<u8>) {
+        let dir = tmp(&format!("ref-{}", mode == ScalesMode::Mse));
+        write_glm_synth(&dir, &dir);
+        let out = dir.join("glm.cnq");
+        assert_eq!(convert_with(&dir, &out, mode, &glm_prov(), None, &ConvertOpts::default()), 0);
+        let r = (std::fs::read(&out).unwrap(), std::fs::read(dir.join("glm.cnq.sidecar.jsonl")).unwrap());
+        assert!(!dir.join("glm.cnq.journal.jsonl").exists(), "the journal is removed after the trailer");
+        std::fs::remove_dir_all(&dir).ok();
+        r
+    }
+
+    /// End to end on the miniature: the FP8 tensor with partial tiles is stored as exactly the
+    /// NVFP4 of its known dequantization; F32 carries are the source bytes; MTP, vision and the
+    /// scales are not written; every routed-expert block starts at an absolute offset that is a
+    /// multiple of 4096, its gate/up/down back to back; provenance comes from hf-revision.json.
+    #[test]
+    fn a_glm_conversion_reads_fp8_and_aligns_every_expert_block() {
+        let dir = tmp("e2e");
+        write_glm_synth(&dir, &dir);
+        let out = dir.join("glm.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts::default()), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        assert_eq!((idx["recipe"].as_str(), idx["model"]["family"].as_str()), (Some("cnq4.5-glm5-next"), Some("Glm5Next")));
+        assert_eq!(idx["model"]["source"]["revision"], "glm-synth");
+        let sh = idx["model"]["source"]["shards"].as_array().unwrap();
+        assert_eq!(sh.len(), 3);
+        assert!(sh.iter().all(|s| s["sha256_from"] == "hf-lfs"));
+        let ts = idx["tensors"].as_array().unwrap();
+        assert_eq!(ts.len(), 20);
+        assert!(ts.iter().all(|t| {
+            let n = t["name"].as_str().unwrap();
+            !n.contains("layers.45.") && !n.contains("visual") && !n.ends_with("_scale_inv")
+        }));
+        let get = |n: &str| ts.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n}"));
+        // the FP8 tensor with partial tiles: known result = quantize(dequant(fp8, scale))
+        let name = "model.language_model.layers.3.self_attn.q_a_proj.weight";
+        let (hdr, start) = read_safetensors_header(&dir.join(GLM_SHARDS[2])).unwrap();
+        let src = std::fs::read(dir.join(GLM_SHARDS[2])).unwrap();
+        let at = |k: &str| {
+            let o = &hdr[k]["data_offsets"];
+            &src[(start + o[0].as_u64().unwrap()) as usize..(start + o[1].as_u64().unwrap()) as usize]
+        };
+        let sc = fp8::scales_to_f32(at(&format!("{name}_scale_inv")), "F32").unwrap();
+        let vals = fp8::dequant_fp8_block(name, at(name), 192, 200, &sc).unwrap();
+        let (want, global, _, _) = quantize_nvfp4(&vals, ScalesMode::Mse);
+        let t = get(name);
+        let off = 12 + t["offset"].as_u64().unwrap() as usize;
+        assert_eq!(&bytes[off..off + want.len()], want.as_slice());
+        assert_eq!(t["global_scale"].as_f64().unwrap() as f32, global);
+        assert_eq!(t["section"], "text");
+        // f32 carries are the source bytes
+        let e = get("model.language_model.layers.3.mlp.gate.e_score_correction_bias");
+        assert_eq!(e["dtype"], "f32");
+        let (hdr2, start2) = read_safetensors_header(&dir.join(GLM_SHARDS[1])).unwrap();
+        let src2 = std::fs::read(dir.join(GLM_SHARDS[1])).unwrap();
+        let o = &hdr2["model.language_model.layers.3.mlp.gate.e_score_correction_bias"]["data_offsets"];
+        let off = 12 + e["offset"].as_u64().unwrap() as usize;
+        assert_eq!(&bytes[off..off + 8], &src2[(start2 + o[0].as_u64().unwrap()) as usize..(start2 + o[1].as_u64().unwrap()) as usize]);
+        assert_eq!(get("model.language_model.layers.0.hc_attn_fn")["dtype"], "bf16");
+        assert_eq!(get("model.language_model.layers.0.self_attn.q_proj.weight")["dtype"], "nvfp4");
+        // expert blocks: aligned, back to back
+        for x in 0..2 {
+            let p = |w: &str| get(&format!("model.language_model.layers.3.mlp.experts.{x}.{w}_proj.weight"));
+            let (g, u, d) = (p("gate"), p("up"), p("down"));
+            let off = |t: &serde_json::Value| t["offset"].as_u64().unwrap();
+            let len = |t: &serde_json::Value| t["len"].as_u64().unwrap();
+            assert_eq!((12 + off(g)) % 4096, 0, "expert {x}");
+            assert_eq!(off(u), off(g) + len(g));
+            assert_eq!(off(d), off(u) + len(u));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #155 failure mode: the histogram must count what is written, also what `mse` clips:
+    /// sum(h_codes) == n and sum(h_scales) == n / 16 on every NVFP4 sidecar line, and the code
+    /// summary has one table per expert block.
+    #[test]
+    fn every_histogram_sums_to_the_value_count() {
+        let (_, sidecar) = glm_reference(ScalesMode::Mse);
+        let lines: Vec<serde_json::Value> = String::from_utf8(sidecar).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let mut n_nvfp4 = 0;
+        for v in lines.iter().filter(|v| v["dtype"] == "nvfp4" && v.get("record").is_none()) {
+            let h = entropy::Hist::from_json(&v["h_codes"], &v["h_scales"]).unwrap();
+            let n = v["n"].as_u64().unwrap();
+            assert_eq!((h.n_codes(), h.n_scales()), (n, n / 16), "{}", v["name"]);
+            n_nvfp4 += 1;
+        }
+        assert_eq!(n_nvfp4, 10);
+        let eb = lines.iter().find(|v| v["record"] == "code_summary" && v["scope"] == "expert_blocks").unwrap();
+        assert_eq!(eb["blocks"], 2);
+        assert!(lines.iter().any(|v| v["record"] == "code_summary" && v["scope"] == "class" && v["class"] == "attn_mla"));
+        // forced clipping: 15 values of 1 and one of 8 per sub-block, which `mse` clips
+        // (the case of `mse_beats_ceil_on_moderate_outlier`)
+        let vals: Vec<f32> = (0..64 * 64).map(|i| if i % 16 == 15 { 8.0 } else if i % 3 == 0 { -1.0 } else { 1.0 }).collect();
+        for mode in [ScalesMode::Ceil, ScalesMode::Mse] {
+            let (blocks, _, st, _) = quantize_nvfp4(&vals, mode);
+            if mode == ScalesMode::Mse {
+                assert!(st.clipped > 0, "the test must clip");
+            }
+            let h = entropy::Hist::of_blocks(&blocks);
+            assert_eq!((h.n_codes(), h.n_scales()), (vals.len() as u64, vals.len() as u64 / 16));
+        }
+    }
+
+    /// #177: a tensor whose largest sub-block scale lands above 448 in f32 (`max_scale /
+    /// (max_scale / 448)` rounds up) gets scale byte 0x7F, the E4M3 NaN code, from the ceiling
+    /// rule. The glm5_next rule writes no 0x7F, and its codes are rounded against the 448 that is
+    /// written (not the engine's byte-only rewrite, which would shrink the block max by 6.7 %).
+    /// The rule of the families of record writes the same bytes as before, 0x7F included.
+    #[test]
+    fn the_glm_rule_keeps_the_e4m3_nan_code_out_of_the_scales() {
+        let v = (0..100_000)
+            .map(|k| 1.0f32 + k as f32 * 1e-4)
+            .find(|v| {
+                let s = *v / 6.0;
+                s / (s / UE4M3_MAX) > UE4M3_MAX
+            })
+            .expect("a block max whose divided scale rounds above 448");
+        // block 0, sub-block 0 is the tensor max (16 x +-v, so `mse` has nothing to clip);
+        // everything else is smaller
+        let vals: Vec<f32> = (0..256).map(|i| if i < 16 { if i % 2 == 0 { v } else { -v } } else { ((i % 13) as f32 - 6.0) * 0.05 }).collect();
+        let scale_bytes = |b: &[u8]| b.chunks_exact(36).flat_map(|blk| blk[..4].to_vec()).collect::<Vec<u8>>();
+        let (old, _, _, _) = quantize_nvfp4(&vals, ScalesMode::Ceil);
+        assert_eq!(old[0], 0x7F, "the fixture must hit the NaN code under the ceiling rule (v = {v})");
+        for mode in [ScalesMode::Ceil, ScalesMode::Mse] {
+            let mn = if mode == ScalesMode::Mse { "mse" } else { "ceil" };
+            // the families of record: byte-identical to `quantize_nvfp4`
+            for f in [recipe::Family::FlashNext, recipe::Family::Qwen35Dense] {
+                let (want, wg, _, _) = quantize_nvfp4(&vals, mode);
+                let (got, gg, _, _) = quantize_nvfp4_cap(&vals, mode, None, f.scale_byte_max());
+                assert_eq!((got, gg), (want, wg), "{f:?} {mn}");
+            }
+            // glm5_next: no 0x7F, and the block max decodes within 1 % (a byte-only rewrite: 6.7 %)
+            let (blocks, global, _, _) = quantize_nvfp4_cap(&vals, mode, None, recipe::Family::Glm5Next.scale_byte_max());
+            assert!(!scale_bytes(&blocks).contains(&0x7F), "{mn}: a glm5_next scale byte is 0x7F");
+            let d = dequant_nvfp4(&blocks, global);
+            assert!((d[0] - v).abs() / v < 0.01, "{mn}: block max {v} decodes to {}", d[0]);
+        }
+    }
+
+    /// #177 end to end: the GLM miniature's container carries no scale byte 0x7F, read from the
+    /// written histograms (`h_scales[0x7F]`) of every NVFP4 sidecar line, in both scale modes.
+    #[test]
+    fn a_glm_container_carries_no_scale_byte_0x7f() {
+        for mode in [ScalesMode::Ceil, ScalesMode::Mse] {
+            let mn = if mode == ScalesMode::Mse { "mse" } else { "ceil" };
+            let (_, sidecar) = glm_reference(mode);
+            let lines: Vec<serde_json::Value> = String::from_utf8(sidecar).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            let nv: Vec<&serde_json::Value> = lines.iter().filter(|v| v["dtype"] == "nvfp4" && v.get("record").is_none()).collect();
+            assert_eq!(nv.len(), 10);
+            for v in nv {
+                assert_eq!(v["h_scales"][0x7F], 0, "{mn} {}", v["name"]);
+            }
+        }
+    }
+
+    /// A conversion killed after k tensors (no trailer, sometimes with a torn tail on the
+    /// container and on the journal) and run again ends with the same container and sidecar
+    /// bytes as an uninterrupted run, for k at the start, inside an expert block, at the
+    /// straddling pair and before the last tensor. A journal of another plan is refused.
+    #[test]
+    fn a_glm_conversion_killed_and_resumed_is_byte_identical() {
+        let (want, want_side) = glm_reference(ScalesMode::Mse);
+        for k in [1usize, 9, 13, 18] {
+            let dir = tmp(&format!("kill-{k}"));
+            write_glm_synth(&dir, &dir);
+            let out = dir.join("glm.cnq");
+            let opts = ConvertOpts { stop_after: Some(k), ..ConvertOpts::default() };
+            assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 4, "k {k}");
+            assert!(dir.join("glm.cnq.journal.jsonl").exists());
+            if k % 2 == 1 {
+                // a kill mid-write: garbage behind the last synced tensor, half a journal line
+                std::fs::OpenOptions::new().append(true).open(&out).unwrap().write_all(&[0xAB; 777]).unwrap();
+                std::fs::OpenOptions::new().append(true).open(dir.join("glm.cnq.journal.jsonl")).unwrap().write_all(b"{\"seq\": 99, \"pad").unwrap();
+            }
+            assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts::default()), 0, "k {k}");
+            assert!(std::fs::read(&out).unwrap() == want, "k {k}: container differs from the uninterrupted run");
+            let got_side = std::fs::read(dir.join("glm.cnq.sidecar.jsonl")).unwrap();
+            if got_side != want_side {
+                let (g, w) = (String::from_utf8(got_side).unwrap(), String::from_utf8(want_side.clone()).unwrap());
+                for (a, b) in g.lines().zip(w.lines()) {
+                    if a != b {
+                        panic!("k {k}: sidecar differs
+ got  {a}
+ want {b}");
+                    }
+                }
+                panic!("k {k}: sidecar differs in length {} vs {}", g.lines().count(), w.lines().count());
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        // a corrupted journalled tensor: everything from it on is written again
+        let dir = tmp("kill-corrupt");
+        write_glm_synth(&dir, &dir);
+        let out = dir.join("glm.cnq");
+        let opts = ConvertOpts { stop_after: Some(12), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 4);
+        let mut b = std::fs::read(&out).unwrap();
+        let n = b.len();
+        b[n - 100] ^= 0xFF;
+        std::fs::write(&out, &b).unwrap();
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts::default()), 0);
+        assert!(std::fs::read(&out).unwrap() == want);
+        // another plan (scale policy) is refused, not mixed
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts { stop_after: Some(3), ..ConvertOpts::default() }), 4);
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Ceil, &glm_prov(), None, &ConvertOpts::default()), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--consume`: the shards live in their own directory and become readable one by one when a
+    /// driver writes `<shard>.verified`; the converter never reads ahead of the markers, writes
+    /// `<shard>.done` when everything that reads a shard is synced, never deletes a shard, and
+    /// writes the same container as a conversion of the whole directory. A marker whose sha256
+    /// disagrees with the HF record is refused.
+    #[test]
+    fn consume_mode_follows_the_verified_markers_and_writes_the_same_container() {
+        let (want, _) = glm_reference(ScalesMode::Mse);
+        let dir = tmp("consume");
+        let shards = dir.join("incoming");
+        write_glm_synth(&dir, &shards);
+        let api = recipe::read_hf_api_info(&dir).unwrap().unwrap();
+        // the driver: a window of two shards, the next one verified when the one before is done;
+        // it records which shards were done at the moment it verified a later one
+        let driver = {
+            let shards = shards.clone();
+            let api_lfs = api.lfs.clone();
+            std::thread::spawn(move || {
+                let verify = |s: &str| {
+                    let (sha, size) = &api_lfs[s];
+                    std::fs::write(shards.join(format!("{s}.verified")), serde_json::to_vec(&serde_json::json!({ "sha256": sha, "size": size })).unwrap()).unwrap();
+                };
+                verify(GLM_SHARDS[0]);
+                verify(GLM_SHARDS[1]);
+                let t0 = std::time::Instant::now();
+                while !shards.join(format!("{}.done", GLM_SHARDS[0])).exists() {
+                    assert!(t0.elapsed().as_secs() < 60, "shard 1 never done");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                verify(GLM_SHARDS[2]);
+            })
+        };
+        let out = dir.join("glm.cnq");
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), consume: Some(shards.clone()), poll: std::time::Duration::from_millis(5), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        driver.join().unwrap();
+        assert!(std::fs::read(&out).unwrap() == want, "--consume wrote another container");
+        for s in GLM_SHARDS {
+            assert!(shards.join(format!("{s}.done")).exists(), "{s}: no .done");
+            assert!(shards.join(s).exists(), "{s}: the converter never deletes a shard");
+        }
+        // a marker with another sha256: refused before a byte of that shard is converted
+        let dir2 = tmp("consume-bad");
+        let shards2 = dir2.join("incoming");
+        write_glm_synth(&dir2, &shards2);
+        std::fs::write(shards2.join(format!("{}.verified", GLM_SHARDS[0])), br#"{"sha256": "00"}"#).unwrap();
+        let opts = ConvertOpts { headers: Some(dir2.join("headers")), consume: Some(shards2.clone()), poll: std::time::Duration::from_millis(5), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir2, &dir2.join("glm.cnq"), ScalesMode::Mse, &glm_prov(), None, &opts), 2);
+        // --consume without --headers is refused
+        let opts = ConvertOpts { consume: Some(shards2.clone()), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir2, &dir2.join("glm2.cnq"), ScalesMode::Mse, &glm_prov(), None, &opts), 2);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    /// `plan --headers` builds the same manifest as reading the shard files, and needs no shard
+    /// on disk: provenance then comes from hf-revision.json without reading one.
+    #[test]
+    fn the_manifest_from_the_header_cache_equals_the_one_from_the_shards() {
+        let dir = tmp("headers");
+        write_glm_synth(&dir, &dir);
+        let key = |m: &Manifest| -> Vec<String> {
+            m.tensors
+                .iter()
+                .map(|t| format!("{} {} {} {} {:?} {:?}", t.name, t.shard, t.data_begin, t.data_end, t.decision, t.scale.as_ref().map(|s| (&s.shard, s.data_begin, s.data_end))))
+                .collect()
+        };
+        let a = build_manifest(&dir).unwrap();
+        let b = build_manifest_from(&dir, Some(&dir.join("headers"))).unwrap();
+        assert_eq!(key(&a), key(&b));
+        assert_eq!(a.omitted, b.omitted);
+        assert_eq!(a.omitted.values().map(|v| v.0).sum::<usize>(), 3, "MTP weight + its scale, the vision tensor");
+        for s in GLM_SHARDS {
+            std::fs::remove_file(dir.join(s)).unwrap();
+        }
+        assert!(build_manifest(&dir).is_err(), "without --headers a missing shard is a refusal");
+        let c = build_manifest_from(&dir, Some(&dir.join("headers"))).unwrap();
+        assert_eq!(key(&a), key(&c));
+        let (_, rev, shards, pending) = provenance(&c, &glm_prov(), true).unwrap();
+        assert_eq!((rev.as_str(), shards.len(), pending), ("glm-synth", 3, 0));
+        assert_eq!(plan(&["--headers".into(), dir.join("headers").display().to_string(), "--source-repo".into(), "r".into(), dir.display().to_string()]), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// crow-nest #154: an unknown dtype is refused by name (it used to be skipped with a line on
+    /// stderr, which would have dropped every F8_E4M3 tensor of GLM-5.3-Flash); an FP8 weight
+    /// without its scale and a scale without its weight are refused by name too.
+    #[test]
+    fn unknown_dtypes_and_unpaired_scales_are_refused_by_name() {
+        let case = |tag: &str, ts: Vec<SynthTensor>| -> String {
+            let dir = tmp(tag);
+            std::fs::write(dir.join("config.json"), serde_json::to_vec(&glm_config()).unwrap()).unwrap();
+            std::fs::write(dir.join("generation_config.json"), b"{}").unwrap();
+            let st = dir.join("model.safetensors");
+            write_st(&st, &ts);
+            let e = build_manifest(&st).err().expect("refused");
+            std::fs::remove_dir_all(&dir).ok();
+            e
+        };
+        let (w, s) = fp8_pair("model.language_model.layers.3.mlp.shared_experts.up_proj.weight", &[256, 128], 1);
+        let e = case("dtype", vec![synth_tensor("model.language_model.layers.3.mlp.shared_experts.gate_proj.weight", "F8_E5M2", &[256, 128], 2), w.clone(), s.clone()]);
+        assert!(e.contains("model.language_model.layers.3.mlp.shared_experts.gate_proj.weight: dtype F8_E5M2"), "{e}");
+        let e = case("noscale", vec![w.clone()]);
+        assert!(e.contains("up_proj.weight: an F8_E4M3 weight without its"), "{e}");
+        let e = case("noweight", vec![s.clone()]);
+        assert!(e.contains("up_proj.weight_scale_inv: a weight_scale_inv without its F8_E4M3 weight"), "{e}");
+        let bad = (s.0.clone(), "F32", vec![1, 1], vec![0u8; 4]);
+        let e = case("grid", vec![w, bad]);
+        assert!(e.contains("the 128x128 grid of [256, 128] is [2, 1]"), "{e}");
+    }
+
+    /// crow-nest #156: `--layers 0,3 --with-embed-head` on the miniature writes exactly layers 0
+    /// and 3 plus embedding, lm_head and final norm, each with the bytes the full conversion
+    /// writes for it; layer 44 is filtered (not missing: exit 0, not 3); the index says
+    /// `partial`. A layer the checkpoint does not have is refused.
+    #[test]
+    fn a_partial_conversion_writes_the_named_layers_with_the_full_bytes() {
+        let (full, _) = glm_reference(ScalesMode::Mse);
+        let fidx = trailer(&full);
+        let dir = tmp("partial");
+        write_glm_synth(&dir, &dir);
+        let out = dir.join("glm-l03.cnq");
+        let f = partial::LayerFilter::parse("0,3", true).unwrap();
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), filter: Some(f), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let ts = idx["tensors"].as_array().unwrap();
+        let names: Vec<&str> = ts.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.iter().all(|n| !n.contains("layers.44.")), "{names:?}");
+        assert_eq!(ts.len(), fidx["tensors"].as_array().unwrap().len() - 1, "only layer 44's norm is filtered");
+        for n in ["lm_head.weight", "model.language_model.embed_tokens.weight", "model.language_model.norm.weight"] {
+            assert!(names.contains(&n), "{n}");
+        }
+        assert_eq!(idx["partial"]["layers"], serde_json::json!([0, 3]));
+        assert_eq!(idx["partial"]["embed_head_norm"], true);
+        assert_eq!(idx["partial"]["tensors_filtered"], 1);
+        let body = |b: &[u8], t: &serde_json::Value| {
+            let o = 12 + t["offset"].as_u64().unwrap() as usize;
+            b[o..o + t["len"].as_u64().unwrap() as usize].to_vec()
+        };
+        for t in ts {
+            let ft = fidx["tensors"].as_array().unwrap().iter().find(|x| x["name"] == t["name"]).unwrap();
+            assert!(body(&bytes, t) == body(&full, ft), "{}: other bytes than the full conversion", t["name"]);
+            assert_eq!(t["global_scale"], ft["global_scale"]);
+        }
+        // without --with-embed-head: no embedding, head or final norm
+        let out2 = dir.join("glm-l03-noeh.cnq");
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), filter: Some(partial::LayerFilter::parse("0,3", false).unwrap()), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out2, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let idx2 = trailer(&std::fs::read(&out2).unwrap());
+        assert!(idx2["tensors"].as_array().unwrap().iter().all(|t| !partial::LayerFilter::is_embed_head_norm(t["name"].as_str().unwrap())));
+        // layers 1 and 2 do not exist in the miniature: refused before a byte is written
+        let out3 = dir.join("glm-l0-3.cnq");
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), filter: Some(partial::LayerFilter::parse("0-3", true).unwrap()), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out3, ScalesMode::Mse, &glm_prov(), None, &opts), 2);
+        assert!(!out3.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// crow-nest #156: `converter dequant` decodes what gate 0 measured. Re-decoding the written
+    /// blocks reproduces the sidecar's squared-error sum and max error bit for bit; a decode with
+    /// the nibble order or the scale order swapped does not.
+    #[test]
+    fn dequant_reproduces_gate_zero_bit_for_bit() {
+        let vals: Vec<f32> = (0..64 * 40).map(|i| ((i as f32 * 0.37).sin() * 3.0 + if i % 29 == 0 { 9.0 } else { 0.0 }) * 1e-2).collect();
+        for mode in [ScalesMode::Ceil, ScalesMode::Mse] {
+            let (blocks, global, st, _) = quantize_nvfp4(&vals, mode);
+            let d = dequant_nvfp4(&blocks, global);
+            assert_eq!(d.len(), vals.len());
+            // summed per 16-value sub-block, then over sub-blocks: gate 0's order (`QuantStats::absorb`)
+            let (mut sse, mut max) = (0.0f64, 0.0f32);
+            for (ds, vs) in d.chunks(16).zip(vals.chunks(16)) {
+                let mut sub = 0.0f64;
+                for (a, b) in ds.iter().zip(vs) {
+                    let e = (a - b).abs();
+                    sub += (e as f64) * (e as f64);
+                    max = max.max(e);
+                }
+                sse += sub;
+            }
+            assert_eq!(sse.to_bits(), st.sum_sq_err.to_bits(), "mode {}: the decode is not gate 0's", mode == ScalesMode::Mse);
+            assert_eq!(max.to_bits(), st.max_abs_err.to_bits());
+            // the controls: a swapped nibble order and a swapped scale order are seen
+            let mut swapped = blocks.clone();
+            for b in swapped.chunks_exact_mut(36) {
+                for k in 4..36 {
+                    b[k] = b[k].rotate_left(4);
+                }
+            }
+            assert_ne!(dequant_nvfp4(&swapped, global), d);
+            let mut sc = blocks.clone();
+            for b in sc.chunks_exact_mut(36) {
+                b[..4].reverse();
+            }
+            assert_ne!(dequant_nvfp4(&sc, global), d);
+        }
+    }
+
+    /// crow-nest #156: the subcommand's decode on a written container: a whole NVFP4 tensor, a row
+    /// range of it, and a BF16 and an F32 tensor, against the bytes in the file.
+    #[test]
+    fn dequant_reads_the_container_records() {
+        let dir = tmp("dequant");
+        write_glm_synth(&dir, &dir);
+        let out = dir.join("glm.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts::default()), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let get = |n: &str| idx["tensors"].as_array().unwrap().iter().find(|t| t["name"] == n).unwrap().clone();
+        let body = |t: &serde_json::Value| {
+            let o = 12 + t["offset"].as_u64().unwrap() as usize;
+            bytes[o..o + t["len"].as_u64().unwrap() as usize].to_vec()
+        };
+        let mut f = std::fs::File::open(&out).unwrap();
+        let q = get("model.language_model.layers.3.self_attn.q_a_proj.weight"); // [192, 200], nvfp4
+        assert_eq!(q["dtype"], "nvfp4");
+        let want = dequant_nvfp4(&body(&q), q["global_scale"].as_f64().unwrap() as f32);
+        let all = dequant::decode(&mut f, 12, &q, None).unwrap();
+        assert!(all == want[..192 * 200]);
+        // row 1 of a 200-wide tensor is not whole 64-value blocks: refused
+        assert!(dequant::decode(&mut f, 12, &q, Some((1, 2))).is_err());
+        let g = get("model.language_model.layers.3.mlp.experts.0.gate_proj.weight"); // [256, 128]
+        let gall = dequant::decode(&mut f, 12, &g, None).unwrap();
+        assert!(dequant::decode(&mut f, 12, &g, Some((5, 9))).unwrap() == gall[5 * 128..9 * 128]);
+        let e = get("lm_head.weight");
+        assert_eq!(e["dtype"], "bf16");
+        assert!(dequant::decode(&mut f, 12, &e, None).unwrap() == bytes_to_f32(&body(&e), "BF16"));
+        let c = get("model.language_model.layers.3.mlp.gate.e_score_correction_bias");
+        assert!(dequant::decode(&mut f, 12, &c, None).unwrap() == bytes_to_f32(&body(&c), "F32"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- crow-nest #182: routed experts as MUL1 K = 3 records from a quantizer store ----
+
+    /// The miniature's experts: hidden 128, inter 256 (gate/up [256, 128], down [128, 256]).
+    const MINI_HIDDEN: usize = 128;
+    const MINI_INTER: usize = 256;
+    /// The miniature's whole experts with `write_glm_synth_with(.., true)`: layer 3 experts 0 and 1
+    /// and the MTP block's expert 0 (the stand-in for GLM-5.3-Flash's 42 x 288 + 288).
+    const MINI_RECORDS: [(u64, u64); 3] = [(3, 0), (3, 1), (45, 0)];
+
+    fn mini_layout() -> mul1::RecordLayout {
+        mul1::RecordLayout::new(MINI_HIDDEN, MINI_INTER, mul1::Bitrate::from_k(3.0).unwrap()).unwrap()
+    }
+
+    /// Synthetic exllamav3 output for one expert (what `quantize_exl3` returns: trellis words,
+    /// suh, svh), seeded by (layer, expert).
+    fn synth_linears(l: u64, e: u64) -> [mul1::Linear; 3] {
+        let lay = mini_layout();
+        let wpt = lay.bitrate.words_per_tile();
+        let words = |n: usize, seed: u64| -> Vec<u16> {
+            let mut x = (seed as u32).wrapping_mul(2654435761).wrapping_add(12345);
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (x >> 13) as u16
+                })
+                .collect()
+        };
+        let s = l * 1000 + e * 10;
+        let m: Vec<mul1::Linear> = lay
+            .shapes()
+            .iter()
+            .enumerate()
+            .map(|(i, &(k, n))| mul1::Linear { k, n, trellis: words(k / 16 * (n / 16) * wpt, s + 3 * i as u64), suh: words(k, s + 3 * i as u64 + 1), svh: words(n, s + 3 * i as u64 + 2) })
+            .collect();
+        m.try_into().unwrap()
+    }
+
+    /// One expert file as `tools/glm_mul1_quantize.py` writes it (9 tensors, I16 / F16).
+    fn write_expert_file(path: &std::path::Path, mats: &[mul1::Linear; 3]) {
+        let le = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let mut ts: Vec<SynthTensor> = Vec::new();
+        for (p, m) in ["gate", "up", "down"].iter().zip(mats) {
+            ts.push((format!("{p}.trellis"), "I16", vec![m.k / 16, m.n / 16, m.trellis.len() / (m.k / 16 * (m.n / 16))], le(&m.trellis)));
+            ts.push((format!("{p}.suh"), "F16", vec![m.k], le(&m.suh)));
+            ts.push((format!("{p}.svh"), "F16", vec![m.n], le(&m.svh)));
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_st(path, &ts);
+    }
+
+    fn write_store_head(store: &std::path::Path) {
+        std::fs::create_dir_all(store).unwrap();
+        let head = serde_json::json!({
+            "format": mul1_store::FORMAT, "version": 1, "k": 3, "hidden": MINI_HIDDEN, "inter": MINI_INTER,
+            "record_bytes": mini_layout().size, "quantizer": { "name": "synthetic (converter tests)" },
+            "calibration": { "files": [], "tokens": 0 },
+        });
+        std::fs::write(store.join(mul1_store::STORE_FILE), serde_json::to_vec_pretty(&head).unwrap()).unwrap();
+    }
+
+    /// Append one expert to a store: its file, then its journal line (the quantizer's order).
+    fn store_add(store: &std::path::Path, l: u64, e: u64) {
+        store_add_mats(store, l, e, &synth_linears(l, e));
+    }
+
+    fn store_add_mats(store: &std::path::Path, l: u64, e: u64, mats: &[mul1::Linear; 3]) {
+        let rel = mul1_store::rel_path(l, e);
+        write_expert_file(&store.join(&rel), mats);
+        let sha = recipe::sha256_file(&store.join(&rel)).unwrap();
+        let line = serde_json::json!({ "layer": l, "expert": e, "file": rel, "sha256": sha });
+        let mut j = std::fs::OpenOptions::new().create(true).append(true).open(store.join(mul1_store::JOURNAL_FILE)).unwrap();
+        writeln!(j, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+    }
+
+    fn write_store(store: &std::path::Path, recs: &[(u64, u64)]) {
+        write_store_head(store);
+        for &(l, e) in recs {
+            store_add(store, l, e);
+        }
+    }
+
+    fn mul1_opts(store: &std::path::Path) -> ConvertOpts {
+        ConvertOpts { mul1: Some(store.to_path_buf()), ..ConvertOpts::default() }
+    }
+
+    /// A MUL1 conversion of the miniature with a complete MTP expert: (container, sidecar).
+    fn mul1_reference() -> (Vec<u8>, Vec<u8>) {
+        let dir = tmp("mul1-ref");
+        write_glm_synth_with(&dir, &dir, true);
+        write_store(&dir.join("store"), &MINI_RECORDS);
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&dir.join("store"))), 0);
+        let r = (std::fs::read(&out).unwrap(), std::fs::read(dir.join("glm3.cnq.sidecar.jsonl")).unwrap());
+        let idx = trailer(&r.0);
+        assert_eq!(idx["expert_codec"]["records"], 3, "the reference holds the three MUL1 records");
+        assert_eq!(entries(&idx).iter().filter(|t| t["dtype"] == "mul1").count(), 9);
+        std::fs::remove_dir_all(&dir).ok();
+        r
+    }
+
+    fn entries(idx: &serde_json::Value) -> Vec<serde_json::Value> {
+        idx["tensors"].as_array().unwrap().clone()
+    }
+
+    fn body_of(b: &[u8], t: &serde_json::Value) -> Vec<u8> {
+        let o = 12 + t["offset"].as_u64().unwrap() as usize;
+        b[o..o + t["len"].as_u64().unwrap() as usize].to_vec()
+    }
+
+    /// #182: every routed expert (layer 3's and the MTP block's) is one record of exactly
+    /// `RecordLayout::size` B on a 4096-B file offset, equal to `mul1::write_record` of the store's
+    /// tensors; its index entries are dtype `mul1` at the trellis starts (record + 0 / T / 2T) with
+    /// lengths T / T / size - 2T, so the engine's rule (next offset after down - gate offset) gives
+    /// the record size; the records follow the whole dense part in (layer, expert) order; the MTP
+    /// experts are section `mtp`; the index names the codec; each record gets its `.done`.
+    /// `synth_linears` with finite scales: suh / svh fp16 of random sign and magnitude
+    /// (1 + m/1024) 2^-4, as exllamav3's quantizer writes them (the trellis words stay synthetic).
+    fn finite_linears(l: u64, e: u64) -> [mul1::Linear; 3] {
+        let mut m = synth_linears(l, e);
+        for lin in m.iter_mut() {
+            for v in lin.suh.iter_mut().chain(lin.svh.iter_mut()) {
+                *v = (*v & 0x8000) | (11 << 10) | (*v & 0x3ff);
+            }
+        }
+        m
+    }
+
+    /// The original-basis weight of one exllamav3 linear in the checkpoint's `[out, in]` layout,
+    /// written out as a matrix product: `W = diag(suh) H W_hat H diag(svh) / 128` (`[in, out]`,
+    /// exllamav3 `LinearEXL3.get_weight_tensor` with `had_k = had_n = 128`), H the 128 x 128
+    /// Sylvester matrix built by its recursion (exllamav3 `util/hadamard.py`), W_hat from the #181
+    /// reference `mul1::reconstruct`, every sum in f64, rounded to f32 once.
+    fn mul1_weight_reference(lin: &mul1::Linear, b: mul1::Bitrate) -> Vec<f32> {
+        let mut h = vec![1.0f64];
+        let mut d = 1;
+        while d < 128 {
+            let mut s = vec![0.0f64; 4 * d * d];
+            for i in 0..d {
+                for j in 0..d {
+                    let v = h[i * d + j];
+                    s[i * 2 * d + j] = v;
+                    s[i * 2 * d + j + d] = v;
+                    s[(i + d) * 2 * d + j] = v;
+                    s[(i + d) * 2 * d + j + d] = -v;
+                }
+            }
+            h = s;
+            d *= 2;
+        }
+        let (k, n) = (lin.k, lin.n);
+        let w_hat: Vec<f64> = mul1::reconstruct(&lin.trellis, k, n, b).into_iter().map(mul1::f16_to_f64).collect();
+        // H W_hat (row blocks), then (H W_hat) H (column blocks)
+        let mut hw = vec![0.0f64; k * n];
+        for i in 0..k {
+            let (blk, a0) = (i / 128 * 128, i % 128);
+            for c in 0..n {
+                hw[i * n + c] = (0..128).map(|a| h[a0 * 128 + a] * w_hat[(blk + a) * n + c]).sum();
+            }
+        }
+        let mut out = vec![0.0f32; n * k];
+        for i in 0..k {
+            let suh = mul1::f16_to_f64(lin.suh[i]);
+            for j in 0..n {
+                let (blk, b0) = (j / 128 * 128, j % 128);
+                let v: f64 = (0..128).map(|c| hw[i * n + blk + c] * h[c * 128 + b0]).sum();
+                out[j * k + i] = (v * suh * mul1::f16_to_f64(lin.svh[j]) / 128.0) as f32;
+            }
+        }
+        out
+    }
+
+    /// crow-nest #156: `converter dequant` decodes a MUL1 expert projection of a written
+    /// container to its original-basis weight in the checkpoint's `[out, in]` layout, bit for bit
+    /// the matrix-product reference above, for gate, up and down of a trunk and the MTP expert;
+    /// a row range is that slice of the whole tensor.
+    #[test]
+    fn dequant_decodes_mul1_records_to_the_original_basis() {
+        let dir = tmp("dequant-mul1");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store_head(&store);
+        for (l, e) in MINI_RECORDS {
+            store_add_mats(&store, l, e, &finite_linears(l, e));
+        }
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 0);
+        let idx = trailer(&std::fs::read(&out).unwrap());
+        let ts = entries(&idx);
+        let b = mini_layout().bitrate;
+        let mut f = std::fs::File::open(&out).unwrap();
+        for (l, e) in MINI_RECORDS {
+            let mats = finite_linears(l, e);
+            for (p, lin) in ["gate", "up", "down"].iter().zip(&mats) {
+                let n = format!("model.language_model.layers.{l}.mlp.experts.{e}.{p}_proj.weight");
+                let t = ts.iter().find(|t| t["name"] == n).unwrap();
+                assert_eq!(t["dtype"], "mul1");
+                let want = mul1_weight_reference(lin, b);
+                assert!(want.iter().all(|v| v.is_finite() && *v != 0.0), "{n}: a reference of finite non-zero weights");
+                let got = dequant::decode(&mut f, 12, t, None).unwrap_or_else(|e| panic!("{n}: {e}"));
+                assert_eq!(got.len(), lin.k * lin.n, "{n}");
+                let bad = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                assert_eq!(bad, 0, "{n}: {bad} of {} values differ from the reference (first: {:?} vs {:?})", want.len(), got[0], want[0]);
+                let rows = dequant::decode(&mut f, 12, t, Some((37, 101))).unwrap();
+                assert!(rows == got[37 * lin.k..101 * lin.k], "{n}: rows 37..101");
+                let one = dequant::mul1_original_basis(lin, b, 0, lin.n, 1);
+                assert!(one.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()), "{n}: 1 thread vs many");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mul1_conversion_writes_one_aligned_record_per_expert() {
+        let dir = tmp("mul1-e2e");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store(&store, &MINI_RECORDS);
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let ts = entries(&idx);
+        assert_eq!(ts.len(), 20 + 3, "the 4.5 miniature's 20 tensors + the MTP expert's three");
+        let lay = mini_layout();
+        assert_eq!((lay.trellis_bytes, lay.size), (12_288, 40_960));
+        let get = |n: String| ts.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n}")).clone();
+        let mut offsets: Vec<u64> = ts.iter().map(|t| t["offset"].as_u64().unwrap()).collect();
+        offsets.sort_unstable();
+        let dense_end = ts.iter().filter(|t| t["dtype"] != "mul1").map(|t| t["offset"].as_u64().unwrap() + t["len"].as_u64().unwrap()).max().unwrap();
+        let mut prev = 0u64;
+        for (l, e) in MINI_RECORDS {
+            let p = |w: &str| get(format!("model.language_model.layers.{l}.mlp.experts.{e}.{w}_proj.weight"));
+            let (g, u, d) = (p("gate"), p("up"), p("down"));
+            let off = |t: &serde_json::Value| t["offset"].as_u64().unwrap();
+            let len = |t: &serde_json::Value| t["len"].as_u64().unwrap();
+            for t in [&g, &u, &d] {
+                assert_eq!(t["dtype"], "mul1", "{}", t["name"]);
+                assert_eq!(t["section"], if l == 45 { "mtp" } else { "text" }, "{}", t["name"]);
+                assert_eq!(t["mul1"]["record_offset"].as_u64(), Some(off(&g)));
+                assert_eq!(t["mul1"]["record_bytes"].as_u64(), Some(lay.size));
+            }
+            let [o0, o1, o2] = lay.tensor_offsets();
+            assert_eq!((off(&g) - off(&g), off(&u) - off(&g), off(&d) - off(&g)), (o0, o1, o2), "layer {l} expert {e}");
+            assert_eq!((len(&g), len(&u), len(&d)), (lay.trellis_bytes, lay.trellis_bytes, lay.size - 2 * lay.trellis_bytes));
+            assert_eq!((12 + off(&g)) % 4096, 0, "layer {l} expert {e}: record at file offset {}", 12 + off(&g));
+            assert!(off(&g) >= dense_end && off(&g) > prev, "records after the dense part, in (layer, expert) order");
+            prev = off(&g);
+            // the engine's rule (nvme_source::glm5_record_from_index): next offset after down - gate
+            let next = offsets.iter().copied().find(|&o| o > off(&d)).unwrap_or((bytes.len() - 8 - trailer_len(&bytes) - 12) as u64);
+            assert_eq!(next - off(&g), lay.size, "layer {l} expert {e}");
+            let m = synth_linears(l, e);
+            let want = mul1::write_record(&lay, [&m[0], &m[1], &m[2]]).unwrap();
+            let at = 12 + off(&g) as usize;
+            assert!(bytes[at..at + lay.size as usize] == want[..], "layer {l} expert {e}: not mul1::write_record of the store tensors");
+            assert!(store.join(mul1_store::rel_path(l, e)).with_extension("done").exists(), "layer {l} expert {e}: no .done");
+        }
+        assert_eq!(idx["expert_codec"]["dtype"], "mul1");
+        assert_eq!(idx["expert_codec"]["records"], 3);
+        assert_eq!(idx["expert_codec"]["record_bytes"].as_u64(), Some(lay.size));
+        assert_eq!(idx["sections"]["mtp"]["optional_to_load"], true);
+        assert!(ts.iter().all(|t| t["dtype"] != "nvfp4" || !t["name"].as_str().unwrap().contains(".mlp.experts.")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn trailer_len(bytes: &[u8]) -> usize {
+        u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) as usize
+    }
+
+    /// #182: the dense part of a MUL1 container is what `cnq4.5-glm5-next` writes: every tensor
+    /// that is not a routed expert has the same bytes and the same index record but its offset,
+    /// and the same sidecar line, as in the plain conversion of the same miniature.
+    #[test]
+    fn the_mul1_dense_part_is_byte_identical_to_the_nvfp4_recipe() {
+        let (plain, plain_side) = glm_reference(ScalesMode::Mse);
+        let (m1, m1_side) = mul1_reference();
+        let (pi, mi) = (trailer(&plain), trailer(&m1));
+        let dense: Vec<serde_json::Value> = entries(&pi).into_iter().filter(|t| recipe::glm_expert(t["name"].as_str().unwrap()).is_none()).collect();
+        assert_eq!(dense.len(), 14);
+        let mut n = 0;
+        for p in &dense {
+            let q = entries(&mi).into_iter().find(|t| t["name"] == p["name"]).unwrap_or_else(|| panic!("{} missing", p["name"]));
+            assert!(body_of(&plain, p) == body_of(&m1, &q), "{}: other bytes than cnq4.5-glm5-next", p["name"]);
+            let (mut a, mut b) = (p.clone(), q.clone());
+            a["offset"] = serde_json::Value::Null;
+            b["offset"] = serde_json::Value::Null;
+            assert_eq!(a, b);
+            n += 1;
+        }
+        assert_eq!(n, 14);
+        let lines = |s: &[u8]| -> Vec<serde_json::Value> { String::from_utf8(s.to_vec()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect() };
+        let ms = lines(&m1_side);
+        for p in lines(&plain_side).iter().filter(|v| v.get("record").is_none() && recipe::glm_expert(v["name"].as_str().unwrap()).is_none()) {
+            assert!(ms.contains(p), "sidecar line of {} differs", p["name"]);
+        }
+        // shard 1 of the MUL1 miniature holds the MTP expert's gate and down too, so only the
+        // checkpoint description is compared, not the shard hashes
+        for k in ["config_json", "family", "geo"] {
+            assert_eq!(pi["model"][k], mi["model"][k], "{k}");
+        }
+        assert_eq!((pi["recipe"].as_str(), pi["scales"].as_str()), (mi["recipe"].as_str(), mi["scales"].as_str()));
+    }
+
+    /// #182: a MUL1 conversion killed after k tensors (inside the dense part, at its end, after a
+    /// record's gate, inside a record, between records, before the last tensor; odd k with a torn
+    /// tail on container and journal) and run again writes the bytes of an uninterrupted one. A
+    /// journal of another store is refused.
+    #[test]
+    fn a_mul1_conversion_killed_and_resumed_is_byte_identical() {
+        let (want, want_side) = mul1_reference();
+        for k in [1usize, 14, 15, 16, 17, 22] {
+            let dir = tmp(&format!("mul1-kill-{k}"));
+            write_glm_synth_with(&dir, &dir, true);
+            let store = dir.join("store");
+            write_store(&store, &MINI_RECORDS);
+            let out = dir.join("glm3.cnq");
+            let opts = ConvertOpts { stop_after: Some(k), ..mul1_opts(&store) };
+            assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 4, "k {k}");
+            assert_eq!(store.join(mul1_store::rel_path(3, 0)).with_extension("done").exists(), k >= 17, "k {k}: .done only once the record is journalled");
+            if k % 2 == 1 {
+                std::fs::OpenOptions::new().append(true).open(&out).unwrap().write_all(&[0xCD; 4097]).unwrap();
+                std::fs::OpenOptions::new().append(true).open(dir.join("glm3.cnq.journal.jsonl")).unwrap().write_all(b"{\"seq\": 77, \"pa").unwrap();
+            }
+            assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 0, "k {k}");
+            assert!(std::fs::read(&out).unwrap() == want, "k {k}: container differs from the uninterrupted run");
+            assert!(std::fs::read(dir.join("glm3.cnq.sidecar.jsonl")).unwrap() == want_side, "k {k}: sidecar differs");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        // another store (another store.json) under the same journal: refused, not mixed
+        let dir = tmp("mul1-kill-other");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store(&store, &MINI_RECORDS);
+        let out = dir.join("glm3.cnq");
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts { stop_after: Some(16), ..mul1_opts(&store) }), 4);
+        let sj = store.join(mul1_store::STORE_FILE);
+        let mut h: serde_json::Value = serde_json::from_slice(&std::fs::read(&sj).unwrap()).unwrap();
+        h["quantizer"]["name"] = serde_json::json!("another run");
+        std::fs::write(&sj, serde_json::to_vec_pretty(&h).unwrap()).unwrap();
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 refusals, each by exit 2: a record the store has not journalled (before the output
+    /// exists), a record file changed after its journal line, a store for other expert shapes or
+    /// another record size, a tensor of another dtype, `--consume` beside `--experts-mul1`, and a
+    /// volume with less free space than the bytes to write plus the reserve (before the output
+    /// exists).
+    #[test]
+    fn mul1_refusals_name_the_cause() {
+        let fresh = |tag: &str, recs: &[(u64, u64)]| -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+            let dir = tmp(tag);
+            write_glm_synth_with(&dir, &dir, true);
+            write_store(&dir.join("store"), recs);
+            let out = dir.join("glm3.cnq");
+            (dir.clone(), dir.join("store"), out)
+        };
+        let run = |dir: &std::path::Path, out: &std::path::Path, opts: &ConvertOpts| convert_with(dir, out, ScalesMode::Mse, &glm_prov(), None, opts);
+        // a record missing: refused before a byte is written
+        let (dir, store, out) = fresh("mul1-missing", &MINI_RECORDS[..2]);
+        assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2);
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).ok();
+        // a record file changed after its journal line: the conversion stops there
+        let (dir, store, out) = fresh("mul1-sha", &MINI_RECORDS);
+        let f = store.join(mul1_store::rel_path(3, 1));
+        let mut b = std::fs::read(&f).unwrap();
+        let n = b.len();
+        b[n - 3] ^= 0x40;
+        std::fs::write(&f, &b).unwrap();
+        assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2);
+        assert!(dir.join("glm3.cnq.journal.jsonl").exists(), "no trailer: the container is not complete");
+        std::fs::remove_dir_all(&dir).ok();
+        // a store of other shapes, and one with a record size that is not its layout's
+        for (field, v) in [("hidden", serde_json::json!(256)), ("record_bytes", serde_json::json!(40_960 - 4096)), ("k", serde_json::json!(4))] {
+            let (dir, store, out) = fresh(&format!("mul1-head-{field}"), &MINI_RECORDS);
+            let sj = store.join(mul1_store::STORE_FILE);
+            let mut h: serde_json::Value = serde_json::from_slice(&std::fs::read(&sj).unwrap()).unwrap();
+            h[field] = v;
+            std::fs::write(&sj, serde_json::to_vec(&h).unwrap()).unwrap();
+            assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2, "{field}");
+            assert!(!out.exists(), "{field}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        // a tensor of another dtype (suh as F32 bits under an F16 label is caught by its length;
+        // here the label itself)
+        let (dir, store, out) = fresh("mul1-dtype", &MINI_RECORDS[..2]);
+        let rel = mul1_store::rel_path(45, 0);
+        let m = synth_linears(45, 0);
+        let mut ts: Vec<SynthTensor> = Vec::new();
+        for (p, x) in ["gate", "up", "down"].iter().zip(&m) {
+            let le = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            ts.push((format!("{p}.trellis"), "I16", vec![x.k / 16, x.n / 16, 48], le(&x.trellis)));
+            ts.push((format!("{p}.suh"), "BF16", vec![x.k], le(&x.suh)));
+            ts.push((format!("{p}.svh"), "F16", vec![x.n], le(&x.svh)));
+        }
+        std::fs::create_dir_all(store.join("L45")).unwrap();
+        write_st(&store.join(&rel), &ts);
+        let sha = recipe::sha256_file(&store.join(&rel)).unwrap();
+        let mut j = std::fs::OpenOptions::new().append(true).open(store.join(mul1_store::JOURNAL_FILE)).unwrap();
+        writeln!(j, "{}", serde_json::json!({ "layer": 45, "expert": 0, "file": rel, "sha256": sha })).unwrap();
+        drop(j);
+        assert_eq!(run(&dir, &out, &mul1_opts(&store)), 2);
+        assert!(mul1_store::parse_expert(&std::fs::read(store.join(&rel)).unwrap(), &mini_layout()).unwrap_err().contains("gate.suh: \"BF16\""));
+        std::fs::remove_dir_all(&dir).ok();
+        // --consume beside --experts-mul1
+        let (dir, store, out) = fresh("mul1-consume", &MINI_RECORDS);
+        let opts = ConvertOpts { headers: Some(dir.join("headers")), consume: Some(dir.clone()), ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 2);
+        // the disk check: 1 MiB free is refused before the output exists; enough free space passes
+        let opts = ConvertOpts { disk_free: Some(1 << 20), disk_reserve: 0, ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 2);
+        assert!(!out.exists());
+        let opts = ConvertOpts { disk_free: Some(200_000), disk_reserve: 1 << 30, ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 2, "the reserve counts");
+        let opts = ConvertOpts { disk_free: Some(64 << 20), disk_reserve: 0, ..mul1_opts(&store) };
+        assert_eq!(run(&dir, &out, &opts), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182: GLM-5.3-Flash's store (hidden 4096, inter 2048) takes exactly 9,474,048 B per record;
+    /// a store.json claiming another size is refused.
+    #[test]
+    fn a_glm_store_takes_records_of_9474048_bytes_only() {
+        let dir = tmp("mul1-glm-head");
+        let head = |rb: u64| serde_json::json!({ "format": mul1_store::FORMAT, "version": 1, "k": 3, "hidden": 4096, "inter": 2048, "record_bytes": rb });
+        std::fs::write(dir.join(mul1_store::STORE_FILE), serde_json::to_vec(&head(9_474_048)).unwrap()).unwrap();
+        let s = mul1_store::Store::open(&dir, 4096, 2048).unwrap();
+        assert_eq!((s.layout.size, s.layout.size % 4096, s.layout.tensor_offsets()), (9_474_048, 0, [0, 3_145_728, 6_291_456]));
+        std::fs::write(dir.join(mul1_store::STORE_FILE), serde_json::to_vec(&head(9_474_000)).unwrap()).unwrap();
+        assert!(mul1_store::Store::open(&dir, 4096, 2048).err().unwrap().contains("is 9474048 B"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 `--mul1-wait`: the converter writes the dense part, then each record as the quantizer
+    /// journals it, and ends with the container of an uninterrupted conversion.
+    #[test]
+    fn mul1_wait_converts_while_the_quantizer_journals() {
+        let (want, _) = mul1_reference();
+        let dir = tmp("mul1-wait");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store_head(&store);
+        let quantizer = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for (l, e) in MINI_RECORDS {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    store_add(&store, l, e);
+                }
+            })
+        };
+        let opts = ConvertOpts { mul1_wait: true, poll: std::time::Duration::from_millis(5), ..mul1_opts(&store) };
+        assert_eq!(convert_with(&dir, &dir.join("glm3.cnq"), ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        quantizer.join().unwrap();
+        assert!(std::fs::read(dir.join("glm3.cnq")).unwrap() == want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 `--mul1-wait`, started together with the quantizer (docs/glm-mul1-conversion.md): the store
+    /// directory and its store.json do not exist yet when the converter starts (the quantizer waits for
+    /// the capture's calibration first). The converter waits for store.json, then converts as the
+    /// quantizer journals, and ends with the container of an uninterrupted conversion.
+    #[test]
+    fn mul1_wait_waits_for_a_store_json_the_quantizer_has_not_written_yet() {
+        let (want, _) = mul1_reference();
+        let dir = tmp("mul1-wait-head");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        assert!(!store.exists());
+        let quantizer = {
+            let (dir, store) = (dir.clone(), store.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                // store.json appears whole (the tool writes it by rename), then the records
+                let staging = dir.join("staging");
+                write_store_head(&staging);
+                std::fs::create_dir_all(&store).unwrap();
+                std::fs::rename(staging.join(mul1_store::STORE_FILE), store.join(mul1_store::STORE_FILE)).unwrap();
+                for (l, e) in MINI_RECORDS {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    store_add(&store, l, e);
+                }
+            })
+        };
+        let opts = ConvertOpts { mul1_wait: true, poll: std::time::Duration::from_millis(5), ..mul1_opts(&store) };
+        let t0 = std::time::Instant::now();
+        assert_eq!(convert_with(&dir, &dir.join("glm3.cnq"), ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(300), "the converter did not wait for store.json");
+        quantizer.join().unwrap();
+        assert!(std::fs::read(dir.join("glm3.cnq")).unwrap() == want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182: without `--mul1-wait` a missing store.json is still refused at once (exit 2, no output file).
+    #[test]
+    fn without_mul1_wait_a_missing_store_json_is_refused() {
+        let dir = tmp("mul1-no-head");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        let out = dir.join("glm3.cnq");
+        let t0 = std::time::Instant::now();
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &mul1_opts(&store)), 2);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(300));
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182 with #156's filter (plan step 11): `--layers 3` writes layer 3's dense tensors and its
+    /// two records, with the bytes of the full MUL1 conversion; the MTP expert is filtered, so the
+    /// store needs no record for it.
+    #[test]
+    fn a_partial_mul1_conversion_writes_the_named_layers_records() {
+        let (full, _) = mul1_reference();
+        let fi = trailer(&full);
+        let dir = tmp("mul1-partial");
+        write_glm_synth_with(&dir, &dir, true);
+        let store = dir.join("store");
+        write_store(&store, &MINI_RECORDS[..2]);
+        let out = dir.join("glm3-l3.cnq");
+        let opts = ConvertOpts { filter: Some(partial::LayerFilter::parse("3", false).unwrap()), ..mul1_opts(&store) };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        let ts = entries(&idx);
+        assert!(ts.iter().all(|t| partial::LayerFilter::layer_of(t["name"].as_str().unwrap()) == Some(3)));
+        assert_eq!(ts.iter().filter(|t| t["dtype"] == "mul1").count(), 6);
+        assert_eq!(idx["expert_codec"]["records"], 2);
+        assert_eq!(idx["partial"]["layers"], serde_json::json!([3]));
+        for t in &ts {
+            let f = entries(&fi).into_iter().find(|x| x["name"] == t["name"]).unwrap();
+            assert!(body_of(&bytes, t) == body_of(&full, &f), "{}", t["name"]);
+            if t["dtype"] == "mul1" && t["name"].as_str().unwrap().ends_with("gate_proj.weight") {
+                assert_eq!((12 + t["offset"].as_u64().unwrap()) % 4096, 0);
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #182: `--mtp-overlay` on the miniature writes exactly the MTP block's non-expert tensors, in
+    /// section `mtp`, each with the overlay row's codec: NVFP4 = the quantization of its (FP8-
+    /// dequantized) source under the glm5 scale cap, BF16 / F32 = the source bytes; no routed expert
+    /// (the container's records), no trunk tensor, no scale. The index is a v2 with the `partial`
+    /// block of layer 45 and the `mtp_overlay` block. The conversion of record of the same miniature
+    /// still omits all of layer 45, and the flag refuses --layers and --experts-mul1.
+    #[test]
+    fn an_mtp_overlay_writes_the_mtp_blocks_non_expert_tensors_only() {
+        let dir = tmp("mtp-overlay");
+        write_glm_synth_full(&dir, &dir, true, true);
+        let out = dir.join("glm-mtp.cnq");
+        let opts = ConvertOpts { mtp_overlay: true, ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &opts), 0);
+        let bytes = std::fs::read(&out).unwrap();
+        let idx = trailer(&bytes);
+        assert_eq!((idx["format_version"].as_u64(), idx["recipe"].as_str()), (Some(2), Some("cnq4.5-glm5-next")));
+        assert_eq!(idx["model"]["source"]["revision"], "glm-synth");
+        assert_eq!(idx["partial"]["layers"], serde_json::json!([45]));
+        let ob = &idx["mtp_overlay"];
+        assert_eq!((ob["layer"].as_u64(), ob["section"].as_str(), ob["tensors"].as_u64()), (Some(45), Some("mtp"), Some(11)));
+        assert_eq!((ob["nvfp4"].as_u64(), ob["bf16"].as_u64(), ob["f32"].as_u64()), (Some(4), Some(6), Some(1)));
+        let ts = entries(&idx);
+        let mut names: Vec<String> = ts.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        names.sort();
+        let mut want: Vec<String> = MINI_MTP_REST.iter().map(|r| format!("model.language_model.layers.45.{}", r.0)).collect();
+        want.sort();
+        assert_eq!(names, want, "exactly the block's non-expert tensors");
+        let (hdr, start) = read_safetensors_header(&dir.join(GLM_SHARDS[0])).unwrap();
+        let src = std::fs::read(dir.join(GLM_SHARDS[0])).unwrap();
+        let at = |k: &str| {
+            let o = &hdr[k]["data_offsets"];
+            &src[(start + o[0].as_u64().unwrap()) as usize..(start + o[1].as_u64().unwrap()) as usize]
+        };
+        for (n, dt, shape, out_dt) in MINI_MTP_REST {
+            let name = format!("model.language_model.layers.45.{n}");
+            let t = ts.iter().find(|t| t["name"] == name.as_str()).unwrap();
+            assert_eq!((t["section"].as_str(), t["dtype"].as_str()), (Some("mtp"), Some(out_dt)), "{name}");
+            let body = body_of(&bytes, t);
+            if out_dt == "nvfp4" {
+                let vals = if dt == "F8_E4M3" {
+                    let sc = fp8::scales_to_f32(at(&format!("{name}_scale_inv")), "F32").unwrap();
+                    fp8::dequant_fp8_block(&name, at(&name), shape[0], shape[1], &sc).unwrap()
+                } else {
+                    bytes_to_f32(at(&name), dt)
+                };
+                let (blocks, global, _, _) = quantize_nvfp4_cap(&vals, ScalesMode::Mse, None, recipe::Family::Glm5Next.scale_byte_max());
+                assert!(body == blocks, "{name}: not the overlay row's NVFP4");
+                assert_eq!(t["global_scale"].as_f64().unwrap() as f32, global, "{name}");
+            } else {
+                assert!(body == at(&name), "{name}: not the source bytes");
+            }
+        }
+        // the conversion of record of the same miniature: layer 45 stays omitted whole
+        let rec = dir.join("glm.cnq");
+        assert_eq!(convert_with(&dir, &rec, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts::default()), 0);
+        let ri = trailer(&std::fs::read(&rec).unwrap());
+        assert!(entries(&ri).iter().all(|t| !t["name"].as_str().unwrap().contains("layers.45.")));
+        // refusals: the overlay sets its own filter and takes no expert store
+        let o2 = dir.join("glm-mtp2.cnq");
+        let with_layers = ConvertOpts { mtp_overlay: true, filter: Some(partial::LayerFilter::parse("3", false).unwrap()), ..ConvertOpts::default() };
+        assert_eq!(convert_with(&dir, &o2, ScalesMode::Mse, &glm_prov(), None, &with_layers), 2);
+        let with_mul1 = ConvertOpts { mtp_overlay: true, ..mul1_opts(&dir.join("store")) };
+        assert_eq!(convert_with(&dir, &o2, ScalesMode::Mse, &glm_prov(), None, &with_mul1), 2);
+        assert!(!o2.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

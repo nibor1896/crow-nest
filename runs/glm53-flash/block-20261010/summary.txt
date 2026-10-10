@@ -1,0 +1,16 @@
+## decode (ids vs base)
+arm rc ids_same cold_dec warm_dec warm_spread cold_ttft warm_ttft prefill_tok_s mtp_accept tok_per_step h2d zc
+base 0,0 True 6.439 9.732 1.057 9.183 3.866 7.781 nan nan 0.183 1.802
+graph 0,0 True 6.588 10.098 1.014 9.143 3.776 8.148 nan nan 0.183 1.802
+flags 0,0 True 6.521 9.837 1.046 9.035 3.821 7.890 nan nan 0.183 1.802
+stager 0,0 True 7.697 10.735 1.026 6.989 3.504 8.765 nan nan 0.183 1.802
+mtp1 0,0 True 6.217 9.048 1.011 9.027 3.936 7.829 0.824 1.800 0.203 1.745
+mtp2 0,0 True 5.804 7.872 1.010 8.972 4.057 7.612 0.692 2.333 0.231 1.923
+all_mtp1 0,0 True 7.408 9.992 1.003 6.815 3.407 9.077 0.824 1.800 0.203 1.745
+all_mtp2 0,0 True 6.866 8.659 1.009 6.827 3.505 8.841 0.692 2.333 0.231 1.923
+## prefill (ids vs pre_chunk1)
+arm rc ids_same cold_dec warm_dec warm_spread cold_ttft warm_ttft prefill_tok_s mtp_accept tok_per_step h2d zc
+pre_chunk1 0,0 True 6.024 nan nan 135.488 nan 15.116 nan nan nan nan
+pre_chunk32 1,1 None nan nan nan nan nan nan nan nan nan nan
+pre121_chunk1 0,0 True 5.919 nan nan 134.595 nan 15.216 nan nan nan nan
+pre121_chunk32 0,0 True 5.434 nan nan 149.932 nan 13.660 nan nan nan nan

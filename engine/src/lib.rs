@@ -74,6 +74,10 @@ pub mod kernels;
 pub mod kernels_p2;
 pub mod manager;
 pub mod residency;
+// #149 (plan step 17b): the stager's ColdSource interface and its NVMe backend; opt-in, wired nowhere
+pub mod nvme_source;
+// #175: dynamic two-tier expert cache policy behind plan_swaps (Glm5Next or CROW_EXPERT_CACHE)
+pub mod expert_cache;
 // the container tensor -> device loaders and the NVFP4 pair (no launch policy):
 // what `gen` and `vit` both need, so neither has to reach into the other
 pub mod weights;
@@ -94,10 +98,46 @@ pub mod toolcall;
 // #93: the lazy tool-call grammar (llama.cpp qwen3_coder semantics) and the
 // vocabulary trie its token masks walk; `bin/serve.rs` owns the redraw
 pub mod toolgrammar;
+// #160: GLM-5.3-Flash prompt side - family test, reasoning words, stop tokens, goldens
+pub mod glm5_template;
+// #185: the glm5_next engine `bin/serve` dispatches to; part 1 is the seam, its boot refuses
+// by name until the expert tiers of #175/#149 give it a body
+pub mod glm5_engine;
+// #165: GLM-5.3-Flash head - stream mean, final RMSNorm, lm_head (wired nowhere yet)
+pub mod glm5_head;
+// #161: GLM-5.3-Flash mHC residual (Sinkhorn stream mixer) - CPU twin and kernels_glm5_mhc.cu
+pub mod glm5_mhc;
+// #162: GLM-5.3-Flash KDA sub-block (conv, gates, state) on the GPU; wired nowhere yet
+pub mod glm5_kda;
+
+// #163: GLM-5.3-Flash MLA over a BF16 latent cache + the DSA indexer (own NVRTC module); wired nowhere yet
+pub mod glm5_mla;
 // #86: the OpenAI stop-string filter of `bin/serve.rs`, the same tail-hold
 // `toolcall::find_marker` gives `<tool_call>`, on arbitrary strings
 pub mod stopstr;
 pub mod reset;
+pub mod cpu_nvfp4;
+// #180: the MUL1 trellis expert GEMV / FFN on the CPU (AVX2 + scalar); the GPU half is kernels::mul1
+pub mod cpu_mul1;
+// #164: the glm5_next FFN - sigmoid router, clamped MUL1 experts, shared expert, dense FFN
+pub mod glm5_moe;
+// #161-#165: the glm5_next decoder layers wired in order (layer driver, NVFP4 projections,
+// one shared compile, layer-at-a-time loader) and the host side of `decode glmgolden`
+pub mod glm5_model;
+// #175 + #149 (plan steps 16-17): the glm5_next experts in VRAM / pinned / NVMe tiers, all
+// layers resident, token by token (`bin/glm5_run.rs`)
+pub mod glm5_tiers;
+// #149 path B / #189: the glm5_next decode switches (CROW_GLM_FLAGS, CROW_GLM_LOOKAHEAD)
+pub mod glm5_flags;
+// #190: the glm5_next decode row as piecewise CUDA graphs (CROW_GLM_GRAPH)
+pub mod glm5_graph;
+// #182: the glm5_next MTP (NextN) block - eh glue, MLA + DSA, MoE, shared head norm
+pub mod glm5_mtp;
+// #186: the prompt call's trunk input gathered and expanded on the device (CROW_GLM_EMBED_GATHER)
+pub mod glm5_embed;
+// the glm-flash-lite integration: GPU tests of the switches of several branches together
+#[cfg(test)]
+mod glm5_int_tests;
 // #31 A9: the prefix cache (spec section 7) - snapshot, rollback and the id prefix rule
 pub mod cache;
 // #32 A10: the slot file behind POST /slots/0?action=save|restore (spec section 7)

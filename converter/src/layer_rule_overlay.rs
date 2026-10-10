@@ -125,6 +125,8 @@ impl Arm {
         match family {
             Family::FlashNext => self.kinds,
             Family::Qwen35Dense => self.kinds_dense,
+            // #155: no layer-rule arm was measured on GLM-5.3-Flash; `base_family` refuses it
+            Family::Glm5Next => &[],
         }
     }
 }
@@ -137,7 +139,10 @@ pub fn base_family(index: &serde_json::Value) -> Result<Family, String> {
         return Ok(Family::FlashNext);
     }
     let name = index["model"]["family"].as_str().unwrap_or("");
-    Family::from_name(name).ok_or_else(|| format!("the base index names model family '{name}', which this converter has no arms for"))
+    match Family::from_name(name) {
+        Some(Family::Glm5Next) | None => Err(format!("the base index names model family '{name}', which this converter has no arms for")),
+        Some(f) => Ok(f),
+    }
 }
 
 pub const ARMS: &[Arm] = &[

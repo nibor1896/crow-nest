@@ -81,10 +81,12 @@
 //!
 //! The spec's component names (`scheduler`, `ring`, `stager`, `kv`, `gdn`,
 //! `qsa`, `converter`, `loader`) are covered by the targets that actually own
-//! code in this tree: the scheduler and the stager live in `residency` and
-//! `adapt`, the ring and the KV in `gen` (target `prefill` / `decode`), the
-//! loader is `load` + `budget`, and the converter is a separate crate with no
-//! engine log site.
+//! code in this tree: the scheduler lives in the `residency` module (targets
+//! `residency` and `adapt`; `adapt` is a target only, there is no `adapt` module),
+//! the KV in `gen` (target `prefill` / `decode`), the loader is `load` + `budget`, and the
+//! converter is a separate crate with no engine log site. The spec's `ring` and
+//! `stager` have no code in this tree (the job ring exists only as the probe
+//! `probes/src/bin/p9_job_ring.rs`; the `ring` in `gen` is the QSA raw-key ring).
 //!
 //! # Environment
 //!

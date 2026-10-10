@@ -1,0 +1,104 @@
+{
+ "a": "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-step06\\ref-fp8",
+ "b": "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-step06\\ref-cnq",
+ "a_weights": {
+  "weights": "fp8 (FP8 E4M3 originals, 128x128 weight_scale_inv blocks, dequantized to f32; BF16/F32 widened)",
+  "path": "..\\crow-nest\\models\\GLM-5.3-Flash-original",
+  "index_json_sha256": "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05",
+  "config_json_sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+  "index_json_mtime": 1791415966,
+  "n_tensors": 76108,
+  "n_fp8": 37338
+ },
+ "b_weights": {
+  "weights": "cnq (CNQ container, decoded by `converter dequant`, the converter's gate-0 decode)",
+  "path": "..\\crow-nest\\models\\GLM-5.3-Flash-step06\\GLM-5.3-Flash-CNQ4.5-L0-3.cnq",
+  "index_json_sha256": "958f3bd78bb2522419c8910c599608aea74bc027bec575a08278e39ed2eadcec",
+  "config_json_sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+  "container_bytes": 7220714871,
+  "container_mtime": 1791419529,
+  "recipe": "cnq4.5-glm5-next",
+  "scales": "mse",
+  "source": {
+   "repo": "zai-org/GLM-5.3-Flash",
+   "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
+  },
+  "partial": {
+   "embed_head_norm": true,
+   "filter": "--layers 0-3 --with-embed-head",
+   "layers": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "tensors_filtered": 72149,
+   "tensors_written": 972
+  },
+  "converter": {
+   "path": "C:\\Users\\robin\\dev\\crow-nest-wt-step6\\converter\\target\\release\\converter.exe",
+   "sha256": "88346a6545cb48c27c56daea56f123f8ae6c5b614330367773005731667e5af4"
+  },
+  "n_tensors": 972,
+  "n_nvfp4": 902
+ },
+ "T": 86,
+ "D": 4,
+ "N": 90,
+ "layers": [
+  {
+   "layer": 0,
+   "kind": "kda+dense",
+   "cosine": 0.9930793640703532,
+   "max_abs": 0.006991653703153133,
+   "max_abs_prompt": 0.006991653703153133,
+   "max_abs_decode": 0.005253255367279053,
+   "rel_rms": 0.11773109729074496,
+   "ref_rms": 0.005864060207854257,
+   "a_sha256": "3db55f30c8e65f0f04d151f1ddc33a09a06542043104bb8bddc43dcc7d11936d",
+   "b_sha256": "0e863990a10b74544f38def746be2f00fc36282efa774d99e519a6cc8774c95e"
+  },
+  {
+   "layer": 1,
+   "kind": "kda+dense",
+   "cosine": 0.9940228144130909,
+   "max_abs": 0.006042345892637968,
+   "max_abs_prompt": 0.006042345892637968,
+   "max_abs_decode": 0.004549738019704819,
+   "rel_rms": 0.11039240575330075,
+   "ref_rms": 0.0053982552919940325,
+   "a_sha256": "bb4ea09f895611e57795eca183b181bf72e0b756c660df5d7714317566f3afc1",
+   "b_sha256": "0a00b4ef743624e18cd322eb9df943f41d99d040f0d48b39aa4ef4a4dbcca3c7"
+  },
+  {
+   "layer": 2,
+   "kind": "kda+dense",
+   "cosine": 0.998059442963548,
+   "max_abs": 0.023313648998737335,
+   "max_abs_prompt": 0.023313648998737335,
+   "max_abs_decode": 0.016239188611507416,
+   "rel_rms": 0.0644113441836338,
+   "ref_rms": 0.030760177824445196,
+   "a_sha256": "4a8c30b0d24348fe938209e4f6b966d2f02e51ae5d0e56a61258f7f5c0d6ea2f",
+   "b_sha256": "23b5db50501023eec10afd2b6d89555b1ee4b3c01a24e869448f5d275d2690c2"
+  },
+  {
+   "layer": 3,
+   "kind": "dsa+moe",
+   "cosine": 0.9978867414224442,
+   "max_abs": 0.19775545597076416,
+   "max_abs_prompt": 0.19775545597076416,
+   "max_abs_decode": 0.04415768384933472,
+   "rel_rms": 0.07137927613331004,
+   "ref_rms": 0.0682517337864452,
+   "a_sha256": "960c649dcc15e48d858045d2cb47d3d280635c377da857780cab7da8bd153925",
+   "b_sha256": "017666e3b5e72153e550658d26760a2f452561b6b86e30d72e04fd6283178e11",
+   "routing_overlap_mean": 0.9111111111111111,
+   "routing_overlap_min": 0.625,
+   "routing_rows_identical": 40,
+   "routing_rows": 90,
+   "dsa_rows_identical": 90,
+   "dsa_rows": 90
+  }
+ ]
+}

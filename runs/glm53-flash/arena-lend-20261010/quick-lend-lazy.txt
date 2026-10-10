@@ -1,0 +1,5 @@
+
+route log route.log: 127 decode tokens, 1 prompt positions/calls; boot (1848, 24, 13, 44, 5, 1), pinned 4956; halflife 64 tokens, margin 1, prior 46.2 tokens; lent slots 128, refill lazy
+  policy     demand     spec  H2D/tok    promo  D2H/tok VRAM/tok  pin/tok ZC GB/tok   ms/tok     check
+  today       28.95     0.00    28.95     0.00    26.21    132.2    174.8     0.583     68.1         -
+  freq        26.65     0.00    20.50    19.49    17.76    191.1    124.4     0.415     64.8         -
