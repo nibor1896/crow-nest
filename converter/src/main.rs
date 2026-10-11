@@ -3538,8 +3538,40 @@ mod tests {
         }
     }
 
+    /// #212: the free space every MUL1 test's disk check sees, 1 GiB above the default reserve: a
+    /// fixed volume instead of the build machine's drive.
+    const TEST_DISK_FREE: u64 = MUL1_DISK_RESERVE + (1 << 30);
+
     fn mul1_opts(store: &std::path::Path) -> ConvertOpts {
-        ConvertOpts { mul1: Some(store.to_path_buf()), ..ConvertOpts::default() }
+        ConvertOpts { mul1: Some(store.to_path_buf()), disk_free: Some(TEST_DISK_FREE), ..ConvertOpts::default() }
+    }
+
+    /// #212: the MUL1 tests never ask the build machine's drive (they failed below 16 GiB free);
+    /// the production options still do (`disk_free: None`) with the 16 GiB default reserve.
+    #[test]
+    fn mul1_tests_never_read_the_real_free_space() {
+        let o = mul1_opts(std::path::Path::new("store"));
+        assert_eq!(o.disk_free, Some(TEST_DISK_FREE), "the MUL1 test options answer the disk check themselves");
+        assert_eq!(o.disk_reserve, MUL1_DISK_RESERVE, "the tests keep the default reserve");
+        let d = ConvertOpts::default();
+        assert_eq!((d.disk_free, d.disk_reserve), (None, 16u64 << 30), "production reads the real volume, reserve 16 GiB");
+    }
+
+    /// #212: the default 16 GiB reserve still refuses through the injected free space, at the exact
+    /// boundary: the miniature needs 1,321,984 B with its index; 1 B less than that + 16 GiB is exit 2
+    /// before the output exists, exactly that is exit 0.
+    #[test]
+    fn the_default_reserve_refuses_through_the_injected_free_space() {
+        const NEED: u64 = 1_321_984;
+        let dir = tmp("mul1-reserve");
+        write_glm_synth_with(&dir, &dir, true);
+        write_store(&dir.join("store"), &MINI_RECORDS);
+        let out = dir.join("glm3.cnq");
+        let run = |free: u64| convert_with(&dir, &out, ScalesMode::Mse, &glm_prov(), None, &ConvertOpts { disk_free: Some(free), ..mul1_opts(&dir.join("store")) });
+        assert_eq!(run(NEED + MUL1_DISK_RESERVE - 1), 2, "1 B short of bytes to write + the default reserve");
+        assert!(!out.exists(), "refused before the output exists");
+        assert_eq!(run(NEED + MUL1_DISK_RESERVE), 0, "bytes to write + the default reserve");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A MUL1 conversion of the miniature with a complete MTP expert: (container, sidecar).

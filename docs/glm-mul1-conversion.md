@@ -142,7 +142,7 @@ converter/target/release/converter.exe --scales mse --source-repo zai-org/GLM-5.
 ## Tests
 
 ```
-cd converter && cargo test --release                                   # 103 passed, 1 ignored (2026-10-09, MTP overlay)
+cd converter && cargo test --release                                   # 105 passed, 1 ignored (2026-10-11, #212)
 python -I tools/test_glm_mul1_quantize.py                              # pure: 10 passed, 4 skipped
 .venv-oracle/Scripts/python.exe -I tools/test_glm_mul1_quantize.py     # + capture vs HF: 12 passed, 2 skipped
 .venv-exl3/Scripts/python.exe -I tools/test_glm_mul1_quantize.py       # + quantize on the GPU and the converter: 12 passed, 2 skipped
