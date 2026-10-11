@@ -976,6 +976,15 @@ pub fn kv_lazy_refusal(lazy: Option<usize>, mtp_drafts: usize, la: bool, batch: 
     Err(format!("{KV_LAZY_ENV} with {}: those decode paths do not map the cache rows they write; turn one of them off", no.join(", ")))
 }
 
+/// #214: serve allocates the prefill staging set at boot when [`KV_LAZY_ENV`] is on and prompts
+/// run in prompt calls (`prompt_chunk` > 1), as `glm5_run` does at setup. Allocated lazily in the
+/// first prompt call instead (the path of record), it comes after that prompt's hand-back has set
+/// the `CROW_GLM_ARENA_REGROW` floor from the free VRAM before the set existed, so the regrowth
+/// leaves `ceil(set / chunk)` elastic chunks down for good ([`elastic_regrow_chunks`]).
+pub fn kv_lazy_stage_at_boot(lazy: Option<usize>, prompt_chunk: usize) -> bool {
+    lazy.is_some() && prompt_chunk > 1
+}
+
 /// #214: the boot invariant of [`KV_LAZY_ENV`]: the KV not mapped yet (`unmapped` bytes) fits in
 /// the live elastic chunks (`elastic` bytes, handed back on demand) plus the free VRAM above
 /// [`ARENA_RESERVE_BYTES`], so a full context can always be mapped
@@ -12628,6 +12637,37 @@ mod tests_214 {
         assert!(!kv_lazy_fits(un, 0, ARENA_RESERVE_BYTES + un - 1));
         assert!(!kv_lazy_fits(un, un / 2, ARENA_RESERVE_BYTES), "half of it in chunks, no free VRAM above the reserve");
         assert!(kv_lazy_fits(0, 0, 0));
+    }
+
+    /// serve with the switch allocates the prefill staging set at boot (prompt calls only); off,
+    /// the path of record (lazily, in the first prompt call) stays
+    #[test]
+    fn kv_lazy_serve_allocates_the_prefill_staging_set_at_boot() {
+        assert!(kv_lazy_stage_at_boot(Some(4096), 8192));
+        assert!(!kv_lazy_stage_at_boot(Some(4096), 1), "row-by-row prompts never stage through the set");
+        assert!(!kv_lazy_stage_at_boot(None, 8192), "off: unchanged");
+    }
+
+    /// The cause on the acceptance run's numbers (RTX 5090, 2026-10-11, `kvlazy-20261011`): 37-slot
+    /// chunks of the 3-bit record, the 128-slot prefill staging set. Allocated inside the first
+    /// prompt, after the hand-back set the floor from the free VRAM before it, the set's bytes are
+    /// missing above the floor at the regrowth: 4 chunks (148 slots, serve 2,324 vs glm5_run B
+    /// 2,472) stay down. Allocated before the floor (glm5_run's order), every chunk comes back.
+    #[test]
+    fn a_staging_set_allocated_after_the_floor_holds_chunks_down() {
+        let rec = 9_474_048u64;
+        let cb = 37 * rec;
+        let set = 128 * rec;
+        let free0 = ARENA_RESERVE_BYTES - (150 << 20); // below the reserve, as both boots were
+        let handed = 6; // the prompt's hand-back
+        // lazily: the floor is the free VRAM before the set; the set stays allocated
+        let floor = regrow_floor(free0);
+        let free_end = free0 + handed * cb - set;
+        assert_eq!(handed as usize - elastic_regrow_chunks(free_end, floor, cb, handed as usize), 4);
+        // at boot: the floor is the free VRAM with the set in place
+        let floor = regrow_floor(free0 - set);
+        let free_end = free0 - set + handed * cb;
+        assert_eq!(elastic_regrow_chunks(free_end, floor, cb, handed as usize), handed as usize);
     }
 
     #[test]

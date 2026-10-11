@@ -274,6 +274,19 @@ impl Glm5Device {
         if batch > 1 {
             log(&format!("[glm5_run] {}={batch}: {batch} sequence slots, a decode step carries one row of each active sequence in one trunk pass", gt::MAX_BATCH_ENV));
         }
+        // #214 CROW_GLM_KV_LAZY: the prefill staging set at boot, as glm5_run allocates it (before
+        // the elastic lift and the boot invariant), not inside the first prompt call after the
+        // hand-back set the regrowth floor (it then held `ceil(set / chunk)` elastic chunks down
+        // for the whole decode: 4 of 37 slots on the RTX 5090, 2026-10-11)
+        if gt::kv_lazy_stage_at_boot(kv_lazy, run.prompt_chunk()) {
+            let pf = gt::prefill_stage_slots(o.g.topk);
+            if let Err(e) = tiers.alloc_prefill_stage(pf) {
+                tiers.free();
+                run.free();
+                return Err(e);
+            }
+            log(&format!("[budget] {}: prefill staging set of {pf} slots allocated at boot, as glm5_run (#214)", gt::KV_LAZY_ENV));
+        }
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         // CROW_GLM_ARENA elastic: the prompt scratch the plan books is held only during a prompt;
         // between prompts it is elastic arena (on top of CROW_GLM_ARENA_ELASTIC_GB)
