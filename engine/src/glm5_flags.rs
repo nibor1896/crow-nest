@@ -1025,6 +1025,19 @@ thread_local! {
     static HINT: std::cell::RefCell<Option<Hint>> = const { std::cell::RefCell::new(None) };
     static SIDE: std::cell::Cell<Option<SideHint>> = const { std::cell::Cell::new(None) };
     static SIDE_READ: std::cell::RefCell<Option<(usize, Vec<i32>)>> = const { std::cell::RefCell::new(None) };
+    static PROMPT_GUESS: std::cell::RefCell<Option<Hint>> = const { std::cell::RefCell::new(None) };
+}
+
+/// crow-nest #216: `Glm5Pass::call_with_expert_batches` leaves a small prompt call's guess of the
+/// next MoE layer here (every row's top-k of that layer's router on this layer's MoE input), the
+/// hand-off to the call's expert hook as [`post_hint`] is the decode call's
+pub fn post_prompt_guess(h: Option<Hint>) {
+    PROMPT_GUESS.with(|c| *c.borrow_mut() = h);
+}
+
+/// #216: the guess [`post_prompt_guess`] left, once (no rank trim: a prompt guess holds every row)
+pub fn take_prompt_guess() -> Option<Hint> {
+    PROMPT_GUESS.with(|c| c.borrow_mut().take())
 }
 
 /// [`Routed::wait_layer`] leaves the call's guess here: the hand-off to the expert hook, the way

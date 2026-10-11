@@ -2579,6 +2579,110 @@ pub fn prefill_nvpf_min_rows(v: Option<&str>) -> Result<usize, String> {
     }
 }
 
+/// crow-nest #216: `CROW_GLM_SMALL_PROMPT=1` (with `CROW_GLM_ARENA=global` and
+/// `CROW_GLM_STAGER=1`, else no effect) serves a prompt call of fewer than
+/// [`SMALL_PROMPT_ROWS_ENV`] rows the way glm53-flash-offload (@ 6769b27, `nv2.py:315-366`,
+/// `nv2_host.cpp:419-491`) serves a forward below its staging minimum: like a multi-row decode
+/// call through the stager. The prompt phase lends nothing back and hands back only the elastic
+/// chunks free VRAM lacks for its scratch ([`small_prompt_chunks_for`], no reserve top-up); the
+/// call stages nothing: VRAM hits and pinned hits are read in place (pinned zero-copy), every NVMe
+/// miss of the layer is read at once into a pinned slot of the RAM tier behind its landed flag
+/// ([`serve_small_prompt`]), where the next decode finds it, and layer l+1's router guess on
+/// layer l's MoE input reads l+1's NVMe experts behind l's demand. Off (default) = unchanged.
+pub const SMALL_PROMPT_ENV: &str = "CROW_GLM_SMALL_PROMPT";
+/// #216: a prompt call takes the small-prompt route below this many rows (default
+/// [`SMALL_PROMPT_ROWS`] = the template's `GLM53_EC_STAGE_MIN` code default of 8,192 picks at top-8)
+pub const SMALL_PROMPT_ROWS_ENV: &str = "CROW_GLM_SMALL_PROMPT_ROWS";
+pub const SMALL_PROMPT_ROWS: usize = 1024;
+/// #216: the bytes a small prompt's hand-back adds to its scratch for the allocator's granularity
+/// (2 MiB pages over the pass's buffers), instead of the 2.5 GiB [`ARENA_RESERVE_BYTES`]
+pub const SMALL_PROMPT_SLACK_BYTES: u64 = 64 << 20;
+
+/// #216 [`SMALL_PROMPT_ENV`] / [`SMALL_PROMPT_ROWS_ENV`]: `None` = the route is off (the switch
+/// not `1`), else the rows a call stays below (a whole number of at least 1)
+pub fn small_prompt_rows(on: Option<&str>, rows: Option<&str>) -> Result<Option<usize>, String> {
+    if on.map(str::trim) != Some("1") {
+        return Ok(None);
+    }
+    match rows.map(str::trim) {
+        None => Ok(Some(SMALL_PROMPT_ROWS)),
+        Some(s) => s.parse::<usize>().ok().filter(|&n| n >= 1).map(Some).ok_or_else(|| format!("{SMALL_PROMPT_ROWS_ENV}={s}: a whole number of rows of at least 1")),
+    }
+}
+
+/// #216: whether a prompt call (or a prompt phase) of `rows` rows takes the small-prompt route
+/// (`below` = [`small_prompt_rows`] where the route is available)
+pub fn small_prompt_route(below: Option<usize>, rows: usize) -> bool {
+    below.is_some_and(|m| rows >= 1 && rows < m)
+}
+
+/// #216: what a prompt phase does with the arena before its calls
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromptPhasePlan {
+    /// every call of the phase takes the small-prompt route
+    pub small: bool,
+    /// `CROW_GLM_ARENA_STAGE_LEND`: the lent prefill staging set comes back first
+    pub lend_back: bool,
+    /// the per-forward staging buffers are sized for the phase (`stage_plan_prompt`)
+    pub stage_plan: bool,
+}
+
+/// #216: the plan of a prompt phase of `rows` rows (`below` as [`small_prompt_route`]): a small
+/// phase stages nothing, so it neither takes the staging set back nor sizes staging buffers
+pub fn prompt_phase_plan(below: Option<usize>, rows: usize) -> PromptPhasePlan {
+    let small = small_prompt_route(below, rows);
+    PromptPhasePlan { small, lend_back: !small, stage_plan: !small }
+}
+
+/// #216: the elastic chunks of `cb` bytes a small prompt phase hands back so that `need` more
+/// bytes (its scratch, #214 KV rows, #217 anchor) fit at `free` bytes of free VRAM: only what free
+/// VRAM lacks (plus [`SMALL_PROMPT_SLACK_BYTES`]), none when it fits; at most `live`. The default
+/// phase hands back [`elastic_chunks_for`] (above the 2.5 GiB reserve).
+pub fn small_prompt_chunks_for(need: u64, free: u64, cb: u64, live: usize) -> usize {
+    if need == 0 || cb == 0 {
+        return 0;
+    }
+    need.saturating_add(SMALL_PROMPT_SLACK_BYTES).saturating_sub(free).div_ceil(cb).min(live as u64) as usize
+}
+
+/// #216: the elastic chunks a prompt phase hands back for `need` bytes ([`small_prompt_chunks_for`]
+/// on the small route, else [`elastic_chunks_for`])
+pub fn prompt_hand_back_chunks(small: bool, need: u64, free: u64, cb: u64, live: usize) -> usize {
+    if small {
+        small_prompt_chunks_for(need, free, cb, live)
+    } else {
+        elastic_chunks_for(need, free, cb, live)
+    }
+}
+
+/// #216: the arena step of one small prompt call of MoE layer `l` (`ids` the distinct selected
+/// experts, ascending): [`serve_global`] without VRAM admission, so the VRAM and pinned hits stay
+/// where they are and are read there (pinned zero-copy), and every NVMe miss enters the RAM tier
+/// (a pinned slot, read straight into it), where the next decode finds it. The default prompt
+/// call ([`serve_global_prompt`]) admits nothing and stages every non-VRAM record.
+pub fn serve_small_prompt(a: &mut GlobalArena, l: usize, ids: &[u32], stage_cap: usize, m: &mut dyn Mover) -> Result<Served, String> {
+    serve_global(a, l, ids, false, stage_cap, m)
+}
+
+/// #216: what the small-prompt route did since construction ([`ExpertTiers::small_prompt_stats`])
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SmallPromptStats {
+    /// prompt phases and prompt calls (MoE layer calls) on the route
+    pub phases: u64,
+    pub calls: u64,
+    /// NVMe misses read into the RAM tier, records read zero-copy from pinned, records staged
+    /// (an NVMe miss no pinned slot took)
+    pub ram_admits: u64,
+    pub zero_copy: u64,
+    pub staged: u64,
+    /// next-layer guesses taken, guessed experts already resident, guessed NVMe reads issued
+    pub guesses: u64,
+    pub guess_resident: u64,
+    pub guess_reads: u64,
+    /// elastic chunks the route's phases handed back
+    pub hand_back_chunks: u64,
+}
+
 /// #196 NVPF: the read-ahead plan of the forward from MoE layer `l0` to `nl`: per layer its
 /// NVMe-tier experts in id order, at most `per_layer` (the ring's slots: a layer's reads then
 /// never wait for a ring slot only a later read of the same layer frees, whatever order the
@@ -3687,11 +3791,47 @@ unsafe fn guess_into_ram(
     prio: crate::nvme_source::ReadPriority,
 ) -> Result<(), String> {
     let Some(h) = glm5_flags::take_guess(pf) else { return Ok(()) };
+    let c = guess_reads(&h, st, d, pinned, ppl, rb, records, src, experts, first_moe, l, prio)?;
+    pf.stats.hints += c.taken as u64;
+    pf.stats.resident += c.resident;
+    pf.stats.issued += c.issued;
+    pf.stats.bytes += c.bytes;
+    Ok(())
+}
+
+/// what [`guess_reads`] did with one guess
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GuessCount {
+    /// the guess was of layer l + 1 (else nothing was done)
+    taken: bool,
+    resident: u64,
+    issued: u64,
+    bytes: u64,
+}
+
+/// [`guess_into_ram`]'s reads of the guess `h` (a decode call's, or #216 a small prompt call's
+/// `Glm5Pass::prompt_guess`, any number of ids, duplicates skipped)
+#[allow(clippy::too_many_arguments)]
+unsafe fn guess_reads(
+    h: &glm5_flags::Hint,
+    st: &mut Stager,
+    d: &mut ArenaDev,
+    pinned: &[Pinned],
+    ppl: usize,
+    rb: u64,
+    records: &[Vec<ExpertRecord>],
+    src: &NvmeSource,
+    experts: usize,
+    first_moe: usize,
+    l: usize,
+    prio: crate::nvme_source::ReadPriority,
+) -> Result<GuessCount, String> {
+    let mut c = GuessCount::default();
     let ln = l + 1;
     if h.layer != first_moe + ln || ln >= records.len() {
-        return Ok(());
+        return Ok(c);
     }
-    pf.stats.hints += 1;
+    c.taken = true;
     let mut seen: Vec<u32> = Vec::with_capacity(h.ids.len());
     for &e in &h.ids {
         if e < 0 || e as usize >= experts || seen.contains(&(e as u32)) {
@@ -3700,7 +3840,7 @@ unsafe fn guess_into_ram(
         let e = e as u32;
         seen.push(e);
         if d.a.place(ln, e) != Place::Nvme {
-            pf.stats.resident += 1;
+            c.resident += 1;
             continue;
         }
         let Some(q) = d.a.prefetch_admit(ln, e, st.seq) else { continue };
@@ -3728,10 +3868,10 @@ unsafe fn guess_into_ram(
                 }
             }
         }
-        pf.stats.issued += 1;
-        pf.stats.bytes += bytes;
+        c.issued += 1;
+        c.bytes += bytes;
     }
-    Ok(())
+    Ok(c)
 }
 
 /// #202 N2 (`CROW_GLM_GUESS_TRIM`), a decode call of MoE layer `l` through the global arena and
@@ -3833,12 +3973,21 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current; no launch reading the arena is pending.
     pub unsafe fn elastic_hand_back(&mut self, need: u64) -> Result<(), String> {
+        self.elastic_hand_back_with(need, false)
+    }
+
+    /// [`ExpertTiers::elastic_hand_back`]; #216 `small`: a small prompt phase's hand-back, only
+    /// what free VRAM lacks ([`small_prompt_chunks_for`])
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::elastic_hand_back`].
+    pub unsafe fn elastic_hand_back_with(&mut self, need: u64, small: bool) -> Result<(), String> {
         if self.arena.is_none() {
             return Ok(());
         }
         self.nvpf_end();
         self.stage_end();
-        self.elastic_enter(need)
+        self.elastic_enter_with(need, small)
     }
 
     /// `CROW_GLM_ARENA` elastic with a borrowed prompt scratch: the elastic part grows by up to
@@ -4046,13 +4195,25 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current; no launch reading the arena is pending.
     unsafe fn elastic_enter(&mut self, need: u64) -> Result<(), String> {
+        self.elastic_enter_with(need, false)
+    }
+
+    /// [`ExpertTiers::elastic_enter`]; #216 `small`: a small prompt phase hands back only the
+    /// chunks free VRAM lacks for `need` ([`prompt_hand_back_chunks`])
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::elastic_enter`].
+    unsafe fn elastic_enter_with(&mut self, need: u64, small: bool) -> Result<(), String> {
         let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("elastic_enter without the global arena");
         let mut live: Vec<usize> = d.flex().filter(|&c| d.chunks[c] != 0).collect();
         let free = cuda::free_vram_bytes();
-        let k = elastic_chunks_for(need, free, vpl as u64 * rb, live.len());
+        let k = prompt_hand_back_chunks(small, need, free, vpl as u64 * rb, live.len());
         if k == 0 {
             return Ok(());
+        }
+        if small {
+            self.small_stats.hand_back_chunks += k as u64;
         }
         d.elastic.enter_free_bytes = free;
         // #188 CROW_GLM_ARENA_REGROW: the first hand-back of a prompt phase sets its floor
@@ -4378,7 +4539,8 @@ impl ExpertTiers {
     /// A CUDA context is current.
     pub unsafe fn nvpf_early(&mut self, rows: usize) -> Result<(), String> {
         let env = |k: &str| std::env::var(k).ok();
-        if !prefill_nvpf_early_on(env(PREFILL_NVPF_EARLY_ENV).as_deref()) || !prefill_nvpf_on(env(PREFILL_NVPF_ENV).as_deref()) || !stage_overlap_on(env(STAGE_OVERLAP_ENV).as_deref()) {
+        // #216: a call on the small-prompt route plans no read-ahead
+        if self.small_prompt_call(rows) || !prefill_nvpf_early_on(env(PREFILL_NVPF_EARLY_ENV).as_deref()) || !prefill_nvpf_on(env(PREFILL_NVPF_ENV).as_deref()) || !stage_overlap_on(env(STAGE_OVERLAP_ENV).as_deref()) {
             return Ok(());
         }
         let Some(d) = self.arena.as_ref() else { return Ok(()) };
@@ -4438,8 +4600,13 @@ impl ExpertTiers {
     /// synchronous mover or the stager
     ///
     /// # Safety
-    /// As [`ExpertTiers::table_for`].
-    unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<CtlReply>) -> Result<(Dev, Served), String> {
+    /// As [`ExpertTiers::table_for`]; `prompt` only with the stager.
+    ///
+    /// #216 `prompt`: a small prompt call through the stager ([`ExpertTiers::tables_small_prompt`]):
+    /// no VRAM admission ([`serve_small_prompt`]), no regrowth of the elastic part (the prompt holds
+    /// its scratch), no CPU lane and no RT2 (`sel` is the call's expert-major pseudo-rows), and the
+    /// next layer's guess is the prompt's own ([`glm5_flags::take_prompt_guess`]).
+    unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<CtlReply>, prompt: bool) -> Result<(Dev, Served), String> {
         if let Some(e) = self.arena.as_mut().and_then(|d| d.refill_err.take()) {
             return Err(e);
         }
@@ -4447,7 +4614,7 @@ impl ExpertTiers {
         // when it can
         self.nvpf_end();
         self.stage_end();
-        if l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
+        if !prompt && l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
             self.elastic_exit();
         }
         // #195 S: and is refilled, here only off the controller and without the stager (else at
@@ -4457,18 +4624,26 @@ impl ExpertTiers {
         }
         let (rb, experts, vpl, ppl, stage) = (self.rb, self.cache.experts, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("table_global without the global arena");
-        let admit = arena_admits(sel.len(), false, d.cfg.admit_max);
+        let admit = arena_admits(sel.len(), prompt, d.cfg.admit_max);
         d.a.set_pin_stay(self.pinned_use.stay);
-        // #188 CROW_GLM_ARENA_FREQ: the decode call's picks counted before it is placed
-        d.a.freq_count(l, sel);
+        // #188 CROW_GLM_ARENA_FREQ: the decode call's picks counted before it is placed (a prompt
+        // call's are not, as on the default prompt path)
+        if !prompt {
+            d.a.freq_count(l, sel);
+        }
         // CROW_GLM_CONTROLLER with the CPU lane: the lane's worker waits per expert, not this thread
         let ctl_lane = reply.is_some() && self.dev_lane.is_some();
         // #202 RT2: a one-row call off the controller through the stager splits early / late
-        let rt2 = self.rt2 && reply.is_none() && self.stager.is_some() && sel.len() == self.topk;
+        let rt2 = !prompt && self.rt2 && reply.is_none() && self.stager.is_some() && sel.len() == self.topk;
+        // #216: the prompt guess of the call (guesses taken, guessed experts resident, reads issued)
+        let mut pguess = (0u64, 0u64, 0u64);
         let mut written: Vec<Dev> = Vec::new();
         let mut waits = LaneWaits::default();
         let served = match self.stager.as_mut() {
             None => {
+                if prompt {
+                    return Err("expert tiers: a small prompt call without the stager (#216)".to_string());
+                }
                 let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[l] };
                 let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut(), gpu_waits: 0 };
                 let served = match self.prefetch.as_mut() {
@@ -4545,9 +4720,10 @@ impl ExpertTiers {
                 let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut(), gpu_waits: 0 };
                 // #203: with the stager the guesses go into the arena's pinned tier (below), not
                 // the store
-                let served = serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?;
+                let served = if prompt { serve_small_prompt(&mut d.a, l, ids, self.stage_cap, &mut m)? } else { serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)? };
                 m.settle_locs(&served.locs);
-                if self.pinned_use.cpu_lane || rt2 {
+                // (#216: a prompt call's pinned hits are read by the GPU only, behind `settle_locs`)
+                if !prompt && (self.pinned_use.cpu_lane || rt2) {
                     for &(e, loc) in &served.locs {
                         if let Loc::Pinned(q) = loc {
                             // #202 RT2: a slot a write-back still lands in is late (the stager
@@ -4573,7 +4749,14 @@ impl ExpertTiers {
                 drop(m);
                 // #202 D1 / #209 D3: the next layer's guess read right behind this layer's demand
                 // (the pool's demand queue), before the answer
-                if let Some(pf) = self.prefetch.as_mut() {
+                if prompt {
+                    // #216: the prompt's own guess of layer l + 1 (`Glm5Pass::prompt_guess`)
+                    if let Some(h) = glm5_flags::take_prompt_guess() {
+                        let prio = if self.lanes2 || self.src.demand_first() { glm5_flags::prefetch_priority(&self.src) } else { crate::nvme_source::ReadPriority::Demand };
+                        let c = guess_reads(&h, st, d, &self.pinned, ppl, rb, &self.records, &self.src, experts, self.first_moe, l, prio)?;
+                        pguess = (c.taken as u64, c.resident, c.issued);
+                    }
+                } else if let Some(pf) = self.prefetch.as_mut() {
                     // #202 lanes: the guesses behind every demand read (the pool's `Prefetch` queue)
                     // #202 N1: the guesses behind every demand read (each reader's `Prefetch` queue)
                     let prio = if self.lanes2 || self.src.demand_first() { glm5_flags::prefetch_priority(&self.src) } else { crate::nvme_source::ReadPriority::Demand };
@@ -4637,7 +4820,7 @@ impl ExpertTiers {
                     PinState::Resident
                 }
             };
-            let lane = self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state);
+            let lane = if prompt { None } else { self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state) };
             (lane, rt2.then_some(late))
         };
         let (lane, rt2_late) = lane;
@@ -4649,6 +4832,16 @@ impl ExpertTiers {
             }
         }
         self.count_heat(l, sel);
+        if prompt {
+            let s = &mut self.small_stats;
+            s.calls += 1;
+            s.ram_admits += served.moves.nvme_to_pinned;
+            s.zero_copy += served.moves.zero_copy;
+            s.staged += served.moves.nvme_to_landing;
+            s.guesses += pguess.0;
+            s.guess_resident += pguess.1;
+            s.guess_reads += pguess.2;
+        }
         if let (Some(pf), None) = (self.prefetch.as_mut(), self.stager.as_ref()) {
             let a = &self.arena.as_ref().expect("table_global without the global arena").a;
             glm5_flags::prefetch_hinted(pf, &self.src, &self.records, experts, &|l, e| a.place(l, e) == Place::Nvme, self.first_moe, self.first_moe + l)?;
@@ -4661,6 +4854,46 @@ impl ExpertTiers {
         Ok((self.tables[l], served))
     }
 
+    /// #216: the rows a prompt call stays below for the small-prompt route, when the route is
+    /// available here (`CROW_GLM_SMALL_PROMPT=1`, the global arena and the stager); `None` = off
+    pub fn small_prompt_below(&self) -> Option<usize> {
+        self.small_prompt.filter(|_| self.arena.is_some() && self.stager.is_some())
+    }
+
+    /// #216: whether a prompt call of `rows` rows takes the small-prompt route
+    pub fn small_prompt_call(&self, rows: usize) -> bool {
+        small_prompt_route(self.small_prompt_below(), rows)
+    }
+
+    /// #216: the small-prompt route's counters since construction
+    pub fn small_prompt_stats(&self) -> SmallPromptStats {
+        self.small_stats
+    }
+
+    /// #216: one small prompt call of MoE layer `l` (`sel` the call's expert-major pseudo-rows,
+    /// `[rows][topk]`): every selected expert placed at once ([`ExpertTiers::table_global`] in
+    /// prompt mode: VRAM and pinned hits read in place, the NVMe misses read into the RAM tier
+    /// behind their landed flags, the stager stream waiting for those, the compute stream for the
+    /// stager), one table and `run` over every pseudo-row. No staging set, no host wait on the NVMe.
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::tables_for_chunk`]; the route is available ([`ExpertTiers::small_prompt_below`]).
+    unsafe fn tables_small_prompt(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+        let k = self.topk;
+        if sel.is_empty() || sel.len() % k != 0 {
+            return Err(format!("expert tiers: layer {l}: a small prompt call of {} ids is no [rows][{k}]", sel.len()));
+        }
+        let ids = distinct_ids(sel, self.cache.experts)?;
+        let (table, _) = self.table_global(l, sel, &ids, None, true)?;
+        run(0, sel.len() / k, table)
+    }
+
+    /// #216 Step 0: host time the prompt calls' NVMe reads blocked on the host since construction
+    /// (the default route's [`PrefillMover`] waits; the staged forwards' are in [`StageStats`])
+    pub fn prompt_nvme_wait_ns(&self) -> u64 {
+        self.pf_ring.as_ref().map_or(0, |r| r.wait_ns)
+    }
+
     /// [`ExpertTiers::tables_for_chunk`] through the global arena (a prompt call never admits):
     /// staged ([`ExpertTiers::stage_call`]) at `stage_min` picks or more with staging on, else in
     /// row sub-batches through the prefill staging set as on the per-layer path. `picks` = the
@@ -4669,6 +4902,11 @@ impl ExpertTiers {
     /// # Safety
     /// As [`ExpertTiers::tables_for_chunk`].
     unsafe fn tables_for_chunk_global(&mut self, l: usize, sel: &[i32], picks: usize, run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+        // #216 CROW_GLM_SMALL_PROMPT: a call below the small-prompt rows is served like a decode
+        // call through the stager (no staging set, no lend-back, no staged forward)
+        if self.small_prompt_call(picks / self.topk.max(1)) {
+            return self.tables_small_prompt(l, sel, run);
+        }
         if self.pf_cap == 0 {
             self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
         }
@@ -6580,6 +6818,8 @@ mod arena_gpu_tests {
                 ARENA_STAGE_LEND_ENV,
                 ARENA_PROMPT_COUNT_ENV,
                 KV_LAZY_ENV,
+                SMALL_PROMPT_ENV,
+                SMALL_PROMPT_ROWS_ENV,
                 // crow-nest #219 / #217: read by serve's boot only; cleared here so no arm inherits them
                 crate::glm5_engine::ANSWER_REUSE_ENV,
                 crate::glm5_engine::PREFIX_ANCHOR_ENV,
@@ -8032,6 +8272,10 @@ pub struct ExpertTiers {
     lanes2: bool,
     /// #202 RT2 (`CROW_GLM_RT2=1`, [`ExpertTiers::set_rt2`])
     rt2: bool,
+    /// #216 `CROW_GLM_SMALL_PROMPT` as read at construction: the rows a prompt call stays below
+    /// for the small-prompt route (`None` = off; [`ExpertTiers::small_prompt_below`])
+    small_prompt: Option<usize>,
+    pub small_stats: SmallPromptStats,
 }
 
 struct GpuMover<'a> {
@@ -8102,6 +8346,9 @@ struct PfRing {
     free_ev: [sys::CUevent; 2],
     ready_ev: sys::CUevent,
     cursor: usize,
+    /// #216 Step 0: host time [`PrefillMover::nvme`] blocked (ring record free + the reads), since
+    /// construction
+    wait_ns: u64,
 }
 
 impl PfRing {
@@ -8114,6 +8361,7 @@ impl PfRing {
             free_ev: [cuda::event_create(), cuda::event_create()],
             ready_ev: cuda::event_create(),
             cursor: 0,
+            wait_ns: 0,
         }
     }
 
@@ -8151,6 +8399,7 @@ impl Mover for PrefillMover<'_> {
     fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
         let (rb, n) = (self.rb as usize, self.pf.ring_ev.len());
         assert!(jobs.len() <= n, "prefill ring: {} reads, {n} ring records", jobs.len());
+        let t0 = std::time::Instant::now();
         let mut v = Vec::with_capacity(jobs.len());
         for &(e, d) in jobs {
             let Dst::Landing(i) = d else { panic!("a prompt call reads no record into a pinned slot") };
@@ -8165,7 +8414,9 @@ impl Mover for PrefillMover<'_> {
         }
         // SAFETY: the destinations are ring records no queued copy reads any more
         let t = unsafe { self.src.fetch(&v) }?;
-        Ok(self.src.wait(t)?.bytes)
+        let r = self.src.wait(t);
+        self.pf.wait_ns += t0.elapsed().as_nanos() as u64;
+        Ok(r?.bytes)
     }
     fn landing_to_stage(&mut self, i: u32) {
         let r = self.landed.iter().find(|&&(s, _)| s == i).expect("a landing is staged after its read").1;
@@ -8533,6 +8784,8 @@ impl ExpertTiers {
             prefetch: None,
             lanes2: false,
             rt2: false,
+            small_prompt: small_prompt_rows(std::env::var(SMALL_PROMPT_ENV).ok().as_deref(), std::env::var(SMALL_PROMPT_ROWS_ENV).ok().as_deref())?,
+            small_stats: SmallPromptStats::default(),
         };
         t.set_lanes2(glm5_flags::lanes2_on());
         t.set_rt2(crate::glm5_moe::lane::rt2_on());
@@ -8590,7 +8843,7 @@ impl ExpertTiers {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         let ids = distinct_ids(sel, self.cache.experts)?;
         if self.arena.is_some() {
-            return self.table_global(l, sel, &ids, None);
+            return self.table_global(l, sel, &ids, None, false);
         }
         if self.stager.is_some() {
             return self.table_staged(l, sel, &ids, None);
@@ -9790,7 +10043,7 @@ impl ExpertTiers {
         }
         let ids = distinct_ids(sel, self.cache.experts)?;
         if self.arena.is_some() {
-            return self.table_global(l, sel, &ids, Some(CtlReply { word: reply, q, wts, early })).map(|_| ());
+            return self.table_global(l, sel, &ids, Some(CtlReply { word: reply, q, wts, early }), false).map(|_| ());
         }
         self.table_staged(l, sel, &ids, Some(CtlReply { word: reply, q, wts, early })).map(|_| ())
     }
@@ -10297,6 +10550,79 @@ impl RowBase {
             routing_syncs: t.routing_syncs - self.routing_syncs,
             sub_batches: t.sub_batches - self.sub_batches,
         }
+    }
+}
+
+/// #216 Step 0: the store's counters at a prompt phase's start (`Glm5Run::prefill_with`); the
+/// `[glm5] prompt phase` line is the difference at its end ([`PhaseBase::line`])
+struct PhaseBase {
+    moves: Moves,
+    nvme_reads: u64,
+    nvme_bytes: u64,
+    wait_ns: u64,
+    routing_syncs: u64,
+    sub_batches: u64,
+    elastic: ElasticStats,
+    stage: StageStats,
+    small: SmallPromptStats,
+}
+
+impl PhaseBase {
+    fn moves_of(t: &ExpertTiers) -> Moves {
+        let mut m = Moves::default();
+        for x in &t.moves {
+            m.add(x);
+        }
+        m
+    }
+
+    fn of(t: &ExpertTiers) -> PhaseBase {
+        let stage = t.arena_stage_stats().map(|s| s.0).unwrap_or_default();
+        PhaseBase {
+            moves: PhaseBase::moves_of(t),
+            nvme_reads: t.nvme_reads,
+            nvme_bytes: t.nvme_bytes,
+            wait_ns: t.prompt_nvme_wait_ns() + stage.host_wait_ns,
+            routing_syncs: t.routing_syncs,
+            sub_batches: t.sub_batches,
+            elastic: t.arena_elastic_stats().unwrap_or_default(),
+            stage,
+            small: t.small_prompt_stats(),
+        }
+    }
+
+    /// the phase's split: its route and rows, the walls of the lend-back, the hand-back (and the
+    /// chunks it freed), the prompt calls and `decode_ready` (`ms`), and the counters the phase moved
+    fn line(&self, t: &ExpertTiers, small: bool, rows: usize, pos0: usize, ms: (f64, f64, f64, f64), chunks: usize) -> String {
+        let m = PhaseBase::moves_of(t).since(&self.moves);
+        let e = t.arena_elastic_stats().unwrap_or_default();
+        let st = t.arena_stage_stats().map(|s| s.0).unwrap_or_default();
+        let s = t.small_prompt_stats();
+        let wait = (t.prompt_nvme_wait_ns() + st.host_wait_ns).saturating_sub(self.wait_ns);
+        format!(
+            "route {}, {rows} rows at {pos0}: lend-back {:.1} ms ({} records), hand-back {:.1} ms ({chunks} chunks, {} written back), calls {:.1} ms, decode_ready {:.1} ms; NVMe {} reads {} B, host wait {:.1} ms; pinned->stage {}, landing->stage {}, zero-copy {}, NVMe->pinned {}; routing syncs {}, sub-batches {}; staged calls {}, unfit {}, NVPF calls {}; small calls {}, guess reads {}",
+            if small { "small" } else { "default" },
+            ms.0,
+            e.lend_write_backs - self.elastic.lend_write_backs,
+            ms.1,
+            e.write_backs - self.elastic.write_backs,
+            ms.2,
+            ms.3,
+            t.nvme_reads - self.nvme_reads,
+            t.nvme_bytes - self.nvme_bytes,
+            wait as f64 / 1e6,
+            m.pinned_to_stage,
+            m.landing_to_stage,
+            m.zero_copy,
+            m.nvme_to_pinned,
+            t.routing_syncs - self.routing_syncs,
+            t.sub_batches - self.sub_batches,
+            st.calls - self.stage.calls,
+            st.unfit - self.stage.unfit,
+            st.nvpf_calls - self.stage.nvpf_calls,
+            s.calls - self.small.calls,
+            s.guess_reads - self.small.guess_reads,
+        )
     }
 }
 
@@ -12438,9 +12764,17 @@ impl Glm5Run {
         // CROW_GLM_ARENA elastic: borrow the scratch this prompt's calls need, give it back
         // whatever happens
         let borrow_t = self.borrow.map_or(0, |b| prompt_borrow_rows(n, self.prompt_chunk, b.0));
+        // #216 CROW_GLM_SMALL_PROMPT: a prompt below the small-prompt rows stages nothing: no
+        // lend-back, no staging buffers, a hand-back of only what free VRAM lacks
+        let plan = prompt_phase_plan(tiers.small_prompt_below(), n);
+        let ph = PhaseBase::of(tiers);
+        let t_lend = std::time::Instant::now();
         // #188 CROW_GLM_ARENA_STAGE_LEND: the lent prefill staging set back before the prompt
         // plans on the arena's places (the NVPF read-ahead, the staged forwards)
-        tiers.stage_lend_back()?;
+        if plan.lend_back {
+            tiers.stage_lend_back()?;
+        }
+        let lend_ms = t_lend.elapsed().as_secs_f64() * 1e3;
         // #196 round 3: the staging buffers sized to what the scratch leaves, before it is taken
         // #214 CROW_GLM_KV_LAZY: the prompt's cache rows not mapped yet are handed back with the
         // scratch (0 when off or mapped)
@@ -12448,11 +12782,19 @@ impl Glm5Run {
         // crow-nest #217: the anchor's device copy is handed back with the scratch and freed
         // after the prompt (never held between requests)
         let anchor_bytes = self.anchor.as_ref().filter(|a| a.pos > pos0 && a.pos < pos0 + n).map_or(0, |_| self.kda_state_bytes());
-        tiers.stage_plan_prompt(self.borrow_bytes(borrow_t) + kv + anchor_bytes);
+        if plan.stage_plan {
+            tiers.stage_plan_prompt(self.borrow_bytes(borrow_t) + kv + anchor_bytes);
+        }
+        let t_hand = std::time::Instant::now();
+        let live0 = tiers.elastic_live().map_or(0, |e| e.0);
         if borrow_t > 0 {
-            self.borrow_scratch(tiers, borrow_t, kv + anchor_bytes)?;
+            self.borrow_scratch(tiers, borrow_t, kv + anchor_bytes, plan.small)?;
         } else if kv + anchor_bytes > 0 {
-            tiers.elastic_hand_back(kv + anchor_bytes)?;
+            tiers.elastic_hand_back_with(kv + anchor_bytes, plan.small)?;
+        }
+        let hand = (t_hand.elapsed().as_secs_f64() * 1e3, live0.saturating_sub(tiers.elastic_live().map_or(0, |e| e.0)));
+        if plan.small {
+            tiers.small_stats.phases += 1;
         }
         if kv > 0 {
             self.kv_stats.hand_back_bytes += kv;
@@ -12463,10 +12805,12 @@ impl Glm5Run {
                 a.dev = d;
             }
         }
+        let t_calls = std::time::Instant::now();
         let r = match self.kv_map_to(pos0 + n) {
             Ok(()) => self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows),
             Err(e) => Err(e),
         };
+        let calls_ms = t_calls.elapsed().as_secs_f64() * 1e3;
         if let Some(a) = self.anchor.as_mut().filter(|a| a.dev != 0) {
             if r.is_ok() {
                 cuda::sync();
@@ -12479,9 +12823,13 @@ impl Glm5Run {
             self.return_scratch();
         }
         // the staged forward ends and the elastic part grows back here, on the host thread
+        let t_ready = std::time::Instant::now();
         cuda::sync();
         tiers.decode_ready();
         self.lift_elastic(tiers);
+        let ready_ms = t_ready.elapsed().as_secs_f64() * 1e3;
+        // #216 Step 0: where the prompt phase's time went
+        tracing::info!(target: "glm5", "[glm5] prompt phase {}", ph.line(tiers, plan.small, n, pos0, (lend_ms, hand.0, calls_ms, ready_ms), hand.1));
         r
     }
 
@@ -12517,8 +12865,8 @@ impl Glm5Run {
     ///
     /// # Safety
     /// As [`Glm5Run::prefill`].
-    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers, t: usize, kv: u64) -> Result<(), String> {
-        tiers.elastic_hand_back(self.borrow_bytes(t) + kv)?;
+    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers, t: usize, kv: u64, small: bool) -> Result<(), String> {
+        tiers.elastic_hand_back_with(self.borrow_bytes(t) + kv, small)?;
         self.resize_rows(t);
         Ok(())
     }
@@ -12597,7 +12945,13 @@ impl Glm5Run {
         let cut = self.anchor.as_ref().filter(|a| a.dev != 0 && a.pos > pos0 && a.pos <= pos0 + t).map(|a| (a.pos - pos0, a.dev));
         let kd = crate::glm5_kda::KdaDims::of(&self.g);
         let mut k = 0u64;
+        // #216 CROW_GLM_SMALL_PROMPT: a small call guesses each next MoE layer's experts
+        let small = tiers.small_prompt_call(t);
         for l in 0..self.g.layers {
+            self.pass.prompt_guess = match self.layers.get(l + 1).map(|lw| &lw.ffn) {
+                Some(gm::FfnW::Moe { w, .. }) if small => Some((l + 1, w.router, w.bias)),
+                _ => None,
+            };
             let kda_layer = self.kda[l].is_some();
             self.pass.kda_cut = match cut {
                 Some((r, dev)) if kda_layer => {
@@ -12618,6 +12972,9 @@ impl Glm5Run {
             let mut hook = |layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>| tiers.tables_for_prompt(layer, sel, picks, run);
             let r = self.pass.call_with_expert_batches(&self.layers[l], self.x, pos0, t, &mut hook);
             self.pass.kda_cut = None;
+            self.pass.prompt_guess = None;
+            // a guess the hook did not take (a failed call) is not left for a later one
+            glm5_flags::post_prompt_guess(None);
             // the layer's own state goes back even when the call failed
             if let Some(s) = self.kda[l].as_mut() {
                 self.pass.swap_kda_state(s);
@@ -12774,6 +13131,189 @@ impl Glm5Run {
             k.trims,
             k.trimmed_bytes
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests_216 {
+    //! #216 `CROW_GLM_SMALL_PROMPT` on the host: the switch, the route by rows, the prompt phase's
+    //! plan (no lend-back, no staging buffers), the hand-back sized against free VRAM, and the
+    //! arena step of a small call (NVMe misses into the RAM tier, pinned hits read in place)
+    use super::*;
+
+    const REC: u64 = 9_474_048;
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn small_prompt_switch_is_off_unless_one() {
+        assert_eq!(small_prompt_rows(None, None), Ok(None));
+        assert_eq!(small_prompt_rows(None, Some("512")), Ok(None));
+        assert_eq!(small_prompt_rows(Some("0"), Some("512")), Ok(None));
+        assert_eq!(small_prompt_rows(Some("1"), None), Ok(Some(1024)));
+        assert_eq!(SMALL_PROMPT_ROWS, 1024, "the template's GLM53_EC_STAGE_MIN code default, 8,192 picks at top-8");
+        assert_eq!(small_prompt_rows(Some(" 1 "), Some(" 512 ")), Ok(Some(512)));
+        for bad in ["0", "-1", "1k", ""] {
+            assert!(small_prompt_rows(Some("1"), Some(bad)).unwrap_err().contains(SMALL_PROMPT_ROWS_ENV), "{bad} refused by name");
+        }
+    }
+
+    /// The G5 t1 rows (#216 Evidence, 2026-10-11): row 3's 86 new rows take the route, row 2's
+    /// 2,343 and row 1's 6,438 stay on the default path; off, no call does
+    #[test]
+    fn the_route_is_taken_below_the_rows_only() {
+        let on = small_prompt_rows(Some("1"), None).unwrap();
+        for (rows, small) in [(86, true), (1, true), (1023, true), (1024, false), (2343, false), (6438, false), (0, false)] {
+            assert_eq!(small_prompt_route(on, rows), small, "{rows} rows, switch on");
+            assert!(!small_prompt_route(None, rows), "{rows} rows, switch off");
+        }
+    }
+
+    /// Ticket Evidence 1: the 86-row prompt took the lent staging set back (two syncs, write-backs)
+    /// and sized staging buffers; on the route it does neither, a prompt at the rows does both
+    #[test]
+    fn a_small_phase_lends_nothing_back_and_sizes_no_staging() {
+        let on = Some(SMALL_PROMPT_ROWS);
+        assert_eq!(prompt_phase_plan(on, 86), PromptPhasePlan { small: true, lend_back: false, stage_plan: false });
+        assert_eq!(prompt_phase_plan(on, 2343), PromptPhasePlan { small: false, lend_back: true, stage_plan: true });
+        assert_eq!(prompt_phase_plan(None, 86), PromptPhasePlan { small: false, lend_back: true, stage_plan: true });
+    }
+
+    /// Ticket Evidence 2: free VRAM about 1.12 GiB in decode, chunks of 37 records of 9,474,048 B,
+    /// 22 live, a ~50 MB scratch. The default hand-back tops up the 2.5 GiB reserve: 5 chunks (the
+    /// measured +185 write-backs = 5 x 37). The small phase hands back none (the scratch fits),
+    /// and for a scratch above free VRAM only the chunks free VRAM lacks.
+    #[test]
+    fn a_small_phase_hands_back_only_what_free_vram_lacks() {
+        let cb = 37 * REC;
+        let free = (1.12 * GIB as f64) as u64;
+        let need = 50 << 20;
+        assert_eq!(prompt_hand_back_chunks(false, need, free, cb, 22), 5, "the default phase");
+        assert_eq!(prompt_hand_back_chunks(true, need, free, cb, 22), 0, "the scratch fits in free VRAM");
+        let big = 2 * GIB;
+        let lacks = (big + SMALL_PROMPT_SLACK_BYTES - free).div_ceil(cb) as usize;
+        assert_eq!(lacks, 3);
+        assert_eq!(prompt_hand_back_chunks(true, big, free, cb, 22), lacks, "only what free VRAM lacks");
+        assert!(prompt_hand_back_chunks(false, big, free, cb, 22) > lacks, "the default adds the reserve");
+        assert_eq!(prompt_hand_back_chunks(true, 40 * GIB, 0, cb, 22), 22, "at most the live chunks");
+        assert_eq!(prompt_hand_back_chunks(true, 0, 0, cb, 22), 0, "nothing asked, nothing handed back");
+    }
+
+    /// the host twin of the slots (every slot holds the key `layer x experts + expert` of its
+    /// record), as `arena_tests::GSim`
+    struct Twin {
+        experts: usize,
+        layer: usize,
+        vram: Vec<u32>,
+        pinned: Vec<u32>,
+        stage: Vec<u32>,
+        landing: Vec<u32>,
+        ops: Moves,
+    }
+
+    impl Mover for Twin {
+        fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+            for &(e, d) in jobs {
+                let key = (self.layer * self.experts) as u32 + e;
+                match d {
+                    Dst::Landing(i) => {
+                        self.landing[i as usize] = key;
+                        self.ops.nvme_to_landing += 1;
+                    }
+                    Dst::Pinned(q) => {
+                        self.pinned[q as usize] = key;
+                        self.ops.nvme_to_pinned += 1;
+                    }
+                }
+            }
+            Ok(jobs.len() as u64 * REC)
+        }
+        fn landing_to_stage(&mut self, i: u32) {
+            self.ops.landing_to_stage += 1;
+            self.stage[i as usize] = self.landing[i as usize];
+        }
+        fn pinned_to_stage(&mut self, q: u32, s: u32) {
+            self.ops.pinned_to_stage += 1;
+            self.stage[s as usize] = self.pinned[q as usize];
+        }
+        fn vram_to_stage(&mut self, v: u32, s: u32) {
+            self.ops.vram_to_stage += 1;
+            self.stage[s as usize] = self.vram[v as usize];
+        }
+        fn barrier(&mut self) {}
+        fn vram_to_pinned(&mut self, v: u32, q: u32) {
+            self.ops.vram_to_pinned += 1;
+            self.pinned[q as usize] = self.vram[v as usize];
+        }
+        fn stage_to_vram(&mut self, s: u32, v: u32) {
+            self.ops.stage_to_vram += 1;
+            self.vram[v as usize] = self.stage[s as usize];
+        }
+    }
+
+    /// two MoE layers of 16 experts, 4 VRAM and 6 pinned slots: layer 0 holds experts 0..4 in
+    /// VRAM and 4..7 in pinned (decode calls placed them), the rest on the NVMe
+    fn warm() -> (GlobalArena, Twin) {
+        let (ex, v, p) = (16usize, 4usize, 6usize);
+        let mut a = GlobalArena::new(2, ex, v, p).unwrap();
+        let mut tw = Twin { experts: ex, layer: 0, vram: vec![u32::MAX; v], pinned: vec![u32::MAX; p], stage: vec![u32::MAX; 8], landing: vec![u32::MAX; 8], ops: Moves::default() };
+        serve_global(&mut a, 0, &[0, 1, 2, 3], true, 8, &mut tw).unwrap();
+        serve_global(&mut a, 0, &[4, 5, 6], false, 8, &mut tw).unwrap();
+        for e in 0..4 {
+            assert!(matches!(a.place(0, e), Place::Vram(_)), "expert {e} in VRAM");
+        }
+        for e in 4..7 {
+            assert!(matches!(a.place(0, e), Place::Ram(_)), "expert {e} pinned");
+        }
+        tw.ops = Moves::default();
+        (a, tw)
+    }
+
+    fn holds(tw: &Twin, e: u32, loc: Loc) -> bool {
+        let key = (tw.layer * tw.experts) as u32 + e;
+        key == match loc {
+            Loc::Vram(v) => tw.vram[v as usize],
+            Loc::Pinned(q) => tw.pinned[q as usize],
+            Loc::Stage(s) => tw.stage[s as usize],
+        }
+    }
+
+    /// A small call of layer 0 selecting VRAM experts 2, 3, pinned 5 and NVMe 9, 12: the NVMe
+    /// misses are read straight into pinned slots (the RAM tier) and every pinned record is read
+    /// in place (zero-copy), nothing is staged or admitted to VRAM, and the next decode call of
+    /// the same experts reads nothing from the NVMe. The default prompt call of the same selection
+    /// ([`serve_chunk_global`], ticket Evidence 4) stages the pinned record and both NVMe records
+    /// through the landing and leaves every place as it was.
+    #[test]
+    fn a_small_call_admits_its_misses_to_the_ram_tier_and_reads_pinned_in_place() {
+        let sel = [2i32, 3, 5, 9, 12, 2, 2, 2];
+        let ids = distinct_ids(&sel, 16).unwrap();
+        let (mut a, mut tw) = warm();
+        let served = serve_small_prompt(&mut a, 0, &ids, 8, &mut tw).unwrap();
+        a.check().unwrap();
+        for &(e, loc) in &served.locs {
+            assert!(holds(&tw, e, loc), "expert {e} at {loc:?} holds its record");
+        }
+        for e in [9, 12] {
+            assert!(matches!(a.place(0, e), Place::Ram(_)), "NVMe miss {e} enters the RAM tier, at {:?}", a.place(0, e));
+        }
+        assert!(served.locs.iter().all(|&(e, loc)| matches!(loc, Loc::Vram(_)) == (e < 4) && (matches!(loc, Loc::Pinned(_)) == (e >= 4))), "VRAM hits in VRAM, the rest read from pinned: {:?}", served.locs);
+        assert_eq!((tw.ops.nvme_to_pinned, tw.ops.nvme_to_landing, tw.ops.pinned_to_stage, tw.ops.landing_to_stage, tw.ops.stage_to_vram), (2, 0, 0, 0, 0), "two reads into pinned, nothing staged: {:?}", tw.ops);
+        assert_eq!((served.nvme_reads, served.moves.zero_copy, served.moves.nvme_to_pinned), (2, 3, 2));
+        let next = serve_global(&mut a, 0, &[9, 12], false, 8, &mut tw).unwrap();
+        assert_eq!(next.nvme_reads, 0, "the next decode call finds the misses in the RAM tier");
+        // the default prompt call of the same selection
+        let (mut a, mut tw) = warm();
+        let mut tables = 0;
+        serve_chunk_global(&mut a, 0, &sel, 8, 8, &mut tw, &mut |_, _, _| {
+            tables += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(tables, 1);
+        for e in [9, 12] {
+            assert_eq!(a.place(0, e), Place::Nvme, "the default prompt call leaves {e} on the NVMe");
+        }
+        assert_eq!((tw.ops.nvme_to_landing, tw.ops.pinned_to_stage, tw.ops.nvme_to_pinned), (2, 1, 0), "{:?}", tw.ops);
     }
 }
 

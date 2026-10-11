@@ -58,6 +58,8 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_KV_LAZY",
     "CROW_GLM_ANSWER_REUSE",
     "CROW_GLM_PREFIX_ANCHOR",
+    "CROW_GLM_SMALL_PROMPT",
+    "CROW_GLM_SMALL_PROMPT_ROWS",
 ];
 
 pub(crate) struct Env(Vec<(String, Option<String>)>);
@@ -1382,4 +1384,114 @@ fn glm5_int_gpu_the_lazy_kv_cache_is_the_eager_one() {
     }
     assert_eq!(outs[0].0, outs[1].0, "ids, eager vs lazy");
     assert!(outs[0].1 == outs[1].1, "every latent and indexer row 0 ..= {last}, eager vs lazy");
+}
+
+/// crow-nest #216 (`CROW_GLM_SMALL_PROMPT`): the arm4 switches of the G5 session (global arena with
+/// warm start, elastic and 2.6 GB stage budgets, frequency tiers, regrowth, the lent staging set
+/// with lazy refill, flags + stager + prefetch on the side stream, CPU lane split, prompt chunk
+/// 8192, NVPF, RT2) with free VRAM held under the 2.5 GiB reserve by a ballast, two generations of
+/// a 40-id prompt (one small prompt call each) and 8 greedy ids, the route off against on. On, both
+/// prompts take the route (every MoE call of both, the next layer guessed), take nothing back
+/// from the lent staging set, open no staged forward and hand back no elastic chunk (their scratch
+/// fits in free VRAM), and read their misses into the RAM tier; off, every prompt tops up the
+/// reserve. The ids equal the off arm's, the logits within G3's 0.9999 cosine (the CPU lane's
+/// split follows the placement, #188).
+#[test]
+#[ignore = "needs the GPU (most of its free VRAM as a ballast, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_int_gpu_the_small_prompt -- --ignored --nocapture --test-threads 1"]
+fn glm5_int_gpu_the_small_prompt_route_keeps_the_ids() {
+    use crate::glm5_tiers::ARENA_RESERVE_BYTES;
+    let dir = std::env::temp_dir().join(format!("crow-int-small-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let warm = synth_warm(&dir);
+    let s = |v: &str| v.to_string();
+    let base: Vec<(&'static str, String)> = vec![
+        ("CROW_GLM_PINNED", s("zerocopy")),
+        ("CROW_GLM_FLAGS", s("1")),
+        ("CROW_GLM_STAGER", s("1")),
+        ("CROW_GLM_ARENA", s("global")),
+        ("CROW_GLM_ARENA_WARM", warm),
+        ("CROW_GLM_ARENA_ELASTIC_GB", format!("{}", 12.0 * 3.0 * REC as f64 / (1u64 << 30) as f64)),
+        ("CROW_GLM_ARENA_STAGE_GB", s("2.6")),
+        ("CROW_GLM_ARENA_FREQ", s("1")),
+        ("CROW_GLM_ARENA_REGROW", s("1")),
+        ("CROW_GLM_ARENA_LAZY_REFILL", s("1")),
+        ("CROW_GLM_ARENA_STAGE_LEND", s("1")),
+        ("CROW_GLM_CPU_LANE", s("split")),
+        ("CROW_PINNED_ALLOC", s("host")),
+        ("CROW_GLM_PREFETCH", s("1")),
+        ("CROW_GLM_PREFETCH_SIDE", s("1")),
+        ("CROW_GLM_SHARED_OVERLAP", s("1")),
+        ("CROW_GLM_HCFUSE", s("1")),
+        ("CROW_GLM_DENSE_GEMM", s("1")),
+        ("CROW_CHUNK", s("8192")),
+        ("CROW_GLM_STAGE_OVERLAP", s("1")),
+        ("CROW_GLM_MOE_TC", s("2")),
+        ("CROW_GLM_ATTN2", s("1")),
+        ("CROW_GLM_PREFILL_NVPF", s("1")),
+        ("CROW_GLM_RT2", s("1")),
+    ];
+    let g = geo8();
+    let sy = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&sy.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&sy.path).unwrap();
+    let prompt: Vec<i64> = (0..40).map(|i| (i * 61 + 7) % 2048).collect();
+    let n = 8;
+    let pf = crate::glm5_tiers::prefill_stage_slots(g.topk);
+    let moe_layers = (g.layers - g.dense_prefix) as u64;
+    let mut outs: Vec<(&str, Vec<Generated>)> = Vec::new();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        for (name, small) in [("off", false), ("small", true)] {
+            let mut env = base.clone();
+            if small {
+                env.push(("CROW_GLM_SMALL_PROMPT", s("1")));
+            }
+            let _env = Env::set(&env);
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, prompt.len() + n + 1, &mut |s| eprintln!("{s}"));
+            // more pinned slots than the lend test: a call's misses and the next layer's guesses
+            // in flight both take pinned slots on the route
+            let mut tiers = ExpertTiers::new(&cnq, &sy.path, &g, &moe, TierSizes { vram: 3, pinned: 8 }, 1, g.topk).unwrap();
+            assert_eq!(tiers.small_prompt_below(), small.then_some(1024), "{name}: the route");
+            tiers.alloc_prefill_stage(pf).unwrap();
+            let (_, _, vpl) = tiers.elastic_live().unwrap();
+            let leave = ARENA_RESERVE_BYTES - 5 * (vpl as u64 * REC) / 2;
+            let free = cuda::free_vram_bytes();
+            assert!(free > leave + (1 << 30), "{free} B free VRAM");
+            let mut ballast = cuda::try_alloc_zeroed("test ballast", (free - leave) as usize).unwrap();
+            let mut gens = Vec::new();
+            for _ in 0..2 {
+                gens.push(run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap());
+            }
+            let e = tiers.arena_elastic_stats().unwrap();
+            let st = tiers.arena_stage_stats().map(|x| x.0).unwrap_or_default();
+            let sp = tiers.small_prompt_stats();
+            eprintln!("glm5 int small {name}: ids {:?} / {:?}; {sp:?}; staged calls {}, NVPF calls {}; {e:?}", gens[0].ids, gens[1].ids, st.calls, st.nvpf_calls);
+            if small {
+                assert_eq!((sp.phases, sp.calls), (2, 2 * moe_layers), "{name}: every MoE call of both prompts on the route ({sp:?})");
+                assert_eq!(sp.guesses, 2 * (moe_layers - 1), "{name}: each MoE call but the last guessed its next layer ({sp:?})");
+                assert!(sp.ram_admits + sp.zero_copy > 0, "{name}: pinned reads in place or misses into the RAM tier ({sp:?})");
+                assert_eq!(sp.hand_back_chunks, 0, "{name}: the scratch fits in free VRAM ({sp:?})");
+                assert_eq!((e.take_backs, e.enter, st.calls), (0, 0, 0), "{name}: no lend-back, no hand-back, no staged forward ({e:?})");
+            } else {
+                assert_eq!(sp, crate::glm5_tiers::SmallPromptStats::default(), "{name}: the route never ran");
+                assert!(e.enter >= 2 && e.take_backs == 1, "{name}: every prompt topped up the reserve, the second took the lent set back ({e:?})");
+            }
+            cuda::free_dev(&mut ballast);
+            tiers.free();
+            run.free();
+            outs.push((name, gens));
+        }
+    }
+    let off = &outs[0];
+    for (name, gens) in &outs[1..] {
+        for (i, (gen, base)) in gens.iter().zip(&off.1).enumerate() {
+            assert_eq!(gen.ids, base.ids, "{name}: ids of generation {i}");
+            let r: Vec<(f64, f64, bool)> = gen.logits.iter().zip(&base.logits).map(|(p, q)| g3(q, p)).collect();
+            let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
+            eprintln!("glm5 int small {name} vs off, generation {i}: logits cosine min {cos:.7}, bits differ {:?}", bit_diff(&gen.logits, &base.logits));
+            assert!(cos >= 0.9999, "{name}: logits cosine {cos} under G3's 0.9999");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
