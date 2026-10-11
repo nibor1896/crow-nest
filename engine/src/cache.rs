@@ -180,6 +180,10 @@
 //! - Spec 7.5 is binding: where the correct state cannot be PROVEN present, recompute.
 //! - Consequence: a snapshot is a reuse candidate only while every row below its position
 //!   was written by `prefill`. That property is called PREFILL CLEAN here.
+//! - The Qwen path keeps this rule. glm5_next may break it under its own gate: with
+//!   `CROW_GLM_ANSWER_REUSE=1` (crow-nest #219, default off) its live state after the answer is
+//!   a reuse point, so decode-written rows are reused; the gate is cosine >= 0.9999 / top-1 and
+//!   the same answers, not bit equality (`glm5_engine.rs` module doc).
 //!
 //! Why the point 1 snapshot is always prefill clean, by induction:
 //!

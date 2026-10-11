@@ -18,6 +18,12 @@
 //!   decode one step, the logits row, reset, and the one-conversation prefix cache of `serve`
 //!   (#31 A9, #36 M2b: one snapshot after each prompt, a warm request rolls back to it; #100:
 //!   an identical re-request prefills nothing).
+//! - crow-nest #219 (`CROW_GLM_ANSWER_REUSE`, default off): the live state after the answer is a
+//!   reuse point too. A prompt that extends the whole held conversation continues from it (no
+//!   rollback, the previous answer is not prefilled again), and a re-render that splits the held
+//!   answer's bytes into other ids is realigned to the held ids first ([`last_sync`]). This
+//!   reuses rows `decode_step` wrote, which the Qwen path forbids ("Prefill clean", `cache.rs`);
+//!   glm5_next accepts it under the ticket's own gate (cosine / top-1 / same answers).
 //!
 //! The prefix snapshot of glm5_next (`docs/glm5-kda.md`, `docs/glm5-mla.md`): the KDA recurrent
 //! state and its conv window of every KDA layer are COPIED (34 x (4 MiB + 288 KiB) f32 = 152,633,344 B
@@ -518,6 +524,150 @@ impl Drop for Glm5Device {
 
 // ---------------------------------------------------------------- the sequence and its prefix cache
 
+/// crow-nest #219: `CROW_GLM_ANSWER_REUSE` (0/1, default 0): (A) a prompt that extends the whole
+/// held conversation (prompt + every fed id) continues from the live state, no rollback; (B) a
+/// re-render that splits the held answer's bytes into other ids is realigned to the held ids
+pub const ANSWER_REUSE_ENV: &str = "CROW_GLM_ANSWER_REUSE";
+
+/// a 0/1 switch of the glm5_next prefix cache: unset, empty or `0` is off, `1` on, anything else
+/// refused by name (serve's boot refuses it)
+pub fn cache_switch(get: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<bool, String> {
+    match get(name).as_deref().map(str::trim) {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(format!("{name}={v}: 0 or 1")),
+    }
+}
+
+/// crow-nest #219: the candidate index of the live state in a [`crate::cache::Decision`] (index 0
+/// is the prompt snapshot): `Some((REUSE_LIVE, held))` = continue from the live state at `held`
+pub const REUSE_LIVE: usize = 1;
+
+/// crow-nest #219 (B): the bytes every id of the vocabulary stands for
+/// (`ChatTokenizer::token_bytes`) and whether it is an added token (`<think>`, `</think>`,
+/// `<|observation|>`, ...), built once at boot
+pub struct TokenBytes {
+    bytes: Vec<u8>,
+    /// `n + 1` offsets into `bytes`
+    off: Vec<u32>,
+    added: Vec<bool>,
+}
+
+impl TokenBytes {
+    /// ids `0 .. n`, `f(id)` = (its bytes, added)
+    pub fn from_fn(n: usize, f: impl Fn(u32) -> (Vec<u8>, bool)) -> TokenBytes {
+        let (mut bytes, mut off, mut added) = (Vec::new(), Vec::with_capacity(n + 1), Vec::with_capacity(n));
+        off.push(0u32);
+        for id in 0..n as u32 {
+            let (b, a) = f(id);
+            bytes.extend_from_slice(&b);
+            off.push(bytes.len() as u32);
+            added.push(a);
+        }
+        TokenBytes { bytes, off, added }
+    }
+
+    /// the ids it holds
+    pub fn len(&self) -> usize {
+        self.added.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+    }
+
+    /// (bytes, added) of `id`; `None` outside the table
+    fn get(&self, id: i64) -> Option<(&[u8], bool)> {
+        let i = usize::try_from(id).ok().filter(|&i| i < self.added.len())?;
+        Some((&self.bytes[self.off[i] as usize..self.off[i + 1] as usize], self.added[i]))
+    }
+
+    /// the bytes of `ids` (ids outside the table count 0)
+    pub fn byte_len(&self, ids: &[i64]) -> usize {
+        ids.iter().filter_map(|&id| self.get(id)).map(|(b, _)| b.len()).sum()
+    }
+}
+
+/// crow-nest #219 (B): the last sync point of two id runs: the largest `(i, j)` reached by walking
+/// both from the start with two pointers over their token BYTES such that the bytes of `a[..i]`
+/// equal the bytes of `b[..j]`. The walk stops at the first byte that differs. An added id meets
+/// only the same id at a sync point (a literal `"</think>"` written as text never stands in for the
+/// token); an id without bytes, or outside the table, ends the walk unless both sides hold it.
+pub fn last_sync(tb: &TokenBytes, a: &[i64], b: &[i64]) -> (usize, usize) {
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut sync = (0, 0);
+    // the bytes one side is ahead by, and whether that side is `a`
+    let mut ahead: Vec<u8> = Vec::new();
+    let mut a_ahead = false;
+    loop {
+        if ahead.is_empty() {
+            sync = (i, j);
+            if i == a.len() || j == b.len() {
+                break;
+            }
+            if a[i] == b[j] {
+                i += 1;
+                j += 1;
+                continue;
+            }
+            let (Some((x, xa)), Some((y, ya))) = (tb.get(a[i]), tb.get(b[j])) else { break };
+            if xa || ya || x.is_empty() || y.is_empty() {
+                break;
+            }
+            let (short, long) = if x.len() <= y.len() { (x, y) } else { (y, x) };
+            if !long.starts_with(short) {
+                break;
+            }
+            ahead = long[short.len()..].to_vec();
+            a_ahead = x.len() > y.len();
+            i += 1;
+            j += 1;
+        } else {
+            // the side behind takes its next id
+            let behind_b = a_ahead;
+            let (k, side) = if behind_b { (j, b) } else { (i, a) };
+            if k == side.len() {
+                break;
+            }
+            let Some((t, added)) = tb.get(side[k]) else { break };
+            if added || t.is_empty() {
+                break;
+            }
+            if t.len() <= ahead.len() {
+                if !ahead.starts_with(t) {
+                    break;
+                }
+                ahead.drain(..t.len());
+            } else {
+                if !t.starts_with(&ahead) {
+                    break;
+                }
+                ahead = t[ahead.len()..].to_vec();
+                a_ahead = !a_ahead;
+            }
+            if behind_b {
+                j += 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    sync
+}
+
+/// crow-nest #219 (B): a prompt realigned to the held ids
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Realign {
+    /// the request's ids from now on: the held ids, then the prompt's tail
+    pub ids: Vec<i64>,
+    /// the prompt's ids `a .. b` that were replaced
+    pub prompt_span: (usize, usize),
+    /// by the held ids `c .. d`
+    pub held_span: (usize, usize),
+    /// the bytes both spans stand for
+    pub bytes: usize,
+}
+
 /// The one prompt snapshot of the held conversation (#36 M2b: one per request, after the
 /// prompt; #100: with its logits row and greedy id, so an identical re-request prefills nothing).
 #[derive(Default)]
@@ -541,6 +691,10 @@ pub struct Glm5Engine<R: Rows = Glm5Device> {
     /// the parked books of every slot (`parked[slot]` is empty while `slot` is current)
     slot: usize,
     parked: Vec<SlotBooks>,
+    /// crow-nest #219 `CROW_GLM_ANSWER_REUSE`: the live state is a reuse point at the held
+    /// position, and the realign's vocabulary bytes (`None`: (A) only)
+    answer_reuse: bool,
+    token_bytes: Option<std::sync::Arc<TokenBytes>>,
 }
 
 /// `CROW_GLM_MAX_BATCH`: a parked slot's held ids and prompt snapshot
@@ -554,7 +708,25 @@ impl<R: Rows> Glm5Engine<R> {
     /// `cache_on` is `CROW_PREFIX_CACHE != 0` in `serve`; off, every request is a cold start
     pub fn new(rows: R, cache_on: bool) -> Glm5Engine<R> {
         let parked = (0..rows.slots()).map(|_| SlotBooks::default()).collect();
-        Glm5Engine { rows, history: Vec::new(), cache_on, snap: Snapshot::default(), slot: 0, parked }
+        Glm5Engine { rows, history: Vec::new(), cache_on, snap: Snapshot::default(), slot: 0, parked, answer_reuse: false, token_bytes: None }
+    }
+
+    /// crow-nest #219 `CROW_GLM_ANSWER_REUSE`: (A) on/off, and (B) the vocabulary bytes the realign
+    /// walks (`None`: no realign)
+    pub fn set_answer_reuse(&mut self, on: bool, token_bytes: Option<std::sync::Arc<TokenBytes>>) {
+        self.answer_reuse = on;
+        self.token_bytes = token_bytes;
+    }
+
+    /// crow-nest #219: is the live state a reuse point? The switch, the cache, and MTP off (the
+    /// spec head-norm row of `state_floats` is not proven consistent after a speculative decode)
+    pub fn answer_reuse(&self) -> bool {
+        self.cache_on && self.answer_reuse && self.rows.mtp_drafts() == 0
+    }
+
+    /// crow-nest #219: does (B) realign re-renders (the switch and the vocabulary bytes)?
+    pub fn realigns(&self) -> bool {
+        self.answer_reuse() && self.token_bytes.is_some()
     }
 
     pub fn rows(&self) -> &R {
@@ -620,13 +792,72 @@ impl<R: Rows> Glm5Engine<R> {
     /// The detection rule of `serve` (spec 7.4, #100) for the one snapshot: `L` is the common
     /// id prefix of the held conversation and `prompt`; the snapshot is reused when it sits at
     /// or below `L` and below the prompt's length, or AT it (its logits row stands in).
+    ///
+    /// crow-nest #219 (A, `CROW_GLM_ANSWER_REUSE`): the live state is a second candidate at the held
+    /// position ([`REUSE_LIVE`]): the decode wrote every fed id's row, so a prompt that extends the
+    /// whole held conversation (`L` = held < prompt) continues from it (llama.cpp's rule,
+    /// `server-context.cpp` `pos_min_thold`).
     pub fn decide(&self, prompt: &[i64]) -> crate::cache::Decision {
+        self.decide_books(&self.history, &self.snap, prompt)
+    }
+
+    fn decide_books(&self, history: &[i64], snap: &Snapshot, prompt: &[i64]) -> crate::cache::Decision {
         if !self.cache_on {
             return crate::cache::Decision { l: 0, reuse: None, parked: false };
         }
-        let l = crate::cache::common_prefix_len(&self.history, prompt);
-        let reuse = crate::cache::reuse_slot_with_logits(&[self.snap.pos], &[self.snap.pos.is_some()], l, prompt.len());
+        let l = crate::cache::common_prefix_len(history, prompt);
+        let live = Some(history.len()).filter(|&h| h > 0 && self.answer_reuse());
+        let reuse = crate::cache::reuse_slot_with_logits(&[snap.pos, live], &[snap.pos.is_some(), false], l, prompt.len());
         crate::cache::Decision { l, reuse, parked: false }
+    }
+
+    /// crow-nest #219 (B): `prompt` realigned to the held ids, when the re-render of the held
+    /// answer is the same bytes in other ids (a non-canonical split the sampler drew) and the walk
+    /// reaches the held end with a tail left: the request becomes `history ++ prompt[j*..]`, so
+    /// (A) continues from the live state. `None` otherwise (the prompt stays as rendered): a
+    /// realign that stops below the held end reaches no reuse point (none exists above the prompt
+    /// snapshot).
+    pub fn realign(&self, prompt: &[i64]) -> Option<Realign> {
+        self.realign_books(&self.history, prompt)
+    }
+
+    fn realign_books(&self, history: &[i64], prompt: &[i64]) -> Option<Realign> {
+        if !self.realigns() {
+            return None;
+        }
+        let tb = self.token_bytes.as_deref()?;
+        let (l, held) = (crate::cache::common_prefix_len(history, prompt), history.len());
+        if l >= held {
+            return None;
+        }
+        let (i, j) = last_sync(tb, &history[l..], &prompt[l..]);
+        if l + i != held || l + j >= prompt.len() {
+            return None;
+        }
+        let ids = [history, &prompt[l + j..]].concat();
+        Some(Realign { ids, prompt_span: (l, l + j), held_span: (l, held), bytes: tb.byte_len(&history[l..]) })
+    }
+
+    /// [`Glm5Engine::realign`], then [`Glm5Engine::decide`] over the realigned ids
+    pub fn plan(&self, prompt: &[i64]) -> (Option<Realign>, crate::cache::Decision) {
+        let r = self.realign(prompt);
+        let d = self.decide(r.as_ref().map_or(prompt, |r| &r.ids));
+        (r, d)
+    }
+
+    /// crow-nest #219 (A): continue from the live state: a row enqueued ahead
+    /// (`CROW_GLM_LA`) is dropped, nothing is restored, the held ids stay. Returns the wall in ms.
+    /// A failure resets the engine.
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    pub unsafe fn continue_live(&mut self) -> Result<f64, String> {
+        let t = std::time::Instant::now();
+        if let Err(e) = self.rows.settle_ahead() {
+            self.reset();
+            return Err(e);
+        }
+        Ok(t.elapsed().as_secs_f64() * 1e3)
     }
 
     /// Back to the snapshot at `p`: the KDA states come back, the held ids are cut to `p`, the
@@ -812,13 +1043,17 @@ impl<R: Rows> Glm5Engine<R> {
     /// [`Glm5Engine::decide`] on slot `s`'s books (serve picks the slot whose snapshot serves
     /// the prompt best)
     pub fn decide_in(&self, s: usize, prompt: &[i64]) -> crate::cache::Decision {
-        if !self.cache_on {
-            return crate::cache::Decision { l: 0, reuse: None, parked: false };
-        }
         let (history, snap) = self.books(s);
-        let l = crate::cache::common_prefix_len(history, prompt);
-        let reuse = crate::cache::reuse_slot_with_logits(&[snap.pos], &[snap.pos.is_some()], l, prompt.len());
-        crate::cache::Decision { l, reuse, parked: false }
+        self.decide_books(history, snap, prompt)
+    }
+
+    /// [`Glm5Engine::plan`] on slot `s`'s books (crow-nest #219: serve prefers the slot that holds
+    /// the whole answer, realigned or not)
+    pub fn plan_in(&self, s: usize, prompt: &[i64]) -> (Option<Realign>, crate::cache::Decision) {
+        let (history, snap) = self.books(s);
+        let r = self.realign_books(history, prompt);
+        let d = self.decide_books(history, snap, r.as_ref().map_or(prompt, |r| &r.ids));
+        (r, d)
     }
 
     /// One decode step of several sequences: per `(slot, id)` (every slot at most once) `id`
@@ -1446,6 +1681,35 @@ mod tests_192_serve {
 pub mod fake {
     use super::Rows;
 
+    /// crow-nest #219: the vocabulary bytes of the host twin's ids: 10..40 one distinct byte
+    /// each (`a`..`z`, `0`..`3`); two splits of the same bytes (41 `" fisher"` + 42 `"men"` =
+    /// 43 `" fishermen"` = 44 `" fish"` + 45 `"ermen"`; 60 `X` + 61 `LC` + 62 `DM` = 63 `XL` +
+    /// 64 `CD` + 65 `M`); the added 50 `</think>` and 54 `<|observation|>`, and the text
+    /// 51 `</` + 52 `think` + 53 `>` that spells the first; every other id has no bytes
+    pub fn token_bytes() -> super::TokenBytes {
+        const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123";
+        super::TokenBytes::from_fn(160, |id| match id {
+            10..=39 => (vec![LETTERS[id as usize - 10]], false),
+            41 => (b" fisher".to_vec(), false),
+            42 => (b"men".to_vec(), false),
+            43 => (b" fishermen".to_vec(), false),
+            44 => (b" fish".to_vec(), false),
+            45 => (b"ermen".to_vec(), false),
+            50 => (b"</think>".to_vec(), true),
+            51 => (b"</".to_vec(), false),
+            52 => (b"think".to_vec(), false),
+            53 => (b">".to_vec(), false),
+            54 => (b"<|observation|>".to_vec(), true),
+            60 => (b"X".to_vec(), false),
+            61 => (b"LC".to_vec(), false),
+            62 => (b"DM".to_vec(), false),
+            63 => (b"XL".to_vec(), false),
+            64 => (b"CD".to_vec(), false),
+            65 => (b"M".to_vec(), false),
+            _ => (Vec::new(), false),
+        })
+    }
+
     /// A recurrent state (a running 64-bit mix of every row fed, split over two f32 bit
     /// patterns: the KDA part) and one position-indexed row per token (the MLA part); a head
     /// row's logits are a function of both over `cands` (every other id is -1e30). A stale row
@@ -1630,6 +1894,192 @@ pub mod fake {
             }
             Ok(ids)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_219 {
+    //! crow-nest #219 `CROW_GLM_ANSWER_REUSE` on the host twin: (A) the live state continues a
+    //! prompt that extends the whole held conversation; (B) a non-canonical re-render is realigned
+    //! to the held ids. Expected result B4 (i)-(iv).
+    use super::fake::{token_bytes, FakeRows};
+    use super::*;
+    use std::sync::Arc;
+
+    fn eng(on: bool) -> Glm5Engine<FakeRows> {
+        let mut e = Glm5Engine::new(FakeRows::new(256, 64, (10..40).collect()), true);
+        e.set_answer_reuse(on, Some(Arc::new(token_bytes())));
+        e
+    }
+
+    fn p1() -> Vec<i64> {
+        (0..31).map(|i| 10 + (i * 13 % 30) as i64).collect()
+    }
+
+    /// a request as serve's prompt phase drives it: prefill `prompt` (cold), the snapshot, then
+    /// `answer` fed id by id (the sampler's draws)
+    unsafe fn first_turn(e: &mut Glm5Engine<FakeRows>, prompt: &[i64], answer: &[i64]) {
+        e.reset();
+        let next = e.prefill(prompt).unwrap();
+        e.snapshot(next);
+        for &id in answer {
+            e.decode_step(id).unwrap();
+        }
+    }
+
+    /// the walk itself: bytes, not ids; an added id meets only itself; the last sync point
+    #[test]
+    fn the_walk_syncs_on_bytes_and_never_on_an_added_id() {
+        let tb = token_bytes();
+        assert_eq!(last_sync(&tb, &[41, 42, 11], &[43, 11]), (3, 2), "' fisher' + 'men' = ' fishermen'");
+        assert_eq!(last_sync(&tb, &[44, 45], &[41, 42]), (2, 2), "' fish' + 'ermen' = ' fisher' + 'men'");
+        assert_eq!(last_sync(&tb, &[60, 61, 62], &[63, 64, 65]), (3, 3), "a split of the same length");
+        assert_eq!(last_sync(&tb, &[41, 42, 11], &[43, 12]), (2, 1), "the walk stops at the first byte that differs");
+        assert_eq!(last_sync(&tb, &[51, 52, 53, 11], &[50, 11]), (0, 0), "text '</think>' never stands in for the token");
+        assert_eq!(last_sync(&tb, &[50, 11], &[51, 52, 53, 11]), (0, 0));
+        assert_eq!(last_sync(&tb, &[43, 54, 11], &[41, 42, 54, 11]), (3, 4), "an added id meets the same id at a sync point");
+        assert_eq!(last_sync(&tb, &[41, 54], &[43, 54]), (0, 0), "' fisher' then the added id: no sync inside the word");
+        assert_eq!(last_sync(&tb, &[100, 11], &[101, 11]), (0, 0), "ids without bytes end the walk");
+        assert_eq!(last_sync(&tb, &[100, 11], &[100, 12]), (1, 1), "unless both sides hold the same id");
+    }
+
+    /// B4 (i): the held answer drew ' fisher' + 'men', the re-render has ' fishermen': the
+    /// prompt is realigned to the held ids, L = held, and the request continues from the live
+    /// state; its logits are a fresh run's over the realigned ids. Off, it rolls back to P.
+    #[test]
+    fn a_non_canonical_rerender_is_realigned_and_continues_live() {
+        let p = p1();
+        let answer = [11, 41, 42, 12, 13];
+        let mut rendered = p.clone();
+        rendered.extend([11, 43, 12, 13, 54, 14, 15]);
+        unsafe {
+            let mut e = eng(true);
+            first_turn(&mut e, &p, &answer);
+            let held = e.history().to_vec();
+            let (r, d) = e.plan(&rendered);
+            let r = r.expect("realigned");
+            let want: Vec<i64> = held.iter().copied().chain([54, 14, 15]).collect();
+            assert_eq!(r.ids, want);
+            assert_eq!((r.prompt_span, r.held_span, r.bytes), ((32, 35), (32, 36), 12));
+            assert_eq!((d.l, d.reuse), (36, Some((REUSE_LIVE, 36))));
+            e.continue_live().unwrap();
+            let (rows, trims) = (e.rows().rows_run, e.rows().trims.len());
+            let next = e.prefill(&r.ids[36..]).unwrap();
+            assert_eq!((e.rows().rows_run - rows, e.rows().trims.len() - trims), (3, 0), "3 rows prefilled, no rollback");
+            let mut fresh = eng(false);
+            assert_eq!(next, fresh.prefill(&r.ids).unwrap());
+            assert_eq!(e.logits(), fresh.logits(), "the live continuation is the fresh run over the same ids");
+            assert_eq!(e.history(), fresh.history());
+
+            let mut off = eng(false);
+            first_turn(&mut off, &p, &answer);
+            assert_eq!(off.plan(&rendered), (None, crate::cache::Decision { l: 32, reuse: Some((0, 31)), parked: false }), "off: rollback to P");
+        }
+    }
+
+    /// B4 (ii): a literal-text "</think>" against the added id (154842; 50 in the twin): not
+    /// realigned, either way round, and the request rolls back to P as before; the control, the
+    /// same split before the added id itself, is realigned through it and continues live
+    #[test]
+    fn a_literal_think_tag_is_not_realigned() {
+        let p = p1();
+        unsafe {
+            let mut e = eng(true);
+            first_turn(&mut e, &p, &[11, 41, 42, 50, 11]);
+            let rendered: Vec<i64> = p.iter().copied().chain([11, 43, 50, 11, 54, 14]).collect();
+            let (r, d) = e.plan(&rendered);
+            assert_eq!((r.map(|r| r.held_span), d.reuse), (Some((32, 36)), Some((REUSE_LIVE, 36))), "control: realigned through the added id");
+            for (answer, tail) in [(vec![11i64, 41, 42, 51, 52, 53, 11], vec![11i64, 43, 50, 11, 54, 14]), (vec![11, 41, 42, 50, 11], vec![11, 43, 51, 52, 53, 11, 54, 14])] {
+                let mut e = eng(true);
+                first_turn(&mut e, &p, &answer);
+                let rendered: Vec<i64> = p.iter().copied().chain(tail).collect();
+                let (r, d) = e.plan(&rendered);
+                assert_eq!((r, d.reuse), (None, Some((0, 31))), "{answer:?}");
+            }
+        }
+    }
+
+    /// B4 (iii): L = held: no rollback, the prefill starts at held, and the ids and logits that
+    /// follow are a fresh run's over the same ids
+    #[test]
+    fn a_prompt_that_extends_the_held_answer_continues_from_the_live_state() {
+        let p = p1();
+        let answer = [11, 12, 13, 14, 15, 16];
+        unsafe {
+            let mut e = eng(true);
+            first_turn(&mut e, &p, &answer);
+            let mut p2 = e.history().to_vec();
+            p2.extend([54, 17, 18, 19]);
+            let (r, d) = e.plan(&p2);
+            assert_eq!((r, d.l, d.reuse), (None, 37, Some((REUSE_LIVE, 37))));
+            let trims = e.rows().trims.clone();
+            e.continue_live().unwrap();
+            let mut warm = vec![e.prefill(&p2[37..]).unwrap()];
+            assert_eq!(e.rows().trims, trims, "nothing rolled back or trimmed");
+            assert_eq!(e.snapshot_pos(), Some(31), "the prompt snapshot at P stays until the next one");
+            let row = e.logits();
+            for _ in 1..8 {
+                warm.push(e.decode_step(*warm.last().unwrap()).unwrap());
+            }
+            let mut c = eng(false);
+            let mut cold = vec![c.prefill(&p2).unwrap()];
+            assert_eq!(row, c.logits());
+            for _ in 1..8 {
+                cold.push(c.decode_step(*cold.last().unwrap()).unwrap());
+            }
+            assert_eq!(warm, cold);
+        }
+    }
+
+    /// B4 (iv): L < held and the text differs after it: no realign, the rollback to P of before;
+    /// the control, the same split with the same text after it, is realigned
+    #[test]
+    fn a_rerender_with_other_text_rolls_back_as_before() {
+        let p = p1();
+        unsafe {
+            let mut e = eng(true);
+            first_turn(&mut e, &p, &[11, 41, 42, 11]);
+            let same: Vec<i64> = p.iter().copied().chain([11, 43, 11, 54, 14]).collect();
+            assert_eq!(e.plan(&same).1.reuse, Some((REUSE_LIVE, 35)), "control: the same text is realigned");
+            let rendered: Vec<i64> = p.iter().copied().chain([11, 43, 12, 54, 14]).collect();
+            let (r, d) = e.plan(&rendered);
+            assert_eq!((r, d.l, d.reuse), (None, 32, Some((0, 31))));
+            // a prompt that stops inside the held answer: also P
+            let mut short = p.clone();
+            short.extend([11, 41]);
+            assert_eq!(e.plan(&short).1.reuse, Some((0, 31)));
+        }
+    }
+
+    /// the live state is a candidate only with the switch on, the cache on and a held id; the
+    /// held conversation itself (no tail) and the prompt again stay the snapshot's (#100)
+    #[test]
+    fn the_live_state_is_a_candidate_only_when_on() {
+        let p = p1();
+        unsafe {
+            let mut e = eng(true);
+            assert_eq!(e.decide(&p).reuse, None, "nothing held");
+            first_turn(&mut e, &p, &[11, 12]);
+            let mut p2 = e.history().to_vec();
+            p2.push(13);
+            assert_eq!(e.decide(&p2).reuse, Some((REUSE_LIVE, 33)));
+            assert_eq!(e.decide(&p).reuse, Some((0, 31)), "#100: the prompt again is the snapshot's row");
+            assert_eq!(e.decide(&p2[..33]).reuse, Some((0, 31)), "the held conversation itself: no tail, no live reuse");
+            e.set_answer_reuse(false, None);
+            assert_eq!(e.decide(&p2).reuse, Some((0, 31)));
+            let mut off = Glm5Engine::new(FakeRows::new(256, 64, (10..40).collect()), false);
+            off.set_answer_reuse(true, Some(Arc::new(token_bytes())));
+            assert!(!off.answer_reuse(), "the cache off");
+        }
+    }
+
+    #[test]
+    fn the_switch_is_0_or_1() {
+        let get = |v: Option<&'static str>| move |_: &str| v.map(str::to_string);
+        assert_eq!(cache_switch(&get(None), ANSWER_REUSE_ENV), Ok(false));
+        assert_eq!(cache_switch(&get(Some("0")), ANSWER_REUSE_ENV), Ok(false));
+        assert_eq!(cache_switch(&get(Some("1")), ANSWER_REUSE_ENV), Ok(true));
+        assert!(cache_switch(&get(Some("yes")), ANSWER_REUSE_ENV).unwrap_err().contains("CROW_GLM_ANSWER_REUSE=yes"));
     }
 }
 
@@ -2131,5 +2581,83 @@ mod tests_215_gpu {
             }
             drop(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_219_gpu {
+    //! crow-nest #219 on the GPU: a LIVE continuation (`CROW_GLM_ANSWER_REUSE`) on a `Glm5Device`
+    //! of the synthetic 8-layer model of `tests_batch_gpu` (vocab 2048) against the cold prefill
+    //! of the same ids: the rows `decode_step` wrote are reused, so bits are not the criterion
+    //! (#219 Attribution, robin's rule); cosine >= 0.9999 and the same top-1 of the prompt-end
+    //! logits row are. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_answer_reuse_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::tests_batch_gpu::{device_sized, geo, EnvGuard};
+    use super::*;
+    use crate::glm5_flags::tests::synth_model;
+    use crate::glm5_tiers::TierSizes;
+    use crate::sample::argmax;
+
+    fn cos(a: &[f32], b: &[f32]) -> f64 {
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            ab += x as f64 * y as f64;
+            aa += x as f64 * x as f64;
+            bb += y as f64 * y as f64;
+        }
+        ab / (aa.sqrt() * bb.sqrt())
+    }
+
+    /// a 20-id prompt, 12 greedy ids fed, then a prompt that extends the held 32 by 6 ids: LIVE
+    /// against the cold prefill of the same 38 ids, at prompt chunk `chunk` (`CROW_CHUNK`)
+    fn live_vs_cold(chunk: &str) {
+        let g = geo();
+        let s = synth_model(&g, 9_474_048);
+        let _env = EnvGuard::set(&[("CROW_CHUNK", chunk)]);
+        let prompt: Vec<i64> = (0..20).map(|i| (i * 37 + 5) % 2048).collect();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut e = Glm5Engine::new(device_sized(&s.path, &g, 64, 1, TierSizes { vram: 3, pinned: 4 }), true);
+            e.set_answer_reuse(true, None);
+            let mut next = e.prefill(&prompt).unwrap();
+            e.snapshot(next);
+            for _ in 0..12 {
+                next = e.decode_step(next).unwrap();
+            }
+            let mut p2 = e.history().to_vec();
+            p2.extend([(next * 3 + 1) % 2048, 7, 99, 1500, 3, 42]);
+            assert_eq!(e.decide(&p2).reuse, Some((REUSE_LIVE, 32)));
+            e.continue_live().unwrap();
+            let mut w = vec![e.prefill(&p2[32..]).unwrap()];
+            let live = e.logits();
+            for _ in 1..8 {
+                w.push(e.decode_step(*w.last().unwrap()).unwrap());
+            }
+            e.reset();
+            let mut c = vec![e.prefill(&p2).unwrap()];
+            let cold = e.logits();
+            for _ in 1..8 {
+                c.push(e.decode_step(*c.last().unwrap()).unwrap());
+            }
+            let cs = cos(&live, &cold);
+            let bits = live.iter().zip(&cold).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let first = w.iter().zip(&c).position(|(a, b)| a != b);
+            eprintln!("glm5_answer_reuse chunk {chunk}: prompt-end row cosine {cs:.9}, {bits} of {} logits differ in bits, top-1 {} vs {}; greedy ids live {w:?} cold {c:?}, first differing index {first:?} (reported, not gated)", live.len(), argmax(&live), argmax(&cold));
+            assert!(cs >= 0.9999, "cosine {cs}");
+            assert_eq!(argmax(&live), argmax(&cold), "top-1");
+            drop(e);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_answer_reuse_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_answer_reuse_gpu_live_is_the_cold_prefill_row_by_row() {
+        live_vs_cold("1");
+    }
+
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_answer_reuse_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_answer_reuse_gpu_live_is_the_cold_prefill_in_prompt_calls() {
+        live_vs_cold("12");
     }
 }

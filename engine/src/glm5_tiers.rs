@@ -6580,6 +6580,8 @@ mod arena_gpu_tests {
                 ARENA_STAGE_LEND_ENV,
                 ARENA_PROMPT_COUNT_ENV,
                 KV_LAZY_ENV,
+                // crow-nest #219: read by serve's boot only; cleared here so no arm inherits it
+                crate::glm5_engine::ANSWER_REUSE_ENV,
             ];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {

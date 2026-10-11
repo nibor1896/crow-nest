@@ -56,6 +56,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_RT2_TABLE_SM",
     "CROW_GLM_ATTN2",
     "CROW_GLM_KV_LAZY",
+    "CROW_GLM_ANSWER_REUSE",
 ];
 
 pub(crate) struct Env(Vec<(String, Option<String>)>);
