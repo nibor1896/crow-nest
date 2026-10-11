@@ -6141,6 +6141,10 @@ impl<R: Rows> GlmSeq for Glm5Engine<R> {
 ///   into other ids is realigned to the held ids first (`[cache] realigned:`), and a prompt that
 ///   extends the whole held conversation continues from the live state (`[cache] LIVE`): no
 ///   rollback, only the new tail is prefilled
+/// - crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`): the anchor is a third reuse point (a new chat with
+///   the same head rolls back to it, `P` = the anchor); the prefill that writes the first
+///   `<|user|>` (or `L` of a cold prompt with `L` >= 1,024) takes the anchor there
+///   (`[cache] anchor at pos ...`)
 /// - `Err` is an engine failure (the engine reset itself)
 unsafe fn glm_prompt_phase<R: Rows>(eng: &mut Glm5Engine<R>, prompt: &[i64]) -> Result<GlmBegun, String> {
     let t_plan = Instant::now();
@@ -6155,6 +6159,7 @@ unsafe fn glm_prompt_phase<R: Rows>(eng: &mut Glm5Engine<R>, prompt: &[i64]) -> 
     let held = eng.history().len();
     let cache_on = eng.cache_enabled();
     let snaps = eng.snapshot_pos();
+    let anchor = eng.anchor_pos();
     let live = matches!(plan.reuse, Some((glm5_engine::REUSE_LIVE, _)));
     let t_reset = Instant::now();
     let cached_n = match plan.reuse {
@@ -6167,24 +6172,37 @@ unsafe fn glm_prompt_phase<R: Rows>(eng: &mut Glm5Engine<R>, prompt: &[i64]) -> 
             p
         }
         None => {
-            eng.reset();
+            // crow-nest #217: the anchor stays when the prompt starts with its ids
+            eng.reset_for(prompt);
             0
         }
     };
     let reset_ms = t_reset.elapsed().as_secs_f64() * 1e3;
     let prefilled = prompt.len() - cached_n;
     tracing::info!(target: "cache",
-        "[cache] {} L {} (held {held}), P {cached_n}, snapshots [{snaps:?}], prefill {prefilled} of {} tok, reset {reset_ms:.3} ms (glm5_next: {}){}",
+        "[cache] {} L {} (held {held}), P {cached_n}, snapshots [{snaps:?}]{}, prefill {prefilled} of {} tok, reset {reset_ms:.3} ms (glm5_next: {}){}",
         if live { "LIVE" } else if plan.reuse.is_some() { "WARM" } else { "COLD" },
         if cache_on { plan.l.to_string() } else { "n/a".to_string() },
+        if eng.prefix_anchor() { format!(", anchor {anchor:?}{}", if matches!(plan.reuse, Some((glm5_engine::REUSE_ANCHOR, _))) { " (P)" } else { "" }) } else { String::new() },
         prompt.len(),
         if live { "the live state continues, nothing restored" } else { "KDA states restored, MLA/DSA rows truncated" },
         if eng.slots() > 1 { format!(", sequence slot {} of {}", eng.slot(), eng.slots()) } else { String::new() }
     );
+    let at = eng.anchor_point(prompt, &plan);
     let t_pre = Instant::now();
     let next = if prefilled == 0 {
         // #100: the whole prompt is held: the snapshot's row and greedy id stand in
         eng.restore_logits()
+    } else if let Some(b) = at {
+        let (id, took) = eng.prefill_anchored(&prompt[cached_n..], b)?;
+        match took {
+            Some(ms) => tracing::info!(target: "cache",
+                "[cache] anchor at pos {b} ({}), {} B in HOST RAM, captured inside the prefill (KDA scan cut there), anchored prefill {ms:.3} ms",
+                if b == plan.l && plan.reuse.is_none() { "L of a cold prompt" } else { "the first <|user|>" },
+                eng.anchor_bytes()),
+            None => tracing::warn!(target: "cache", "[cache] anchor at pos {b} skipped: no VRAM for the device copy of the KDA states ({} B); no anchor held", eng.anchor_bytes()),
+        }
+        id
     } else {
         eng.prefill(&prompt[cached_n..])?
     } as usize;
@@ -6492,6 +6510,24 @@ fn glm_answer_reuse_line<R: Rows>(eng: &Glm5Engine<R>) -> String {
     }
 }
 
+/// crow-nest #217: the boot line of `CROW_GLM_PREFIX_ANCHOR`
+fn glm_prefix_anchor_line<R: Rows>(eng: &Glm5Engine<R>) -> String {
+    let k = glm5_engine::PREFIX_ANCHOR_ENV;
+    if eng.prefix_anchor() {
+        format!(
+            "{k}=1 (#217): + 1 anchor snapshot per sequence slot, {} B in HOST RAM (KDA states, no logits row), at the first <|user|> or at L of a cold prompt with L >= {}, captured inside the prefill by cutting the KDA scan (device copy from the prompt's elastic hand-back, freed after the prompt)",
+            eng.anchor_bytes(),
+            glm5_engine::ANCHOR_MIN
+        )
+    } else if !eng.cache_enabled() {
+        format!("{k}: off (the prefix cache is off)")
+    } else if eng.rows().mtp_drafts() > 0 {
+        format!("{k}: off while CROW_GLM_MTP > 0 (the spec head-norm row exists only at the prompt's end, #217)")
+    } else {
+        format!("{k}: off (default; a new chat with the same tools and system prompt starts cold)")
+    }
+}
+
 /// - #185 part 2: boot and serve a glm5_next container; never returns (the process exits
 ///   through the same drops and the `ctx_hard_reset` the `Engine` path ends with)
 /// - the boot: `boot::open_glm5` (the container checked, the context, the CUDA context), then
@@ -6520,14 +6556,17 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
     let env = |k: &str| std::env::var(k).ok();
     // crow-nest #219: CROW_GLM_ANSWER_REUSE, refused by name before the engine takes the device
     let answer_reuse = glm5_engine::cache_switch(&env, glm5_engine::ANSWER_REUSE_ENV);
+    // crow-nest #217: CROW_GLM_PREFIX_ANCHOR, the same rule
+    let prefix_anchor = glm5_engine::cache_switch(&env, glm5_engine::PREFIX_ANCHOR_ENV);
     let mut eng = Glm5Engine::new(dev, cache_on);
-    let answer_reuse = match answer_reuse {
-        Ok(on) => on,
-        Err(why) => {
+    let (answer_reuse, prefix_anchor) = match (answer_reuse, prefix_anchor) {
+        (Ok(a), Ok(p)) => (a, p),
+        (Err(why), _) | (_, Err(why)) => {
             drop(eng);
-            die(&format!("[boot] refused: {why} (#219) - refusing to boot"));
+            die(&format!("[boot] refused: {why} (#219, #217) - refusing to boot"));
         }
     };
+    eng.set_prefix_anchor(prefix_anchor);
     if answer_reuse {
         // (B) walks the vocabulary's bytes; without the tokenizer (A) runs alone
         let tb = match crow_nest_engine::tokenizer::global() {
@@ -6552,11 +6591,13 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
     tracing::info!(target: "serve", "[serve] n_ctx {}", eng.n_ctx());
     tracing::info!(target: "serve", "[serve] prompt_chunk {GLM_PROMPT_CHUNK} (glm5_next prefills one row at a time; the chunked prefill is #186)");
     tracing::info!(target: "serve",
-        "[serve] prefix cache {}, {} B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt",
+        "[serve] prefix cache {}, {} B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt{}",
         if eng.cache_enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
-        eng.snapshot_bytes()
+        eng.snapshot_bytes(),
+        if eng.prefix_anchor() { format!(" + 1 anchor of {} B (CROW_GLM_PREFIX_ANCHOR, #217)", eng.anchor_bytes()) } else { String::new() }
     );
     tracing::info!(target: "serve", "[serve] {}", glm_answer_reuse_line(&eng));
+    tracing::info!(target: "serve", "[serve] {}", glm_prefix_anchor_line(&eng));
     tracing::info!(target: "serve",
         "[serve] glm5_next: device sampler {} (#215), MTP {} (#192), no vision tower, no slot files, no VRAM lending (#185)",
         match eng.rows().dev_sampler_refusal() {
@@ -11992,11 +12033,15 @@ Red is #FF0000."), "{off}");
     /// answer re-rendered canonically, and the new tail (`<|observation|>` + the tool result).
     /// t1's first answer drew ' fisher' + 'men' at answer offset 574, where the re-render has
     /// ' fishermen' (one id fewer); t2's first drew 'X' 'LC' 'DM' at offset 6,669, where the
-    /// re-render has 'XL' 'CD' 'M'. t2's first prompt shares 6,043 ids with the held t1.
+    /// re-render has 'XL' 'CD' 'M'. t2's first prompt shares 6,043 ids with the held t1: Crow's
+    /// system message names the chat's working area (`%LOCALAPPDATA%\crow\session\` t1 and t2
+    /// differ from char 363 on), so both first `<|user|>` (154827, at 6,100 and 6,099 here) sit
+    /// above that branch point (#217).
     fn g5_session() -> Vec<G5Req> {
         let tail = |seed: u64, n: usize| -> Vec<i64> { std::iter::once(54).chain(g5_text(seed, n - 1)).collect() };
         let cat = |parts: &[&[i64]]| -> Vec<i64> { parts.concat() };
-        let t1p = g5_text(1, 6438);
+        let mut t1p = g5_text(1, 6438);
+        t1p[6100] = glm5_engine::USER_ID;
         let mut a1 = g5_text(2, 2187);
         a1[574..576].copy_from_slice(&[41, 42]);
         let r1 = cat(&[&a1[..574], &[43], &a1[576..]]);
@@ -12005,6 +12050,7 @@ Red is #FF0000."), "{off}");
         let mut t2p = t1p[..6043].to_vec();
         t2p.push(10 + (t1p[6043] - 10 + 1) % 30);
         t2p.extend(g5_text(7, 6456 - 6044));
+        t2p[6099] = glm5_engine::USER_ID;
         let mut a4 = g5_text(8, 7545);
         a4[6669..6672].copy_from_slice(&[60, 61, 62]);
         let mut r4 = a4.clone();
@@ -12088,6 +12134,47 @@ Red is #FF0000."), "{off}");
             assert_eq!(realigned, [false, true, true, false, true, true, true, true, true], "every later round of a chat with a non-canonical split re-syncs it");
             // t2's second request: the 7,545 answer rows held, 65 prefilled (G5: 7,610)
             assert_eq!((rows[4].1, rows[4].0), (14_001, 65));
+        }
+    }
+
+    /// the first request of a third chat t3 (`CROW_GLM_PREFIX_ANCHOR`, #217): its working-area
+    /// line parts from t1 and t2 at the same id, 6,043, its first `<|user|>` at 6,095; 6,450 ids
+    fn g5_t3() -> Vec<i64> {
+        let t1p = g5_text(1, 6438);
+        let mut t3 = t1p[..6043].to_vec();
+        t3.push(10 + (t1p[6043] - 10 + 2) % 30);
+        t3.extend(g5_text(19, 6450 - 6044));
+        t3[6095] = glm5_engine::USER_ID;
+        t3
+    }
+
+    /// crow-nest #217 on the G5 session's shape (host twin): with `CROW_GLM_PREFIX_ANCHOR=1`, t1's
+    /// first request anchors at its first `<|user|>` (6,100); t2's first request shares only 6,043
+    /// ids (the working-area line), so it stays cold (6,456 rows, as measured) and anchors at that
+    /// L; a third chat t3 rolls back to the anchor and prefills 407 of 6,450 rows instead of all.
+    /// With `CROW_GLM_ANSWER_REUSE=1` too, the tool rounds are #219's and the anchor survives them.
+    #[test]
+    fn glm_g5_new_chats_roll_back_to_the_anchor() {
+        unsafe {
+            for answer_reuse in [false, true] {
+                let mut e = g5_engine();
+                e.set_prefix_anchor(true);
+                if answer_reuse {
+                    e.set_answer_reuse(true, Some(std::sync::Arc::new(crow_nest_engine::glm5_engine::fake::token_bytes())));
+                }
+                let mut rows = g5_replay(&mut e);
+                assert_eq!(e.anchor_pos(), Some(6043), "t2's first request anchored at its L");
+                let b = glm_prompt_phase(&mut e, &g5_t3()).unwrap();
+                rows.push((b.prefilled, b.cached_n, b.realigned.is_some()));
+                let f: Vec<usize> = rows.iter().map(|r| r.0).collect();
+                let want: &[usize] = if answer_reuse { &[6438, 157, 70, 6456, 65, 158, 206, 491, 38, 407] } else { &[6438, 2343, 86, 6456, 7610, 920, 1763, 608, 124, 407] };
+                assert_eq!(f, want, "answer reuse {answer_reuse}");
+                assert_eq!(rows[9].1, 6043, "t3 from the anchor");
+            }
+            let mut off = g5_engine();
+            let mut rows = g5_replay(&mut off);
+            rows.push((glm_prompt_phase(&mut off, &g5_t3()).unwrap().prefilled, 0, false));
+            assert_eq!(rows[9].0, 6450, "off: t3 is cold");
         }
     }
 

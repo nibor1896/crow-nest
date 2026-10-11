@@ -6580,8 +6580,9 @@ mod arena_gpu_tests {
                 ARENA_STAGE_LEND_ENV,
                 ARENA_PROMPT_COUNT_ENV,
                 KV_LAZY_ENV,
-                // crow-nest #219: read by serve's boot only; cleared here so no arm inherits it
+                // crow-nest #219 / #217: read by serve's boot only; cleared here so no arm inherits them
                 crate::glm5_engine::ANSWER_REUSE_ENV,
+                crate::glm5_engine::PREFIX_ANCHOR_ENV,
             ];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {
@@ -10208,6 +10209,19 @@ pub struct Glm5Run {
     /// boot) and whether it is armed: armed, every head draws into `next` behind its argmax
     dsamp: Option<crate::gen::DevSampler>,
     dsamp_on: bool,
+    /// crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`): the anchor the running prompt phase captures
+    /// ([`Glm5Run::prefill_anchored`]); `None` outside it
+    anchor: Option<AnchorCut>,
+}
+
+/// crow-nest #217: the prefix anchor of one prompt phase: the position whose KDA states are
+/// copied (the state after rows `0 .. pos`), the device copy of every KDA layer's state there
+/// (`dev`, the layout of the host copy; 0 = none: row by row or no VRAM), and the host copy
+struct AnchorCut {
+    pos: usize,
+    dev: Dev,
+    host: Vec<f32>,
+    done: bool,
 }
 
 /// #214 `CROW_GLM_KV_LAZY`: what the run mapped and released, cumulative since load
@@ -10379,6 +10393,7 @@ impl Glm5Run {
             kv_stats: KvLazyStats::default(),
             dsamp: None,
             dsamp_on: false,
+            anchor: None,
         };
         let sw = Switches::from_env();
         if sw != Switches::default() {
@@ -12330,6 +12345,63 @@ impl Glm5Run {
         self.prefill_with(cnq, tiers, ids, pos0, report, &mut |_, _, _, _| Ok(()))
     }
 
+    /// crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`): [`Glm5Run::prefill`], and the KDA state of every
+    /// KDA layer after the first `cut` rows (0 < `cut` < `ids.len()`) copied into `anchor` (the
+    /// layout of a prefix snapshot: per KDA layer S, then the conv window). No extra prompt call:
+    /// the call that holds row `cut` cuts each KDA layer's scan there and copies the state D2D
+    /// into a device buffer taken from the elastic arena with the prompt's scratch, one DtoH after
+    /// the prompt (prompt chunk 1: a DtoH after the row). `Some(ms)` = captured, the wall of the
+    /// whole anchored prefill; `None` = no VRAM for the device copy, the rows are prefilled all
+    /// the same. Not with MTP (the spec head-norm row exists only at the prompt's end).
+    ///
+    /// # Safety
+    /// As [`Glm5Run::prefill`]; `anchor` holds at least the KDA states' floats.
+    pub unsafe fn prefill_anchored(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, ids: &[i64], pos0: usize, cut: usize, anchor: &mut [f32]) -> Result<(i64, Option<f64>), String> {
+        if cut == 0 || cut >= ids.len() {
+            return Err(format!("glm5_run: an anchor after {cut} of {} prompt rows", ids.len()));
+        }
+        if self.mtp_drafts() > 0 {
+            return Err("glm5_run: no prefix anchor with CROW_GLM_MTP (#217)".to_string());
+        }
+        let need = (self.kda_state_bytes() / 4) as usize;
+        if anchor.len() < need {
+            return Err(format!("glm5_run: an anchor of {} floats, the KDA states take {need}", anchor.len()));
+        }
+        self.anchor = Some(AnchorCut { pos: pos0 + cut, dev: 0, host: vec![0.0; need], done: false });
+        let t = std::time::Instant::now();
+        let r = self.prefill(cnq, tiers, ids, pos0, &mut |_| {});
+        let a = self.anchor.take().expect("set above");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let id = r?;
+        if !a.done {
+            return Ok((id, None));
+        }
+        anchor[..need].copy_from_slice(&a.host);
+        Ok((id, Some(ms)))
+    }
+
+    /// crow-nest #217: the device bytes of every KDA layer's state (S + conv window)
+    pub fn kda_state_bytes(&self) -> u64 {
+        self.kda_states().map(|k| k.bytes()).sum()
+    }
+
+    /// crow-nest #217: every KDA layer's state into `into` (per layer S, then the conv window;
+    /// synchronizes)
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn kda_states_to_host(&self, into: &mut [f32]) {
+        let kd = crate::glm5_kda::KdaDims::of(&self.g);
+        cuda::sync();
+        let mut at = 0;
+        for k in self.kda_states() {
+            for (src, n) in [(k.s, kd.state_floats()), (k.conv, kd.conv_floats())] {
+                cuda::ck(cudarc::driver::sys::cuMemcpyDtoH_v2(into[at..at + n].as_mut_ptr() as *mut std::ffi::c_void, src, n * 4));
+                at += n;
+            }
+        }
+    }
+
     /// [`Glm5Run::prefill`], and after every prompt call (prompt chunk 1: every row) `rows`
     /// sees the run, the container and the call's rows `(r0, t)` (indices into `ids`): their
     /// final residuals are the first `t` rows of the residual `x` (`[t][streams][H]`), queued,
@@ -12351,6 +12423,13 @@ impl Glm5Run {
                 let t0 = std::time::Instant::now();
                 let base = RowBase::of(tiers);
                 last = self.row(cnq, tiers, tok, pos0 + i, i + 1 == n)?;
+                // crow-nest #217: the anchor's states after its row, straight to the host
+                if self.anchor.as_ref().is_some_and(|a| a.pos == pos0 + i + 1) {
+                    let mut a = self.anchor.take().expect("checked");
+                    self.kda_states_to_host(&mut a.host);
+                    a.done = true;
+                    self.anchor = Some(a);
+                }
                 rows(self, cnq, i, 1)?;
                 report(&base.report(tiers, pos0 + i, true, last, t0));
             }
@@ -12366,19 +12445,36 @@ impl Glm5Run {
         // #214 CROW_GLM_KV_LAZY: the prompt's cache rows not mapped yet are handed back with the
         // scratch (0 when off or mapped)
         let kv = self.kv_grow_bytes(pos0 + n);
-        tiers.stage_plan_prompt(self.borrow_bytes(borrow_t) + kv);
+        // crow-nest #217: the anchor's device copy is handed back with the scratch and freed
+        // after the prompt (never held between requests)
+        let anchor_bytes = self.anchor.as_ref().filter(|a| a.pos > pos0 && a.pos < pos0 + n).map_or(0, |_| self.kda_state_bytes());
+        tiers.stage_plan_prompt(self.borrow_bytes(borrow_t) + kv + anchor_bytes);
         if borrow_t > 0 {
-            self.borrow_scratch(tiers, borrow_t, kv)?;
-        } else if kv > 0 {
-            tiers.elastic_hand_back(kv)?;
+            self.borrow_scratch(tiers, borrow_t, kv + anchor_bytes)?;
+        } else if kv + anchor_bytes > 0 {
+            tiers.elastic_hand_back(kv + anchor_bytes)?;
         }
         if kv > 0 {
             self.kv_stats.hand_back_bytes += kv;
+        }
+        if anchor_bytes > 0 {
+            // no VRAM for the copy: the anchor is skipped, the prompt runs as without it
+            if let (Some(a), Ok(d)) = (self.anchor.as_mut(), cuda::try_alloc_zeroed("glm5 prefix anchor (KDA states, #217)", anchor_bytes as usize)) {
+                a.dev = d;
+            }
         }
         let r = match self.kv_map_to(pos0 + n) {
             Ok(()) => self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows),
             Err(e) => Err(e),
         };
+        if let Some(a) = self.anchor.as_mut().filter(|a| a.dev != 0) {
+            if r.is_ok() {
+                cuda::sync();
+                cuda::ck(cudarc::driver::sys::cuMemcpyDtoH_v2(a.host.as_mut_ptr() as *mut std::ffi::c_void, a.dev, anchor_bytes as usize));
+                a.done = true;
+            }
+            cuda::free_dev(&mut a.dev);
+        }
         if borrow_t > 0 {
             self.return_scratch();
         }
@@ -12497,7 +12593,20 @@ impl Glm5Run {
     /// # Safety
     /// A CUDA context is current; `tiers` belongs to this model; `t <= max_t`.
     unsafe fn layers_chunk(&mut self, tiers: &mut ExpertTiers, pos0: usize, t: usize) -> Result<(), String> {
+        // crow-nest #217: the call that holds the anchor's row cuts every KDA layer's scan there
+        let cut = self.anchor.as_ref().filter(|a| a.dev != 0 && a.pos > pos0 && a.pos <= pos0 + t).map(|a| (a.pos - pos0, a.dev));
+        let kd = crate::glm5_kda::KdaDims::of(&self.g);
+        let mut k = 0u64;
         for l in 0..self.g.layers {
+            let kda_layer = self.kda[l].is_some();
+            self.pass.kda_cut = match cut {
+                Some((r, dev)) if kda_layer => {
+                    let at = dev + k * ((kd.state_floats() + kd.conv_floats()) * 4) as u64;
+                    Some((r, at, at + (kd.state_floats() * 4) as u64))
+                }
+                _ => None,
+            };
+            k += kda_layer as u64;
             if let Some(s) = self.kda[l].as_mut() {
                 self.pass.swap_kda_state(s);
             }
@@ -12508,6 +12617,7 @@ impl Glm5Run {
             let picks = t * self.moe.topk;
             let mut hook = |layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>| tiers.tables_for_prompt(layer, sel, picks, run);
             let r = self.pass.call_with_expert_batches(&self.layers[l], self.x, pos0, t, &mut hook);
+            self.pass.kda_cut = None;
             // the layer's own state goes back even when the call failed
             if let Some(s) = self.kda[l].as_mut() {
                 self.pass.swap_kda_state(s);
