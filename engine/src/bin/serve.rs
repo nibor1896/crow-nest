@@ -621,6 +621,7 @@ use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::glm5_engine::{self, Glm5Device, Glm5Engine, Rows};
 use crow_nest_engine::glm5_template;
+use crow_nest_engine::glm5_tiers::CopyCounts;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, resolve_default, Family, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
 use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, MAX_TOP_LOGPROBS};
@@ -2907,11 +2908,17 @@ fn next_delta(full: &str, emitted: usize) -> Option<&str> {
     Some(&full[emitted..])
 }
 
-/// #67: `<think>`, the tag the model opens a reasoning block with. Ordinary TEXT, not an
-/// added token, so it arrives split across decode steps like any other markup.
+/// - #67: `<think>`, the tag the model opens a reasoning block with.
+/// - The Qwen path (`chat_generate`) matches it as TEXT, so it arrives split across decode
+///   steps like any other markup.
+/// - #221: on GLM-5.3-Flash it is an ADDED token as well; the filter still opens on the text.
 const THINK_OPEN: &str = "<think>";
-/// #67: `</think>`. The prompt already carries a CLOSED empty block (`enable_thinking` is
-/// false, `tokenizer.rs:18-19`), so every one of these in the generation is a stray.
+/// - #67: `</think>`. The prompt already carries a CLOSED empty block (`enable_thinking` is
+///   false, `tokenizer.rs:18-19`), so every one of these in the generation is a stray.
+/// - The Qwen path matches it as TEXT, wherever it came from.
+/// - #221: on GLM-5.3-Flash it is the added token 154842 (`glm_realign_walks_glms_own_vocabulary`),
+///   and the same text out of ordinary tokens (`</` `think` `>`) is a QUOTE: the glm5_next loop
+///   closes the block on the id (`ThinkFilter::closing_on_id`), as vLLM's reasoning parser does.
 const THINK_CLOSE: &str = "</think>";
 
 /// #67: what one fed piece splits into - `delta.content` and `delta.reasoning_content`
@@ -2956,6 +2963,23 @@ enum Think {
 ///   completes leaves as content at `flush()`, so no byte is ever lost.
 /// - `<` that opens no candidate is emitted immediately; only a real prefix is held.
 /// - pure: no engine, no socket, so the tests drive it at every split point directly.
+///
+/// - #221: the CLOSE-BY-ID mode (`closing_on_id(true)`), the glm5_next loop's alone; every
+///   other user keeps the table above byte for byte (the mode is off by default).
+/// - Why: on GLM `</think>` is the added id 154842, and a model reasoning about a text that
+///   contains `</think>` writes it as ordinary tokens - closing on that TEXT leaked the rest
+///   of the reasoning into `content`. vLLM ends reasoning on the id, never on the text.
+/// - `Inside`, no close pending: NO candidate - every byte is reasoning, a literal `</think>`
+///   included, and nothing is held back as a partial tag.
+/// - the loop sees the id (`close_id_seen`, block open): the close is PENDING, `is_inside()`
+///   unchanged; `</think>` is the candidate in `Inside` again and its complete match is the
+///   `take_tag` of the table. No partial is held while pending either: the id's whole text
+///   arrives in the same step (`ToolStream` releases a `</think>` whole), and a split it did
+///   not resolve stays reasoning, in order.
+/// - `end_step` after that step's text: a close still pending (the id rendered no text, a
+///   tokenizer where it is special) is taken there, so the block closes on the id in every
+///   case and no pending flag outlives its step to make a later quote close the block.
+/// - `Lead` and `Body` are the table's, unchanged: a stray `</think>` text in `Body` is dropped.
 #[derive(Debug, Clone, Default)]
 struct ThinkFilter {
     /// the state above; `Lead` at the first byte of every generation
@@ -2968,6 +2992,12 @@ struct ThinkFilter {
     drop_lead: bool,
     /// how many tags were stripped, for the one `[chat]` line
     stripped: usize,
+    /// #221: `Inside` closes on the `</think>` ID (the loop's `close_id_seen`), not on its text
+    close_by_id: bool,
+    /// #221: the id came in THIS step; its text (or `end_step`) closes the block
+    close_pending: bool,
+    /// #221: a block closed on the id, for the one `[chat]` line
+    closed_on_id: bool,
 }
 
 impl ThinkFilter {
@@ -2996,6 +3026,41 @@ impl ThinkFilter {
         }
     }
 
+    /// #221: the close-by-id mode of the doc above, for the glm5_next loop; off by default
+    fn closing_on_id(mut self, on: bool) -> Self {
+        self.close_by_id = on;
+        self
+    }
+
+    /// - #221: the loop generated the `</think>` id while the block is open: the close is
+    ///   PENDING until this step's text matches the tag, or `end_step` takes it.
+    /// - `is_inside()` does not change here, so `admit_id` still sees this id as the
+    ///   block's last one, as it does on the text path.
+    /// - ignored outside the mode and outside the block (the loop guards it the same way).
+    fn close_id_seen(&mut self) {
+        if self.close_by_id && self.state == Think::Inside {
+            self.close_pending = true;
+        }
+    }
+
+    /// - #221: the step's text has been fed. A close still pending rendered no text (the
+    ///   id is special and `decode` skipped it), so the id closes the block here.
+    /// - nothing pending: a no-op, so every other path and step is untouched.
+    fn end_step(&mut self) {
+        if self.close_pending {
+            self.close_pending = false;
+            if self.state == Think::Inside {
+                self.closed_on_id = true;
+                self.take_tag(THINK_CLOSE);
+            }
+        }
+    }
+
+    /// #221: a block closed on the `</think>` id, for the one `[chat]` line
+    fn closed_on_id(&self) -> bool {
+        self.closed_on_id
+    }
+
     /// #81: is the block still open? The budget counter asks this of every generated
     /// token AFTER the filter has seen its text, so a token that closes the block itself
     /// is the model's own close and never a counted reasoning token.
@@ -3012,8 +3077,15 @@ impl ThinkFilter {
     fn candidates(&self) -> &'static [&'static str] {
         match self.state {
             Think::Lead => &[THINK_OPEN, THINK_CLOSE],
+            // #221: by id, the text closes the block only in the step of the id
+            Think::Inside if self.close_by_id && !self.close_pending => &[],
             Think::Inside | Think::Body => &[THINK_CLOSE],
         }
+    }
+
+    /// #221: a partial tag is held back, except in a by-id block, where nothing is
+    fn holds_partial(&self) -> bool {
+        !(self.close_by_id && self.state == Think::Inside)
     }
 
     /// one decoded piece in, its content and reasoning halves out
@@ -3038,11 +3110,16 @@ impl ThinkFilter {
                     }
                 }
                 if let Some(tag) = hit {
+                    if self.close_pending && self.state == Think::Inside {
+                        // #221: the text of the `</think>` id of this step
+                        self.close_pending = false;
+                        self.closed_on_id = true;
+                    }
                     self.take_tag(tag);
                     i += tag.len();
                     continue;
                 }
-                if partial {
+                if partial && self.holds_partial() {
                     // the piece ends inside a candidate tag: hold it, the next one decides
                     self.held.push_str(rest);
                     return out;
@@ -5218,9 +5295,7 @@ fn chat_generate(
         repeat_run: rep.repeat_run,
         single_token: rep.single_token,
     });
-    // #13: the full id list of every answer is DEBUG now (`CROW_LOG=info,chat=debug`).
-    // At INFO it made a redirected stderr and the log file grow with every answer.
-    tracing::debug!(target: "chat", "[chat] ids {out:?}");
+    log_answer_ids(&out);
     // #VIT: the image request is done — back to the load-time rope tables.
     // The next request re-arms them from its own plan. The dump gains the
     // generated ids, so the oracle can compare its own greedy continuation.
@@ -5463,6 +5538,15 @@ impl RepeatRing {
         self.seen.push_back(h);
         RepeatStats { repeat_of, repeat_run, single_token, single_run: self.single_run }
     }
+}
+
+/// #223: the generated ids of an answer, ONE `[chat] ids` line at INFO after the answer,
+/// written by both generation loops (`chat_generate`, `glm_generate_on`). One line per request,
+/// never per token. #13 had moved it to DEBUG for log growth; it is INFO again (robin, 2026-10-11)
+/// because #219 (non-canonical splits) and #221 (which token closed a think block) had to be
+/// reconstructed offline without it. The prompt ids stay DEBUG (`CROW_LOG=info,chat=debug`).
+fn log_answer_ids(out: &[u32]) {
+    tracing::info!(target: "chat", "[chat] ids {out:?}");
 }
 
 /// #68: true when the answer is exactly one generated id AND the model ended it itself.
@@ -6005,6 +6089,28 @@ struct GlmSrv<'a, R: Rows> {
     book: std::sync::Mutex<GlmBook>,
 }
 
+/// #30 A8 for glm5_next: the `[chat] counters` line. The cumulative figures since boot (never
+/// reset): expert accesses per tier, NVMe bytes, #222 the H2D and D2H record copy bytes and the
+/// `CROW_GLM_TIERS=unified` refusals; then this request's pinned hit rate (pinned-served share of
+/// its expert accesses) and D2H bytes, the difference to what the previous request left (`prev`,
+/// `prev_copies`). The leading `expert accesses ... NVMe bytes N` text is unchanged (#215 harness).
+fn glm_counters_line(acc: [u64; 3], nvme_bytes: u64, c: CopyCounts, prev: [u64; 3], pc: CopyCounts, layers: usize, ms: f64) -> String {
+    let d: Vec<u64> = (0..3).map(|i| acc[i].saturating_sub(prev[i])).collect();
+    let n = d[0] + d[1] + d[2];
+    let hit = if n == 0 { 0.0 } else { 100.0 * d[1] as f64 / n as f64 };
+    format!(
+        "[chat] counters (cumulative, never reset): expert accesses vram {} pinned {} nvme {}, NVMe bytes {nvme_bytes}, H2D bytes {}, D2H bytes {}, unified pinned refused {} write-backs filtered {}, layers {layers}, counter read {ms:.3} ms; this request: pinned hit {hit:.1} % of {n} expert accesses, D2H bytes {}",
+        acc[0],
+        acc[1],
+        acc[2],
+        c.h2d_bytes,
+        c.d2h_bytes,
+        c.pin_refused,
+        c.wb_filtered,
+        c.d2h_bytes.saturating_sub(pc.d2h_bytes)
+    )
+}
+
 /// - #185 part 2: what the requests of a glm5_next process share; `CROW_GLM_MAX_BATCH`: they
 ///   run on threads of their own, so the book sits behind a lock taken at the start and the end
 ///   of a request only
@@ -6014,20 +6120,22 @@ struct GlmBook {
     /// #13: the cumulative `[vram, pinned, nvme]` expert accesses and NVMe bytes the previous
     /// request left, so the routing line of one request is a difference
     prev_counters: ([u64; 3], u64),
+    /// #222: the cumulative record copies the previous request left (the request's D2H bytes)
+    prev_copies: CopyCounts,
     /// #68: the cross-turn repeat counter's ring
     repeats: RepeatRing,
 }
 
 impl GlmBook {
-    fn new(prev_counters: ([u64; 3], u64)) -> GlmBook {
-        GlmBook { seq: 0, prev_counters, repeats: RepeatRing::default() }
+    fn new(prev_counters: ([u64; 3], u64), prev_copies: CopyCounts) -> GlmBook {
+        GlmBook { seq: 0, prev_counters, prev_copies, repeats: RepeatRing::default() }
     }
 }
 
 impl<'a, R: Rows> GlmSrv<'a, R> {
     fn new(eng: &'a mut Glm5Engine<R>, model_path: &'a str) -> Self {
         let n_ctx = eng.n_ctx();
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let markup = ServeEngine::markup(&*eng);
         GlmSrv { eng, markup, model_path, n_ctx, stream_head_sent: false, book }
     }
@@ -6061,6 +6169,8 @@ trait GlmSeq {
     unsafe fn decode_step(&mut self, id: i64) -> Result<i64, String>;
     /// the cumulative expert tier counters and NVMe bytes since boot
     fn counters(&mut self) -> ([u64; 3], u64);
+    /// #222: the cumulative expert record copies (H2D, D2H) and unified-tier refusals since boot
+    fn copy_counts(&mut self) -> CopyCounts;
     /// decoder layers (`crow_layers`)
     fn layers(&self) -> usize;
     /// crow-nest #215: why this sequence's sampled ids cannot be drawn by the device sampler
@@ -6115,6 +6225,9 @@ impl<R: Rows> GlmSeq for Glm5Engine<R> {
     }
     fn counters(&mut self) -> ([u64; 3], u64) {
         Glm5Engine::counters(self)
+    }
+    fn copy_counts(&mut self) -> CopyCounts {
+        Glm5Engine::copy_counts(self)
     }
     fn layers(&self) -> usize {
         Glm5Engine::layers(self)
@@ -6248,6 +6361,8 @@ enum GlmCmd {
     /// batched step that carried it
     Decode { slot: usize, id: i64, reply: std::sync::mpsc::Sender<Result<i64, GlmFail>> },
     Counters { reply: std::sync::mpsc::Sender<([u64; 3], u64)> },
+    /// #222: the record copies and unified-tier refusals ([`CopyCounts`])
+    Copies { reply: std::sync::mpsc::Sender<CopyCounts> },
     /// `/slots`: the furthest prompt snapshot of any slot
     SnapPos { reply: std::sync::mpsc::Sender<Option<usize>> },
     /// the request is done with its slot (its ids and snapshot stay for the next prompt)
@@ -6327,6 +6442,9 @@ impl GlmSeq for GlmSlotSeq {
     }
     fn counters(&mut self) -> ([u64; 3], u64) {
         self.ask(|reply| GlmCmd::Counters { reply }).unwrap_or_default()
+    }
+    fn copy_counts(&mut self) -> CopyCounts {
+        self.ask(|reply| GlmCmd::Copies { reply }).unwrap_or_default()
     }
     fn layers(&self) -> usize {
         self.layers
@@ -6421,6 +6539,9 @@ fn glm_schedule<R: Rows>(eng: &mut Glm5Engine<R>, rx: std::sync::mpsc::Receiver<
                 }
                 GlmCmd::Counters { reply } => {
                     let _ = reply.send(eng.counters());
+                }
+                GlmCmd::Copies { reply } => {
+                    let _ = reply.send(eng.copy_counts());
                 }
                 GlmCmd::SnapPos { reply } => {
                     let _ = reply.send((0..n).filter_map(|s| eng.snapshot_pos_of(s)).max());
@@ -6754,7 +6875,7 @@ fn glm_batch_serve<R: Rows>(listener: TcpListener, eng: &mut Glm5Engine<R>, mode
         vocab: eng.vocab(),
         layers: eng.layers(),
         markup: ServeEngine::markup(&*eng),
-        book: std::sync::Mutex::new(GlmBook::new(eng.counters())),
+        book: std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts())),
     });
     {
         let tx = tx.clone();
@@ -7117,7 +7238,10 @@ fn glm_generate_on(
 
     let mut ts = tool_stream(req);
     let tool_open = tk.token_id(TOOL_OPEN);
-    let mut think = ThinkFilter::for_request(req.enable_thinking);
+    // crow-nest #221: `</think>` is the added id 154842 here; the block closes on that id, and
+    // the same text out of ordinary tokens is reasoning (a quote), as in vLLM
+    let think_close_id = tk.token_id(THINK_CLOSE).filter(|&id| tk.is_added(id));
+    let mut think = ThinkFilter::for_request(req.enable_thinking).closing_on_id(think_close_id.is_some());
     let mut stops = StopStrings::new(&req.stop);
     let mut counts = Chunks::default();
     let cx = ChunkCtx::new(&id, created, &model);
@@ -7194,6 +7318,11 @@ fn glm_generate_on(
                 break;
             }
             out.push(next as u32);
+            // crow-nest #221: the model's own close (or #81's injected one, or a forced id):
+            // pending until this step's text, `is_inside()` unchanged for `admit_id` below
+            if Some(next as u32) == think_close_id && think.is_inside() {
+                think.close_id_seen();
+            }
             let phase = gate.as_ref().map_or("idle", |g| g.phase());
             if !admit_id(next as u32, tool_open, &think, &mut ts, gate.as_mut()) {
                 tracing::warn!(target: "chat",
@@ -7233,6 +7362,9 @@ fn glm_generate_on(
                     break;
                 }
             }
+            // crow-nest #221: a close the id's text did not take (none rendered) is taken
+            // here, before the budget counter, which must see the block closed
+            think.end_step();
             if !injection_built {
                 if let Some(cap) = think_budget {
                     if think.is_inside() {
@@ -7321,9 +7453,13 @@ fn glm_generate_on(
     }
     if think.stripped() > 0 {
         tracing::info!(target: "chat",
-            "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content (#67); the generated ids are untouched{}",
+            "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content (#67); the generated ids are untouched{}{}",
             think.stripped(),
-            if req.enable_thinking { ", and this request was thinking, so one of them is its own </think>" } else { "" });
+            if req.enable_thinking { ", and this request was thinking, so one of them is its own </think>" } else { "" },
+            match think_close_id {
+                Some(c) if think.closed_on_id() => format!(", closed on id {c} (#221)"),
+                _ => String::new(),
+            });
     }
     if aborted {
         let open = args_acc.iter().filter(|a| args_object_or_raw(a).1.is_some()).count();
@@ -7358,6 +7494,7 @@ fn glm_generate_on(
     // every access is a selection, an NVMe-served access is a cold one; no PLE
     let t_ctr = Instant::now();
     let (acc, nvme_bytes) = seq.counters();
+    let copies = seq.copy_counts();
     let selections_total = acc[0] + acc[1] + acc[2];
     let cold_total = acc[2];
     let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
@@ -7365,6 +7502,7 @@ fn glm_generate_on(
     let mut bk = book.lock().unwrap_or_else(|p| p.into_inner());
     let rep = bk.repeats.observe(&out, single_token_answer(gen, finish));
     let (prev, prev_bytes) = std::mem::replace(&mut bk.prev_counters, (acc, nvme_bytes));
+    let prev_copies = std::mem::replace(&mut bk.prev_copies, copies);
     drop(bk);
     if let Some(w) = loop_warning(&rep) {
         tracing::warn!(target: "chat", "{w}");
@@ -7402,9 +7540,7 @@ fn glm_generate_on(
         },
         repeat_note(&rep)
     );
-    tracing::info!(target: "chat",
-        "[chat] counters (cumulative, never reset): expert accesses vram {} pinned {} nvme {}, NVMe bytes {nvme_bytes}, layers {}, counter read {counters_ms:.3} ms",
-        acc[0], acc[1], acc[2], seq.layers());
+    tracing::info!(target: "chat", "{}", glm_counters_line(acc, nvme_bytes, copies, prev, prev_copies, seq.layers(), counters_ms));
     let d_sel = selections_total.saturating_sub(prev[0] + prev[1] + prev[2]);
     let d_cold = cold_total.saturating_sub(prev[2]);
     crow_nest_engine::log::routing(&crow_nest_engine::log::Routing {
@@ -7436,7 +7572,7 @@ fn glm_generate_on(
     if let Some(l) = seq.kv_report() {
         tracing::info!(target: "chat", "[chat] KV lazy (#214): {l}");
     }
-    tracing::debug!(target: "chat", "[chat] ids {out:?}");
+    log_answer_ids(&out);
     Ok(GenOut { id, created, finish, timing, aborted, malformed: ts.malformed().to_vec() })
 }
 
@@ -8143,6 +8279,176 @@ mod tests {
         assert!(!s.reasoning.is_empty(), "the wrap-up lands in the block");
         assert!(!g.is_inside());
         assert!(s.content.is_empty(), "Lead trims the break after the close");
+    }
+
+    // ------------------------------------------- close on the `</think>` id (#221)
+
+    /// one decode step of the glm5_next loop as the filter sees it: the id guard, the step's
+    /// text, `end_step`; `None` is an ordinary id, `Some(text)` the close id rendering `text`
+    fn by_id_step(f: &mut ThinkFilter, acc: &mut Split, close: Option<&str>, text: &str) {
+        if close.is_some() && f.is_inside() {
+            f.close_id_seen();
+        }
+        let s = f.push(close.unwrap_or(text));
+        acc.content.push_str(&s.content);
+        acc.reasoning.push_str(&s.reasoning);
+        f.end_step();
+    }
+
+    fn by_id_flush(f: &mut ThinkFilter, acc: &mut Split) {
+        let s = f.flush();
+        acc.content.push_str(&s.content);
+        acc.reasoning.push_str(&s.reasoning);
+    }
+
+    #[test]
+    fn a_quoted_close_tag_stays_reasoning_when_the_block_closes_on_its_id() {
+        // #221 expected result 1: the quote arrives as ordinary tokens `</` `think` `>`
+        let quote = ["reasoning … (the ", "</", "think", ">", "-in-content repair) …"];
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        for p in quote {
+            by_id_step(&mut f, &mut acc, None, p);
+            assert!(f.is_inside(), "the quote {p:?} keeps the block open");
+        }
+        by_id_step(&mut f, &mut acc, Some("</think>"), "");
+        assert!(!f.is_inside(), "the id closes the block");
+        for p in ["\n\n", "Answer"] {
+            by_id_step(&mut f, &mut acc, None, p);
+        }
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.reasoning, "reasoning … (the </think>-in-content repair) …");
+        assert_eq!(acc.content, "Answer");
+        assert_eq!(f.stripped(), 1);
+        assert!(f.closed_on_id());
+
+        // the same text on the TEXT filter (every other path) splits at the quote: the
+        // defect of #221, and what keeps this test red without the mode
+        let mut t = ThinkFilter::inside();
+        let mut old = Split::default();
+        for p in quote.iter().copied().chain(["</think>", "\n\n", "Answer"]) {
+            let s = t.push(p);
+            old.content.push_str(&s.content);
+            old.reasoning.push_str(&s.reasoning);
+        }
+        let s = t.flush();
+        old.content.push_str(&s.content);
+        assert_eq!(old.reasoning, "reasoning … (the ");
+        assert_eq!(old.content, "-in-content repair) …\n\nAnswer", "and the real close is dropped as a stray");
+        assert!(!t.closed_on_id());
+
+        // the quote in ONE piece is reasoning too
+        let mut g = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut g, &mut acc, None, "a quoted </think> here");
+        assert!(g.is_inside());
+        by_id_step(&mut g, &mut acc, Some("</think>"), "");
+        by_id_step(&mut g, &mut acc, None, "\n\nAnswer");
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!(acc.reasoning, "a quoted </think> here");
+        assert_eq!(acc.content, "Answer");
+        assert_eq!(g.stripped(), 1);
+    }
+
+    #[test]
+    fn the_close_id_at_the_quote_position_still_closes_there() {
+        // #221 expected result 2, the control: the id itself, where the quote stood
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut f, &mut acc, None, "reasoning … (the ");
+        by_id_step(&mut f, &mut acc, Some("</think>"), "");
+        by_id_step(&mut f, &mut acc, None, "-in-content repair) …");
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.reasoning, "reasoning … (the ");
+        assert_eq!(acc.content, "-in-content repair) …");
+        assert_eq!(f.stripped(), 1);
+        assert!(f.closed_on_id());
+        // the step's text may carry bytes ahead of the tag (a `<` `ToolStream` held): they
+        // are reasoning, in order, and the tag still closes
+        let mut g = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        g.close_id_seen();
+        let s = g.push("<</think>\n\nA");
+        acc.reasoning.push_str(&s.reasoning);
+        acc.content.push_str(&s.content);
+        g.end_step();
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!((acc.reasoning.as_str(), acc.content.as_str()), ("<", "A"));
+    }
+
+    #[test]
+    fn a_close_id_that_renders_no_text_closes_the_block_at_end_step() {
+        // #221: a tokenizer where `</think>` is special and `decode` skips it
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut f, &mut acc, None, "thinking");
+        f.close_id_seen();
+        assert!(f.is_inside(), "close_id_seen alone never moves the state");
+        f.end_step();
+        assert!(!f.is_inside(), "end_step takes the pending close");
+        for p in ["\n\n", "Answer"] {
+            by_id_step(&mut f, &mut acc, None, p);
+        }
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.reasoning, "thinking");
+        assert_eq!(acc.content, "Answer", "the break after the close is trimmed");
+        assert_eq!(f.stripped(), 1);
+        assert!(f.closed_on_id());
+    }
+
+    #[test]
+    fn a_pending_close_never_outlives_its_step() {
+        // #221: a text match takes the pending close, so end_step has nothing left to do
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut f, &mut acc, Some("</think>"), "");
+        assert_eq!(f.stripped(), 1, "one close, not a second one from end_step");
+        // the model opens a block of its own again (`Lead`), and quotes the tag in it
+        by_id_step(&mut f, &mut acc, None, "<think>");
+        assert!(f.is_inside());
+        by_id_step(&mut f, &mut acc, None, "a quoted </think> stays");
+        assert!(f.is_inside(), "no flag left over from the earlier close");
+        // the id outside the block is ignored, so it arms nothing for a later block
+        let mut g = ThinkFilter::new().closing_on_id(true);
+        let mut acc = Split::default();
+        g.close_id_seen();
+        g.end_step();
+        by_id_step(&mut g, &mut acc, None, "<think>");
+        by_id_step(&mut g, &mut acc, None, "x </think> y");
+        assert!(g.is_inside());
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!(acc.reasoning, "x </think> y");
+        assert!(acc.content.is_empty());
+        // and on the text filter the id calls are no-ops: every other path is unchanged
+        let mut t = ThinkFilter::inside();
+        t.close_id_seen();
+        t.end_step();
+        assert!(t.is_inside());
+        assert_eq!(t.stripped(), 0);
+    }
+
+    #[test]
+    fn by_id_mode_keeps_lead_and_body_as_they_were() {
+        // #221: only `Inside` changes; a stray `</think>` text in `Body` is still dropped (#67)
+        let mut f = ThinkFilter::new().closing_on_id(true);
+        let mut acc = Split::default();
+        for p in ["\n", "Answer", " text</", "think>", " more"] {
+            by_id_step(&mut f, &mut acc, None, p);
+        }
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.content, "\nAnswer text more");
+        assert!(acc.reasoning.is_empty());
+        assert_eq!(f.stripped(), 1);
+        assert!(!f.closed_on_id());
+        // `Lead`: a leading stray `</think>` and the whitespace around it are dropped
+        let mut g = ThinkFilter::new().closing_on_id(true);
+        let mut acc = Split::default();
+        for p in ["  </thi", "nk>\n\n", "Hi"] {
+            by_id_step(&mut g, &mut acc, None, p);
+        }
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!(acc.content, "Hi");
+        assert_eq!(g.stripped(), 1);
     }
 
     // ------------------------------------------------------- sampling (#28 A6)
@@ -9155,6 +9461,22 @@ mod tests {
         }
         // exactly fourteen keys: the nine of A5 plus the five of A8, nothing crept in
         assert_eq!(g.as_object().unwrap().len(), 14, "{g}");
+    }
+
+    /// #222: glm5_next's `[chat] counters` line carries the cumulative H2D / D2H copy bytes and the
+    /// unified tiers' refusals, and this request's pinned hit rate and D2H bytes (differences to
+    /// what the previous request left); the #215 harness's leading text is unchanged
+    #[test]
+    fn glm_counters_line_carries_the_pinned_hit_rate_and_d2h_bytes() {
+        let c = CopyCounts { h2d_bytes: 7_000, d2h_bytes: 5_000, pin_refused: 3, wb_filtered: 2 };
+        let pc = CopyCounts { d2h_bytes: 1_000, ..CopyCounts::default() };
+        let l = glm_counters_line([150, 60, 30], 9_474_048, c, [100, 30, 20], pc, 92, 0.25);
+        assert!(l.starts_with("[chat] counters (cumulative, never reset): expert accesses vram 150 pinned 60 nvme 30, NVMe bytes 9474048, "), "{l}");
+        assert!(l.contains("H2D bytes 7000, D2H bytes 5000, unified pinned refused 3 write-backs filtered 2"), "{l}");
+        // this request: 50 + 30 + 10 accesses, 30 from pinned
+        assert!(l.ends_with("; this request: pinned hit 33.3 % of 90 expert accesses, D2H bytes 4000"), "{l}");
+        let first = glm_counters_line([0; 3], 0, CopyCounts::default(), [0; 3], CopyCounts::default(), 92, 0.0);
+        assert!(first.contains("pinned hit 0.0 % of 0 expert accesses, D2H bytes 0"), "{first}");
     }
 
     /// #30 A8: cumulative means the builder never subtracts and never resets
@@ -11924,7 +12246,7 @@ Red is #FF0000."), "{off}");
         let cands = glm_fake(&tk, 4096).cands;
         let mut eng = Glm5Engine::new(FakeRows::with_slots(4096, GLM_VOCAB, cands, 4), true);
         assert_eq!(eng.slots(), 4);
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let got = glm_batch_wave(&mut eng, &book, &tk, &bodies);
         let mut slots: Vec<usize> = got.iter().map(|g| g.3).collect();
         for (k, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -11961,7 +12283,7 @@ Red is #FF0000."), "{off}");
         let Some(tk) = glm_tk() else { return };
         let cands = glm_fake(&tk, 4096).cands;
         let mut eng = Glm5Engine::new(FakeRows::with_slots(4096, GLM_VOCAB, cands, 2), true);
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8 });
         let mut sse = doc.clone();
         sse["stream"] = serde_json::json!(true);
@@ -12218,7 +12540,7 @@ Red is #FF0000."), "{off}");
         }
         let Some(tk) = glm_tk() else { return };
         let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8 });
         let mut sse = doc.clone();
         sse["stream"] = serde_json::json!(true);
@@ -12245,6 +12567,56 @@ Red is #FF0000."), "{off}");
             let line = format!("fake: row {fail} failed");
             assert!(text.starts_with(head) && text.contains(&line), "{what}: {status} {text}");
             assert!(log.contains("[serve] the request failed: ") && log.contains(&line), "{what}: the log lacks the engine error: {log:?}");
+        }
+    }
+
+    /// #223 (#219, #221): at the operator's default level (`info`) a request logs its
+    /// generated ids as ONE `[chat] ids` line after the answer, every id `usage` counts; the
+    /// prompt ids stay debug (red before: the line was debug, the default log had none)
+    #[test]
+    fn glm_generated_ids_are_logged_at_info_once_per_request() {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let Some(tk) = glm_tk() else { return };
+        let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
+        // `crow_force_ids: []` forces nothing but reaches the debug `[chat] prompt ids` line
+        let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8,
+            "crow_force_ids": [] });
+        let mut sse = doc.clone();
+        sse["stream"] = serde_json::json!(true);
+        for (what, body) in [("document", &doc), ("stream", &sse)] {
+            let buf = Buf::default();
+            let w = buf.clone();
+            let sub = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(crow_nest_engine::log::DEFAULT_FILTER))
+                .with_ansi(false)
+                .with_writer(move || w.clone())
+                .finish();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (mut server, _) = l.accept().unwrap();
+            let mut head_sent = false;
+            let status = tracing::subscriber::with_default(sub, || glm_chat_on(&mut server, &tk, &mut eng, &book, Markup::Glm, 4096, &mut head_sent, body.to_string().as_bytes()));
+            let _ = server.shutdown(Shutdown::Write);
+            let mut text = String::new();
+            client.read_to_string(&mut text).unwrap();
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            let lines: Vec<&str> = log.lines().filter(|l| l.contains("[chat] ids [")).collect();
+            assert_eq!(lines.len(), 1, "{what} ({status}): one INFO `[chat] ids` line per request: {log:?}");
+            assert!(lines[0].contains(" INFO "), "{what}: {}", lines[0]);
+            let ids: Vec<u32> = serde_json::from_str(lines[0].split("[chat] ids ").nth(1).unwrap()).unwrap();
+            assert_eq!(ids.len(), 8, "{what}: the line carries every generated id: {}", lines[0]);
+            assert!(!log.contains("[chat] prompt ids"), "{what}: prompt ids stay debug: {log:?}");
         }
     }
 

@@ -406,6 +406,21 @@ pub trait Mover {
     fn end_batch(&mut self) {}
 }
 
+/// #222: the expert copies over PCIe and the unified tiers' refusals, cumulative since
+/// construction ([`ExpertTiers::copy_counts`]; serve's `[chat] counters` line)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyCounts {
+    /// host -> device record copies ([`Moves::landing_to_stage`] + [`Moves::pinned_to_stage`]) x
+    /// record bytes; zero-copy reads of pinned records by the kernels are not in it
+    pub h2d_bytes: u64,
+    /// device -> host write-backs (a call's [`Moves::vram_to_pinned`] + the elastic hand-backs' and
+    /// take-backs' write-backs) x record bytes
+    pub d2h_bytes: u64,
+    /// `CROW_GLM_TIERS=unified`: [`ArenaStats::pin_refused`], [`ArenaStats::wb_filtered`]
+    pub pin_refused: u64,
+    pub wb_filtered: u64,
+}
+
 /// The slot of every expert of one MoE layer in its tier, and the free slots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerSlots {
@@ -1128,6 +1143,20 @@ pub const ARENA_PROMPT_COUNT_ENV: &str = "CROW_GLM_ARENA_PROMPT_COUNT";
 /// count (`tools/glm_tier_sim.py arena` `fprompt`, runs/glm53-flash/cache-sim-20261010m: quick decode
 /// 27.07 -> 25.04 NVMe experts per token, held-out todo-1006 33.21 -> 33.21)
 pub const PROMPT_COUNT_WEIGHT: f64 = 2.0;
+/// #222: `unified` = the expert tiers as one policy ([`GlobalArena::set_unified`]): the frequency
+/// tiers' count also gates the pinned tier (NVMe admission, write-back of VRAM victims); needs
+/// `CROW_GLM_ARENA=global` and `CROW_GLM_ARENA_FREQ=1`, refused with `CROW_GLM_ARENA_NOADMIT=1`.
+/// Unset or empty (default) = the arena as before. Placement only: lossless.
+pub const TIERS_ENV: &str = "CROW_GLM_TIERS";
+
+/// Parse `CROW_GLM_TIERS`: unset or empty = off; `unified` = on; anything else refused by name.
+pub fn tiers_unified(v: Option<&str>) -> Result<bool, String> {
+    match v.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("unified") => Ok(true),
+        Some(x) => Err(format!("{TIERS_ENV}={x:?}: accepted unset (default), unified")),
+    }
+}
 /// #188 frequency tiers: the scores' half-life in decode tokens (`tools/glm_tier_sim.py arena`, runs/glm53-flash/cache-sim-20261010)
 pub const FREQ_HALFLIFE_TOKENS: f64 = 64.0;
 /// #188 frequency tiers: an expert enters a full VRAM tier only above (1 + margin) x the lowest VRAM score
@@ -1154,11 +1183,13 @@ pub struct ArenaConfig {
     pub stage_lend: bool,
     /// #188 `CROW_GLM_ARENA_PROMPT_COUNT=1`: prompt calls count into the frequency tiers
     pub prompt_count: bool,
+    /// #222 `CROW_GLM_TIERS=unified`: the expert tiers as one policy
+    pub unified: bool,
 }
 
 impl Default for ArenaConfig {
     fn default() -> ArenaConfig {
-        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false }
+        ArenaConfig { admit_max: expert_cache::ADMIT_MAX, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false, unified: false }
     }
 }
 
@@ -1233,6 +1264,13 @@ pub fn arena_config(get: &dyn Fn(&str) -> Option<String>) -> Result<ArenaConfig,
     };
     if c.prompt_count && !c.freq {
         return Err(format!("{ARENA_PROMPT_COUNT_ENV}=1 counts into the frequency tiers: it needs {ARENA_FREQ_ENV}=1"));
+    }
+    c.unified = tiers_unified(get(TIERS_ENV).as_deref())?;
+    if c.unified && !c.freq {
+        return Err(format!("{TIERS_ENV}=unified gates every tier by the frequency tiers' count: it needs {ARENA_FREQ_ENV}=1"));
+    }
+    if c.unified && c.noadmit {
+        return Err(format!("{TIERS_ENV}=unified admits by count: {ARENA_NOADMIT_ENV}=1 is refused with it"));
     }
     Ok(c)
 }
@@ -1357,6 +1395,11 @@ pub struct ArenaStats {
     /// prompt phases folded into the scores
     pub prompt_calls: u64,
     pub prompt_folds: u64,
+    /// #222 `CROW_GLM_TIERS=unified`: NVMe misses of admitting calls left out of pinned (their
+    /// decayed count did not beat pinned's lowest; served from staging), and VRAM victims dropped
+    /// to the NVMe instead of written back (not worth a pinned slot: no D2H)
+    pub pin_refused: u64,
+    pub wb_filtered: u64,
 }
 
 /// sybil-solutions/glm53-flash-offload 6769b27 (`glm53/expert_cache.py` `ec_step_k`,
@@ -1425,6 +1468,9 @@ pub struct GlobalArena {
     /// #188 `CROW_GLM_ARENA_FREQ=1`: the frequency tiers ([`GlobalArena::set_freq`]); `None` = the
     /// CLOCK / LRU arena above
     freq: Option<FreqState>,
+    /// #222 `CROW_GLM_TIERS=unified` ([`GlobalArena::set_unified`]): the frequency tiers' count
+    /// also gates the pinned tier (admission and write-back)
+    unified: bool,
 }
 
 /// A lazy min-heap entry of the frequency tiers: (score bits, key). Scores are never negative, so
@@ -1502,17 +1548,18 @@ impl GlobalArena {
             fresh: Vec::new(),
             score: Vec::new(),
             freq: None,
+            unified: false,
         })
     }
 
     /// empty again (as [`GlobalArena::new`]); the switches, the warm scores and the disabled slots
     /// are kept; the frequency tiers' scores restart at their prior
     pub fn reset(&mut self) {
-        let (stay, noadmit, gen, score) = (self.pin_stay, self.noadmit, self.gen, std::mem::take(&mut self.score));
+        let (stay, noadmit, gen, score, unified) = (self.pin_stay, self.noadmit, self.gen, std::mem::take(&mut self.score), self.unified);
         let freq = self.freq.take().map(|f| FreqState { fscore: f.prior.clone(), inc: 1.0, vheap: FreqHeap::new(), rheap: FreqHeap::new(), vfree: true, pend: vec![0; f.pend.len()], ptouched: Vec::new(), pcalls: 0, ..f });
         let off: Vec<bool> = self.vpin.iter().map(|&p| p == DISABLED).collect();
         *self = GlobalArena::new(self.layers, self.experts, self.vowner.len(), self.rowner.len()).expect("the same shape");
-        (self.pin_stay, self.noadmit, self.gen, self.score, self.freq) = (stay, noadmit, gen + 1, score, freq);
+        (self.pin_stay, self.noadmit, self.gen, self.score, self.freq, self.unified) = (stay, noadmit, gen + 1, score, freq, unified);
         for (p, off) in self.vpin.iter_mut().zip(off) {
             if off {
                 *p = DISABLED;
@@ -1556,21 +1603,26 @@ impl GlobalArena {
         self.epoch += 1;
         self.gen += 1;
         self.touched.clear();
+        let mut out = Vec::new();
         for s in r {
             self.vpin[s] = DISABLED;
             self.refb[s] = false;
             let v = std::mem::replace(&mut self.vowner[s], NONE);
             if v != NONE {
                 self.lent.push(v);
-                let v = v as usize;
-                self.record(v);
-                self.place[v] = Place::Nvme;
-                if self.ram_insert(v).is_some() {
-                    self.stats.write_backs += 1;
-                } else {
-                    self.stats.wb_dropped += 1;
-                }
+                out.push(v as usize);
             }
+        }
+        // #222 unified: the experts going out compete for pinned in score order (the highest
+        // first), each kept only when the pinned rule admits it
+        if self.unified {
+            let f = self.freq.as_ref().expect("the unified tiers run on the frequency tiers");
+            out.sort_by(|&a, &b| f.fscore[b].partial_cmp(&f.fscore[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+        }
+        for v in out {
+            self.record(v);
+            self.place[v] = Place::Nvme;
+            self.demote(v);
         }
         let mut ch: Vec<(u32, Place, Place)> = self.touched.iter().filter(|&&(k, b)| self.place[k as usize] != b).map(|&(k, b)| (k, b, self.place[k as usize])).collect();
         ch.sort_unstable_by_key(|c| c.0);
@@ -2236,11 +2288,7 @@ impl GlobalArena {
                     let v = v as usize;
                     self.record(v);
                     self.place[v] = Place::Nvme;
-                    if self.ram_insert(v).is_some() {
-                        self.stats.write_backs += 1;
-                    } else {
-                        self.stats.wb_dropped += 1;
-                    }
+                    self.demote(v);
                 }
             }
         }
@@ -2248,7 +2296,13 @@ impl GlobalArena {
             match self.place[k] {
                 Place::Vram(_) => {}
                 Place::Ram(q) => self.ram_touch(q),
+                // #222 unified: an admitting call's NVMe miss enters pinned only when the pinned
+                // rule admits it; else it stays on the NVMe and the call stages it (no eviction)
                 Place::Nvme => {
+                    if admit && self.unified && !self.pinned_admits(k) {
+                        self.stats.pin_refused += 1;
+                        continue;
+                    }
                     self.record(k);
                     self.ram_insert(k);
                 }
@@ -2257,6 +2311,53 @@ impl GlobalArena {
         let mut ch: Vec<(u32, Place, Place)> = self.touched.iter().filter(|&&(k, b)| self.place[k as usize] != b).map(|&(k, b)| (k, b, self.place[k as usize])).collect();
         ch.sort_unstable_by_key(|c| c.0);
         ch
+    }
+
+    /// #222 `CROW_GLM_TIERS=unified`: the pinned tier's admission rule, the same for an NVMe miss
+    /// and for a VRAM victim: a free pinned slot, or a decayed count strictly above the lowest
+    /// pinned count not routed in this call (TinyLFU's rule; no margin: the NVMe read happens
+    /// anyway, and a VRAM victim's D2H is the only copy it costs). Without such a resident (every
+    /// pinned expert routed in this call or in flight) the former path decides (`true`). Always
+    /// `true` with the switch off.
+    fn pinned_admits(&mut self, k: usize) -> bool {
+        if !self.unified || !self.rfree.is_empty() {
+            return true;
+        }
+        let Some(x) = self.ram_victim() else { return true };
+        let f = self.freq.as_ref().expect("the unified tiers run on the frequency tiers");
+        f.fscore[k] > f.fscore[self.rowner[x as usize] as usize]
+    }
+
+    /// a VRAM victim `k` (its place already the NVMe): written back into pinned (a free slot, or
+    /// the pinned victim drops to the NVMe), or, without such a slot, dropped; #222 unified:
+    /// dropped also when the pinned rule ([`GlobalArena::pinned_admits`]) does not admit it
+    fn demote(&mut self, k: usize) {
+        if !self.pinned_admits(k) {
+            self.stats.wb_filtered += 1;
+        } else if self.ram_insert(k).is_some() {
+            self.stats.write_backs += 1;
+        } else {
+            self.stats.wb_dropped += 1;
+        }
+    }
+
+    /// #222 `CROW_GLM_TIERS=unified`: one rule over VRAM, pinned and NVMe, on top of the frequency
+    /// tiers ([`GlobalArena::set_freq`], required: their decayed count is the one score, seeded by
+    /// the warm file and fed by prompt counting). VRAM admission and both victims stay the
+    /// frequency tiers' (an empty slot, or above (1 + margin) x the lowest VRAM count; the lowest
+    /// count leaves either tier). New: the pinned tier admits by the same count
+    /// ([`GlobalArena::pinned_admits`]): an admitting call's NVMe miss enters pinned, and a VRAM
+    /// victim (a call's, or an elastic hand-back's in score order) is written back, only into a
+    /// free slot or above pinned's lowest count; otherwise the miss is staged for the call and the
+    /// victim dropped to its home on the NVMe (no D2H). Lossless: only where records lie changes.
+    pub fn set_unified(&mut self, on: bool) {
+        assert!(!on || self.freq.is_some(), "the unified tiers run on the frequency tiers (set_freq first)");
+        self.unified = on;
+    }
+
+    /// whether `CROW_GLM_TIERS=unified` is on
+    pub fn unified_on(&self) -> bool {
+        self.unified
     }
 
     /// #188 frequency tiers: the VRAM slot routed expert `k` (outside VRAM) enters, or `None` (it
@@ -4055,6 +4156,24 @@ impl ExpertTiers {
         }
     }
 
+    /// #222: the H2D / D2H record copies and the unified tiers' refusals since construction
+    pub fn copy_counts(&self) -> CopyCounts {
+        let (mut h2d, mut d2h) = (0u64, 0u64);
+        for m in &self.moves {
+            h2d += m.landing_to_stage + m.pinned_to_stage;
+            d2h += m.vram_to_pinned;
+        }
+        let mut c = CopyCounts::default();
+        if let Some(d) = self.arena.as_ref() {
+            d2h += d.elastic.write_backs + d.elastic.lend_write_backs;
+            c.pin_refused = d.a.stats.pin_refused;
+            c.wb_filtered = d.a.stats.wb_filtered;
+        }
+        c.h2d_bytes = h2d * self.rb;
+        c.d2h_bytes = d2h * self.rb;
+        c
+    }
+
     /// VRAM the global arena holds beyond the per-layer allocations (elastic chunks, staging)
     fn arena_extra_vram_bytes(&self) -> u64 {
         let Some(d) = self.arena.as_ref() else { return 0 };
@@ -4083,6 +4202,8 @@ impl ExpertTiers {
             if d.cfg.prompt_count {
                 d.a.set_prompt_count(PROMPT_COUNT_WEIGHT);
             }
+            // #222 CROW_GLM_TIERS=unified (arena_config refuses it without the frequency tiers)
+            d.a.set_unified(d.cfg.unified);
         }
         let base = nl * vpl;
         if d.cfg.vring > 0 && base >= 2 * d.cfg.vring && d.a.ram_slots() > 0 {
@@ -5490,7 +5611,7 @@ mod arena_tests {
         }
         let none = |_: &str| None;
         assert_eq!(arena_config(&none).unwrap(), ArenaConfig::default());
-        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false });
+        assert_eq!(ArenaConfig::default(), ArenaConfig { admit_max: 64, noadmit: false, warm: None, vring: 24, elastic_bytes: 0, stage_bytes: 0, stage_min: 512, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false, unified: false });
         let set = |k: &str| match k {
             ARENA_ADMIT_MAX_ENV => Some("16".to_string()),
             ARENA_NOADMIT_ENV => Some("1".to_string()),
@@ -5502,7 +5623,7 @@ mod arena_tests {
             _ => None,
         };
         let c = arena_config(&set).unwrap();
-        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false });
+        assert_eq!(c, ArenaConfig { admit_max: 16, noadmit: true, warm: Some("w.json".into()), vring: 0, elastic_bytes: 10 << 30, stage_bytes: 5 << 29, stage_min: 256, freq: false, regrow: false, lazy_refill: false, stage_lend: false, prompt_count: false, unified: false });
         for (k, v) in [(ARENA_ADMIT_MAX_ENV, "x"), (ARENA_NOADMIT_ENV, "yes"), (ARENA_VRING_ENV, "-1"), (ARENA_ELASTIC_ENV, "nan"), (ARENA_STAGE_MIN_ENV, "0")] {
             let one = |q: &str| (q == k).then(|| v.to_string());
             assert!(arena_config(&one).unwrap_err().contains(k), "{k}={v}");
@@ -6010,6 +6131,159 @@ mod arena_tests {
         assert!(arena_config(&get("yes")).unwrap_err().contains(ARENA_FREQ_ENV));
     }
 
+    /// #222 the unified tiers' arena by hand: 1 layer of 6 experts, no decay, margin 1, top-k 1;
+    /// `n` picks of expert `e` counted (a pick list repeats an id: each adds the increment), then
+    /// one admitting call of `e`
+    fn ucall(a: &mut GlobalArena, e: u32, n: usize) -> Vec<(u32, Place, Place)> {
+        a.freq_count(0, &vec![e as i32; n]);
+        a.step(0, &[e], true)
+    }
+
+    fn unified(vram: usize, pinned: usize, on: bool) -> GlobalArena {
+        let mut a = GlobalArena::new(1, 6, vram, pinned).unwrap();
+        a.set_freq(f64::INFINITY, 1.0, 1);
+        a.set_pin_stay(true);
+        a.set_unified(on);
+        a
+    }
+
+    /// #222 `CROW_GLM_TIERS=unified`, the pinned admission: an NVMe miss whose count does not beat
+    /// pinned's lowest stays on the NVMe and is staged for its call (no pinned slot, no eviction);
+    /// one that beats it takes the slot of the lowest. Off (the frequency tiers alone) the
+    /// one-pick newcomer displaces the resident counted three times. A pinned hit below 2 x the VRAM
+    /// count stays in pinned (zero-copy), switch on or off.
+    #[test]
+    fn unified_tiers_admit_into_pinned_by_count() {
+        for on in [false, true] {
+            let mut a = unified(1, 1, on);
+            assert_eq!(ucall(&mut a, 0, 5), vec![(0, Place::Nvme, Place::Vram(0))]);
+            assert_eq!(ucall(&mut a, 1, 2), vec![(1, Place::Nvme, Place::Ram(0))], "a free pinned slot admits");
+            assert!(ucall(&mut a, 1, 1).is_empty(), "3 > 2 x 5 is false: the pinned hit stays in pinned");
+            let ch = ucall(&mut a, 2, 1);
+            if on {
+                assert!(ch.is_empty(), "1 > 3 is false: expert 2 stays on the NVMe");
+                assert_eq!((a.place(0, 2), a.place(0, 1), a.stats.pin_refused, a.stats.ram_evictions), (Place::Nvme, Place::Ram(0), 1, 0));
+                assert_eq!(ucall(&mut a, 2, 3), vec![(1, Place::Ram(0), Place::Nvme), (2, Place::Nvme, Place::Ram(0))], "4 > 3: the lowest leaves pinned");
+                assert_eq!(a.stats.pin_refused, 1);
+            } else {
+                assert_eq!(ch, vec![(1, Place::Ram(0), Place::Nvme), (2, Place::Nvme, Place::Ram(0))], "off: every NVMe miss lands in pinned");
+                assert_eq!(a.stats.pin_refused, 0);
+            }
+            a.check().unwrap();
+        }
+        // the refused miss is served from staging: one NVMe read through the landing, no pinned write
+        let mut a = unified(1, 1, true);
+        ucall(&mut a, 0, 5);
+        ucall(&mut a, 1, 2);
+        a.freq_count(0, &[2]);
+        let mut sim = GSim::new(6, 1, 1, 2);
+        let served = serve_global(&mut a, 0, &[2], true, 2, &mut sim).unwrap();
+        sim.barrier();
+        assert_eq!(served.locs, vec![(2, Loc::Stage(0))]);
+        assert!(holds(&sim, 0, 2, Loc::Stage(0)));
+        assert_eq!((served.nvme_reads, served.moves.nvme_to_landing, served.moves.nvme_to_pinned, served.moves.n2p, served.moves.p2n), (1, 1, 0, 0, 0));
+    }
+
+    /// #222 `CROW_GLM_TIERS=unified`, demote-or-drop: a VRAM victim is written back (D2H) only into
+    /// a free pinned slot or above pinned's lowest count; else it drops to its home on the NVMe
+    /// with no copy. Off, the victim counted once is written back over the pinned expert counted
+    /// twice (one D2H, and the better expert lost).
+    #[test]
+    fn unified_tiers_write_back_only_victims_worth_keeping() {
+        for on in [false, true] {
+            // VRAM holds 0 (count 1), pinned holds 1 (count 2); 3 enters VRAM with count 3 > 2 x 1
+            let mut a = unified(1, 1, on);
+            ucall(&mut a, 0, 1);
+            ucall(&mut a, 1, 2);
+            let mut sim = GSim::new(6, 1, 1, 2);
+            sim.vram[0] = 0;
+            sim.pinned[0] = 1;
+            a.freq_count(0, &[3, 3, 3]);
+            let served = serve_global(&mut a, 0, &[3], true, 2, &mut sim).unwrap();
+            sim.barrier();
+            assert_eq!(served.locs, vec![(3, Loc::Vram(0))]);
+            assert!(holds(&sim, 0, 3, Loc::Vram(0)));
+            if on {
+                assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Nvme, Place::Ram(0)), "the cold victim dropped, the pinned expert kept");
+                assert_eq!((served.moves.vram_to_pinned, served.moves.v2n, a.stats.write_backs, a.stats.wb_filtered), (0, 1, 0, 1), "no D2H");
+            } else {
+                assert_eq!((a.place(0, 0), a.place(0, 1)), (Place::Ram(0), Place::Nvme), "off: the victim written back over the better expert");
+                assert_eq!((served.moves.vram_to_pinned, a.stats.write_backs, a.stats.wb_filtered), (1, 1, 0));
+                assert!(holds(&sim, 0, 0, Loc::Pinned(0)));
+            }
+            a.check().unwrap();
+        }
+        // a victim worth keeping: VRAM 0 (count 3), pinned 1 (count 1) and 4 (count 2); 2 enters
+        // VRAM from the NVMe with count 7 > 2 x 3; 0 beats pinned's lowest (1) and is written
+        // back into its slot
+        let mut a = unified(1, 2, true);
+        ucall(&mut a, 0, 3);
+        ucall(&mut a, 1, 1);
+        ucall(&mut a, 4, 2);
+        let ch = ucall(&mut a, 2, 7);
+        assert_eq!(ch, vec![(0, Place::Vram(0), Place::Ram(0)), (1, Place::Ram(0), Place::Nvme), (2, Place::Nvme, Place::Vram(0))]);
+        assert_eq!((a.stats.write_backs, a.stats.wb_filtered), (1, 0));
+        a.check().unwrap();
+    }
+
+    /// #222 `CROW_GLM_TIERS=unified`, an elastic hand-back ([`GlobalArena::disable`]): the experts
+    /// going out compete for pinned in score order, through the same demote-or-drop. VRAM slot 0
+    /// holds 1 (count 4), slot 1 holds 0 (count 1); pinned holds 2 (count 2) and 5 (count 5),
+    /// placed by non-admitting calls. On: 1 replaces 2, 0 drops. Off (slot order, every victim
+    /// written back): 1 replaces 2, then 0 replaces 1: the cold expert kept, the hot one lost.
+    #[test]
+    fn unified_tiers_hand_back_demotes_in_score_order() {
+        for on in [false, true] {
+            let mut a = unified(2, 2, on);
+            assert_eq!(ucall(&mut a, 1, 4), vec![(1, Place::Nvme, Place::Vram(0))]);
+            assert_eq!(ucall(&mut a, 0, 1), vec![(0, Place::Nvme, Place::Vram(1))]);
+            for (e, n) in [(2u32, 2usize), (5, 5)] {
+                a.freq_count(0, &vec![e as i32; n]);
+                a.step(0, &[e], false);
+            }
+            assert_eq!((a.place(0, 2), a.place(0, 5)), (Place::Ram(0), Place::Ram(1)));
+            let ch = a.disable(0..2);
+            let mut sim = GSim::new(6, 2, 2, 2);
+            assert_eq!(write_back(&ch, &mut sim).unwrap(), 1, "one D2H either way");
+            if on {
+                assert_eq!(ch, vec![(0, Place::Vram(1), Place::Nvme), (1, Place::Vram(0), Place::Ram(0)), (2, Place::Ram(0), Place::Nvme)]);
+                assert_eq!((a.stats.write_backs, a.stats.wb_filtered), (1, 1));
+            } else {
+                assert_eq!(ch, vec![(0, Place::Vram(1), Place::Ram(0)), (1, Place::Vram(0), Place::Nvme), (2, Place::Ram(0), Place::Nvme)]);
+                assert_eq!((a.stats.write_backs, a.stats.wb_filtered), (2, 0));
+            }
+            a.check().unwrap();
+        }
+    }
+
+    /// #222 `CROW_GLM_TIERS`: unset or empty = off, `unified` = on, anything else refused by name;
+    /// on needs `CROW_GLM_ARENA_FREQ=1` and refuses `CROW_GLM_ARENA_NOADMIT=1`
+    #[test]
+    fn the_tiers_switch_parses_and_refuses_by_name() {
+        assert_eq!((tiers_unified(None), tiers_unified(Some("")), tiers_unified(Some(" unified "))), (Ok(false), Ok(false), Ok(true)));
+        assert!(tiers_unified(Some("on")).unwrap_err().contains(TIERS_ENV));
+        let get = |t: &'static str, f: &'static str, n: &'static str| {
+            move |k: &str| match k {
+                TIERS_ENV => Some(t.to_string()),
+                ARENA_FREQ_ENV => Some(f.to_string()),
+                ARENA_NOADMIT_ENV => Some(n.to_string()),
+                _ => None,
+            }
+        };
+        assert!(arena_config(&get("unified", "1", "0")).unwrap().unified);
+        assert!(!arena_config(&get("", "1", "0")).unwrap().unified);
+        assert!(!arena_config(&|_: &str| None).unwrap().unified, "off by default");
+        let e = arena_config(&get("unified", "0", "0")).unwrap_err();
+        assert!(e.contains(TIERS_ENV) && e.contains(ARENA_FREQ_ENV), "{e}");
+        let e = arena_config(&get("unified", "1", "1")).unwrap_err();
+        assert!(e.contains(TIERS_ENV) && e.contains(ARENA_NOADMIT_ENV), "{e}");
+        assert!(arena_config(&get("yes", "1", "0")).unwrap_err().contains(TIERS_ENV));
+        // a reset keeps the switch
+        let mut a = unified(1, 1, true);
+        a.reset();
+        assert!(a.unified_on() && a.freq_on());
+    }
+
     /// #188 `CROW_GLM_ARENA_PROMPT_COUNT=1` on the shared trace is `tools/glm_tier_sim.py`
     /// `FreqTiers` with `prompt_weight` 2 (`fprompt`; half-life 64, margin 1, no prior): prompt
     /// tokens 0-99 (4 calls of 25 rows, each call's distinct experts per layer), decode 100-299,
@@ -6274,21 +6548,26 @@ mod arena_tests {
         let (nl, ex, k) = (3usize, 24u64, 6usize);
         let tr = trace(160, nl, ex, k);
         for (v, p) in [(0, 0), (0, 9), (3, 0), (6, 6), (9, 30), (24, 12)] {
-            for variant in 0..4 {
+            for variant in 0..5 {
                 let mut a = GlobalArena::new(nl, ex as usize, v, p).unwrap();
-                a.set_pin_stay(variant == 1);
+                a.set_pin_stay(variant == 1 || variant == 4);
                 a.set_noadmit(variant == 2);
+                // #222: variant 4 = the unified tiers on the frequency tiers, with the hand-back
+                if variant == 4 {
+                    a.set_freq(FREQ_HALFLIFE_TOKENS, FREQ_MARGIN, k);
+                    a.set_unified(true);
+                }
                 let mut sim = GSim::new(ex as usize, v, p, 2 * k);
                 let mut cache = ExpertCache::new(Policy::Lru, Scope::PerLayer, nl, ex as usize, v / nl, p / nl).unwrap();
                 let mut slots: Vec<LayerSlots> = (0..nl).map(|_| LayerSlots::new(ex as usize, TierSizes { vram: v / nl, pinned: p / nl })).collect();
                 let mut psim = tests_sim_free::PSim::default();
                 for (t, tok) in tr.iter().enumerate() {
-                    if variant == 3 && v >= 6 && t == 60 {
+                    if variant >= 3 && v >= 6 && t == 60 {
                         let ch = a.disable(v - 3..v);
                         write_back(&ch, &mut sim).unwrap();
                         sim.barrier();
                     }
-                    if variant == 3 && v >= 6 && t == 120 {
+                    if variant >= 3 && v >= 6 && t == 120 {
                         a.enable(v - 3..v);
                         // #195 S: the brought-back slots refilled (the hand-back, then the scores)
                         a.set_scores(&(0..nl).map(|l| (0..ex).map(|e| ((e * 5 + l as u64) % 11) as f64).collect()).collect::<Vec<_>>());
@@ -6317,6 +6596,9 @@ mod arena_tests {
                     }
                     for (l, ids) in tok.iter().enumerate() {
                         let admit = arena_admits(ids.len() * if t % 7 == 3 { 20 } else { 1 }, false, 64);
+                        if variant == 4 {
+                            a.freq_count(l, &ids.iter().map(|&e| e as i32).collect::<Vec<_>>());
+                        }
                         sim.layer = l;
                         let before = sim.ops;
                         let served = serve_global(&mut a, l, ids, admit, 2 * k, &mut sim).unwrap();
@@ -6337,6 +6619,9 @@ mod arena_tests {
                         assert_eq!(served.locs.iter().map(|x| x.0).collect::<Vec<_>>(), *ids);
                     }
                     a.check().unwrap_or_else(|e| panic!("V {v} P {p} variant {variant} token {t}: {e}"));
+                }
+                if variant == 4 && v > 0 && p > 0 {
+                    assert!(a.stats.pin_refused > 0, "V {v} P {p}: the unified tiers refused no NVMe miss ({:?})", a.stats);
                 }
             }
         }
@@ -6817,6 +7102,7 @@ mod arena_gpu_tests {
                 ARENA_LAZY_REFILL_ENV,
                 ARENA_STAGE_LEND_ENV,
                 ARENA_PROMPT_COUNT_ENV,
+                TIERS_ENV,
                 KV_LAZY_ENV,
                 SMALL_PROMPT_ENV,
                 SMALL_PROMPT_ROWS_ENV,
@@ -8726,6 +9012,10 @@ impl ExpertTiers {
         crate::glm5_moe::lane::THREADS.store(lane_threads, std::sync::atomic::Ordering::Relaxed);
         let cache = ExpertCache::new(policy, Scope::PerLayer, nl, g.experts, sizes.vram, sizes.pinned)?;
         let arena = match arena_kind(std::env::var(ARENA_ENV).ok().as_deref())? {
+            // #222: the unified tiers are a policy of the global arena
+            ArenaKind::Layer if tiers_unified(std::env::var(TIERS_ENV).ok().as_deref())? => {
+                return Err(format!("{TIERS_ENV}=unified is a policy of the global arena: it needs {ARENA_ENV}=global"));
+            }
             ArenaKind::Layer => None,
             ArenaKind::Global => Some(ArenaDev::new(GlobalArena::new(nl, g.experts, nl * sizes.vram, nl * sizes.pinned)?, arena_config(&|k| std::env::var(k).ok())?)),
         };
