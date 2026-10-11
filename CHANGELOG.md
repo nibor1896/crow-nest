@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- **`typical_p` no longer empties the candidate list on the host sampler** (#218, 2026-10-11): since #92 the typical filter kept list positions but filtered the candidates by token id, so a request with `typical_p < 1` (host route, Qwen and GLM) lost every candidate whose id was not below the list length - on a real vocabulary all of them - and serve's sampler panicked at the next stage (`index out of bounds: the len is 0 but the index is 0`, CPU unit test 2026-10-11); with low ids in the top-k it drew tail tokens instead. The kept set is now a mask over list positions, as llama.cpp's `llama_sampler_typical` keeps the entries by position; llama.cpp's own `test_typical` cases give its kept sets at high token ids. Not measured in a live serve run.
 - **Converter tests no longer depend on the build machine's free disk** (#212, 2026-10-11): the MUL1 tests answer the converter's disk check with a fixed volume (16 GiB reserve + 1 GiB) instead of asking the temp drive, so `cargo test --release` in `converter/` no longer fails below 16 GiB free: 95 passed, 8 failed -> 105 passed, 0 failed, 1 ignored with C: at 11.4 GiB free. The conversion itself is unchanged: it still reads the real volume and refuses below bytes to write + `--disk-reserve-gib` (default 16); a new test pins that boundary to the byte.
 
 ## 2026-10-10 — v0.11.0
