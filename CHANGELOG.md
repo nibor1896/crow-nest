@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **serve logs the generated token ids of every request at INFO** (#223, 2026-10-11): the `[chat] ids [...]` line (one per request, after the answer, never per token) was DEBUG since #13, so the default log (`CROW_LOG` unset = `info`) had none and #219 and #221 had to be reconstructed offline (#221: which token closed the think block is not measured). It is INFO again on every generation path: Flash-Next and the 27B (`chat_generate`) and glm5_next (`glm_generate_on`, one-sequence and `CROW_GLM_MAX_BATCH`); the text of the line is unchanged. The prompt ids stay DEBUG (`CROW_LOG=info,chat=debug`). Size (arithmetic, not measured): at most 8 bytes per id, about 8 KB for a 1,000-token answer; the rotation (`CROW_LOG_ROTATE_MB` x `CROW_LOG_KEEP`) bounds the total.
+
 ## 2026-10-11 — v0.12.0
 
 **GLM-5.3-Flash in serve gets an operating set with its KV mapped as the context grows (`arm4.env`) and draws sampled tokens on the device; three prefill switches for Crow's tool rounds and new chats land default off.** v0.12.0 carries the 15 commits from v0.11.0 to `2a18fbc` (2026-10-11) and the release commit:

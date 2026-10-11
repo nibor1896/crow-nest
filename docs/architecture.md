@@ -5401,7 +5401,7 @@ default `info` is the behaviour of record. Failure lines became `warn!` / `error
 failure, the write failures, the I/O timeouts, the 400 detail, the `[chat] BUG:` line, the
 `[alloc]` refusal, the tokenizer and slot refusals — which changes the FILE (it carries the level)
 and not one byte of stderr. Two things moved down: `[chat] ids [...]` to DEBUG, because at INFO it
-made a redirected log grow with every answer, and the new per-token decode forensics to TRACE.
+made a redirected log grow with every answer, and the new per-token decode forensics to TRACE. (#223, 2026-10-11: `[chat] ids` is INFO again, one line per request, because #219 and #221 had to be reconstructed without it; the rotation bounds the growth. The prompt ids stay DEBUG.)
 
 **Process exit.** `WorkerGuard` drains its queue when it drops, so `main` binds the guard
 (`let _log = crow_nest_engine::log::init();`, the first statement of every one of the 19 bins).

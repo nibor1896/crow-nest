@@ -5218,9 +5218,7 @@ fn chat_generate(
         repeat_run: rep.repeat_run,
         single_token: rep.single_token,
     });
-    // #13: the full id list of every answer is DEBUG now (`CROW_LOG=info,chat=debug`).
-    // At INFO it made a redirected stderr and the log file grow with every answer.
-    tracing::debug!(target: "chat", "[chat] ids {out:?}");
+    log_answer_ids(&out);
     // #VIT: the image request is done — back to the load-time rope tables.
     // The next request re-arms them from its own plan. The dump gains the
     // generated ids, so the oracle can compare its own greedy continuation.
@@ -5463,6 +5461,15 @@ impl RepeatRing {
         self.seen.push_back(h);
         RepeatStats { repeat_of, repeat_run, single_token, single_run: self.single_run }
     }
+}
+
+/// #223: the generated ids of an answer, ONE `[chat] ids` line at INFO after the answer,
+/// written by both generation loops (`chat_generate`, `glm_generate_on`). One line per request,
+/// never per token. #13 had moved it to DEBUG for log growth; it is INFO again (robin, 2026-10-11)
+/// because #219 (non-canonical splits) and #221 (which token closed a think block) had to be
+/// reconstructed offline without it. The prompt ids stay DEBUG (`CROW_LOG=info,chat=debug`).
+fn log_answer_ids(out: &[u32]) {
+    tracing::info!(target: "chat", "[chat] ids {out:?}");
 }
 
 /// #68: true when the answer is exactly one generated id AND the model ended it itself.
@@ -7436,7 +7443,7 @@ fn glm_generate_on(
     if let Some(l) = seq.kv_report() {
         tracing::info!(target: "chat", "[chat] KV lazy (#214): {l}");
     }
-    tracing::debug!(target: "chat", "[chat] ids {out:?}");
+    log_answer_ids(&out);
     Ok(GenOut { id, created, finish, timing, aborted, malformed: ts.malformed().to_vec() })
 }
 
@@ -12245,6 +12252,56 @@ Red is #FF0000."), "{off}");
             let line = format!("fake: row {fail} failed");
             assert!(text.starts_with(head) && text.contains(&line), "{what}: {status} {text}");
             assert!(log.contains("[serve] the request failed: ") && log.contains(&line), "{what}: the log lacks the engine error: {log:?}");
+        }
+    }
+
+    /// #223 (#219, #221): at the operator's default level (`info`) a request logs its
+    /// generated ids as ONE `[chat] ids` line after the answer, every id `usage` counts; the
+    /// prompt ids stay debug (red before: the line was debug, the default log had none)
+    #[test]
+    fn glm_generated_ids_are_logged_at_info_once_per_request() {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let Some(tk) = glm_tk() else { return };
+        let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        // `crow_force_ids: []` forces nothing but reaches the debug `[chat] prompt ids` line
+        let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8,
+            "crow_force_ids": [] });
+        let mut sse = doc.clone();
+        sse["stream"] = serde_json::json!(true);
+        for (what, body) in [("document", &doc), ("stream", &sse)] {
+            let buf = Buf::default();
+            let w = buf.clone();
+            let sub = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(crow_nest_engine::log::DEFAULT_FILTER))
+                .with_ansi(false)
+                .with_writer(move || w.clone())
+                .finish();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (mut server, _) = l.accept().unwrap();
+            let mut head_sent = false;
+            let status = tracing::subscriber::with_default(sub, || glm_chat_on(&mut server, &tk, &mut eng, &book, Markup::Glm, 4096, &mut head_sent, body.to_string().as_bytes()));
+            let _ = server.shutdown(Shutdown::Write);
+            let mut text = String::new();
+            client.read_to_string(&mut text).unwrap();
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            let lines: Vec<&str> = log.lines().filter(|l| l.contains("[chat] ids [")).collect();
+            assert_eq!(lines.len(), 1, "{what} ({status}): one INFO `[chat] ids` line per request: {log:?}");
+            assert!(lines[0].contains(" INFO "), "{what}: {}", lines[0]);
+            let ids: Vec<u32> = serde_json::from_str(lines[0].split("[chat] ids ").nth(1).unwrap()).unwrap();
+            assert_eq!(ids.len(), 8, "{what}: the line carries every generated id: {}", lines[0]);
+            assert!(!log.contains("[chat] prompt ids"), "{what}: prompt ids stay debug: {log:?}");
         }
     }
 
