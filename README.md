@@ -62,6 +62,11 @@ cd engine && cargo build --release --bin glm5_run && cd ..
 env $(cat runs/glm53-flash/quick/arm4.env) CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json   engine/target/release/glm5_run --cold --reps 1 --tokenizer models/GLM-5.3-Flash-original/tokenizer.json --prompt "Explain how a CPU cache works." -n 128
 ```
 
+| GLM-5.3-Flash container | format |
+|---|---|
+| routed experts | exllamav3's EXL3 (MUL1 codebook, K=3, 3.05 bpw): [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3); trellis method from QTIP (Tseng et al. 2024): [arXiv:2406.11235](https://arxiv.org/abs/2406.11235) |
+| dense part | crow-nest `cnq4.5-glm5-next` (NVFP4) |
+
 **Use from Crow**
 
 ```bash
