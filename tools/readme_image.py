@@ -78,7 +78,7 @@ card(X0, y, 800, 300, r=14)
 o.append(f'<svg x="48" y="44" width="280" height="280" viewBox="0 0 1024 1024">{mark()}</svg>')
 t(340, 146, "CROW-NEST", 50, C["text"], weight=300, ls=12)
 t(344, 182, "INFERENCE ENGINE", 13, C["faint"], ls=5)
-o.append(f'<text x="342" y="226" font-family="{UI}" font-size="20" fill="{C["soft"]}">One GPU, its own quant, two model families.'
+o.append(f'<text x="342" y="226" font-family="{UI}" font-size="20" fill="{C["soft"]}">One GPU, its own quant, three model families.'
          f'<tspan fill="{C["mark"]}">▍<animate attributeName="opacity" values="1;1;0;0" keyTimes="0;.5;.5;1" '
          f'dur="1.1s" repeatCount="indefinite"/></tspan></text>')
 x = 342
@@ -90,17 +90,19 @@ for label, acc in (("v" + VERSION, "mark"), ("Apache-2.0", "faint"), ("Linux · 
 y = 364
 for i, line in enumerate((
         "An inference engine for one GPU: its own quantization, its own container, thin CUDA",
-        "kernels in Rust. OpenAI-compatible HTTP, and the engine behind Crow. Two models from the",
-        "original safetensors: Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5.")):
+        "kernels in Rust. OpenAI-compatible HTTP, and the engine behind Crow. Three models: Qwen3.8-",
+        "Flash-Next as CNQ4.5-M, the dense Qwen3.8-27B as CNQ4.5 and GLM-5.3-Flash as MUL1K3.")):
     t(W / 2, y + i * 24, line, 15.5, C["soft"], anchor="middle")
 
 # ---------------------------------------------------------------- stats
 y = 452
 STATS = [("40", "tok/s decode in Crow, 8k"), ("780", "tok/s prefill, 100k–175k"), ("104.7 GB", "Flash-Next container file"),
          ("4.5 bpw", "NVFP4, CNQ4.5-M"), ("200k", "context, one slot"), ("1.7 GiB", "VRAM lent to Crow while idle"),
-         ("120", "tok/s decode, 27B with MTP"), ("17.8 GB", "27B container file"), ("8.48 GiB", "free beside the 27B, 64k context")]
+         ("120", "tok/s decode, 27B with MTP"), ("17.8 GB", "27B container file"), ("8.48 GiB", "free beside the 27B, 64k context"),
+         ("14.17", "tok/s decode, GLM-5.3-Flash in Crow"), ("124.6 GB", "GLM-5.3-Flash container file"), ("3.05 bpw", "GLM experts, EXL3 MUL1")]
 STATS_NOTE = ("Flash-Next, one RTX 5090, Windows 2026-10-06, after the PLE fix: decode in a live Crow session; prefill cold, 100k–175k; VRAM loan #117.",
-              "27B: one RTX 5090, Linux, CROW_MMA=1 CROW_GRAPH=1, BF16 KV, 2026-09-27 (#95, #122). Conditions: docs/measurements.md, CHANGELOG.md")
+              "27B: one RTX 5090, Linux, CROW_MMA=1 CROW_GRAPH=1, BF16 KV, 2026-09-27 (#95, #122).",
+              "GLM-5.3-Flash: one RTX 5090, Windows, live Crow task of 3 tool rounds, 2026-10-11. Conditions: docs/measurements.md, CHANGELOG.md")
 for i, (v, l) in enumerate(STATS):
     sx, sy = X0 + (i % 3) * 270, y + (i // 3) * 86
     card(sx, sy, 260, 76, C["raised"], C["raised"])
@@ -117,17 +119,18 @@ FEATURES = [
  ("Own container", "one .cnq file with a verification sidecar", "gold"),
  ("Rust + CUDA", "thin kernels via NVRTC, Blackwell sm_120", "sub"),
  ("OpenAI-compatible", "HTTP API, Crow is the client", "ok"),
- ("Two model families", "MoE Qwen3.8-Flash-Next, dense Qwen3.8-27B", "gold"),
+ ("Three model families", "Qwen3.8-Flash-Next, Qwen3.8-27B, GLM-5.3-Flash", "gold"),
  ("MTP on the 27B", "speculative decode, output identical to plain", "sub"),
- ("Vision", "both models, 1,024 to 1,280 tokens per image", "ok"),
+ ("Vision", "both Qwen models, 1,024 to 1,280 tokens per image", "ok"),
  ("Hot set", "Flash-Next, calibrated on Crow traffic (#106)", "gold"),
  ("Prefix cache", "a side request parks the main conversation", "sub"),
  ("GPU sharing", "lends VRAM to Crow's renderer while idle", "ok"),
  ("Image generation", "the 27B at 64k leaves room for Qwen-Image 2.1", "gold"),
  ("Sampling", "the model card's row, never greedy (#111)", "sub"),
  ("Output integrity", "#91 fixed 2026-09-23: 60 to 0 corrupt tokens", "ok"),
- ("Linux + Windows", "both models run on both; 27B speed measured on Linux", "gold"),
- ("GLM-5.3-Flash, measuring", "3-bit MUL1 experts in VRAM, RAM and NVMe", "sub"),
+ ("Linux + Windows", "the Qwen models on both; GLM-5.3-Flash on Windows", "gold"),
+ ("Expert tiers", "GLM-5.3-Flash: experts in VRAM, pinned RAM, NVMe", "sub"),
+ ("Prompt reuse", "GLM tool rounds and new chats skip the re-prefill", "ok"),
 ]
 for i, (ti, d, acc) in enumerate(FEATURES):
     fx, fy = X0 + (i % 2) * 405, y + (i // 2) * 80
@@ -159,15 +162,17 @@ t(X0 + 24, y + MROWS * 100 + 28, "Every figure has an issue or a release note be
 y += MROWS * 100 + 100
 
 # ---------------------------------------------------------------- requirements
-y = section(y, "Requirements", "sub", "one GPU, either model")
+y = section(y, "Requirements", "sub", "one GPU, any of the three")
 REQ = [("GPU", "NVIDIA Blackwell sm_120, RTX 5090 32 GB"),
-       ("Host RAM", "64 GB"),
+       ("Host RAM", "64 GB (GLM-5.3-Flash pins 46 GiB of it)"),
        ("CUDA", "13.3 runtime (NVRTC)"),
        ("Rust", "stable"),
-       ("OS", "Linux, Windows; 27B speed measured on Linux"),
+       ("OS", "Linux, Windows; 27B speed on Linux, GLM on Windows"),
        ("Container", "Qwen3.8-Flash-Next-CNQ4.5-M.cnq, 104.7 GB, Hugging Face"),
        ("27B container", "Qwen3.8-27B-CNQ4.5.cnq, 17.8 GB, Hugging Face"),
-       ("27B vision", "models/Qwen3.8-27B/mmproj-F16.gguf, the F16 projector")]
+       ("27B vision", "models/Qwen3.8-27B/mmproj-F16.gguf, the F16 projector"),
+       ("GLM container", "GLM-5.3-Flash-MUL1K3.cnq, 124.6 GB, Hugging Face"),
+       ("GLM disk", "~130 GB free on an NVMe, experts stream from it")]
 card(X0, y, 800, 24 + len(REQ) * 34)
 for i, (g, v) in enumerate(REQ):
     ry = y + 20 + i * 34
@@ -204,13 +209,14 @@ y += 40 + len(OPS) * 44 + 60 + 40
 
 # ---------------------------------------------------------------- run pointer
 y = section(y, "Build and run", "ok")
-card(X0, y, 800, 140, C["term"], C["bevel"], 12)
+card(X0, y, 800, 164, C["term"], C["bevel"], 12)
 t(X0 + 24, y + 38, "Build, run and ask. Copy it right below this picture.", 16, C["text"], weight=600)
 t(X0 + 24, y + 66, "cargo build, then serve on port 8099. Crow connects with --base-url.", 13, C["faint"])
 t(X0 + 24, y + 90, "The 104.7 GB Flash-Next container downloads from Hugging Face.", 13, C["faint"])
 t(X0 + 24, y + 114, "The 17.8 GB 27B container downloads from Hugging Face too.", 13, C["faint"])
+t(X0 + 24, y + 138, "GLM-5.3-Flash: the 124.6 GB container, its own start script in GLM-5.3-Flash-crow-nest.", 13, C["faint"])
 t(X1 - 30, y + 66, "↓", 40, C["ok"], anchor="end")
-y += 180
+y += 204
 
 
 def wrap(text, n):
@@ -241,7 +247,7 @@ def mobile():
     t(W / 2, y + 222, "CROW-NEST", 40, C["text"], weight=300, anchor="middle", ls=8)
     t(W / 2, y + 248, "INFERENCE ENGINE", 12.5, C["faint"], anchor="middle", ls=5)
     o.append(f'<text x="{W/2}" y="{y + 284}" text-anchor="middle" font-family="{UI}" font-size="18" fill="{C["soft"]}">'
-             f'One GPU, its own quant, two model families.<tspan fill="{C["mark"]}">▍<animate attributeName="opacity" values="1;1;0;0" '
+             f'One GPU, its own quant, three model families.<tspan fill="{C["mark"]}">▍<animate attributeName="opacity" values="1;1;0;0" '
              f'keyTimes="0;.5;.5;1" dur="1.1s" repeatCount="indefinite"/></tspan></text>')
     pills = (("v" + VERSION, "mark"), ("Apache-2.0", "faint"), ("Linux · Windows · sm_120", "sub"))
     tot = sum(22 + len(l) * 7.6 for l, _ in pills) + 10 * (len(pills) - 1)
@@ -251,8 +257,8 @@ def mobile():
     y += 350 + 26
 
     intro = ("An inference engine for one GPU: its own quantization, its own container, thin CUDA kernels in "
-             "Rust. OpenAI-compatible HTTP, and the engine behind Crow. Two models from the original "
-             "safetensors: Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5.")
+             "Rust. OpenAI-compatible HTTP, and the engine behind Crow. Three models: Qwen3.8-Flash-Next "
+             "as CNQ4.5-M, the dense Qwen3.8-27B as CNQ4.5 and GLM-5.3-Flash as MUL1K3.")
     for i, line in enumerate(wrap(intro, 46)):
         t(W / 2, y + i * 23, line, 16, C["soft"], anchor="middle")
     y += len(wrap(intro, 46)) * 23 + 14
@@ -325,7 +331,8 @@ def mobile():
 
     y = msection(y, "Build and run", "ok")
     body = wrap("cargo build, then serve on port 8099. Crow connects with --base-url. The 104.7 GB Flash-Next container "
-                "downloads from Hugging Face; the 17.8 GB 27B container downloads from Hugging Face too.", 50)
+                "downloads from Hugging Face; the 17.8 GB 27B container downloads from Hugging Face too. GLM-5.3-Flash: "
+                "the 124.6 GB container, its own start script in GLM-5.3-Flash-crow-nest.", 50)
     ih = 58 + len(body) * 20 + 14
     card(X0, y, CW, ih, C["term"], C["bevel"], 12)
     t(X0 + 18, y + 34, "Copy it right below this picture.", 17, C["text"], weight=600)
@@ -340,6 +347,6 @@ if MOBILE:
 H = y - 20
 
 svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
-       f'aria-label="crow-nest: one GPU, its own quant, two model families. Features, measurements, requirements.">'
+       f'aria-label="crow-nest: one GPU, its own quant, three model families. Features, measurements, requirements.">'
        + "".join(o) + "</svg>\n")
 (OUT / ("crow-nest-" + ("mobile-" if MOBILE else "") + VARIANT + ".svg")).write_text(svg)
