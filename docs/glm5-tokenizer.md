@@ -252,6 +252,8 @@ family once at boot and every GLM request follows it:
    (154843), found by text as for Qwen.
 4. **Reasoning filter.** A GLM request has `enable_thinking` true, so `ThinkFilter::for_request`
    starts `Inside`. The `[chat]` line names the rendered level (`low`, `high`, `max`), never `off`.
+   The block closes on the added id 154842 of `</think>`, not on its text (#221,
+   `ThinkFilter::closing_on_id`): the text out of ordinary tokens is a quote and stays reasoning.
 5. **Stop ids.** The loop and the tool trie take their stop ids from the engine through the
    `ServeEngine` seam: `Geo::eos_ids` for Flash-Next and the 27B, `glm5_template::EOS_IDS` for
    `Glm5Engine`. `sample::EOS_IDS` keeps its type and value.

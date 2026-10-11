@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A `</think>` that GLM-5.3-Flash quotes inside its reasoning no longer ends the think block** (#221, 2026-10-11): serve's reasoning filter closed `Inside` on the detokenized TEXT `</think>`. On GLM that tag is the added id 154842, and the same text out of ordinary tokens (`</` `think` `>`) is a quote: in robin's Crow session of 2026-10-11 (task: read the crow-nest issues, which contain the literal tag) the grey reasoning box ended at `(the` and the rest of the reasoning streamed as answer text (n = 1, screenshot; ids not logged). The glm5_next loop now closes the block on the id, as vLLM's reasoning parser does: `ThinkFilter::closing_on_id`, set when `</think>` resolves to an added id; inside the block a literal `</think>` is reasoning, the id closes it (also when it renders no text), and #81's injected close and forced ids take the same road. `Lead` and `Body` are unchanged (a stray `</think>` in the answer is still dropped, #67). The `[chat] reasoning filter` line adds `closed on id 154842 (#221)`. Flash-Next and the 27B keep the text filter, byte for byte. Five new tests (pure filter, no tokenizer): a quoted tag stays reasoning and the old filter splits there; the id at the quote position closes there; a close id without text closes at the step's end; a pending close never outlives its step; `Lead`/`Body` as before. `cargo test --release --bin serve` on Linux without `models/`: 130 passed, 10 failed, the same 10 as on `9e39425` (they `expect` the Qwen tokenizer file). Live check in Crow (#221 expected result 3) not run.
+
 ## 2026-10-11 — v0.12.0
 
 **GLM-5.3-Flash in serve gets an operating set with its KV mapped as the context grows (`arm4.env`) and draws sampled tokens on the device; three prefill switches for Crow's tool rounds and new chats land default off.** v0.12.0 carries the 15 commits from v0.11.0 to `2a18fbc` (2026-10-11) and the release commit:

@@ -2907,11 +2907,17 @@ fn next_delta(full: &str, emitted: usize) -> Option<&str> {
     Some(&full[emitted..])
 }
 
-/// #67: `<think>`, the tag the model opens a reasoning block with. Ordinary TEXT, not an
-/// added token, so it arrives split across decode steps like any other markup.
+/// - #67: `<think>`, the tag the model opens a reasoning block with.
+/// - The Qwen path (`chat_generate`) matches it as TEXT, so it arrives split across decode
+///   steps like any other markup.
+/// - #221: on GLM-5.3-Flash it is an ADDED token as well; the filter still opens on the text.
 const THINK_OPEN: &str = "<think>";
-/// #67: `</think>`. The prompt already carries a CLOSED empty block (`enable_thinking` is
-/// false, `tokenizer.rs:18-19`), so every one of these in the generation is a stray.
+/// - #67: `</think>`. The prompt already carries a CLOSED empty block (`enable_thinking` is
+///   false, `tokenizer.rs:18-19`), so every one of these in the generation is a stray.
+/// - The Qwen path matches it as TEXT, wherever it came from.
+/// - #221: on GLM-5.3-Flash it is the added token 154842 (`glm_realign_walks_glms_own_vocabulary`),
+///   and the same text out of ordinary tokens (`</` `think` `>`) is a QUOTE: the glm5_next loop
+///   closes the block on the id (`ThinkFilter::closing_on_id`), as vLLM's reasoning parser does.
 const THINK_CLOSE: &str = "</think>";
 
 /// #67: what one fed piece splits into - `delta.content` and `delta.reasoning_content`
@@ -2956,6 +2962,23 @@ enum Think {
 ///   completes leaves as content at `flush()`, so no byte is ever lost.
 /// - `<` that opens no candidate is emitted immediately; only a real prefix is held.
 /// - pure: no engine, no socket, so the tests drive it at every split point directly.
+///
+/// - #221: the CLOSE-BY-ID mode (`closing_on_id(true)`), the glm5_next loop's alone; every
+///   other user keeps the table above byte for byte (the mode is off by default).
+/// - Why: on GLM `</think>` is the added id 154842, and a model reasoning about a text that
+///   contains `</think>` writes it as ordinary tokens - closing on that TEXT leaked the rest
+///   of the reasoning into `content`. vLLM ends reasoning on the id, never on the text.
+/// - `Inside`, no close pending: NO candidate - every byte is reasoning, a literal `</think>`
+///   included, and nothing is held back as a partial tag.
+/// - the loop sees the id (`close_id_seen`, block open): the close is PENDING, `is_inside()`
+///   unchanged; `</think>` is the candidate in `Inside` again and its complete match is the
+///   `take_tag` of the table. No partial is held while pending either: the id's whole text
+///   arrives in the same step (`ToolStream` releases a `</think>` whole), and a split it did
+///   not resolve stays reasoning, in order.
+/// - `end_step` after that step's text: a close still pending (the id rendered no text, a
+///   tokenizer where it is special) is taken there, so the block closes on the id in every
+///   case and no pending flag outlives its step to make a later quote close the block.
+/// - `Lead` and `Body` are the table's, unchanged: a stray `</think>` text in `Body` is dropped.
 #[derive(Debug, Clone, Default)]
 struct ThinkFilter {
     /// the state above; `Lead` at the first byte of every generation
@@ -2968,6 +2991,12 @@ struct ThinkFilter {
     drop_lead: bool,
     /// how many tags were stripped, for the one `[chat]` line
     stripped: usize,
+    /// #221: `Inside` closes on the `</think>` ID (the loop's `close_id_seen`), not on its text
+    close_by_id: bool,
+    /// #221: the id came in THIS step; its text (or `end_step`) closes the block
+    close_pending: bool,
+    /// #221: a block closed on the id, for the one `[chat]` line
+    closed_on_id: bool,
 }
 
 impl ThinkFilter {
@@ -2996,6 +3025,41 @@ impl ThinkFilter {
         }
     }
 
+    /// #221: the close-by-id mode of the doc above, for the glm5_next loop; off by default
+    fn closing_on_id(mut self, on: bool) -> Self {
+        self.close_by_id = on;
+        self
+    }
+
+    /// - #221: the loop generated the `</think>` id while the block is open: the close is
+    ///   PENDING until this step's text matches the tag, or `end_step` takes it.
+    /// - `is_inside()` does not change here, so `admit_id` still sees this id as the
+    ///   block's last one, as it does on the text path.
+    /// - ignored outside the mode and outside the block (the loop guards it the same way).
+    fn close_id_seen(&mut self) {
+        if self.close_by_id && self.state == Think::Inside {
+            self.close_pending = true;
+        }
+    }
+
+    /// - #221: the step's text has been fed. A close still pending rendered no text (the
+    ///   id is special and `decode` skipped it), so the id closes the block here.
+    /// - nothing pending: a no-op, so every other path and step is untouched.
+    fn end_step(&mut self) {
+        if self.close_pending {
+            self.close_pending = false;
+            if self.state == Think::Inside {
+                self.closed_on_id = true;
+                self.take_tag(THINK_CLOSE);
+            }
+        }
+    }
+
+    /// #221: a block closed on the `</think>` id, for the one `[chat]` line
+    fn closed_on_id(&self) -> bool {
+        self.closed_on_id
+    }
+
     /// #81: is the block still open? The budget counter asks this of every generated
     /// token AFTER the filter has seen its text, so a token that closes the block itself
     /// is the model's own close and never a counted reasoning token.
@@ -3012,8 +3076,15 @@ impl ThinkFilter {
     fn candidates(&self) -> &'static [&'static str] {
         match self.state {
             Think::Lead => &[THINK_OPEN, THINK_CLOSE],
+            // #221: by id, the text closes the block only in the step of the id
+            Think::Inside if self.close_by_id && !self.close_pending => &[],
             Think::Inside | Think::Body => &[THINK_CLOSE],
         }
+    }
+
+    /// #221: a partial tag is held back, except in a by-id block, where nothing is
+    fn holds_partial(&self) -> bool {
+        !(self.close_by_id && self.state == Think::Inside)
     }
 
     /// one decoded piece in, its content and reasoning halves out
@@ -3038,11 +3109,16 @@ impl ThinkFilter {
                     }
                 }
                 if let Some(tag) = hit {
+                    if self.close_pending && self.state == Think::Inside {
+                        // #221: the text of the `</think>` id of this step
+                        self.close_pending = false;
+                        self.closed_on_id = true;
+                    }
                     self.take_tag(tag);
                     i += tag.len();
                     continue;
                 }
-                if partial {
+                if partial && self.holds_partial() {
                     // the piece ends inside a candidate tag: hold it, the next one decides
                     self.held.push_str(rest);
                     return out;
@@ -7117,7 +7193,10 @@ fn glm_generate_on(
 
     let mut ts = tool_stream(req);
     let tool_open = tk.token_id(TOOL_OPEN);
-    let mut think = ThinkFilter::for_request(req.enable_thinking);
+    // crow-nest #221: `</think>` is the added id 154842 here; the block closes on that id, and
+    // the same text out of ordinary tokens is reasoning (a quote), as in vLLM
+    let think_close_id = tk.token_id(THINK_CLOSE).filter(|&id| tk.is_added(id));
+    let mut think = ThinkFilter::for_request(req.enable_thinking).closing_on_id(think_close_id.is_some());
     let mut stops = StopStrings::new(&req.stop);
     let mut counts = Chunks::default();
     let cx = ChunkCtx::new(&id, created, &model);
@@ -7194,6 +7273,11 @@ fn glm_generate_on(
                 break;
             }
             out.push(next as u32);
+            // crow-nest #221: the model's own close (or #81's injected one, or a forced id):
+            // pending until this step's text, `is_inside()` unchanged for `admit_id` below
+            if Some(next as u32) == think_close_id && think.is_inside() {
+                think.close_id_seen();
+            }
             let phase = gate.as_ref().map_or("idle", |g| g.phase());
             if !admit_id(next as u32, tool_open, &think, &mut ts, gate.as_mut()) {
                 tracing::warn!(target: "chat",
@@ -7233,6 +7317,9 @@ fn glm_generate_on(
                     break;
                 }
             }
+            // crow-nest #221: a close the id's text did not take (none rendered) is taken
+            // here, before the budget counter, which must see the block closed
+            think.end_step();
             if !injection_built {
                 if let Some(cap) = think_budget {
                     if think.is_inside() {
@@ -7321,9 +7408,13 @@ fn glm_generate_on(
     }
     if think.stripped() > 0 {
         tracing::info!(target: "chat",
-            "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content (#67); the generated ids are untouched{}",
+            "[chat] reasoning filter: {} <think>/</think> tag(s) stripped from the content (#67); the generated ids are untouched{}{}",
             think.stripped(),
-            if req.enable_thinking { ", and this request was thinking, so one of them is its own </think>" } else { "" });
+            if req.enable_thinking { ", and this request was thinking, so one of them is its own </think>" } else { "" },
+            match think_close_id {
+                Some(c) if think.closed_on_id() => format!(", closed on id {c} (#221)"),
+                _ => String::new(),
+            });
     }
     if aborted {
         let open = args_acc.iter().filter(|a| args_object_or_raw(a).1.is_some()).count();
@@ -8143,6 +8234,176 @@ mod tests {
         assert!(!s.reasoning.is_empty(), "the wrap-up lands in the block");
         assert!(!g.is_inside());
         assert!(s.content.is_empty(), "Lead trims the break after the close");
+    }
+
+    // ------------------------------------------- close on the `</think>` id (#221)
+
+    /// one decode step of the glm5_next loop as the filter sees it: the id guard, the step's
+    /// text, `end_step`; `None` is an ordinary id, `Some(text)` the close id rendering `text`
+    fn by_id_step(f: &mut ThinkFilter, acc: &mut Split, close: Option<&str>, text: &str) {
+        if close.is_some() && f.is_inside() {
+            f.close_id_seen();
+        }
+        let s = f.push(close.unwrap_or(text));
+        acc.content.push_str(&s.content);
+        acc.reasoning.push_str(&s.reasoning);
+        f.end_step();
+    }
+
+    fn by_id_flush(f: &mut ThinkFilter, acc: &mut Split) {
+        let s = f.flush();
+        acc.content.push_str(&s.content);
+        acc.reasoning.push_str(&s.reasoning);
+    }
+
+    #[test]
+    fn a_quoted_close_tag_stays_reasoning_when_the_block_closes_on_its_id() {
+        // #221 expected result 1: the quote arrives as ordinary tokens `</` `think` `>`
+        let quote = ["reasoning … (the ", "</", "think", ">", "-in-content repair) …"];
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        for p in quote {
+            by_id_step(&mut f, &mut acc, None, p);
+            assert!(f.is_inside(), "the quote {p:?} keeps the block open");
+        }
+        by_id_step(&mut f, &mut acc, Some("</think>"), "");
+        assert!(!f.is_inside(), "the id closes the block");
+        for p in ["\n\n", "Answer"] {
+            by_id_step(&mut f, &mut acc, None, p);
+        }
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.reasoning, "reasoning … (the </think>-in-content repair) …");
+        assert_eq!(acc.content, "Answer");
+        assert_eq!(f.stripped(), 1);
+        assert!(f.closed_on_id());
+
+        // the same text on the TEXT filter (every other path) splits at the quote: the
+        // defect of #221, and what keeps this test red without the mode
+        let mut t = ThinkFilter::inside();
+        let mut old = Split::default();
+        for p in quote.iter().copied().chain(["</think>", "\n\n", "Answer"]) {
+            let s = t.push(p);
+            old.content.push_str(&s.content);
+            old.reasoning.push_str(&s.reasoning);
+        }
+        let s = t.flush();
+        old.content.push_str(&s.content);
+        assert_eq!(old.reasoning, "reasoning … (the ");
+        assert_eq!(old.content, "-in-content repair) …\n\nAnswer", "and the real close is dropped as a stray");
+        assert!(!t.closed_on_id());
+
+        // the quote in ONE piece is reasoning too
+        let mut g = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut g, &mut acc, None, "a quoted </think> here");
+        assert!(g.is_inside());
+        by_id_step(&mut g, &mut acc, Some("</think>"), "");
+        by_id_step(&mut g, &mut acc, None, "\n\nAnswer");
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!(acc.reasoning, "a quoted </think> here");
+        assert_eq!(acc.content, "Answer");
+        assert_eq!(g.stripped(), 1);
+    }
+
+    #[test]
+    fn the_close_id_at_the_quote_position_still_closes_there() {
+        // #221 expected result 2, the control: the id itself, where the quote stood
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut f, &mut acc, None, "reasoning … (the ");
+        by_id_step(&mut f, &mut acc, Some("</think>"), "");
+        by_id_step(&mut f, &mut acc, None, "-in-content repair) …");
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.reasoning, "reasoning … (the ");
+        assert_eq!(acc.content, "-in-content repair) …");
+        assert_eq!(f.stripped(), 1);
+        assert!(f.closed_on_id());
+        // the step's text may carry bytes ahead of the tag (a `<` `ToolStream` held): they
+        // are reasoning, in order, and the tag still closes
+        let mut g = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        g.close_id_seen();
+        let s = g.push("<</think>\n\nA");
+        acc.reasoning.push_str(&s.reasoning);
+        acc.content.push_str(&s.content);
+        g.end_step();
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!((acc.reasoning.as_str(), acc.content.as_str()), ("<", "A"));
+    }
+
+    #[test]
+    fn a_close_id_that_renders_no_text_closes_the_block_at_end_step() {
+        // #221: a tokenizer where `</think>` is special and `decode` skips it
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut f, &mut acc, None, "thinking");
+        f.close_id_seen();
+        assert!(f.is_inside(), "close_id_seen alone never moves the state");
+        f.end_step();
+        assert!(!f.is_inside(), "end_step takes the pending close");
+        for p in ["\n\n", "Answer"] {
+            by_id_step(&mut f, &mut acc, None, p);
+        }
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.reasoning, "thinking");
+        assert_eq!(acc.content, "Answer", "the break after the close is trimmed");
+        assert_eq!(f.stripped(), 1);
+        assert!(f.closed_on_id());
+    }
+
+    #[test]
+    fn a_pending_close_never_outlives_its_step() {
+        // #221: a text match takes the pending close, so end_step has nothing left to do
+        let mut f = ThinkFilter::inside().closing_on_id(true);
+        let mut acc = Split::default();
+        by_id_step(&mut f, &mut acc, Some("</think>"), "");
+        assert_eq!(f.stripped(), 1, "one close, not a second one from end_step");
+        // the model opens a block of its own again (`Lead`), and quotes the tag in it
+        by_id_step(&mut f, &mut acc, None, "<think>");
+        assert!(f.is_inside());
+        by_id_step(&mut f, &mut acc, None, "a quoted </think> stays");
+        assert!(f.is_inside(), "no flag left over from the earlier close");
+        // the id outside the block is ignored, so it arms nothing for a later block
+        let mut g = ThinkFilter::new().closing_on_id(true);
+        let mut acc = Split::default();
+        g.close_id_seen();
+        g.end_step();
+        by_id_step(&mut g, &mut acc, None, "<think>");
+        by_id_step(&mut g, &mut acc, None, "x </think> y");
+        assert!(g.is_inside());
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!(acc.reasoning, "x </think> y");
+        assert!(acc.content.is_empty());
+        // and on the text filter the id calls are no-ops: every other path is unchanged
+        let mut t = ThinkFilter::inside();
+        t.close_id_seen();
+        t.end_step();
+        assert!(t.is_inside());
+        assert_eq!(t.stripped(), 0);
+    }
+
+    #[test]
+    fn by_id_mode_keeps_lead_and_body_as_they_were() {
+        // #221: only `Inside` changes; a stray `</think>` text in `Body` is still dropped (#67)
+        let mut f = ThinkFilter::new().closing_on_id(true);
+        let mut acc = Split::default();
+        for p in ["\n", "Answer", " text</", "think>", " more"] {
+            by_id_step(&mut f, &mut acc, None, p);
+        }
+        by_id_flush(&mut f, &mut acc);
+        assert_eq!(acc.content, "\nAnswer text more");
+        assert!(acc.reasoning.is_empty());
+        assert_eq!(f.stripped(), 1);
+        assert!(!f.closed_on_id());
+        // `Lead`: a leading stray `</think>` and the whitespace around it are dropped
+        let mut g = ThinkFilter::new().closing_on_id(true);
+        let mut acc = Split::default();
+        for p in ["  </thi", "nk>\n\n", "Hi"] {
+            by_id_step(&mut g, &mut acc, None, p);
+        }
+        by_id_flush(&mut g, &mut acc);
+        assert_eq!(acc.content, "Hi");
+        assert_eq!(g.stripped(), 1);
     }
 
     // ------------------------------------------------------- sampling (#28 A6)
