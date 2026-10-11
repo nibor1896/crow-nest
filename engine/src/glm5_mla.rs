@@ -261,6 +261,31 @@ pub struct MlaCache {
     pub latent: CUdeviceptr,
     pub index: CUdeviceptr,
     pub cap: usize,
+    /// #214 `CROW_GLM_KV_LAZY`: the VMM ranges behind `latent` and `index` (VA for `cap` rows,
+    /// physical memory for the rows mapped so far); `None` = both `cuMemAlloc`'d for `cap` rows
+    lazy: Option<Box<[cuda::Growable; 2]>>,
+}
+
+/// #214: the bytes a lazy cache of `cap` rows maps to hold `rows` rows at the VMM granularity
+/// `g`: latent and indexer each rounded up to `g`, at most their reservation (`cap` rows rounded
+/// up to `g`)
+pub fn kv_lazy_mapped_bytes(d: &MlaDims, cap: usize, rows: usize, g: usize) -> [usize; 2] {
+    [d.latent_bytes_per_token(), d.indexer_bytes_per_token()].map(|b| {
+        let b = b as usize;
+        cuda::growable_target(rows.min(cap) * b, g, cuda::round_up(cap * b, g))
+    })
+}
+
+/// #214: the bytes a lazy cache of `cap` rows with `have` bytes mapped (latent, indexer) maps
+/// more to hold `rows` rows at granularity `g` (0 when they are mapped)
+pub fn kv_lazy_grow_bytes(d: &MlaDims, cap: usize, have: [usize; 2], rows: usize, g: usize) -> u64 {
+    let want = kv_lazy_mapped_bytes(d, cap, rows, g);
+    (want[0].saturating_sub(have[0]) + want[1].saturating_sub(have[1])) as u64
+}
+
+/// #214: the rows mapped bytes `m` (latent, indexer) hold, at most `cap`
+pub fn kv_lazy_rows_of(d: &MlaDims, cap: usize, m: [usize; 2]) -> usize {
+    (m[0] / d.latent_bytes_per_token() as usize).min(m[1] / d.indexer_bytes_per_token() as usize).min(cap)
 }
 
 impl MlaCache {
@@ -276,11 +301,81 @@ impl MlaCache {
             latent: cuda::alloc_named("glm5 MLA latent cache", cap * d.latent_bytes_per_token() as usize),
             index: cuda::alloc_named("glm5 DSA indexer cache", cap * d.indexer_bytes_per_token() as usize),
             cap,
+            lazy: None,
         }
+    }
+    /// #214 `CROW_GLM_KV_LAZY`: a cache of `cap` rows whose VA is reserved whole and whose
+    /// physical memory is mapped for the first `rows` rows only ([`MlaCache::grow_to`]); same
+    /// addressing as [`MlaCache::new`]
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn new_lazy(d: &MlaDims, cap: usize, rows: usize) -> Result<MlaCache, cuda::AllocFailed> {
+        assert!(cap / KPOOL <= MAX_POOLS, "glm5_mla: a cache of {cap} tokens has more than {MAX_POOLS} pools");
+        let rows = rows.min(cap);
+        let mut lat = cuda::Growable::reserve("glm5 MLA latent cache (lazy)", cap * d.latent_bytes_per_token() as usize, rows * d.latent_bytes_per_token() as usize)?;
+        let idx = match cuda::Growable::reserve("glm5 DSA indexer cache (lazy)", cap * d.indexer_bytes_per_token() as usize, rows * d.indexer_bytes_per_token() as usize) {
+            Ok(g) => g,
+            Err(e) => {
+                lat.free();
+                return Err(e);
+            }
+        };
+        Ok(MlaCache { latent: lat.va, index: idx.va, cap, lazy: Some(Box::new([lat, idx])) })
+    }
+    /// #214: true for a [`MlaCache::new_lazy`] cache
+    pub fn is_lazy(&self) -> bool {
+        self.lazy.is_some()
+    }
+    /// #214: the bytes mapped now (latent, indexer); a cache of [`MlaCache::new`] holds all of it
+    pub fn mapped_bytes(&self, d: &MlaDims) -> [usize; 2] {
+        match &self.lazy {
+            Some(g) => [g[0].mapped(), g[1].mapped()],
+            None => [self.cap * d.latent_bytes_per_token() as usize, self.cap * d.indexer_bytes_per_token() as usize],
+        }
+    }
+    /// #214: the rows the mapped memory holds (`cap` for a cache of [`MlaCache::new`])
+    pub fn rows_mapped(&self, d: &MlaDims) -> usize {
+        kv_lazy_rows_of(d, self.cap, self.mapped_bytes(d))
+    }
+    /// #214: the bytes [`MlaCache::grow_to`] `rows` maps at granularity `g` (0 for an eager cache)
+    pub fn grow_bytes(&self, d: &MlaDims, rows: usize, g: usize) -> u64 {
+        if self.lazy.is_none() {
+            return 0;
+        }
+        kv_lazy_grow_bytes(d, self.cap, self.mapped_bytes(d), rows, g)
+    }
+    /// #214: map the rows up to `rows` (latent and indexer); a no-op for an eager cache. Returns
+    /// the bytes mapped.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn grow_to(&mut self, d: &MlaDims, rows: usize) -> Result<u64, cuda::AllocFailed> {
+        let Some(g) = self.lazy.as_mut() else { return Ok(0) };
+        let rows = rows.min(self.cap);
+        let a = g[0].grow_to(rows * d.latent_bytes_per_token() as usize)?;
+        let b = g[1].grow_to(rows * d.indexer_bytes_per_token() as usize)?;
+        Ok((a + b) as u64)
+    }
+    /// #214: unmap the pieces above `rows` rows (rows `>= rows` are not read again before they
+    /// are written); a no-op for an eager cache. Returns the bytes released.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the rows above `rows` is pending.
+    pub unsafe fn shrink_to(&mut self, d: &MlaDims, rows: usize) -> u64 {
+        let Some(g) = self.lazy.as_mut() else { return 0 };
+        (g[0].shrink_to(rows * d.latent_bytes_per_token() as usize) + g[1].shrink_to(rows * d.indexer_bytes_per_token() as usize)) as u64
     }
     /// # Safety
     /// No launch that reads the cache is pending.
     pub unsafe fn free(&mut self) {
+        if let Some(mut g) = self.lazy.take() {
+            g[0].free();
+            g[1].free();
+            self.latent = 0;
+            self.index = 0;
+            return;
+        }
         cuda::free_dev(&mut self.latent);
         cuda::free_dev(&mut self.index);
     }

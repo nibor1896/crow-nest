@@ -55,6 +55,7 @@ pub(crate) const KEYS: &[&str] = &[
     "CROW_GLM_RT2",
     "CROW_GLM_RT2_TABLE_SM",
     "CROW_GLM_ATTN2",
+    "CROW_GLM_KV_LAZY",
 ];
 
 pub(crate) struct Env(Vec<(String, Option<String>)>);
@@ -1310,4 +1311,73 @@ fn glm5_int_gpu_lazy_refill_and_the_lent_staging_set_keep_the_ids() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #214 Expected result 5 (`CROW_GLM_KV_LAZY`): the lazy caches map 2,048 rows at boot (the
+/// floor of 16 rows rounded up to a 2 MiB latent granule), grow across granule boundaries in a
+/// 4,500-row prompt of 1,024-row calls (the elastic arena handing back what they take), shrink
+/// back to the floor (`kv_trim`) and grow again in a second generation. Every id and every latent
+/// and indexer row `0 ..= last` equal the eager caches' (switch off), and the second generation
+/// equals the first.
+#[test]
+#[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_int_gpu_the_lazy_kv -- --ignored --nocapture --test-threads 1"]
+fn glm5_int_gpu_the_lazy_kv_cache_is_the_eager_one() {
+    let s = |v: &str| v.to_string();
+    let g = geo8();
+    let sy = synth_model(&g, REC);
+    let (spec, _) = crate::nvme_source::glm5_record_of_container(&sy.path).unwrap();
+    let moe = MoeGeo::new(&g, spec).unwrap();
+    let mut cnq = Cnq::open_checked(&sy.path).unwrap();
+    let prompt: Vec<i64> = (0..4500).map(|i| (i * 61 + 7) % 2048).collect();
+    let (n, cap) = (6usize, 12_000usize);
+    let last = prompt.len() + n - 2;
+    let md = crate::glm5_mla::MlaDims::of(&g);
+    // SAFETY: called inside the test's CUDA context, no launch pending after the sync
+    let rows = |run: &Glm5Run| -> Vec<Vec<u8>> {
+        unsafe {
+            cuda::sync();
+            run.mla_caches()
+                .flat_map(|c| [cuda::dtoh_t::<u8>(c.latent, (last + 1) * md.latent_bytes_per_token() as usize), cuda::dtoh_t::<u8>(c.index, (last + 1) * md.indexer_bytes_per_token() as usize)])
+                .collect()
+        }
+    };
+    let mut outs = Vec::new();
+    unsafe {
+        let _ctx = cuda::Ctx::init();
+        for lazy in [None, Some("16")] {
+            let mut env = vec![("CROW_CHUNK", s("1024")), ("CROW_GLM_ARENA", s("global")), ("CROW_GLM_ARENA_ELASTIC_GB", s("1"))];
+            if let Some(w) = lazy {
+                env.push(("CROW_GLM_KV_LAZY", s(w)));
+            }
+            let _env = Env::set(&env);
+            let mut run = Glm5Run::load(&mut cnq, &g, &moe, cap, &mut |l| eprintln!("{l}"));
+            let mut tiers = ExpertTiers::new(&cnq, &sy.path, &g, &moe, TierSizes { vram: 3, pinned: 4 }, 1, g.topk).unwrap();
+            assert_eq!(run.kv_lazy(), lazy.map(|_| 16));
+            let boot = run.kv_rows_mapped();
+            let a = run.generate(&mut cnq, &mut tiers, &prompt, n, false, &mut |_| {}).unwrap();
+            let ra = rows(&run);
+            let grown = run.kv_rows_mapped();
+            run.kv_trim(0);
+            let trimmed = run.kv_rows_mapped();
+            let b = run.generate(&mut cnq, &mut tiers, &prompt, n, false, &mut |_| {}).unwrap();
+            let rb = rows(&run);
+            eprintln!("glm5 int lazy KV {lazy:?}: rows mapped boot {boot}, after the run {grown}, after the trim {trimmed}; {:?}; {}", run.kv_stats, run.kv_report(&tiers).unwrap_or_default());
+            if lazy.is_some() {
+                assert_eq!(boot, 2048, "the floor rounded up to one latent granule");
+                assert!(grown > last && grown < cap, "grown to the run's rows, not the cap ({grown})");
+                assert_eq!(trimmed, 2048, "back to the floor");
+                assert!(run.kv_stats.grows >= 2 && run.kv_stats.trims == 1 && run.kv_stats.hand_back_bytes > 0, "{:?}", run.kv_stats);
+            } else {
+                assert_eq!((boot, grown, trimmed), (cap, cap, cap));
+                assert_eq!(run.kv_stats, crate::glm5_tiers::KvLazyStats::default());
+            }
+            assert_eq!(a.ids, b.ids, "{lazy:?}: the second generation (after the trim) is the first");
+            assert!(ra == rb, "{lazy:?}: every cache row after the regrowth equals the first run's");
+            tiers.free();
+            run.free();
+            outs.push((a.ids, ra));
+        }
+    }
+    assert_eq!(outs[0].0, outs[1].0, "ids, eager vs lazy");
+    assert!(outs[0].1 == outs[1].1, "every latent and indexer row 0 ..= {last}, eager vs lazy");
 }

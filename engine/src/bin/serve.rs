@@ -6020,6 +6020,8 @@ trait GlmSeq {
     fn consts(&self) -> &dyn ServeEngine;
     /// #192: the MTP counters since the last call (`None` when off)
     fn mtp_report(&mut self) -> Option<String>;
+    /// #214: the mapped KV and the VRAM slots (`None` when `CROW_GLM_KV_LAZY` is off)
+    fn kv_report(&mut self) -> Option<String>;
     /// the prompt phase: the prefix decision, rollback or reset, prefill (or the snapshot's
     /// row), the snapshot (`glm_prompt_phase`)
     ///
@@ -6058,6 +6060,9 @@ impl<R: Rows> GlmSeq for Glm5Engine<R> {
     }
     fn mtp_report(&mut self) -> Option<String> {
         self.rows_mut().mtp_report()
+    }
+    fn kv_report(&mut self) -> Option<String> {
+        self.rows_mut().kv_report()
     }
     unsafe fn begin(&mut self, prompt: &[i64]) -> Result<GlmBegun, String> {
         glm_prompt_phase(self, prompt)
@@ -6209,6 +6214,10 @@ impl GlmSeq for GlmSlotSeq {
     }
     fn mtp_report(&mut self) -> Option<String> {
         // MTP is refused with sequence slots (`Glm5Run::set_slots`)
+        None
+    }
+    fn kv_report(&mut self) -> Option<String> {
+        // CROW_GLM_KV_LAZY is refused with sequence slots (`glm5_tiers::kv_lazy_refusal`)
         None
     }
     unsafe fn begin(&mut self, prompt: &[i64]) -> Result<GlmBegun, String> {
@@ -7216,6 +7225,9 @@ fn glm_generate_on(
     });
     if let Some(l) = seq.mtp_report() {
         tracing::info!(target: "chat", "[chat] MTP (#192): {l}");
+    }
+    if let Some(l) = seq.kv_report() {
+        tracing::info!(target: "chat", "[chat] KV lazy (#214): {l}");
     }
     tracing::debug!(target: "chat", "[chat] ids {out:?}");
     Ok(GenOut { id, created, finish, timing, aborted, malformed: ts.malformed().to_vec() })

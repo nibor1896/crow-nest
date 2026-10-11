@@ -929,6 +929,73 @@ pub fn prompt_borrow_from_env(get: &dyn Fn(&str) -> Option<String>, chunk: usize
     chunk > decode_t && arena_kind(get(ARENA_ENV).as_deref()) == Ok(ArenaKind::Global) && arena_config(get).is_ok_and(|c| c.elastic_bytes > 0)
 }
 
+/// #214: `CROW_GLM_KV_LAZY=<rows>`: the MLA latent and DSA indexer caches of `Glm5Run::load`
+/// reserve VA for the whole context and map physical memory for the first `<rows>` rows only;
+/// more is mapped as the context grows (the elastic arena hands back what it takes), less after a
+/// reset. Unset, empty or `0` = off (every cache `cuMemAlloc`'d whole, the path of record).
+pub const KV_LAZY_ENV: &str = "CROW_GLM_KV_LAZY";
+
+/// #214: parse [`KV_LAZY_ENV`]: unset, empty or `0` = `None` (off); a positive whole number = the
+/// rows mapped at least (the working floor); anything else refused by name
+pub fn kv_lazy_from(v: Option<&str>) -> Result<Option<usize>, String> {
+    match v.map(str::trim) {
+        None | Some("") | Some("0") => Ok(None),
+        Some(x) => match x.parse::<usize>() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(format!("{KV_LAZY_ENV}={x:?}: accepted unset or 0 (off), or the rows mapped at boot (a positive whole number)")),
+        },
+    }
+}
+
+/// #214: [`kv_lazy_from`] of the environment
+pub fn kv_lazy_from_env() -> Result<Option<usize>, String> {
+    kv_lazy_from(std::env::var(KV_LAZY_ENV).ok().as_deref())
+}
+
+/// #214: the decode paths that grow the caches through [`Glm5Run::row`] and
+/// [`Glm5Run::prefill_with`] only: with [`KV_LAZY_ENV`] on, serve refuses MTP drafts
+/// (`CROW_GLM_MTP`), the lookahead decode (`CROW_GLM_LA`) and sequence slots
+/// (`CROW_GLM_MAX_BATCH` above 1) by name; their rows would reach unmapped memory
+pub fn kv_lazy_refusal(lazy: Option<usize>, mtp_drafts: usize, la: bool, batch: usize) -> Result<(), String> {
+    if lazy.is_none() {
+        return Ok(());
+    }
+    let mut no = Vec::new();
+    if mtp_drafts > 0 {
+        no.push(format!("{}={mtp_drafts}", crate::glm5_mtp::MTP_ENV));
+    }
+    if la {
+        no.push("CROW_GLM_LA".to_string());
+    }
+    if batch > 1 {
+        no.push(format!("{MAX_BATCH_ENV}={batch}"));
+    }
+    if no.is_empty() {
+        return Ok(());
+    }
+    Err(format!("{KV_LAZY_ENV} with {}: those decode paths do not map the cache rows they write; turn one of them off", no.join(", ")))
+}
+
+/// #214: the boot invariant of [`KV_LAZY_ENV`]: the KV not mapped yet (`unmapped` bytes) fits in
+/// the live elastic chunks (`elastic` bytes, handed back on demand) plus the free VRAM above
+/// [`ARENA_RESERVE_BYTES`], so a full context can always be mapped
+pub fn kv_lazy_fits(unmapped: u64, elastic: u64, free: u64) -> bool {
+    elastic.saturating_add(free.saturating_sub(ARENA_RESERVE_BYTES)) >= unmapped
+}
+
+/// #214: the KV bytes the caches of a run of `cap` rows with `layers` DSA layers hold at boot at
+/// the VMM granularity `g`: `layers x MlaCache::bytes(cap)` off, the working floor `lazy` rows
+/// rounded up to `g` (latent and indexer each) on
+pub fn kv_boot_bytes(md: &MlaDims, cap: usize, layers: usize, lazy: Option<usize>, g: usize) -> u64 {
+    match lazy {
+        None => layers as u64 * MlaCache::bytes(md, cap),
+        Some(w) => {
+            let m = crate::glm5_mla::kv_lazy_mapped_bytes(md, cap, w, g);
+            layers as u64 * (m[0] + m[1]) as u64
+        }
+    }
+}
+
 pub fn prompt_calls(n: usize, chunk: usize) -> Vec<(usize, usize)> {
     let c = chunk.max(1);
     let mut v: Vec<(usize, usize)> = (0..n / c).map(|i| (i * c, c)).collect();
@@ -6503,6 +6570,7 @@ mod arena_gpu_tests {
                 ARENA_LAZY_REFILL_ENV,
                 ARENA_STAGE_LEND_ENV,
                 ARENA_PROMPT_COUNT_ENV,
+                KV_LAZY_ENV,
             ];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {
@@ -10122,6 +10190,22 @@ pub struct Glm5Run {
     cur: usize,
     /// `CROW_GLM_MAX_BATCH`: the head buffers of a batched decode step (`None` with one slot)
     bat: Option<BatchHead>,
+    /// #214 `CROW_GLM_KV_LAZY`: the working floor in rows (`None` = off, the caches whole)
+    kv_lazy: Option<usize>,
+    pub kv_stats: KvLazyStats,
+}
+
+/// #214 `CROW_GLM_KV_LAZY`: what the run mapped and released, cumulative since load
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvLazyStats {
+    /// growths that mapped memory, and the bytes they mapped
+    pub grows: u64,
+    pub grown_bytes: u64,
+    /// the bytes the growths asked the elastic arena for (`ExpertTiers::elastic_hand_back`)
+    pub hand_back_bytes: u64,
+    /// shrinks that released memory, and the bytes they released
+    pub trims: u64,
+    pub trimmed_bytes: u64,
 }
 
 /// `CROW_GLM_MAX_BATCH`: one parked sequence: a KDA state per KDA layer, an MLA cache per DSA
@@ -10212,7 +10296,26 @@ impl Glm5Run {
         ));
         let (kd, md) = (KdaDims::of(g), MlaDims::of(g));
         let kda = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Kda).then(|| KdaState::alloc(&kd))).collect();
-        let mla = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Mla).then(|| MlaCache::new(&md, cap))).collect();
+        // #214 CROW_GLM_KV_LAZY: a malformed value reads as off here (the callers refuse it by
+        // name first, `kv_lazy_from_env`)
+        let kv_lazy = kv_lazy_from_env().ok().flatten();
+        let mla: Vec<Option<MlaCache>> = (0..g.layers)
+            .map(|l| {
+                (gm::attn_kind(g, l) == AttnKind::Mla).then(|| match kv_lazy {
+                    None => MlaCache::new(&md, cap),
+                    Some(w) => MlaCache::new_lazy(&md, cap, w).unwrap_or_else(|e| e.raise()),
+                })
+            })
+            .collect();
+        if let Some(w) = kv_lazy {
+            let n = mla.iter().flatten().count();
+            let mapped: u64 = mla.iter().flatten().map(|c| c.mapped_bytes(&md).iter().sum::<usize>() as u64).sum();
+            let rows = mla.iter().flatten().map(|c| c.rows_mapped(&md)).min().unwrap_or(cap);
+            log(&format!(
+                "[glm5_run] {KV_LAZY_ENV}={w}: MLA latent + DSA indexer VA reserved for {cap} rows x {n} DSA layers ({} B), {rows} rows mapped ({mapped} B); more is mapped as the context grows (the elastic arena hands back what it takes), less after a reset",
+                n as u64 * MlaCache::bytes(&md, cap)
+            ));
+        }
         let row = g.hc_streams * g.hidden;
         // #186: the pass and the residual hold a prompt call of CROW_CHUNK rows (1 = row by row)
         let chunk = prompt_chunk_from_env().clamp(1, cap.max(1));
@@ -10257,6 +10360,8 @@ impl Glm5Run {
             seqs: Vec::new(),
             cur: 0,
             bat: None,
+            kv_lazy,
+            kv_stats: KvLazyStats::default(),
         };
         let sw = Switches::from_env();
         if sw != Switches::default() {
@@ -10400,6 +10505,11 @@ impl Glm5Run {
         }
         for s in self.kda.iter().flatten() {
             s.reset();
+        }
+        // #214 CROW_GLM_KV_LAZY: the speculative, controlled-lookahead and lookahead paths queue
+        // rows without `row` / `prefill_with`: every row of the run mapped up front
+        if self.kv_lazy.is_some() && (self.spec.is_some() || (self.sw.la && self.pass.ctl.is_some()) || self.feed.is_some()) {
+            self.kv_ensure(tiers, rows)?;
         }
         if self.spec.is_some() {
             return self.generate_spec(cnq, tiers, prompt, n, keep_logits, report);
@@ -11664,6 +11774,8 @@ impl Glm5Run {
             return Err(format!("glm5_run: token id {tok} outside the vocab of {}", self.g.vocab));
         }
         self.settle_ahead(tiers)?;
+        // #214 CROW_GLM_KV_LAZY: the row's cache rows mapped first (a no-op when off or mapped)
+        self.kv_ensure(tiers, pos + 1)?;
         if self.pass.ctl.is_some() {
             return self.row_ctl(cnq, tiers, tok, pos, head);
         }
@@ -12143,11 +12255,22 @@ impl Glm5Run {
         // plans on the arena's places (the NVPF read-ahead, the staged forwards)
         tiers.stage_lend_back()?;
         // #196 round 3: the staging buffers sized to what the scratch leaves, before it is taken
-        tiers.stage_plan_prompt(self.borrow_bytes(borrow_t));
+        // #214 CROW_GLM_KV_LAZY: the prompt's cache rows not mapped yet are handed back with the
+        // scratch (0 when off or mapped)
+        let kv = self.kv_grow_bytes(pos0 + n);
+        tiers.stage_plan_prompt(self.borrow_bytes(borrow_t) + kv);
         if borrow_t > 0 {
-            self.borrow_scratch(tiers, borrow_t)?;
+            self.borrow_scratch(tiers, borrow_t, kv)?;
+        } else if kv > 0 {
+            tiers.elastic_hand_back(kv)?;
         }
-        let r = self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows);
+        if kv > 0 {
+            self.kv_stats.hand_back_bytes += kv;
+        }
+        let r = match self.kv_map_to(pos0 + n) {
+            Ok(()) => self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows),
+            Err(e) => Err(e),
+        };
         if borrow_t > 0 {
             self.return_scratch();
         }
@@ -12184,13 +12307,14 @@ impl Glm5Run {
         }
     }
 
-    /// `CROW_GLM_ARENA` elastic: the elastic chunks a scratch of `t` rows takes handed back, the
-    /// pass and the residual at `t` rows; captured row graphs dropped (they hold the old buffers)
+    /// `CROW_GLM_ARENA` elastic: the elastic chunks a scratch of `t` rows (and #214's `kv` bytes of
+    /// cache rows still to be mapped) takes handed back, the pass and the residual at `t` rows;
+    /// captured row graphs dropped (they hold the old buffers)
     ///
     /// # Safety
     /// As [`Glm5Run::prefill`].
-    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers, t: usize) -> Result<(), String> {
-        tiers.elastic_hand_back(self.borrow_bytes(t))?;
+    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers, t: usize, kv: u64) -> Result<(), String> {
+        tiers.elastic_hand_back(self.borrow_bytes(t) + kv)?;
         self.resize_rows(t);
         Ok(())
     }
@@ -12286,6 +12410,233 @@ impl Glm5Run {
             r.map_err(|e| format!("glm5_run: prompt rows {pos0}..{} layer {l}: {e}", pos0 + t))?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- #214 CROW_GLM_KV_LAZY
+
+impl Glm5Run {
+    /// #214: the working floor of `CROW_GLM_KV_LAZY` in rows (`None` = off)
+    pub fn kv_lazy(&self) -> Option<usize> {
+        self.kv_lazy
+    }
+
+    /// #214: the rows every MLA cache has mapped (`cap` when off)
+    pub fn kv_rows_mapped(&self) -> usize {
+        let md = MlaDims::of(&self.g);
+        self.mla.iter().flatten().map(|c| c.rows_mapped(&md)).min().unwrap_or(self.cap)
+    }
+
+    /// #214: the KV bytes mapped now and the bytes reserved, over every DSA layer
+    pub fn kv_bytes(&self) -> (u64, u64) {
+        let md = MlaDims::of(&self.g);
+        let n = self.mla.iter().flatten().count() as u64;
+        let mapped = self.mla.iter().flatten().map(|c| c.mapped_bytes(&md).iter().sum::<usize>() as u64).sum();
+        (mapped, n * MlaCache::bytes(&md, self.cap))
+    }
+
+    /// #214: the bytes mapping the cache rows up to `rows` takes (0 when off or mapped)
+    ///
+    /// # Safety
+    /// A CUDA context is current (the VMM granularity is read).
+    pub unsafe fn kv_grow_bytes(&self, rows: usize) -> u64 {
+        if self.kv_lazy.is_none() {
+            return 0;
+        }
+        let (md, g) = (MlaDims::of(&self.g), cuda::vmm_granularity());
+        self.mla.iter().flatten().map(|c| c.grow_bytes(&md, rows, g)).sum()
+    }
+
+    /// #214: map the cache rows up to `rows` in every DSA layer; a refusal names the call and the
+    /// rows (the run never runs on fewer rows). A no-op when off or mapped.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn kv_map_to(&mut self, rows: usize) -> Result<(), String> {
+        if self.kv_lazy.is_none() {
+            return Ok(());
+        }
+        let md = MlaDims::of(&self.g);
+        let mut grown = 0;
+        for c in self.mla.iter_mut().flatten() {
+            grown += c.grow_to(&md, rows).map_err(|e| format!("glm5_run: {KV_LAZY_ENV}: mapping the cache rows up to {rows}: {}", e.message()))?;
+        }
+        if grown > 0 {
+            self.kv_stats.grows += 1;
+            self.kv_stats.grown_bytes += grown;
+        }
+        Ok(())
+    }
+
+    /// #214: the cache rows up to `rows` mapped, the bytes they take handed back by the elastic
+    /// arena first ([`ExpertTiers::elastic_hand_back`]); a no-op when off or mapped
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the arena is pending.
+    pub unsafe fn kv_ensure(&mut self, tiers: &mut ExpertTiers, rows: usize) -> Result<(), String> {
+        let kv = self.kv_grow_bytes(rows);
+        if kv == 0 {
+            return Ok(());
+        }
+        tiers.elastic_hand_back(kv)?;
+        self.kv_stats.hand_back_bytes += kv;
+        self.kv_map_to(rows)
+    }
+
+    /// #214: the cache rows above `max(keep, CROW_GLM_KV_LAZY)` unmapped (serve's reset and
+    /// rollback; rows `>= keep` are written before they are read again). The elastic arena takes
+    /// the freed VRAM back at its next regrowth (`ExpertTiers::decode_ready`). A no-op when off.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch of this run is pending.
+    pub unsafe fn kv_trim(&mut self, keep: usize) {
+        let Some(w) = self.kv_lazy else { return };
+        let md = MlaDims::of(&self.g);
+        let keep = keep.max(w);
+        let mut freed = 0;
+        for c in self.mla.iter_mut().flatten() {
+            freed += c.shrink_to(&md, keep);
+        }
+        if freed > 0 {
+            self.kv_stats.trims += 1;
+            self.kv_stats.trimmed_bytes += freed;
+        }
+    }
+
+    /// #214: the boot invariant ([`kv_lazy_fits`]) on `tiers` as built: `Ok(Some)` = its log
+    /// line, `Err` = the numbers that break it; `Ok(None)` when off
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn kv_boot_check(&self, tiers: &ExpertTiers) -> Result<Option<String>, String> {
+        let Some(w) = self.kv_lazy else { return Ok(None) };
+        let (mapped, all) = self.kv_bytes();
+        let unmapped = all.saturating_sub(mapped);
+        let (live, _, vpl) = tiers.elastic_live().unwrap_or((0, 0, 0));
+        let elastic = (live * vpl) as u64 * tiers.rb;
+        let free = cuda::free_vram_bytes();
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let nums = format!(
+            "KV unmapped {unmapped} B ({:.2} GiB) of {all} B, live elastic chunks {elastic} B ({:.2} GiB), free VRAM {free} B ({:.2} GiB), reserve {ARENA_RESERVE_BYTES} B",
+            gib(unmapped),
+            gib(elastic),
+            gib(free)
+        );
+        if !kv_lazy_fits(unmapped, elastic, free) {
+            return Err(format!("{KV_LAZY_ENV}={w}: a full context cannot be mapped: {nums}; elastic + free above the reserve must hold the unmapped KV"));
+        }
+        Ok(Some(format!("[budget] {KV_LAZY_ENV}={w}: {} rows mapped at boot; {nums}: a full context can be mapped", self.kv_rows_mapped())))
+    }
+
+    /// #214: one line of the mapped KV, the VRAM slots and the elastic counters (serve logs it
+    /// after each request); `None` when off
+    pub fn kv_report(&self, tiers: &ExpertTiers) -> Option<String> {
+        let w = self.kv_lazy?;
+        let (mapped, all) = self.kv_bytes();
+        let k = self.kv_stats;
+        let arena = match (tiers.arena(), tiers.elastic_live(), tiers.arena_elastic_stats()) {
+            (Some(a), Some((live, n, vpl)), Some(e)) => format!(
+                "VRAM slots {} ({live} of {n} elastic chunks x {vpl} live); elastic enter {} exit {} realloc_fail {} write_backs {} regrown {}",
+                a.enabled_vram(),
+                e.enter,
+                e.exit,
+                e.realloc_fail,
+                e.write_backs,
+                e.regrown
+            ),
+            _ => "per-layer arena (no elastic part)".to_string(),
+        };
+        Some(format!(
+            "{KV_LAZY_ENV}={w}: KV {} of {} rows mapped ({mapped} of {all} B); growths {} ({} B, {} B asked of the arena), trims {} ({} B); {arena}",
+            self.kv_rows_mapped(),
+            self.cap,
+            k.grows,
+            k.grown_bytes,
+            k.hand_back_bytes,
+            k.trims,
+            k.trimmed_bytes
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests_214 {
+    //! #214 `CROW_GLM_KV_LAZY` on the host: the switch, the bytes a boot maps, the bytes a growth
+    //! asks the elastic arena for, the boot invariant, the refused paths
+    use super::*;
+    use crate::glm5_mla::kv_lazy_mapped_bytes;
+    use crate::manager::Glm5States;
+
+    /// the VMM granularity of the RTX 5090 (`cuda::vmm_granularity`, 2 MiB)
+    const G: usize = 2 << 20;
+
+    #[test]
+    fn kv_lazy_switch_is_off_unless_it_names_rows() {
+        assert_eq!(kv_lazy_from(None), Ok(None));
+        assert_eq!(kv_lazy_from(Some("")), Ok(None));
+        assert_eq!(kv_lazy_from(Some("0")), Ok(None));
+        assert_eq!(kv_lazy_from(Some("4096")), Ok(Some(4096)));
+        assert_eq!(kv_lazy_from(Some(" 16 ")), Ok(Some(16)));
+        for bad in ["on", "-1", "4k"] {
+            assert!(kv_lazy_from(Some(bad)).unwrap_err().contains(KV_LAZY_ENV), "{bad} refused by name");
+        }
+    }
+
+    /// Off, a boot holds the KV the planner books (`Glm5States::plan` at 200,000 rows, the
+    /// 3,383,600,000 B of serve-session.log l.21-22); on at 4,096 rows it maps 4 MiB latent + 4 MiB
+    /// indexer per DSA layer
+    #[test]
+    fn kv_boot_maps_the_floor_not_the_context() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let md = MlaDims::of(&g);
+        let st = Glm5States::plan(&g, 200_000);
+        let off = kv_boot_bytes(&md, 200_000, g.dsa_layers, None, G);
+        assert_eq!(off, st.latent_bytes + st.indexer_bytes, "off: the plan's KV, byte for byte");
+        assert_eq!(off, 3_383_600_000);
+        let on = kv_boot_bytes(&md, 200_000, g.dsa_layers, Some(4096), G);
+        assert_eq!(on, g.dsa_layers as u64 * 8 * (1 << 20), "on: 4 MiB latent + 4 MiB indexer per DSA layer");
+        assert_eq!(kv_lazy_mapped_bytes(&md, 200_000, 4096, G), [4 << 20, 4 << 20]);
+        let r = crate::glm5_mla::kv_lazy_rows_of(&md, 200_000, kv_lazy_mapped_bytes(&md, 200_000, 4096, G));
+        assert_eq!(r, 4096, "4 MiB latent holds 4,096 rows, 4 MiB indexer 8,160");
+    }
+
+    /// A growth asks the arena for the granules it newly maps: nothing within the floor; the
+    /// 8,192-row prompt of the quick decode set 6 MiB latent + 2 MiB indexer per layer; the whole
+    /// context the reservation, at least the plan's KV
+    #[test]
+    fn kv_growth_hands_back_the_granules_it_maps() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let md = MlaDims::of(&g);
+        let grow = |from: usize, to: usize| g.dsa_layers as u64 * crate::glm5_mla::kv_lazy_grow_bytes(&md, 200_000, kv_lazy_mapped_bytes(&md, 200_000, from, G), to, G);
+        assert_eq!(grow(4096, 57 + 128), 0, "the quick decode fits in the floor: nothing handed back");
+        assert_eq!(grow(4096, 8192 + 57), g.dsa_layers as u64 * (8 << 20));
+        let full = kv_lazy_mapped_bytes(&md, 200_000, 200_000, G);
+        assert_eq!(full, [98 * G, 50 * G], "the reservation, whole granules");
+        assert!(grow(4096, 200_000) + kv_boot_bytes(&md, 200_000, g.dsa_layers, Some(4096), G) >= kv_boot_bytes(&md, 200_000, g.dsa_layers, None, G));
+        // the hand-back of the 8,192-row growth at 37 slots per elastic chunk, free VRAM at the reserve
+        let cb = 37 * 9_474_048u64;
+        assert_eq!(elastic_chunks_for(grow(4096, 8192 + 57), ARENA_RESERVE_BYTES, cb, 11), 1);
+        assert_eq!(elastic_chunks_for(grow(4096, 8192 + 57), ARENA_RESERVE_BYTES + (1 << 30), cb, 11), 0);
+    }
+
+    /// The boot invariant: elastic chunks + free VRAM above the reserve hold the unmapped KV
+    #[test]
+    fn kv_lazy_fits_only_with_room_for_a_full_context() {
+        let un = 3_383_600_000 - 92_274_688u64;
+        assert!(kv_lazy_fits(un, 10 << 30, ARENA_RESERVE_BYTES));
+        assert!(kv_lazy_fits(un, 0, ARENA_RESERVE_BYTES + un));
+        assert!(!kv_lazy_fits(un, 0, ARENA_RESERVE_BYTES + un - 1));
+        assert!(!kv_lazy_fits(un, un / 2, ARENA_RESERVE_BYTES), "half of it in chunks, no free VRAM above the reserve");
+        assert!(kv_lazy_fits(0, 0, 0));
+    }
+
+    #[test]
+    fn kv_lazy_refuses_the_paths_that_do_not_map_their_rows() {
+        assert_eq!(kv_lazy_refusal(None, 2, true, 4), Ok(()), "off: nothing refused");
+        assert_eq!(kv_lazy_refusal(Some(4096), 0, false, 1), Ok(()));
+        let e = kv_lazy_refusal(Some(4096), 2, true, 4).unwrap_err();
+        assert!(e.contains(KV_LAZY_ENV) && e.contains("CROW_GLM_MTP=2") && e.contains("CROW_GLM_LA") && e.contains("CROW_GLM_MAX_BATCH=4"), "{e}");
+        assert!(kv_lazy_refusal(Some(1), 0, false, 2).is_err());
     }
 }
 

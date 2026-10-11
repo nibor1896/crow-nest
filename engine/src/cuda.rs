@@ -1662,3 +1662,166 @@ pub unsafe fn lend_remap() -> Result<LendOutcome, AllocFailed> {
     out.ms = t.elapsed().as_secs_f64() * 1e3;
     Ok(out)
 }
+
+// ---------- #214: growable device memory (CUDA VMM, the VA reserved once, pages mapped on demand) ----------
+//
+// `CROW_GLM_KV_LAZY` keeps the MLA latent and DSA indexer caches of a glm5_next run contiguous but
+// maps physical memory only for the rows in use (vAttention, Prabhu et al. arXiv 2405.04437): the
+// whole range is reserved once (`cuMemAddressReserve`), each growth maps ONE new piece at the end
+// of the mapped range (`vmm_map`), each shrink unmaps whole pieces from the end (`cuMemUnmap`
+// cannot unmap a sub-range of a mapping). Kernels and captured graphs keep their pointers.
+
+/// the mapped bytes a growable range of `reserved` bytes holds to cover `bytes`: `bytes` rounded
+/// up to the granularity `g`, at most `reserved` (itself a multiple of `g`)
+pub const fn growable_target(bytes: usize, g: usize, reserved: usize) -> usize {
+    let t = round_up(bytes, g);
+    if t < reserved {
+        t
+    } else {
+        reserved
+    }
+}
+
+/// #214: how many pieces (`(offset, size)` in mapping order) stay mapped when the range shrinks
+/// to cover `keep` bytes at granularity `g`: every piece that starts below `keep` rounded up
+/// to `g` (a piece across that line stays whole)
+pub fn growable_pieces_kept(pieces: &[(usize, usize)], keep: usize, g: usize) -> usize {
+    let line = round_up(keep, g);
+    pieces.iter().take_while(|p| p.0 < line).count()
+}
+
+/// #214: a device range of `reserved` bytes whose physical memory is mapped from its start, on
+/// demand ([`Growable::grow_to`], [`Growable::shrink_to`]); never freed through `free_dev`
+pub struct Growable {
+    pub va: CUdeviceptr,
+    /// bytes of VA reserved (a multiple of the granularity)
+    pub reserved: usize,
+    what: String,
+    /// `(offset, size, handle)` of every mapped piece, in order; they cover `0 .. mapped()`
+    pieces: Vec<(usize, usize, sys::CUmemGenericAllocationHandle)>,
+}
+
+impl Growable {
+    /// Reserve VA for `bytes` (rounded up to the granularity) and map the first `initial` bytes
+    /// (rounded up likewise); the mapped bytes are zeroed, as `try_alloc_zeroed` leaves them.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn reserve(what: &str, bytes: usize, initial: usize) -> Result<Growable, AllocFailed> {
+        assert!(bytes > 0, "a growable range of 0 bytes ({what})");
+        let reserved = round_up(bytes, vmm_granularity());
+        let mut va: CUdeviceptr = 0;
+        let r = sys::cuMemAddressReserve(&mut va, reserved, 0, 0, 0);
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(AllocFailed { what: format!("{what} (cuMemAddressReserve)"), bytes: reserved, free: free_vram_bytes(), result: format!("{r:?}") });
+        }
+        live_allocs().lock().unwrap().insert(va, 0);
+        let mut g = Growable { va, reserved, what: what.to_string(), pieces: Vec::new() };
+        if let Err(e) = g.grow_to(initial) {
+            g.free();
+            return Err(e);
+        }
+        Ok(g)
+    }
+
+    /// the bytes mapped now, from the start of the range
+    pub fn mapped(&self) -> usize {
+        self.pieces.last().map_or(0, |p| p.0 + p.1)
+    }
+
+    /// pieces mapped now
+    pub fn pieces(&self) -> usize {
+        self.pieces.len()
+    }
+
+    /// Map one piece so that at least `bytes` are mapped ([`growable_target`]); zeroed, the
+    /// context synchronized after. Returns the bytes added (0: already mapped). A refusal names
+    /// the failing call; nothing is mapped then.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn grow_to(&mut self, bytes: usize) -> Result<usize, AllocFailed> {
+        let g = vmm_granularity();
+        let (have, want) = (self.mapped(), growable_target(bytes, g, self.reserved));
+        if want <= have {
+            return Ok(0);
+        }
+        let size = want - have;
+        let at = self.va + have as u64;
+        let h = vmm_map(at, size).map_err(|(call, r)| AllocFailed { what: format!("{} ({call})", self.what), bytes: size, free: free_vram_bytes(), result: format!("{r:?}") })?;
+        MEM_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        self.pieces.push((have, size, h));
+        memset_zero_sync(at, size);
+        ck(sys::cuCtxSynchronize());
+        live_allocs().lock().unwrap().insert(self.va, want);
+        Ok(size)
+    }
+
+    /// Unmap the pieces above `keep` bytes ([`growable_pieces_kept`]). Returns the bytes released.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the bytes above `keep` is pending.
+    pub unsafe fn shrink_to(&mut self, keep: usize) -> usize {
+        let spans: Vec<(usize, usize)> = self.pieces.iter().map(|p| (p.0, p.1)).collect();
+        let k = growable_pieces_kept(&spans, keep, vmm_granularity());
+        if k == self.pieces.len() {
+            return 0;
+        }
+        ck(sys::cuCtxSynchronize());
+        let mut out = 0;
+        while self.pieces.len() > k {
+            let (off, size, h) = self.pieces.pop().unwrap();
+            ck_call("cuMemUnmap", sys::cuMemUnmap(self.va + off as u64, size));
+            ck_call("cuMemRelease", sys::cuMemRelease(h));
+            MEM_FREES.fetch_add(1, Ordering::Relaxed);
+            out += size;
+        }
+        mem_released();
+        live_allocs().lock().unwrap().insert(self.va, self.mapped());
+        out
+    }
+
+    /// Unmap every piece and free the VA.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the range is pending.
+    pub unsafe fn free(&mut self) {
+        if self.va == 0 {
+            return;
+        }
+        self.shrink_to(0);
+        ck_call("cuMemAddressFree", sys::cuMemAddressFree(self.va, self.reserved));
+        live_allocs().lock().unwrap().remove(&self.va);
+        self.va = 0;
+    }
+}
+
+#[cfg(test)]
+mod growable_tests {
+    use super::*;
+
+    const G: usize = 2 << 20;
+
+    /// #214: a growth maps whole granules up to the reservation, never more
+    #[test]
+    fn growable_target_rounds_to_the_granule_and_stops_at_the_reservation() {
+        let reserved = round_up(200_000 * 1024, G);
+        assert_eq!(growable_target(0, G, reserved), 0);
+        assert_eq!(growable_target(1, G, reserved), G);
+        assert_eq!(growable_target(2048 * 1024, G, reserved), G, "2,048 latent rows are one granule");
+        assert_eq!(growable_target(2049 * 1024, G, reserved), 2 * G);
+        assert_eq!(growable_target(200_000 * 1024, G, reserved), reserved);
+        assert_eq!(growable_target(usize::MAX / 2, G, reserved), reserved);
+    }
+
+    /// #214: a shrink keeps every piece that starts below the line, a piece across it whole
+    #[test]
+    fn growable_shrink_drops_whole_pieces_from_the_end() {
+        let pieces = [(0, 4 * G), (4 * G, G), (5 * G, 3 * G)];
+        assert_eq!(growable_pieces_kept(&pieces, 8 * G, G), 3);
+        assert_eq!(growable_pieces_kept(&pieces, 5 * G + 1, G), 3, "a piece across the line stays");
+        assert_eq!(growable_pieces_kept(&pieces, 5 * G, G), 2);
+        assert_eq!(growable_pieces_kept(&pieces, 1, G), 1);
+        assert_eq!(growable_pieces_kept(&pieces, 0, G), 0);
+    }
+}

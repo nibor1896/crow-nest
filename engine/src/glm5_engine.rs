@@ -112,6 +112,17 @@ pub trait Rows {
     fn mtp_report(&mut self) -> Option<String> {
         None
     }
+    /// #214 `CROW_GLM_KV_LAZY`: the mapped KV, the VRAM slots and the elastic counters as one
+    /// line (`None` when off)
+    fn kv_report(&mut self) -> Option<String> {
+        None
+    }
+    /// #214 `CROW_GLM_KV_LAZY`: the cache rows `>= keep` will be written before they are read
+    /// again; the device unmaps them down to its working floor. The default holds nothing.
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    unsafe fn kv_trim(&mut self, _keep: usize) {}
     /// # Safety
     /// As [`Rows::row`].
     unsafe fn logits(&self) -> Vec<f32>;
@@ -226,6 +237,8 @@ impl Glm5Device {
         // --vram-slots / --pinned-slots / --readers); unset = the plan and READERS
         let ask = crate::boot::glm5_tier_ask_from_env()?;
         let (sizes, readers) = ask.resolve(&plan, READERS)?;
+        // #214 CROW_GLM_KV_LAZY: refused by name before the caches are allocated
+        let kv_lazy = gt::kv_lazy_from_env()?;
         let mut run = Glm5Run::load(&mut o.cnq, &o.g, &o.moe, context, log);
         let mtp_n = match run.mtp_from_env(&mut o.cnq, log) {
             Ok(n) => n,
@@ -236,6 +249,10 @@ impl Glm5Device {
         };
         // CROW_GLM_MAX_BATCH: the sequence slots (refused by name with MTP or the graphs)
         if let Err(e) = run.set_slots(batch) {
+            run.free();
+            return Err(e);
+        }
+        if let Err(e) = gt::kv_lazy_refusal(kv_lazy, mtp_n, run.switches().la, batch) {
             run.free();
             return Err(e);
         }
@@ -273,6 +290,16 @@ impl Glm5Device {
                 plan.hot,
                 sizes.vram as f64 + (live * vpl) as f64 / ml as f64
             ));
+        }
+        // #214 CROW_GLM_KV_LAZY: the unmapped KV fits in the elastic part + free VRAM above the reserve
+        match run.kv_boot_check(&tiers) {
+            Ok(Some(l)) => log(&l),
+            Ok(None) => {}
+            Err(e) => {
+                tiers.free();
+                run.free();
+                return Err(e);
+            }
         }
         log(&format!(
             "[budget] glm5_next tiers per MoE layer: VRAM {} / pinned {} / NVMe {} x {} MoE layers (plan {} / {} / {}; {}); {:.2} GiB VRAM (slots, {} staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start, NVMe readers {readers}",
@@ -341,6 +368,12 @@ impl Rows for Glm5Device {
     }
     fn mtp_report(&mut self) -> Option<String> {
         self.run.mtp_take_stats().map(|s| s.summary())
+    }
+    fn kv_report(&mut self) -> Option<String> {
+        self.run.kv_report(&self.tiers)
+    }
+    unsafe fn kv_trim(&mut self, keep: usize) {
+        self.run.kv_trim(keep);
     }
     unsafe fn logits(&self) -> Vec<f32> {
         // CROW_GLM_LA: a row may be running ahead; the stream first (a blocking pageable copy
@@ -557,6 +590,8 @@ impl<R: Rows> Glm5Engine<R> {
         let t = std::time::Instant::now();
         self.rows.load_state(&self.snap.state);
         self.history.truncate(p);
+        // #214 CROW_GLM_KV_LAZY: the rows above the snapshot are unmapped down to the floor
+        self.rows.kv_trim(p);
         Ok(t.elapsed().as_secs_f64() * 1e3)
     }
 
@@ -579,6 +614,8 @@ impl<R: Rows> Glm5Engine<R> {
         // a failed drop leaves nothing to keep: the state is zeroed next
         let _ = self.rows.settle_ahead();
         self.rows.zero_state();
+        // #214 CROW_GLM_KV_LAZY: every row is written again from 0
+        self.rows.kv_trim(0);
         self.history.clear();
         self.snap.pos = None;
         t.elapsed().as_secs_f64() * 1e3
@@ -1381,6 +1418,9 @@ pub mod fake {
         parked: Vec<(u64, Vec<i64>, Vec<f32>)>,
         cur: usize,
         pub batches: Vec<usize>,
+        /// #214: the `keep` of every `kv_trim`; a trim poisons the rows `>= keep` (a row read
+        /// before it is written again changes the logits)
+        pub trims: Vec<usize>,
     }
 
     impl FakeRows {
@@ -1391,7 +1431,7 @@ pub mod fake {
         /// `slots` sequences (`CROW_GLM_MAX_BATCH`)
         pub fn with_slots(n_ctx: usize, vocab: usize, cands: Vec<u32>, slots: usize) -> FakeRows {
             let parked = (0..slots).map(|i| if i == 0 { (0, Vec::new(), Vec::new()) } else { (0, vec![-1; n_ctx], vec![0.0; vocab]) }).collect();
-            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new() }
+            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new(), trims: Vec::new() }
         }
     }
 
@@ -1461,6 +1501,10 @@ pub mod fake {
         fn counters(&self) -> ([u64; 3], u64) {
             ([self.rows_run as u64 * 8, 0, 0], 0)
         }
+        unsafe fn kv_trim(&mut self, keep: usize) {
+            self.trims.push(keep);
+            self.mla.iter_mut().skip(keep).for_each(|r| *r = -7);
+        }
         fn slots(&self) -> usize {
             self.parked.len().max(1)
         }
@@ -1488,6 +1532,53 @@ pub mod fake {
                 ids.push(self.decode(tok, pos)?);
             }
             Ok(ids)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_214 {
+    //! #214 `CROW_GLM_KV_LAZY` on the host twin: what the engine tells the device it may unmap
+    use super::fake::FakeRows;
+    use super::*;
+
+    fn eng() -> Glm5Engine<FakeRows> {
+        Glm5Engine::new(FakeRows::new(256, 64, (10..40).collect()), true)
+    }
+
+    unsafe fn greedy(e: &mut Glm5Engine<FakeRows>, p: &[i64], n: usize) -> Vec<i64> {
+        let mut out = vec![e.prefill(p).unwrap()];
+        for _ in 1..n {
+            out.push(e.decode_step(*out.last().unwrap()).unwrap());
+        }
+        out
+    }
+
+    /// A cold start trims the cache rows to 0, a warm start to its snapshot; the rows above
+    /// (poisoned by the twin's trim) are never read before they are written again: the warm turn
+    /// gives the ids of a cold re-prefill, the cold second request those of a fresh engine
+    #[test]
+    fn reset_and_rollback_trim_the_rows_above_what_they_keep() {
+        let p1: Vec<i64> = (0..31).map(|i| (i * 13 % 60) as i64).collect();
+        let mut p2 = p1.clone();
+        p2.extend([3, 5, 8, 13, 21]);
+        unsafe {
+            let mut w = eng();
+            w.reset();
+            let first = w.prefill(&p1).unwrap();
+            w.snapshot(first);
+            let mut out = vec![first];
+            for _ in 0..9 {
+                out.push(w.decode_step(*out.last().unwrap()).unwrap());
+            }
+            w.rollback(31).unwrap();
+            let warm = greedy(&mut w, &p2[31..], 16);
+            let cold = greedy(&mut eng(), &p2, 16);
+            assert_eq!(warm, cold, "the trimmed rows above the snapshot were not read");
+            w.reset();
+            let again = greedy(&mut w, &p2, 16);
+            assert_eq!(again, cold, "a cold start after a trim to 0 reads no stale row");
+            assert_eq!(w.rows().trims, vec![0, 31, 0], "reset trims to 0, rollback to its snapshot");
         }
     }
 }
