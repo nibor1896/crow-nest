@@ -18,6 +18,9 @@ Operating sets:
   `_EMBED_GATHER`, `_RT2_TABLE_SM`, `_SIDE_NOJOIN`, `CROW_NVME_DEMAND_FIRST`, `CROW_GLM_GUESS_TRIM`, `_ARENA_STAGE_LEND`,
   `_ARENA_LAZY_REFILL`, `_MUL1_FUSE`, `_ATTN_FUSE`, `_RT2_GATHER_EARLY`, `_ARENA_PROMPT_COUNT`), the environment of
   `b6-promptcount` (crow-nest v0.11.0 operating set). Run: `quick.sh <label> $(cat arm3.env)`.
+- `arm4.env` = `arm3.env` + `CROW_GLM_KV_LAZY=4096` (#214), the operating set since 2026-10-11 (robin; the code default
+  stays off). Measured in `serve`, not with `quick.sh`: quick request, 3 cold boots per arm, decode 67.19 -> 60.29 ms/token
+  median (build `732369c`, `runs/glm53-flash/kvlazy-20261011/recheck/`, local). Run: `quick.sh <label> $(cat arm4.env)`.
 
 Figures of record for v0.11.0: start of the day `q6-arm2` / `b1-base`; end of the day `b6-promptcount` (arm3.env):
 prefill 8,192 tokens 1137.54 tok/s (TTFT 7.201 s), decode 127 tokens 16.84 tok/s median over tokens, 16.27 tok/s wall.

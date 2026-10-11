@@ -2,8 +2,9 @@
 # 3-minute check, robin 2026-10-10: one cold 8192-token prefill of real text (held-out todo-1006, first 8192 ids)
 # + 128 cold decode tokens on a real question (no random ids: they fall into a two-token loop).
 # Usage: quick.sh <label> [extra env...]   -> runs/glm53-flash/quick/<label>/
-# The operating set of the evening of 2026-10-10 (b6-promptcount) is arm3.env = arm2.env + RT2 + 13 switches:
-#   quick.sh <label> $(cat arm3.env)   (README.md in this directory lists every arm and its figures)
+# The operating set since 2026-10-11 is arm4.env = arm3.env + CROW_GLM_KV_LAZY=4096 (#214); arm3.env, the set of the
+# evening of 2026-10-10 (b6-promptcount), = arm2.env + RT2 + 13 switches:
+#   quick.sh <label> $(cat arm4.env)   (README.md in this directory lists every arm and its figures)
 W=/c/Users/robin/dev/crow-nest-wt-int; Q=$W/runs/glm53-flash/quick; L=$1; shift; D=$Q/$L; mkdir -p $D; E=${ENGINE_DIR:-$W/engine}
 export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
 TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
