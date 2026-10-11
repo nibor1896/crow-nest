@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Converter tests no longer depend on the build machine's free disk** (#212, 2026-10-11): the MUL1 tests answer the converter's disk check with a fixed volume (16 GiB reserve + 1 GiB) instead of asking the temp drive, so `cargo test --release` in `converter/` no longer fails below 16 GiB free: 95 passed, 8 failed -> 105 passed, 0 failed, 1 ignored with C: at 11.4 GiB free. The conversion itself is unchanged: it still reads the real volume and refuses below bytes to write + `--disk-reserve-gib` (default 16); a new test pins that boundary to the byte.
+
 ## 2026-10-10 — v0.11.0
 
 **GLM-5.3-Flash runs on one RTX 5090 as a third model family, for measurement: a 3-bit container, an engine path with the routed experts in VRAM, pinned RAM and NVMe, and on 2026-10-10 a cold 8,192-token prefill at 1137.5 tok/s and 127 decode tokens at 16.84 tok/s median.** v0.11.0 carries the 320 commits from v0.10.1 to `d3e0d87` (216 changes, 104 merges, 2026-10-07 to 2026-10-10) and the release commits (run data, docs, NOTICE), almost all of them the GLM-5.3-Flash series (#145 to #209):
