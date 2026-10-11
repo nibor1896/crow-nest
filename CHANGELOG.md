@@ -6,6 +6,16 @@
 
 ## Unreleased
 
+## 2026-10-12 — v0.13.0
+
+**GLM-5.3-Flash's reasoning box closes on the `</think>` token id, serve logs the generated ids of every request by default, and the glm5_next expert tiers can run as one policy behind a switch, default off.** v0.13.0 carries 3 changes since v0.12.0 (`6161c6b`, `67dbf79`, `e374bc5` merged as `eae8b8a`) and the release commit:
+
+- a `</think>` that GLM quotes inside its reasoning no longer ends the grey box; the glm5_next loop closes the block on the added id 154842 (#221);
+- the `[chat] ids [...]` line of every request is INFO again, on every generation path (#223);
+- `CROW_GLM_TIERS=unified` lets the frequency count gate the pinned tier too, default off, speed not measured yet; the `[chat] counters` line carries H2D / D2H bytes and the pinned hit rate (#222).
+
+Flash-Next and the 27B keep their default path and their text reasoning filter. Windows only; `tools/gate-linux.sh` was not run.
+
 ### Added
 
 - **The glm5_next expert tiers can run as one policy, default off** (#222, 2026-10-11): `CROW_GLM_TIERS=unified` (needs `CROW_GLM_ARENA=global` and `CROW_GLM_ARENA_FREQ=1`; refused with `CROW_GLM_ARENA_NOADMIT=1`) lets the frequency tiers' decayed routing count gate the pinned tier too. Today every NVMe miss lands in pinned and every VRAM victim is written back by D2H, cold ones included, whatever their count. With the switch an NVMe miss of a decode call enters pinned only into a free slot or above pinned's lowest count (else it is read through staging and evicts nothing), and a VRAM victim, including an elastic hand-back's (in score order), is written back only under the same rule (else it drops to the NVMe with no copy). VRAM admission stays the frequency tiers' 2x gate, so pinned hits are still read zero-copy and not copied up; `ADMIT_MAX`, the write-back ring and `STAGE_MIN` keep their defaults. Placement only. Host tests only; speed **not measured yet** (GPU A/B `arm4.env` vs `arm4.env` + `CROW_GLM_TIERS=unified` on serve, #222).
@@ -18,6 +28,15 @@
 ### Fixed
 
 - **A `</think>` that GLM-5.3-Flash quotes inside its reasoning no longer ends the think block** (#221, 2026-10-11): serve's reasoning filter closed `Inside` on the detokenized TEXT `</think>`. On GLM that tag is the added id 154842, and the same text out of ordinary tokens (`</` `think` `>`) is a quote: in robin's Crow session of 2026-10-11 (task: read the crow-nest issues, which contain the literal tag) the grey reasoning box ended at `(the` and the rest of the reasoning streamed as answer text (n = 1, screenshot; ids not logged). The glm5_next loop now closes the block on the id, as vLLM's reasoning parser does: `ThinkFilter::closing_on_id`, set when `</think>` resolves to an added id; inside the block a literal `</think>` is reasoning, the id closes it (also when it renders no text), and #81's injected close and forced ids take the same road. `Lead` and `Body` are unchanged (a stray `</think>` in the answer is still dropped, #67). The `[chat] reasoning filter` line adds `closed on id 154842 (#221)`. Flash-Next and the 27B keep the text filter, byte for byte. Five new tests (pure filter, no tokenizer): a quoted tag stays reasoning and the old filter splits there; the id at the quote position closes there; a close id without text closes at the step's end; a pending close never outlives its step; `Lead`/`Body` as before. `cargo test --release --bin serve` on Linux without `models/`: 130 passed, 10 failed, the same 10 as on `9e39425` (they `expect` the Qwen tokenizer file). Live check in Crow (#221 expected result 3) not run.
+
+### Measured
+
+- **The three v0.12.0 prefill switches together in robin's Crow window** (#216, #217, #219; robin, 2026-10-12): the installed v0.12.0 serve with `CROW_GLM_SMALL_PROMPT=1`, `CROW_GLM_ANSWER_REUSE=1` and `CROW_GLM_PREFIX_ANCHOR=1`, one task of 3 rounds: `[cache] LIVE` every round, prefill 55 / 154 / 86 new tokens in 2,680.8 / 4,539.0 / 3,105.1 ms (10.3 s in total), against 4.7 to 7.2 s per round and 36.5 s for 6 rounds in the task before with the switches off; decode 14.03 tok/s; no hang (n = 1 task, Crow's `engine.log`). The v0.12.0 Known limitation (serve stopped logging mid-decode once with all three on) did not recur in this run.
+
+### Known limitations
+
+- `CROW_GLM_TIERS=unified` (#222): speed not measured; the GPU A/B on serve is open.
+- #221: the live check in Crow (a task whose reasoning quotes the literal tag) is open.
 
 ## 2026-10-11 — v0.12.0
 
