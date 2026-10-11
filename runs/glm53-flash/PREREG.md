@@ -208,3 +208,28 @@ Written 2026-10-11 on crow-nest `36b0d9d` (branch `g56-prereg`), before any G5 o
 3. Control arm: what must the 4-of-8 arm break for G6 to count as answered (an S1, or the bar of point 1)?
 4. #166 adaptation: k, the mild control, the process-error factor over the A/A arm, and #166's open S1 question (does an S1 still disqualify if the A/A arm shows the same S1 on the same task?).
 5. G5 wall clock per task: no threshold, or an absolute bar per task?
+
+### Amendment 7 — 2026-10-11: answers to amendment 6's open points (crow-nest #151, #152, #166)
+
+Written 2026-10-11 on crow-nest `16d24c8` (branch `g56-amend7`), before any G5 or G6 row exists. Seen when written: what amendment 6 saw; since then no Crow-window turn, no ten-task run, no control-arm and no 27B row of this series. Form as amendment 6: owner's word, before the first row of either gate. A point marked **lead's decision** was set by the lead, under robin's guidance where he gave one; robin can overrule it by a further amendment before the first row of its gate.
+
+**G5** (all else as amendment 6 left it):
+1. **Decode bar 40 → 23.7 tok/s**, median over the ≥ 5 window turns in the Crow window. robin, 2026-10-11: 23.7 is, in his view, the most this hardware gives, and below it is no longer really a fail criterion. A median below 23.7 is therefore recorded as "below the bar" with its number; it is not a G5 failure under "Abort rules" and does not by itself stop the series (the < 5 tok/s rule for step 17 stands). Cold prefill at ~32k ≥ 150 tok/s and spread max/min ≤ 1.15 over 3 boots are unchanged and still fail G5.
+2. **Wall clock per task:** recorded per turn, no threshold (robin confirmed, 2026-10-11).
+
+**G6.** The dense 27B becomes G6's reference, "for now" (robin, 2026-10-11); this replaces amendment 6's "reported, no threshold, never in the verdict" for the 27B. Arms: GLM (8 of 8), 27B, 27B A/A, GLM 6 of 8, GLM 4 of 8, each n ≥ 3 runs with the one wire body. G6 passes only if all of 3–6 hold, and is judged only if 7 holds:
+3. **Correct tasks:** GLM's median of correct tasks over its runs ≥ the 27B's median over its runs. robin, 2026-10-11: orient on normal other references; if too many tasks are wrong, it does not ship. **Lead's decision** under that guidance: the reference is the 27B arm, the only other model in the series.
+4. **Tokens per answer and `length`** (reference the 27B, robin): tokens per answer GLM ≤ 1.5 × 27B; `finish_reason length` count GLM ≤ 27B (`length` stays undecided, not correct); the form Q2/Q3 had against Flash-Next. Unit: each arm's own `usage.completion_tokens` (the tokenizers differ), answer characters reported beside, as #152 "Proposed fix" 1 proposed.
+5. **Zero S1** in the GLM arm (amendment 6, unchanged; see the S1 point below).
+6. **Process errors:** GLM's process-error rate ≤ 1.5 × the A/A arm's (#166 item 9; factor below).
+7. **Sensitivity (4-of-8 arm), lead's decision** (robin gave no view): G6 counts as answered only if robin's blind grades score the 4-of-8 arm worse than the GLM 8-of-8 arm, i.e. a lower median of correct tasks or at least one S1. If not, the grading is not sensitive enough and G6 is "not answered", whatever 3–6 show.
+
+**#166 adaptation** (robin, 2026-10-11: yes). #166's defaults are proposals "fixed per series in its PREREG"; fixed here:
+- **k = 3** generations per task and arm in each run: #166 item 4's default, which is the harness's three seeds (`tools/ten-task-run.py:128`, 2101–2103).
+- **A/A arm:** #166 item 1, "the reference again with other seeds": the 27B once more, same wire body and n, seeds 2104–2106 (**lead's decision** on the seeds: the next three after the default, fixed before any run). It is the noise floor for point 6; its correct-task, token and `length` figures are reported beside the 27B's.
+- **Mild control:** 6 of 8 active experts (`CROW_MOE_TOPK=6`, the setting the 4-of-8 arm uses, #152 "Proposed fix" 2), #166 item 1's first example. Reported, not in pass/fail; per #166 item 10, if it does not score worse than GLM 8-of-8 by the test of point 7, the verdict is recorded as resolving only collapses.
+- **Process-error factor 1.5, lead's decision** (#166 names no value): the factor this series already uses for tokens per answer, so no new number enters. Process errors are #166 item 5's as far as the single-turn harness shows them (unclosed think tags, repeated loops; it sends no tools); `length` and tokens count under point 4 only. Rate = generations with ≥ 1 process error / all generations of the arm.
+- **An S1 the reference also shows, lead's decision** (#166 leaves it open): a GLM S1 still disqualifies when the 27B or the A/A arm makes the same S1 on the same task; the row notes it. Reason: robin's rule of 2026-10-08 (a gross error disqualifies however many tasks pass) has no such exception.
+- Not adopted: the rest of #166 (stage 1 KLD, which #166 skips across tokenizers; 20–40 Crow tasks with tools; the CI/margin rule, which point 3 replaces). G6's method stays as amendment 6 left it.
+
+Amendment 6's open points 1–5 are closed by this amendment; G5 and G6 rows may be taken.
