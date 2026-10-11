@@ -308,8 +308,9 @@ pub fn kernel_geo(g: &Glm5Geo) -> KernelGeo {
     glm5_kda::kernel_geo(g)
 }
 
-/// every `KERNEL_SRC` entry the glm5 path launches from the shared module
-pub const MAIN_NAMES: &[&str] = &["gemv_bf16_b", "gemv_bf16_w", "argmax_k", "qsa_select_fast"];
+/// every `KERNEL_SRC` entry the glm5 path launches from the shared module (crow-nest #215: the
+/// #20 device sampler pair `sample_topk_part` / `sample_k` on the head's logits row)
+pub const MAIN_NAMES: &[&str] = &["gemv_bf16_b", "gemv_bf16_w", "argmax_k", "qsa_select_fast", "sample_topk_part", "sample_k"];
 
 /// The modules of the glm5_next path: `KERNEL_SRC` compiled ONCE at [`kernel_geo`] (KDA's GDN
 /// kernels, the engine kernel table, `qsa_select_fast`), plus the blocks' own NVRTC modules

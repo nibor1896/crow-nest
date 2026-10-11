@@ -10202,6 +10202,10 @@ pub struct Glm5Run {
     /// #214 `CROW_GLM_KV_LAZY`: the working floor in rows (`None` = off, the caches whole)
     kv_lazy: Option<usize>,
     pub kv_stats: KvLazyStats,
+    /// crow-nest #215: the #20 device sampler's buffers (`None` until serve allocates them at
+    /// boot) and whether it is armed: armed, every head draws into `next` behind its argmax
+    dsamp: Option<crate::gen::DevSampler>,
+    dsamp_on: bool,
 }
 
 /// #214 `CROW_GLM_KV_LAZY`: what the run mapped and released, cumulative since load
@@ -10371,6 +10375,8 @@ impl Glm5Run {
             bat: None,
             kv_lazy,
             kv_stats: KvLazyStats::default(),
+            dsamp: None,
+            dsamp_on: false,
         };
         let sw = Switches::from_env();
         if sw != Switches::default() {
@@ -10701,6 +10707,20 @@ impl Glm5Run {
     /// # Safety
     /// A CUDA context is current.
     unsafe fn head_row(&mut self) -> Result<(), String> {
+        self.head_greedy()?;
+        // crow-nest #215: armed, the device sampler draws from the row into `next` (the argmax
+        // slot, so the caller's 4-byte readback returns the draw). An eager launch on the legacy
+        // stream behind the head (or its graph), never captured: the head graph is the same
+        // for greedy and sampled requests.
+        self.sample_into_next();
+        Ok(())
+    }
+
+    /// the head of [`Glm5Run::head_row`] without the device sampler: the greedy id into `next`
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn head_greedy(&mut self) -> Result<(), String> {
         let Some(gr) = self.graph.as_mut() else {
             gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
             return Ok(());
@@ -10714,6 +10734,79 @@ impl Glm5Run {
         gr.head = Some(glm5_graph::end_row().map_err(|e| format!("glm5_run: head: {e}"))?);
         gr.head_captures += 1;
         Ok(())
+    }
+
+    /// crow-nest #215: queue the device sampler's draw from `logits` into `next` when it is armed
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn sample_into_next(&self) {
+        if let (true, Some(ds)) = (self.dsamp_on, self.dsamp.as_ref()) {
+            crate::gen::launch_dev_sampler(&self.pass.kn.k, ds, self.logits, self.next, self.head.vocab_param());
+        }
+    }
+
+    /// crow-nest #215: allocate the #20 device sampler's buffers (`gen::sampler_bytes(vocab)`,
+    /// held until `free`); serve calls it at boot, `glm5_run` never does. Returns the bytes.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn alloc_dev_sampler(&mut self) -> u64 {
+        if self.dsamp.is_none() {
+            self.dsamp = Some(crate::gen::DevSampler::alloc(self.g.vocab));
+        }
+        crate::gen::sampler_bytes(self.g.vocab)
+    }
+
+    /// crow-nest #215: why a sampled id of this run cannot be drawn on the device (`None`: it can)
+    pub fn dev_sampler_refusal(&self) -> Option<&'static str> {
+        if self.dsamp.is_none() {
+            Some("no device sampler buffers (glm5_run allocates none; serve does at boot)")
+        } else if self.mtp_drafts() > 0 {
+            Some("CROW_GLM_MTP > 0 (the verify rows draw on the host; device per-row draws are a follow-up)")
+        } else if self.slots() > 1 {
+            Some("CROW_GLM_MAX_BATCH > 1 (the batched step reads every row back; a follow-up)")
+        } else if self.sw.la {
+            Some("CROW_GLM_LA (a row run ahead would book a draw the host may drop)")
+        } else {
+            None
+        }
+    }
+
+    /// crow-nest #215: arm the device sampler with the profile of `s` (`gen::arm_dev_sampler`,
+    /// the uploads Qwen's `Engine::enable_dev_sampler` makes) and draw the first id from the
+    /// logits row the prompt (or a restored snapshot) left: one eager launch, the twin of Qwen's
+    /// `sample_last`. Every later head draws until [`Glm5Run::park_dev_sampler`].
+    ///
+    /// # Safety
+    /// A CUDA context is current; nothing is ahead (`CROW_GLM_LA` is refused).
+    pub unsafe fn arm_dev_sampler(&mut self, s: &crate::sample::Sampler) -> Result<i64, String> {
+        if let Some(r) = self.dev_sampler_refusal() {
+            return Err(format!("glm5_run: no device sampler: {r}"));
+        }
+        let ds = self.dsamp.as_ref().expect("checked by dev_sampler_refusal");
+        crate::gen::arm_dev_sampler(ds, s, self.g.vocab);
+        self.dsamp_on = true;
+        self.sample_into_next();
+        cuda::sync();
+        Ok(cuda::dtoh_i32(self.next, 1)[0] as i64)
+    }
+
+    /// crow-nest #215: the heads take the greedy id again (a greedy or host-route request, the
+    /// prompt phase); the buffers stay for the next sampled request
+    pub fn park_dev_sampler(&mut self) {
+        self.dsamp_on = false;
+    }
+
+    /// crow-nest #215 (#93): the device sampler booked `drawn`, the host kept `kept` (a tool
+    /// grammar redraw): move the booking (`gen::rebook_dev_sampler`). Not armed: nothing.
+    ///
+    /// # Safety
+    /// A CUDA context is current; between two decode steps.
+    pub unsafe fn rebook_dev_sampler(&self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+        if let (true, Some(ds)) = (self.dsamp_on, self.dsamp.as_ref()) {
+            crate::gen::rebook_dev_sampler(ds, self.g.vocab, drawn, kept, drawn_seen, lastn);
+        }
     }
 
     /// [`Glm5Run::layers`], every launch eager (with a capture open, into its segments).
@@ -10795,6 +10888,10 @@ impl Glm5Run {
         self.kda_bak.clear();
         // CROW_GLM_MAX_BATCH: the parked sequences and the batch head
         self.free_slots();
+        if let Some(mut ds) = self.dsamp.take() {
+            ds.free();
+        }
+        self.dsamp_on = false;
     }
 }
 

@@ -2341,6 +2341,26 @@ fn host_knobs_line(s: &Sampler) -> String {
     )
 }
 
+/// - crow-nest #215: the route line of a glm5_next request that draws on the HOST: every reason
+///   it is not on the device sampler (the `draws_on_host` knobs, or the sequence's refusal)
+/// - pure: the test drives it on built requests
+fn glm_host_route_line(req: &ChatReq, s: &Sampler, dev_refusal: Option<&str>) -> String {
+    let mut why: Vec<String> = Vec::new();
+    if !req.logit_bias.is_empty() {
+        why.push(format!("logit_bias, {} entries (#86)", req.logit_bias.len()));
+    }
+    if s.top_k_needs_host() {
+        why.push(format!("top_k {} outside the device sampler's 1..={} (#111)", top_k_word(s.top_k), crow_nest_engine::gen::SAMPLE_MAXK));
+    }
+    if s.host_route() {
+        why.push(format!("host-only knobs {} (#85/#92)", s.host_knobs().join(", ")));
+    }
+    if let Some(r) = dev_refusal {
+        why.push(r.to_string());
+    }
+    format!("[chat] glm5_next draws on the HOST sampler (#215): {}; one logits row read back per token", why.join("; "))
+}
+
 /// - #86: the request's `logit_bias` on ONE logits row, FIRST, before any sampler
 ///   reads it - llama.cpp applies the map outside its sampler chain, and
 ///   `Sampler::sample` is that chain, so the bias is on the row the chain sees.
@@ -5967,8 +5987,9 @@ fn listener_wait(listener: &TcpListener, ms: i32) -> i32 {
 const GLM_PROMPT_CHUNK: usize = 1;
 
 /// - #185 part 2: the server state of a glm5_next process. The `Engine` families keep `Srv`;
-///   what a glm5_next engine does not have (the device sampler, the park of #118, slot files,
-///   VRAM lending, vision, the trickle) has no field here, and its routes answer by name.
+///   what a glm5_next engine does not have (the park of #118, slot files, VRAM lending, vision,
+///   the trickle) has no field here, and its routes answer by name. crow-nest #215: its device
+///   sampler lives in the engine (`Glm5Run`), armed and parked per request by `glm_generate_on`.
 struct GlmSrv<'a, R: Rows> {
     /// the one loaded engine of this process, with its held conversation and prompt snapshot
     eng: &'a mut Glm5Engine<R>,
@@ -6042,6 +6063,22 @@ trait GlmSeq {
     fn counters(&mut self) -> ([u64; 3], u64);
     /// decoder layers (`crow_layers`)
     fn layers(&self) -> usize;
+    /// crow-nest #215: why this sequence's sampled ids cannot be drawn by the device sampler
+    /// (`None`: they can)
+    fn dev_sampler_refusal(&self) -> Option<String>;
+    /// crow-nest #215: arm the device sampler with `s` and draw the first id from the prompt's
+    /// logits row; every `decode_step` then returns the device's draw
+    ///
+    /// # Safety
+    /// As `begin`.
+    unsafe fn arm_sampler(&mut self, s: &Sampler) -> Result<i64, String>;
+    /// crow-nest #215: `decode_step` returns the greedy id again
+    fn park_sampler(&mut self);
+    /// crow-nest #215 (#93): the device booked `drawn`, the grammar kept `kept`: move the booking
+    ///
+    /// # Safety
+    /// As `begin`.
+    unsafe fn rebook_sampler(&mut self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize);
 }
 
 /// what the prompt phase of one request did
@@ -6078,6 +6115,18 @@ impl<R: Rows> GlmSeq for Glm5Engine<R> {
     }
     fn layers(&self) -> usize {
         Glm5Engine::layers(self)
+    }
+    fn dev_sampler_refusal(&self) -> Option<String> {
+        self.rows().dev_sampler_refusal()
+    }
+    unsafe fn arm_sampler(&mut self, s: &Sampler) -> Result<i64, String> {
+        self.rows_mut().arm_sampler(s)
+    }
+    fn park_sampler(&mut self) {
+        self.rows_mut().park_sampler();
+    }
+    unsafe fn rebook_sampler(&mut self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+        self.rows_mut().rebook_sampler(drawn, kept, drawn_seen, lastn);
     }
 }
 
@@ -6243,6 +6292,15 @@ impl GlmSeq for GlmSlotSeq {
     fn layers(&self) -> usize {
         self.layers
     }
+    fn dev_sampler_refusal(&self) -> Option<String> {
+        // crow-nest #215: the batched step (`GlmCmd::Logits`) stays on the host, a follow-up
+        Some("CROW_GLM_MAX_BATCH > 1 (the batched step reads every row back; a follow-up)".to_string())
+    }
+    unsafe fn arm_sampler(&mut self, _s: &Sampler) -> Result<i64, String> {
+        Err(self.dev_sampler_refusal().unwrap_or_default())
+    }
+    fn park_sampler(&mut self) {}
+    unsafe fn rebook_sampler(&mut self, _drawn: usize, _kept: usize, _drawn_seen: bool, _lastn: usize) {}
 }
 
 impl Drop for GlmSlotSeq {
@@ -6437,7 +6495,11 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
         eng.snapshot_bytes()
     );
     tracing::info!(target: "serve",
-        "[serve] glm5_next: no device sampler (sampled requests draw on the host), MTP {} (#192), no vision tower, no slot files, no VRAM lending (#185)",
+        "[serve] glm5_next: device sampler {} (#215), MTP {} (#192), no vision tower, no slot files, no VRAM lending (#185)",
+        match eng.rows().dev_sampler_refusal() {
+            None => "on (sampled requests draw on the device unless logit_bias, top_k 0 / > 64 or a host-only knob sends them to the host)".to_string(),
+            Some(r) => format!("off: {r} (sampled requests draw on the host)"),
+        },
         match eng.rows().mtp_drafts() { 0 => "off (CROW_GLM_MTP unset or 0)".to_string(), n => format!("{n} drafts per verify step (CROW_GLM_MTP; every id drawn from its own verify row)") });
     if cli.slot_save_path.is_some() {
         tracing::warn!(target: "serve", "[serve] --slot-save-path is not built for glm5_next: POST /slots/0 refuses save and restore (#185)");
@@ -6841,9 +6903,12 @@ fn glm_chat_on(
 /// - the prefix cache (#31 A9, #36 M2b, #100): the decision first; a warm request rolls back to
 ///   the prompt snapshot (KDA states copied back, MLA / DSA rows truncated) and prefills the
 ///   rest, a cold one resets; ONE snapshot after the prompt, with its logits row
-/// - sampling: greedy takes the head's argmax (the id `glm5_run` takes); a sampled request
-///   draws on the HOST (`draw_row`) on the logits row read back, since glm5_next has no device
-///   sampler; a greedy request inside a tool call redraws under the grammar (`redraw_from_row`)
+/// - sampling: greedy takes the head's argmax (the id `glm5_run` takes); crow-nest #215: a
+///   sampled request draws on the device sampler (#20's kernel pair behind the head, armed per
+///   request, the first id from the prompt's row) unless `draws_on_host` or the sequence's
+///   `dev_sampler_refusal` (MTP, CROW_GLM_MAX_BATCH > 1, LA) sends it to the HOST (`draw_row` on
+///   the logits row read back); a greedy or device-drawn id refused inside a tool call is redrawn
+///   under the grammar (`redraw_from_row`) and the device booking moved (`rebook_sampler`)
 /// - #192 MTP (`CROW_GLM_MTP`): inside `decode_step`; a verify step's ids come back one per
 ///   step, every id with its own logits row (the one-row decode's bits), so greedy, sampled and
 ///   forced ids are those without MTP; `timings` count the emitted ids; one `[chat] MTP` line
@@ -6885,6 +6950,9 @@ fn glm_generate_on(
 
     // #192: the MTP counters start at this request
     let _ = seq.mtp_report();
+    // crow-nest #215: the prompt phase's heads give the greedy id (the snapshot's), whatever
+    // the previous request armed; this request arms the device sampler below if it draws there
+    seq.park_sampler();
     // unsafe: the engine's device state, its thread's
     let GlmBegun { cached_n, prefilled, reset_ms, prefill_ms, next } = unsafe { seq.begin(&prompt)? };
     let mut next = next;
@@ -6893,8 +6961,13 @@ fn glm_generate_on(
     if let Some(s) = sampler.as_mut() {
         s.observe_prompt(ids);
     }
-    // no device sampler on glm5_next: every sampled request draws on the host
-    let host = sampler.is_some();
+    // crow-nest #215: a sampled request draws on the device (#20's `sample_topk_part` /
+    // `sample_k` behind the head, the id comes back in the 4-byte readback) unless it needs the
+    // host as on Qwen (`draws_on_host`: logit_bias, top_k 0 or > 64, DRY / #92 knobs) or this
+    // sequence has no device sampler (MTP, CROW_GLM_MAX_BATCH > 1, LA: `dev_sampler_refusal`)
+    let knobs_host = draws_on_host(req, sampler.as_ref());
+    let dev_refusal = if sampler.is_some() && !knobs_host { seq.dev_sampler_refusal() } else { None };
+    let host = knobs_host || dev_refusal.is_some();
     let (mut gate, gate_line) = tool_gate(req, tk, seq.consts(), tool_grammar_on());
     if let Some(l) = gate_line {
         tracing::info!(target: "chat", "{l}");
@@ -6903,9 +6976,10 @@ fn glm_generate_on(
     if let Some(l) = card_fill_line(req) {
         tracing::info!(target: "chat", "{l}");
     }
-    match sampler.as_mut() {
-        Some(s) => {
+    match (sampler.as_mut(), host) {
+        (Some(s), true) => {
             next = draw_row(unsafe { seq.logits() }, s, &req.logit_bias, gate.as_mut());
+            tracing::info!(target: "chat", "{}", glm_host_route_line(req, s, dev_refusal.as_deref()));
             let sent = req.sampling_sent;
             if s.temperature > 0.0 {
                 tracing::info!(target: "chat", "{}", sampling_line(s, sent, req.card, true));
@@ -6915,7 +6989,22 @@ fn glm_generate_on(
                     s.presence_penalty, SamplingSent::tag(sent.presence_penalty));
             }
         }
-        None => tracing::info!(target: "chat", "[chat] greedy (temperature <= 0 sent explicitly)"),
+        (Some(s), false) => {
+            // unsafe: the uploads of the profile and one eager draw on the prompt's logits row
+            next = unsafe { seq.arm_sampler(s)? } as usize;
+            let sent = req.sampling_sent;
+            if s.temperature > 0.0 {
+                tracing::info!(target: "chat", "{}", sampling_line(s, sent, req.card, false));
+            } else {
+                tracing::info!(target: "chat",
+                    "[chat] greedy with windowed penalties (#84) on the device sampler: repeat_penalty {} ({}) frequency_penalty {} ({}) penalty_last_n {} ({}) presence_penalty {} ({})",
+                    s.repeat_penalty, SamplingSent::tag(sent.repeat_penalty),
+                    s.frequency_penalty, SamplingSent::tag(sent.frequency_penalty),
+                    s.penalty_last_n, SamplingSent::tag(sent.penalty_last_n),
+                    s.presence_penalty, SamplingSent::tag(sent.presence_penalty));
+            }
+        }
+        (None, _) => tracing::info!(target: "chat", "[chat] greedy (temperature <= 0 sent explicitly)"),
     }
     tracing::info!(target: "chat", "{}", thinking_line(req));
 
@@ -6972,13 +7061,20 @@ fn glm_generate_on(
             if !inject.is_empty() {
                 next = inject.pop_front().expect("checked non-empty");
             } else if let Some(gt) = gate.as_mut() {
-                // greedy inside a call: the argmax is checked, a refused id redrawn under the
-                // mask from the same row (the host route checked inside `draw_row`)
+                // greedy or device-drawn inside a call: the id is checked, a refused id redrawn
+                // under the mask from the same row (the host route checked inside `draw_row`)
                 if !host && gt.armed() && !gt.check(next as u32) {
                     let t_rd = Instant::now();
                     let drawn = next;
                     next = redraw_from_row(req, ids, &out, gt, unsafe { seq.logits() });
                     gt.stats.redrawn += 1;
+                    // crow-nest #215 (#93): the device sampler booked `drawn`; move that to `next`
+                    if let Some(s) = sampler.as_ref() {
+                        let lastn = if s.win_armed() { s.penalty_last_n.min(crow_nest_engine::gen::SAMPLE_RING_MAX) } else { 0 };
+                        let seen = out.contains(&(drawn as u32));
+                        // unsafe: a few bytes read and written on the sampler's buffers
+                        unsafe { seq.rebook_sampler(drawn, next, seen, lastn) };
+                    }
                     redraw_ms += t_rd.elapsed().as_secs_f64() * 1e3;
                     tracing::info!(target: "chat",
                         "[chat] tool grammar: id {drawn} {:?} refused in phase {}, redrawn {next} {:?}",
@@ -7057,13 +7153,17 @@ fn glm_generate_on(
             }
             let t = *t_dec.get_or_insert_with(Instant::now);
             // unsafe: the engine's device state, this thread's
+            // crow-nest #215: on the device route the id is the device sampler's draw
             next = unsafe { seq.decode_step(next as i64)? } as usize;
-            if let Some(s) = sampler.as_mut() {
-                next = draw_row(unsafe { seq.logits() }, s, &req.logit_bias, gate.as_mut());
+            if host {
+                if let Some(s) = sampler.as_mut() {
+                    next = draw_row(unsafe { seq.logits() }, s, &req.logit_bias, gate.as_mut());
+                }
             }
             decode_ms = t.elapsed().as_secs_f64() * 1e3;
         }
     }
+    seq.park_sampler();
     if let Some(gt) = gate.as_ref() {
         let st = gt.stats;
         if st.checked > 0 || st.stepped_aside {
@@ -11843,6 +11943,118 @@ Red is #FF0000."), "{off}");
             let line = format!("fake: row {fail} failed");
             assert!(text.starts_with(head) && text.contains(&line), "{what}: {status} {text}");
             assert!(log.contains("[serve] the request failed: ") && log.contains(&line), "{what}: the log lacks the engine error: {log:?}");
+        }
+    }
+
+    // ------------------------------------------------ crow-nest #215: the glm5_next device sampler
+
+    /// a sampled request with GLM's row (`generation_config.json` + the card's top_k 20, Crow's
+    /// min_p 0.01) and G5 row 1's seed, 16 ids; `extra` overrides fields
+    fn glm_sampled_body(extra: serde_json::Value) -> serde_json::Value {
+        let mut b = serde_json::json!({ "messages": [{ "role": "user", "content": "count the owls" }], "stream": true,
+            "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.01, "presence_penalty": 0.0,
+            "seed": 1408639702u64, "max_tokens": 16 });
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    }
+
+    /// crow-nest #215 on the host twin (whose device sampler is the host chain, `FakeRows`):
+    /// - a sampled glm5_next request draws every id on the device (the first from the prompt's
+    ///   row, the rest behind each head), and feeds the ids the host route draws for the seed;
+    ///   the same seed twice gives the same ids
+    /// - `logit_bias`, top_k 0 / > 64 and the host-only knobs stay on the host, as on Qwen
+    ///   (`draws_on_host`), and so does a sequence without a device sampler
+    /// - the sampler is parked after the request: a greedy request on the same engine draws
+    ///   nothing and feeds the cold greedy run's ids
+    /// - the host route line names every reason
+    /// (Red before: every sampled request drew on the host, `dev_draws` 0.)
+    #[test]
+    fn glm_sampled_requests_draw_on_the_device_unless_the_host_is_needed() {
+        let Some(tk) = glm_tk() else { return };
+        // one request on a fresh twin: (device draws, held ids)
+        let run = |dev: bool, body: &serde_json::Value| -> (usize, Vec<i64>) {
+            let mut f = glm_fake(&tk, 4096);
+            f.dev_sampler_ok = dev;
+            let mut eng = Glm5Engine::new(f, true);
+            let mut srv = GlmSrv::new(&mut eng, "synthetic-glm.cnq");
+            let (_, _, out) = glm_turn(&mut srv, &tk, body);
+            assert_eq!(out.timing.predicted_n, 16);
+            (srv.eng.rows().dev_draws, srv.eng.history().to_vec())
+        };
+        let glm = glm_sampled_body(serde_json::json!({}));
+        let (draws, dev_ids) = run(true, &glm);
+        assert_eq!(draws, 16, "every id of the sampled request is the device's draw");
+        let (host_draws, host_ids) = run(false, &glm);
+        assert_eq!(host_draws, 0, "no device sampler: the host route");
+        assert_eq!(dev_ids, host_ids, "the device route feeds the ids the host route draws (same seed, same chain)");
+        assert_eq!(run(true, &glm).1, dev_ids, "the same seed twice");
+        assert_ne!(run(true, &glm_sampled_body(serde_json::json!({ "seed": 7 }))).1, dev_ids, "another seed, other ids");
+        let bias_id = glm_fake(&tk, 16).cands[0].to_string();
+        for (what, extra) in [
+            ("logit_bias", serde_json::json!({ "logit_bias": { bias_id.clone(): 0.0 } })),
+            ("top_k 0", serde_json::json!({ "top_k": 0 })),
+            ("top_k 100", serde_json::json!({ "top_k": 100 })),
+            ("DRY", serde_json::json!({ "dry_multiplier": 0.8 })),
+            ("top_n_sigma", serde_json::json!({ "top_n_sigma": 1.0 })),
+        ] {
+            assert_eq!(run(true, &glm_sampled_body(extra)).0, 0, "{what}: drawn on the host");
+        }
+        // a greedy request after a sampled one on the same engine
+        let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let mut srv = GlmSrv::new(&mut eng, "synthetic-glm.cnq");
+        glm_turn(&mut srv, &tk, &glm);
+        let draws = srv.eng.rows().dev_draws;
+        let greedy = glm_stream_body(serde_json::json!([{ "role": "user", "content": "count the owls" }]));
+        glm_turn(&mut srv, &tk, &greedy);
+        assert_eq!(srv.eng.rows().dev_draws, draws, "a greedy request after a sampled one draws nothing");
+        let mut cold_eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let mut cold = GlmSrv::new(&mut cold_eng, "synthetic-glm.cnq");
+        glm_turn(&mut cold, &tk, &greedy);
+        assert_eq!(srv.eng.history(), cold.eng.history(), "and feeds the cold greedy run's ids");
+        // the host route line
+        let body = glm_sampled_body(serde_json::json!({ "top_k": 100, "logit_bias": { bias_id: 0.0 } }));
+        let (req, _) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, body.to_string().as_bytes()).unwrap();
+        let s = sampler_from(&req).unwrap();
+        let line = glm_host_route_line(&req, &s, Some("CROW_GLM_MTP > 0"));
+        assert!(line.starts_with("[chat] glm5_next draws on the HOST sampler (#215): "), "{line}");
+        for w in ["logit_bias, 1 entries (#86)", "top_k 100 outside the device sampler's 1..=64 (#111)", "CROW_GLM_MTP > 0"] {
+            assert!(line.contains(w), "{w}: {line}");
+        }
+    }
+
+    /// crow-nest #215 (#93) on the host twin: inside a tool call the device's draw is checked; a
+    /// refused draw is redrawn on the host from the same row (`redraw_from_row`) and the device
+    /// booking moves from the refused id to the kept one (`rebook_sampler`). The forced
+    /// `</think>` `<tool_call>` opens a call; the twin then draws ordinary words, which no tool
+    /// name starts with. (Red without the re-book: `rebooks` stays empty.) The grammar's trie is
+    /// built once per process (`TOOL_VOCAB`, one model per serve); when another test of this
+    /// binary built it from Qwen's vocabulary first, the GLM `<tool_call>` id never arms the gate
+    /// and the test is skipped by name: run it alone with
+    /// `cargo test --release --bin serve glm_a_refused_device_draw`.
+    #[test]
+    fn glm_a_refused_device_draw_is_redrawn_on_the_host_and_rebooked() {
+        let Some(tk) = glm_tk() else { return };
+        if let Some((v, _)) = TOOL_VOCAB.get().filter(|(v, _)| v.len() != GLM_VOCAB) {
+            eprintln!("the tool-grammar trie of this process holds {} ids, not GLM's {GLM_VOCAB} - skipped; run it alone", v.len());
+            return;
+        }
+        let close = tk.token_id(THINK_CLOSE).unwrap();
+        let open = tk.token_id(TOOL_OPEN).unwrap();
+        let tools: serde_json::Value = serde_json::from_str(TOOLS_3DBC015).unwrap();
+        let body = glm_sampled_body(serde_json::json!({ "tools": tools, "crow_force_ids": [close, open], "max_tokens": 12 }));
+        let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
+        let cands = eng.rows().cands.clone();
+        let mut srv = GlmSrv::new(&mut eng, "synthetic-glm.cnq");
+        glm_turn(&mut srv, &tk, &body);
+        let rows = srv.eng.rows();
+        assert!(rows.dev_draws > 0, "the request drew on the device");
+        assert!(!rows.rebooks.is_empty(), "a word drawn inside the call was refused, redrawn and its booking moved");
+        for &(drawn, kept, _, lastn) in &rows.rebooks {
+            assert!(cands.contains(&(drawn as u32)), "the refused id {drawn} is the device's draw");
+            assert_ne!(drawn, kept);
+            assert_eq!(lastn, 0, "repeat 1, frequency 0: no window");
         }
     }
 }

@@ -184,6 +184,27 @@ pub trait Rows {
         }
         Ok(ids)
     }
+    /// crow-nest #215: why a sampled id of this model cannot be drawn by the device sampler
+    /// (`None`: it can, and serve routes a sampled request there unless `draws_on_host`)
+    fn dev_sampler_refusal(&self) -> Option<String> {
+        Some("this model has no device sampler".to_string())
+    }
+    /// crow-nest #215: arm the device sampler with `s` and draw the first id from the current
+    /// logits row; until [`Rows::park_sampler`], every head row's id is the device's draw
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    unsafe fn arm_sampler(&mut self, _s: &crate::sample::Sampler) -> Result<i64, String> {
+        Err(self.dev_sampler_refusal().unwrap_or_default())
+    }
+    /// crow-nest #215: the head rows give the greedy id again
+    fn park_sampler(&mut self) {}
+    /// crow-nest #215 (#93): the device booked `drawn`, the host kept `kept` (a tool-grammar
+    /// redraw): move the presence / window booking. `lastn` = the window depth, 0 unarmed.
+    ///
+    /// # Safety
+    /// As [`Rows::row`].
+    unsafe fn rebook_sampler(&mut self, _drawn: usize, _kept: usize, _drawn_seen: bool, _lastn: usize) {}
 }
 
 // ---------------------------------------------------------------- the device
@@ -255,6 +276,12 @@ impl Glm5Device {
         if let Err(e) = gt::kv_lazy_refusal(kv_lazy, mtp_n, run.switches().la, batch) {
             run.free();
             return Err(e);
+        }
+        // crow-nest #215: the #20 device sampler's buffers, before the tiers spend the plan's
+        // launch slack; not where it cannot draw (MTP, sequence slots, LA: those stay on the host)
+        if mtp_n == 0 && batch <= 1 && !run.switches().la {
+            let b = run.alloc_dev_sampler();
+            log(&format!("[budget] device sampler (#215): {b} B (mask, window counts, ring, candidates, profile) held from boot"));
         }
         // #192: a verify call stages the experts of 1 + N rows at once; the CPU lane is refused
         // (CROW_GLM_MAX_BATCH: a batched step those of N rows)
@@ -462,6 +489,18 @@ impl Rows for Glm5Device {
     unsafe fn decode_batch(&mut self, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
         self.run.settle_ahead(&mut self.tiers)?;
         self.run.decode_batch(&mut self.o.cnq, &mut self.tiers, rows)
+    }
+    fn dev_sampler_refusal(&self) -> Option<String> {
+        self.run.dev_sampler_refusal().map(str::to_string)
+    }
+    unsafe fn arm_sampler(&mut self, s: &crate::sample::Sampler) -> Result<i64, String> {
+        self.run.arm_dev_sampler(s)
+    }
+    fn park_sampler(&mut self) {
+        self.run.park_dev_sampler();
+    }
+    unsafe fn rebook_sampler(&mut self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+        self.run.rebook_dev_sampler(drawn, kept, drawn_seen, lastn);
     }
 }
 
@@ -1434,6 +1473,15 @@ pub mod fake {
         /// #214: the `keep` of every `kv_trim`; a trim poisons the rows `>= keep` (a row read
         /// before it is written again changes the logits)
         pub trims: Vec<usize>,
+        /// crow-nest #215: the device sampler's host twin. `dev_sampler_ok` offers it (the
+        /// device's boot does with MTP, sequence slots and LA off); armed, a head row's id is
+        /// this sampler's draw from the row (`Sampler::sample` + `observe`: the chain the #20
+        /// kernel pair is bit-identical to), the twin of `sample_k` writing the argmax slot
+        pub dev_sampler_ok: bool,
+        armed: Option<crate::sample::Sampler>,
+        /// draws the twin made, and every `rebook_sampler` call `(drawn, kept, drawn_seen, lastn)`
+        pub dev_draws: usize,
+        pub rebooks: Vec<(usize, usize, bool, usize)>,
     }
 
     impl FakeRows {
@@ -1444,7 +1492,16 @@ pub mod fake {
         /// `slots` sequences (`CROW_GLM_MAX_BATCH`)
         pub fn with_slots(n_ctx: usize, vocab: usize, cands: Vec<u32>, slots: usize) -> FakeRows {
             let parked = (0..slots).map(|i| if i == 0 { (0, Vec::new(), Vec::new()) } else { (0, vec![-1; n_ctx], vec![0.0; vocab]) }).collect();
-            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new(), trims: Vec::new() }
+            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new(), trims: Vec::new(), dev_sampler_ok: true, armed: None, dev_draws: 0, rebooks: Vec::new() }
+        }
+
+        /// crow-nest #215: the armed twin's draw from the current row (booked, as `sample_k` books)
+        fn dev_draw(&mut self) -> Option<i64> {
+            let s = self.armed.as_mut()?;
+            let t = s.sample(&self.logits);
+            s.observe(t);
+            self.dev_draws += 1;
+            Some(t as i64)
         }
     }
 
@@ -1487,13 +1544,16 @@ pub mod fake {
             let mut best = (f32::NEG_INFINITY, 0usize);
             self.logits.iter_mut().for_each(|l| *l = -1e30);
             for (k, &c) in self.cands.iter().enumerate() {
-                let v = (mix(self.state ^ att, k as u64) >> 40) as f32 / 1024.0;
+                // [0, 4): a power-of-two scale (exact, the argmax order of before), narrow
+                // enough that a temperature-1 draw is not always the argmax (crow-nest #215)
+                let v = (mix(self.state ^ att, k as u64) >> 40) as f32 / 4_194_304.0;
                 self.logits[c as usize] = v;
                 if v > best.0 {
                     best = (v, c as usize);
                 }
             }
-            Ok(Some(best.1 as i64))
+            // crow-nest #215: armed, the draw replaces the argmax (the device's argmax slot)
+            Ok(Some(self.dev_draw().unwrap_or(best.1 as i64)))
         }
         unsafe fn logits(&self) -> Vec<f32> {
             self.logits.clone()
@@ -1536,6 +1596,30 @@ pub mod fake {
             }
             self.cur = s;
             Ok(())
+        }
+        fn dev_sampler_refusal(&self) -> Option<String> {
+            if !self.dev_sampler_ok {
+                Some("fake: no device sampler".to_string())
+            } else if self.slots() > 1 {
+                Some("fake: CROW_GLM_MAX_BATCH > 1".to_string())
+            } else {
+                None
+            }
+        }
+        unsafe fn arm_sampler(&mut self, s: &crate::sample::Sampler) -> Result<i64, String> {
+            if let Some(r) = self.dev_sampler_refusal() {
+                return Err(r);
+            }
+            self.armed = Some(s.clone());
+            Ok(self.dev_draw().expect("just armed"))
+        }
+        fn park_sampler(&mut self) {
+            self.armed = None;
+        }
+        unsafe fn rebook_sampler(&mut self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+            if self.armed.is_some() {
+                self.rebooks.push((drawn, kept, drawn_seen, lastn));
+            }
         }
         unsafe fn decode_batch(&mut self, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
             self.batches.push(rows.len());
@@ -1747,7 +1831,7 @@ mod tests_batch_gpu {
 
     const REC: u64 = 9_474_048;
 
-    fn geo() -> Glm5Geo {
+    pub(super) fn geo() -> Glm5Geo {
         let mut g = Glm5Geo::GLM_5_3_FLASH;
         (g.layers, g.dense_prefix, g.experts, g.topk, g.vocab) = (8, 3, 16, 8, 2048);
         g
@@ -1759,7 +1843,7 @@ mod tests_batch_gpu {
     }
 
     /// [`device`] with the tier sizes per layer
-    unsafe fn device_sized(path: &str, g: &Glm5Geo, cap: usize, slots: usize, sizes: TierSizes) -> Glm5Device {
+    pub(super) unsafe fn device_sized(path: &str, g: &Glm5Geo, cap: usize, slots: usize, sizes: TierSizes) -> Glm5Device {
         let (spec, _) = crate::nvme_source::glm5_record_of_container(path).unwrap();
         let moe = MoeGeo::new(g, spec).unwrap();
         let mut cnq = Cnq::open_checked(path).unwrap();
@@ -1944,6 +2028,107 @@ mod tests_batch_gpu {
                 assert_eq!(e.history_of(k), held.as_slice(), "slot {k}: held ids");
             }
             eprintln!("glm5_batch {together:?}: 4 slots, {n} ids each, ids and logits rows bit-identical to the solo runs");
+            drop(e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_215_gpu {
+    //! crow-nest #215 on the GPU: the #20 device sampler behind glm5_next's head, on a
+    //! `Glm5Device` of the synthetic 8-layer model of `tests_batch_gpu` (vocab 2048). `#[ignore]`:
+    //! CI has no GPU. Run with
+    //! `cargo test --release --lib glm5_devsampler_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::*;
+    use crate::glm5_flags::tests::synth_model;
+    use crate::glm5_tiers::TierSizes;
+    use crate::sample::{argmax, Sampler};
+
+    const REC: u64 = 9_474_048;
+
+    /// the profile `serve` builds from the request (`sampler_from`): `(temperature, top_p, top_k,
+    /// min_p, presence, repeat, last_n)`
+    fn profile(seed: u64, p: (f32, f32, usize, f32, f32, f32, usize)) -> Sampler {
+        let mut s = Sampler::new(seed);
+        (s.temperature, s.top_p, s.top_k, s.min_p, s.presence_penalty, s.repeat_penalty, s.penalty_last_n) = p;
+        s
+    }
+
+    /// One sampled answer as `glm_generate_on` runs it on the device route: cold prompt, the
+    /// sampler armed (its first id from the prompt's row), `n - 1` decode steps; the ids and the
+    /// logits row each id was drawn from.
+    unsafe fn answer(e: &mut Glm5Engine<Glm5Device>, prompt: &[i64], s: &Sampler, n: usize) -> (Vec<i64>, Vec<Vec<f32>>) {
+        e.rows_mut().park_sampler();
+        e.reset();
+        e.prefill(prompt).unwrap();
+        let mut next = e.rows_mut().arm_sampler(s).unwrap();
+        let (mut ids, mut rows) = (vec![next], vec![e.logits()]);
+        for _ in 1..n {
+            next = e.decode_step(next).unwrap();
+            ids.push(next);
+            rows.push(e.logits());
+        }
+        e.rows_mut().park_sampler();
+        (ids, rows)
+    }
+
+    /// The device draws are the host chain's (`Sampler::sample` + `observe` on the same rows, the
+    /// draw `draw_row` makes) for GLM's row, a penalty-window profile and a wide hot profile; the
+    /// same seed twice gives the same ids; a parked sampler gives the argmax again; the run
+    /// refuses to arm before its buffers exist.
+    #[test]
+    #[ignore = "needs the GPU (about 2 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_devsampler_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_devsampler_gpu_draws_are_the_host_chain() {
+        let g = super::tests_batch_gpu::geo();
+        let syn = synth_model(&g, REC);
+        let prompt: Vec<i64> = (0..9i64).map(|i| (i * 37 + 5) % 2048).collect();
+        let pu: Vec<u32> = prompt.iter().map(|&v| v as u32).collect();
+        let n = 24;
+        let profiles = [
+            ("GLM row", 1408639702u64, (1.0f32, 0.95f32, 20usize, 0.01f32, 0.0f32, 1.0f32, 64usize)),
+            ("window", 7, (0.8, 0.9, 40, 0.0, 1.5, 1.1, 64)),
+            ("hot", 3, (4.0, 1.0, 64, 0.0, 0.0, 1.0, 64)),
+        ];
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut dev = super::tests_batch_gpu::device_sized(&syn.path, &g, prompt.len() + n + 2, 1, TierSizes { vram: 3, pinned: 4 });
+            assert!(dev.dev_sampler_refusal().is_some(), "no buffers before alloc_dev_sampler");
+            assert!(dev.arm_sampler(&profile(1, profiles[0].2)).is_err());
+            dev.run.alloc_dev_sampler();
+            assert_eq!(dev.dev_sampler_refusal(), None);
+            let mut e = Glm5Engine::new(dev, true);
+            for (name, seed, p) in profiles {
+                let s = {
+                    let mut s = profile(seed, p);
+                    s.observe_prompt(&pu);
+                    s
+                };
+                let (ids, rows) = answer(&mut e, &prompt, &s, n);
+                let (again, _) = answer(&mut e, &prompt, &s, n);
+                assert_eq!(ids, again, "{name}: the same seed twice");
+                let mut h = s.clone();
+                let want: Vec<i64> = rows
+                    .iter()
+                    .map(|r| {
+                        let t = h.sample(r);
+                        h.observe(t);
+                        t as i64
+                    })
+                    .collect();
+                let off = ids.iter().zip(&rows).filter(|(&t, r)| t != argmax(r) as i64).count();
+                eprintln!("glm5_devsampler {name}: ids {ids:?}, {off}/{n} away from the argmax");
+                assert_eq!(ids, want, "{name}: device draws vs the host chain on the same rows");
+                if name == "hot" {
+                    assert!(off > 0, "hot: every draw was the argmax, the comparison means nothing");
+                }
+            }
+            // parked: the heads give the argmax again
+            e.reset();
+            let mut next = e.prefill(&prompt).unwrap();
+            for _ in 1..n {
+                assert_eq!(next, argmax(&e.logits()) as i64, "a parked sampler: the greedy id");
+                next = e.decode_step(next).unwrap();
+            }
             drop(e);
         }
     }
