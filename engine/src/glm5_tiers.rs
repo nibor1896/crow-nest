@@ -929,6 +929,82 @@ pub fn prompt_borrow_from_env(get: &dyn Fn(&str) -> Option<String>, chunk: usize
     chunk > decode_t && arena_kind(get(ARENA_ENV).as_deref()) == Ok(ArenaKind::Global) && arena_config(get).is_ok_and(|c| c.elastic_bytes > 0)
 }
 
+/// #214: `CROW_GLM_KV_LAZY=<rows>`: the MLA latent and DSA indexer caches of `Glm5Run::load`
+/// reserve VA for the whole context and map physical memory for the first `<rows>` rows only;
+/// more is mapped as the context grows (the elastic arena hands back what it takes), less after a
+/// reset. Unset, empty or `0` = off (every cache `cuMemAlloc`'d whole, the path of record).
+pub const KV_LAZY_ENV: &str = "CROW_GLM_KV_LAZY";
+
+/// #214: parse [`KV_LAZY_ENV`]: unset, empty or `0` = `None` (off); a positive whole number = the
+/// rows mapped at least (the working floor); anything else refused by name
+pub fn kv_lazy_from(v: Option<&str>) -> Result<Option<usize>, String> {
+    match v.map(str::trim) {
+        None | Some("") | Some("0") => Ok(None),
+        Some(x) => match x.parse::<usize>() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(format!("{KV_LAZY_ENV}={x:?}: accepted unset or 0 (off), or the rows mapped at boot (a positive whole number)")),
+        },
+    }
+}
+
+/// #214: [`kv_lazy_from`] of the environment
+pub fn kv_lazy_from_env() -> Result<Option<usize>, String> {
+    kv_lazy_from(std::env::var(KV_LAZY_ENV).ok().as_deref())
+}
+
+/// #214: the decode paths that grow the caches through [`Glm5Run::row`] and
+/// [`Glm5Run::prefill_with`] only: with [`KV_LAZY_ENV`] on, serve refuses MTP drafts
+/// (`CROW_GLM_MTP`), the lookahead decode (`CROW_GLM_LA`) and sequence slots
+/// (`CROW_GLM_MAX_BATCH` above 1) by name; their rows would reach unmapped memory
+pub fn kv_lazy_refusal(lazy: Option<usize>, mtp_drafts: usize, la: bool, batch: usize) -> Result<(), String> {
+    if lazy.is_none() {
+        return Ok(());
+    }
+    let mut no = Vec::new();
+    if mtp_drafts > 0 {
+        no.push(format!("{}={mtp_drafts}", crate::glm5_mtp::MTP_ENV));
+    }
+    if la {
+        no.push("CROW_GLM_LA".to_string());
+    }
+    if batch > 1 {
+        no.push(format!("{MAX_BATCH_ENV}={batch}"));
+    }
+    if no.is_empty() {
+        return Ok(());
+    }
+    Err(format!("{KV_LAZY_ENV} with {}: those decode paths do not map the cache rows they write; turn one of them off", no.join(", ")))
+}
+
+/// #214: serve allocates the prefill staging set at boot when [`KV_LAZY_ENV`] is on and prompts
+/// run in prompt calls (`prompt_chunk` > 1), as `glm5_run` does at setup. Allocated lazily in the
+/// first prompt call instead (the path of record), it comes after that prompt's hand-back has set
+/// the `CROW_GLM_ARENA_REGROW` floor from the free VRAM before the set existed, so the regrowth
+/// leaves `ceil(set / chunk)` elastic chunks down for good ([`elastic_regrow_chunks`]).
+pub fn kv_lazy_stage_at_boot(lazy: Option<usize>, prompt_chunk: usize) -> bool {
+    lazy.is_some() && prompt_chunk > 1
+}
+
+/// #214: the boot invariant of [`KV_LAZY_ENV`]: the KV not mapped yet (`unmapped` bytes) fits in
+/// the live elastic chunks (`elastic` bytes, handed back on demand) plus the free VRAM above
+/// [`ARENA_RESERVE_BYTES`], so a full context can always be mapped
+pub fn kv_lazy_fits(unmapped: u64, elastic: u64, free: u64) -> bool {
+    elastic.saturating_add(free.saturating_sub(ARENA_RESERVE_BYTES)) >= unmapped
+}
+
+/// #214: the KV bytes the caches of a run of `cap` rows with `layers` DSA layers hold at boot at
+/// the VMM granularity `g`: `layers x MlaCache::bytes(cap)` off, the working floor `lazy` rows
+/// rounded up to `g` (latent and indexer each) on
+pub fn kv_boot_bytes(md: &MlaDims, cap: usize, layers: usize, lazy: Option<usize>, g: usize) -> u64 {
+    match lazy {
+        None => layers as u64 * MlaCache::bytes(md, cap),
+        Some(w) => {
+            let m = crate::glm5_mla::kv_lazy_mapped_bytes(md, cap, w, g);
+            layers as u64 * (m[0] + m[1]) as u64
+        }
+    }
+}
+
 pub fn prompt_calls(n: usize, chunk: usize) -> Vec<(usize, usize)> {
     let c = chunk.max(1);
     let mut v: Vec<(usize, usize)> = (0..n / c).map(|i| (i * c, c)).collect();
@@ -2503,6 +2579,110 @@ pub fn prefill_nvpf_min_rows(v: Option<&str>) -> Result<usize, String> {
     }
 }
 
+/// crow-nest #216: `CROW_GLM_SMALL_PROMPT=1` (with `CROW_GLM_ARENA=global` and
+/// `CROW_GLM_STAGER=1`, else no effect) serves a prompt call of fewer than
+/// [`SMALL_PROMPT_ROWS_ENV`] rows the way glm53-flash-offload (@ 6769b27, `nv2.py:315-366`,
+/// `nv2_host.cpp:419-491`) serves a forward below its staging minimum: like a multi-row decode
+/// call through the stager. The prompt phase lends nothing back and hands back only the elastic
+/// chunks free VRAM lacks for its scratch ([`small_prompt_chunks_for`], no reserve top-up); the
+/// call stages nothing: VRAM hits and pinned hits are read in place (pinned zero-copy), every NVMe
+/// miss of the layer is read at once into a pinned slot of the RAM tier behind its landed flag
+/// ([`serve_small_prompt`]), where the next decode finds it, and layer l+1's router guess on
+/// layer l's MoE input reads l+1's NVMe experts behind l's demand. Off (default) = unchanged.
+pub const SMALL_PROMPT_ENV: &str = "CROW_GLM_SMALL_PROMPT";
+/// #216: a prompt call takes the small-prompt route below this many rows (default
+/// [`SMALL_PROMPT_ROWS`] = the template's `GLM53_EC_STAGE_MIN` code default of 8,192 picks at top-8)
+pub const SMALL_PROMPT_ROWS_ENV: &str = "CROW_GLM_SMALL_PROMPT_ROWS";
+pub const SMALL_PROMPT_ROWS: usize = 1024;
+/// #216: the bytes a small prompt's hand-back adds to its scratch for the allocator's granularity
+/// (2 MiB pages over the pass's buffers), instead of the 2.5 GiB [`ARENA_RESERVE_BYTES`]
+pub const SMALL_PROMPT_SLACK_BYTES: u64 = 64 << 20;
+
+/// #216 [`SMALL_PROMPT_ENV`] / [`SMALL_PROMPT_ROWS_ENV`]: `None` = the route is off (the switch
+/// not `1`), else the rows a call stays below (a whole number of at least 1)
+pub fn small_prompt_rows(on: Option<&str>, rows: Option<&str>) -> Result<Option<usize>, String> {
+    if on.map(str::trim) != Some("1") {
+        return Ok(None);
+    }
+    match rows.map(str::trim) {
+        None => Ok(Some(SMALL_PROMPT_ROWS)),
+        Some(s) => s.parse::<usize>().ok().filter(|&n| n >= 1).map(Some).ok_or_else(|| format!("{SMALL_PROMPT_ROWS_ENV}={s}: a whole number of rows of at least 1")),
+    }
+}
+
+/// #216: whether a prompt call (or a prompt phase) of `rows` rows takes the small-prompt route
+/// (`below` = [`small_prompt_rows`] where the route is available)
+pub fn small_prompt_route(below: Option<usize>, rows: usize) -> bool {
+    below.is_some_and(|m| rows >= 1 && rows < m)
+}
+
+/// #216: what a prompt phase does with the arena before its calls
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromptPhasePlan {
+    /// every call of the phase takes the small-prompt route
+    pub small: bool,
+    /// `CROW_GLM_ARENA_STAGE_LEND`: the lent prefill staging set comes back first
+    pub lend_back: bool,
+    /// the per-forward staging buffers are sized for the phase (`stage_plan_prompt`)
+    pub stage_plan: bool,
+}
+
+/// #216: the plan of a prompt phase of `rows` rows (`below` as [`small_prompt_route`]): a small
+/// phase stages nothing, so it neither takes the staging set back nor sizes staging buffers
+pub fn prompt_phase_plan(below: Option<usize>, rows: usize) -> PromptPhasePlan {
+    let small = small_prompt_route(below, rows);
+    PromptPhasePlan { small, lend_back: !small, stage_plan: !small }
+}
+
+/// #216: the elastic chunks of `cb` bytes a small prompt phase hands back so that `need` more
+/// bytes (its scratch, #214 KV rows, #217 anchor) fit at `free` bytes of free VRAM: only what free
+/// VRAM lacks (plus [`SMALL_PROMPT_SLACK_BYTES`]), none when it fits; at most `live`. The default
+/// phase hands back [`elastic_chunks_for`] (above the 2.5 GiB reserve).
+pub fn small_prompt_chunks_for(need: u64, free: u64, cb: u64, live: usize) -> usize {
+    if need == 0 || cb == 0 {
+        return 0;
+    }
+    need.saturating_add(SMALL_PROMPT_SLACK_BYTES).saturating_sub(free).div_ceil(cb).min(live as u64) as usize
+}
+
+/// #216: the elastic chunks a prompt phase hands back for `need` bytes ([`small_prompt_chunks_for`]
+/// on the small route, else [`elastic_chunks_for`])
+pub fn prompt_hand_back_chunks(small: bool, need: u64, free: u64, cb: u64, live: usize) -> usize {
+    if small {
+        small_prompt_chunks_for(need, free, cb, live)
+    } else {
+        elastic_chunks_for(need, free, cb, live)
+    }
+}
+
+/// #216: the arena step of one small prompt call of MoE layer `l` (`ids` the distinct selected
+/// experts, ascending): [`serve_global`] without VRAM admission, so the VRAM and pinned hits stay
+/// where they are and are read there (pinned zero-copy), and every NVMe miss enters the RAM tier
+/// (a pinned slot, read straight into it), where the next decode finds it. The default prompt
+/// call ([`serve_global_prompt`]) admits nothing and stages every non-VRAM record.
+pub fn serve_small_prompt(a: &mut GlobalArena, l: usize, ids: &[u32], stage_cap: usize, m: &mut dyn Mover) -> Result<Served, String> {
+    serve_global(a, l, ids, false, stage_cap, m)
+}
+
+/// #216: what the small-prompt route did since construction ([`ExpertTiers::small_prompt_stats`])
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SmallPromptStats {
+    /// prompt phases and prompt calls (MoE layer calls) on the route
+    pub phases: u64,
+    pub calls: u64,
+    /// NVMe misses read into the RAM tier, records read zero-copy from pinned, records staged
+    /// (an NVMe miss no pinned slot took)
+    pub ram_admits: u64,
+    pub zero_copy: u64,
+    pub staged: u64,
+    /// next-layer guesses taken, guessed experts already resident, guessed NVMe reads issued
+    pub guesses: u64,
+    pub guess_resident: u64,
+    pub guess_reads: u64,
+    /// elastic chunks the route's phases handed back
+    pub hand_back_chunks: u64,
+}
+
 /// #196 NVPF: the read-ahead plan of the forward from MoE layer `l0` to `nl`: per layer its
 /// NVMe-tier experts in id order, at most `per_layer` (the ring's slots: a layer's reads then
 /// never wait for a ring slot only a later read of the same layer frees, whatever order the
@@ -3611,11 +3791,47 @@ unsafe fn guess_into_ram(
     prio: crate::nvme_source::ReadPriority,
 ) -> Result<(), String> {
     let Some(h) = glm5_flags::take_guess(pf) else { return Ok(()) };
+    let c = guess_reads(&h, st, d, pinned, ppl, rb, records, src, experts, first_moe, l, prio)?;
+    pf.stats.hints += c.taken as u64;
+    pf.stats.resident += c.resident;
+    pf.stats.issued += c.issued;
+    pf.stats.bytes += c.bytes;
+    Ok(())
+}
+
+/// what [`guess_reads`] did with one guess
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GuessCount {
+    /// the guess was of layer l + 1 (else nothing was done)
+    taken: bool,
+    resident: u64,
+    issued: u64,
+    bytes: u64,
+}
+
+/// [`guess_into_ram`]'s reads of the guess `h` (a decode call's, or #216 a small prompt call's
+/// `Glm5Pass::prompt_guess`, any number of ids, duplicates skipped)
+#[allow(clippy::too_many_arguments)]
+unsafe fn guess_reads(
+    h: &glm5_flags::Hint,
+    st: &mut Stager,
+    d: &mut ArenaDev,
+    pinned: &[Pinned],
+    ppl: usize,
+    rb: u64,
+    records: &[Vec<ExpertRecord>],
+    src: &NvmeSource,
+    experts: usize,
+    first_moe: usize,
+    l: usize,
+    prio: crate::nvme_source::ReadPriority,
+) -> Result<GuessCount, String> {
+    let mut c = GuessCount::default();
     let ln = l + 1;
     if h.layer != first_moe + ln || ln >= records.len() {
-        return Ok(());
+        return Ok(c);
     }
-    pf.stats.hints += 1;
+    c.taken = true;
     let mut seen: Vec<u32> = Vec::with_capacity(h.ids.len());
     for &e in &h.ids {
         if e < 0 || e as usize >= experts || seen.contains(&(e as u32)) {
@@ -3624,7 +3840,7 @@ unsafe fn guess_into_ram(
         let e = e as u32;
         seen.push(e);
         if d.a.place(ln, e) != Place::Nvme {
-            pf.stats.resident += 1;
+            c.resident += 1;
             continue;
         }
         let Some(q) = d.a.prefetch_admit(ln, e, st.seq) else { continue };
@@ -3652,10 +3868,10 @@ unsafe fn guess_into_ram(
                 }
             }
         }
-        pf.stats.issued += 1;
-        pf.stats.bytes += bytes;
+        c.issued += 1;
+        c.bytes += bytes;
     }
-    Ok(())
+    Ok(c)
 }
 
 /// #202 N2 (`CROW_GLM_GUESS_TRIM`), a decode call of MoE layer `l` through the global arena and
@@ -3757,12 +3973,21 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current; no launch reading the arena is pending.
     pub unsafe fn elastic_hand_back(&mut self, need: u64) -> Result<(), String> {
+        self.elastic_hand_back_with(need, false)
+    }
+
+    /// [`ExpertTiers::elastic_hand_back`]; #216 `small`: a small prompt phase's hand-back, only
+    /// what free VRAM lacks ([`small_prompt_chunks_for`])
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::elastic_hand_back`].
+    pub unsafe fn elastic_hand_back_with(&mut self, need: u64, small: bool) -> Result<(), String> {
         if self.arena.is_none() {
             return Ok(());
         }
         self.nvpf_end();
         self.stage_end();
-        self.elastic_enter(need)
+        self.elastic_enter_with(need, small)
     }
 
     /// `CROW_GLM_ARENA` elastic with a borrowed prompt scratch: the elastic part grows by up to
@@ -3970,13 +4195,25 @@ impl ExpertTiers {
     /// # Safety
     /// A CUDA context is current; no launch reading the arena is pending.
     unsafe fn elastic_enter(&mut self, need: u64) -> Result<(), String> {
+        self.elastic_enter_with(need, false)
+    }
+
+    /// [`ExpertTiers::elastic_enter`]; #216 `small`: a small prompt phase hands back only the
+    /// chunks free VRAM lacks for `need` ([`prompt_hand_back_chunks`])
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::elastic_enter`].
+    unsafe fn elastic_enter_with(&mut self, need: u64, small: bool) -> Result<(), String> {
         let (rb, vpl, ppl, stage) = (self.rb, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("elastic_enter without the global arena");
         let mut live: Vec<usize> = d.flex().filter(|&c| d.chunks[c] != 0).collect();
         let free = cuda::free_vram_bytes();
-        let k = elastic_chunks_for(need, free, vpl as u64 * rb, live.len());
+        let k = prompt_hand_back_chunks(small, need, free, vpl as u64 * rb, live.len());
         if k == 0 {
             return Ok(());
+        }
+        if small {
+            self.small_stats.hand_back_chunks += k as u64;
         }
         d.elastic.enter_free_bytes = free;
         // #188 CROW_GLM_ARENA_REGROW: the first hand-back of a prompt phase sets its floor
@@ -4302,7 +4539,8 @@ impl ExpertTiers {
     /// A CUDA context is current.
     pub unsafe fn nvpf_early(&mut self, rows: usize) -> Result<(), String> {
         let env = |k: &str| std::env::var(k).ok();
-        if !prefill_nvpf_early_on(env(PREFILL_NVPF_EARLY_ENV).as_deref()) || !prefill_nvpf_on(env(PREFILL_NVPF_ENV).as_deref()) || !stage_overlap_on(env(STAGE_OVERLAP_ENV).as_deref()) {
+        // #216: a call on the small-prompt route plans no read-ahead
+        if self.small_prompt_call(rows) || !prefill_nvpf_early_on(env(PREFILL_NVPF_EARLY_ENV).as_deref()) || !prefill_nvpf_on(env(PREFILL_NVPF_ENV).as_deref()) || !stage_overlap_on(env(STAGE_OVERLAP_ENV).as_deref()) {
             return Ok(());
         }
         let Some(d) = self.arena.as_ref() else { return Ok(()) };
@@ -4362,8 +4600,13 @@ impl ExpertTiers {
     /// synchronous mover or the stager
     ///
     /// # Safety
-    /// As [`ExpertTiers::table_for`].
-    unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<CtlReply>) -> Result<(Dev, Served), String> {
+    /// As [`ExpertTiers::table_for`]; `prompt` only with the stager.
+    ///
+    /// #216 `prompt`: a small prompt call through the stager ([`ExpertTiers::tables_small_prompt`]):
+    /// no VRAM admission ([`serve_small_prompt`]), no regrowth of the elastic part (the prompt holds
+    /// its scratch), no CPU lane and no RT2 (`sel` is the call's expert-major pseudo-rows), and the
+    /// next layer's guess is the prompt's own ([`glm5_flags::take_prompt_guess`]).
+    unsafe fn table_global(&mut self, l: usize, sel: &[i32], ids: &[u32], reply: Option<CtlReply>, prompt: bool) -> Result<(Dev, Served), String> {
         if let Some(e) = self.arena.as_mut().and_then(|d| d.refill_err.take()) {
             return Err(e);
         }
@@ -4371,7 +4614,7 @@ impl ExpertTiers {
         // when it can
         self.nvpf_end();
         self.stage_end();
-        if l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
+        if !prompt && l == 0 && self.arena.as_ref().is_some_and(|d| d.flex().any(|c| d.chunks[c] == 0)) {
             self.elastic_exit();
         }
         // #195 S: and is refilled, here only off the controller and without the stager (else at
@@ -4381,18 +4624,26 @@ impl ExpertTiers {
         }
         let (rb, experts, vpl, ppl, stage) = (self.rb, self.cache.experts, self.sizes.vram, self.sizes.pinned, self.stage);
         let d = self.arena.as_mut().expect("table_global without the global arena");
-        let admit = arena_admits(sel.len(), false, d.cfg.admit_max);
+        let admit = arena_admits(sel.len(), prompt, d.cfg.admit_max);
         d.a.set_pin_stay(self.pinned_use.stay);
-        // #188 CROW_GLM_ARENA_FREQ: the decode call's picks counted before it is placed
-        d.a.freq_count(l, sel);
+        // #188 CROW_GLM_ARENA_FREQ: the decode call's picks counted before it is placed (a prompt
+        // call's are not, as on the default prompt path)
+        if !prompt {
+            d.a.freq_count(l, sel);
+        }
         // CROW_GLM_CONTROLLER with the CPU lane: the lane's worker waits per expert, not this thread
         let ctl_lane = reply.is_some() && self.dev_lane.is_some();
         // #202 RT2: a one-row call off the controller through the stager splits early / late
-        let rt2 = self.rt2 && reply.is_none() && self.stager.is_some() && sel.len() == self.topk;
+        let rt2 = !prompt && self.rt2 && reply.is_none() && self.stager.is_some() && sel.len() == self.topk;
+        // #216: the prompt guess of the call (guesses taken, guessed experts resident, reads issued)
+        let mut pguess = (0u64, 0u64, 0u64);
         let mut written: Vec<Dev> = Vec::new();
         let mut waits = LaneWaits::default();
         let served = match self.stager.as_mut() {
             None => {
+                if prompt {
+                    return Err("expert tiers: a small prompt call without the stager (#216)".to_string());
+                }
                 let inner = GpuMover { vram: 0, pinned: None, stage, landing: self.landing.p, rb, src: &self.src, recs: &self.records[l] };
                 let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut(), gpu_waits: 0 };
                 let served = match self.prefetch.as_mut() {
@@ -4469,9 +4720,10 @@ impl ExpertTiers {
                 let mut m = ChunkMover { inner, vram: &d.chunks, pinned: &self.pinned, vpl, ppl, rb, ring: d.ring.as_mut(), gpu_waits: 0 };
                 // #203: with the stager the guesses go into the arena's pinned tier (below), not
                 // the store
-                let served = serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)?;
+                let served = if prompt { serve_small_prompt(&mut d.a, l, ids, self.stage_cap, &mut m)? } else { serve_global(&mut d.a, l, ids, admit, self.stage_cap, &mut m)? };
                 m.settle_locs(&served.locs);
-                if self.pinned_use.cpu_lane || rt2 {
+                // (#216: a prompt call's pinned hits are read by the GPU only, behind `settle_locs`)
+                if !prompt && (self.pinned_use.cpu_lane || rt2) {
                     for &(e, loc) in &served.locs {
                         if let Loc::Pinned(q) = loc {
                             // #202 RT2: a slot a write-back still lands in is late (the stager
@@ -4497,7 +4749,14 @@ impl ExpertTiers {
                 drop(m);
                 // #202 D1 / #209 D3: the next layer's guess read right behind this layer's demand
                 // (the pool's demand queue), before the answer
-                if let Some(pf) = self.prefetch.as_mut() {
+                if prompt {
+                    // #216: the prompt's own guess of layer l + 1 (`Glm5Pass::prompt_guess`)
+                    if let Some(h) = glm5_flags::take_prompt_guess() {
+                        let prio = if self.lanes2 || self.src.demand_first() { glm5_flags::prefetch_priority(&self.src) } else { crate::nvme_source::ReadPriority::Demand };
+                        let c = guess_reads(&h, st, d, &self.pinned, ppl, rb, &self.records, &self.src, experts, self.first_moe, l, prio)?;
+                        pguess = (c.taken as u64, c.resident, c.issued);
+                    }
+                } else if let Some(pf) = self.prefetch.as_mut() {
                     // #202 lanes: the guesses behind every demand read (the pool's `Prefetch` queue)
                     // #202 N1: the guesses behind every demand read (each reader's `Prefetch` queue)
                     let prio = if self.lanes2 || self.src.demand_first() { glm5_flags::prefetch_priority(&self.src) } else { crate::nvme_source::ReadPriority::Demand };
@@ -4561,7 +4820,7 @@ impl ExpertTiers {
                     PinState::Resident
                 }
             };
-            let lane = self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state);
+            let lane = if prompt { None } else { self.lane_plan(l, sel, &mut served, &|e| tv[e as usize], &|q| (pinned[q as usize / ppl].host as *const u8).add((q as usize % ppl) * rb as usize), &state) };
             (lane, rt2.then_some(late))
         };
         let (lane, rt2_late) = lane;
@@ -4573,6 +4832,16 @@ impl ExpertTiers {
             }
         }
         self.count_heat(l, sel);
+        if prompt {
+            let s = &mut self.small_stats;
+            s.calls += 1;
+            s.ram_admits += served.moves.nvme_to_pinned;
+            s.zero_copy += served.moves.zero_copy;
+            s.staged += served.moves.nvme_to_landing;
+            s.guesses += pguess.0;
+            s.guess_resident += pguess.1;
+            s.guess_reads += pguess.2;
+        }
         if let (Some(pf), None) = (self.prefetch.as_mut(), self.stager.as_ref()) {
             let a = &self.arena.as_ref().expect("table_global without the global arena").a;
             glm5_flags::prefetch_hinted(pf, &self.src, &self.records, experts, &|l, e| a.place(l, e) == Place::Nvme, self.first_moe, self.first_moe + l)?;
@@ -4585,6 +4854,46 @@ impl ExpertTiers {
         Ok((self.tables[l], served))
     }
 
+    /// #216: the rows a prompt call stays below for the small-prompt route, when the route is
+    /// available here (`CROW_GLM_SMALL_PROMPT=1`, the global arena and the stager); `None` = off
+    pub fn small_prompt_below(&self) -> Option<usize> {
+        self.small_prompt.filter(|_| self.arena.is_some() && self.stager.is_some())
+    }
+
+    /// #216: whether a prompt call of `rows` rows takes the small-prompt route
+    pub fn small_prompt_call(&self, rows: usize) -> bool {
+        small_prompt_route(self.small_prompt_below(), rows)
+    }
+
+    /// #216: the small-prompt route's counters since construction
+    pub fn small_prompt_stats(&self) -> SmallPromptStats {
+        self.small_stats
+    }
+
+    /// #216: one small prompt call of MoE layer `l` (`sel` the call's expert-major pseudo-rows,
+    /// `[rows][topk]`): every selected expert placed at once ([`ExpertTiers::table_global`] in
+    /// prompt mode: VRAM and pinned hits read in place, the NVMe misses read into the RAM tier
+    /// behind their landed flags, the stager stream waiting for those, the compute stream for the
+    /// stager), one table and `run` over every pseudo-row. No staging set, no host wait on the NVMe.
+    ///
+    /// # Safety
+    /// As [`ExpertTiers::tables_for_chunk`]; the route is available ([`ExpertTiers::small_prompt_below`]).
+    unsafe fn tables_small_prompt(&mut self, l: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+        let k = self.topk;
+        if sel.is_empty() || sel.len() % k != 0 {
+            return Err(format!("expert tiers: layer {l}: a small prompt call of {} ids is no [rows][{k}]", sel.len()));
+        }
+        let ids = distinct_ids(sel, self.cache.experts)?;
+        let (table, _) = self.table_global(l, sel, &ids, None, true)?;
+        run(0, sel.len() / k, table)
+    }
+
+    /// #216 Step 0: host time the prompt calls' NVMe reads blocked on the host since construction
+    /// (the default route's [`PrefillMover`] waits; the staged forwards' are in [`StageStats`])
+    pub fn prompt_nvme_wait_ns(&self) -> u64 {
+        self.pf_ring.as_ref().map_or(0, |r| r.wait_ns)
+    }
+
     /// [`ExpertTiers::tables_for_chunk`] through the global arena (a prompt call never admits):
     /// staged ([`ExpertTiers::stage_call`]) at `stage_min` picks or more with staging on, else in
     /// row sub-batches through the prefill staging set as on the per-layer path. `picks` = the
@@ -4593,6 +4902,11 @@ impl ExpertTiers {
     /// # Safety
     /// As [`ExpertTiers::tables_for_chunk`].
     unsafe fn tables_for_chunk_global(&mut self, l: usize, sel: &[i32], picks: usize, run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>) -> Result<(), String> {
+        // #216 CROW_GLM_SMALL_PROMPT: a call below the small-prompt rows is served like a decode
+        // call through the stager (no staging set, no lend-back, no staged forward)
+        if self.small_prompt_call(picks / self.topk.max(1)) {
+            return self.tables_small_prompt(l, sel, run);
+        }
         if self.pf_cap == 0 {
             self.alloc_prefill_stage(prefill_stage_slots(self.topk))?;
         }
@@ -6503,6 +6817,12 @@ mod arena_gpu_tests {
                 ARENA_LAZY_REFILL_ENV,
                 ARENA_STAGE_LEND_ENV,
                 ARENA_PROMPT_COUNT_ENV,
+                KV_LAZY_ENV,
+                SMALL_PROMPT_ENV,
+                SMALL_PROMPT_ROWS_ENV,
+                // crow-nest #219 / #217: read by serve's boot only; cleared here so no arm inherits them
+                crate::glm5_engine::ANSWER_REUSE_ENV,
+                crate::glm5_engine::PREFIX_ANCHOR_ENV,
             ];
             let old = names.iter().map(|n| (n.to_string(), std::env::var(n).ok())).collect();
             for n in names {
@@ -7952,6 +8272,10 @@ pub struct ExpertTiers {
     lanes2: bool,
     /// #202 RT2 (`CROW_GLM_RT2=1`, [`ExpertTiers::set_rt2`])
     rt2: bool,
+    /// #216 `CROW_GLM_SMALL_PROMPT` as read at construction: the rows a prompt call stays below
+    /// for the small-prompt route (`None` = off; [`ExpertTiers::small_prompt_below`])
+    small_prompt: Option<usize>,
+    pub small_stats: SmallPromptStats,
 }
 
 struct GpuMover<'a> {
@@ -8022,6 +8346,9 @@ struct PfRing {
     free_ev: [sys::CUevent; 2],
     ready_ev: sys::CUevent,
     cursor: usize,
+    /// #216 Step 0: host time [`PrefillMover::nvme`] blocked (ring record free + the reads), since
+    /// construction
+    wait_ns: u64,
 }
 
 impl PfRing {
@@ -8034,6 +8361,7 @@ impl PfRing {
             free_ev: [cuda::event_create(), cuda::event_create()],
             ready_ev: cuda::event_create(),
             cursor: 0,
+            wait_ns: 0,
         }
     }
 
@@ -8071,6 +8399,7 @@ impl Mover for PrefillMover<'_> {
     fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
         let (rb, n) = (self.rb as usize, self.pf.ring_ev.len());
         assert!(jobs.len() <= n, "prefill ring: {} reads, {n} ring records", jobs.len());
+        let t0 = std::time::Instant::now();
         let mut v = Vec::with_capacity(jobs.len());
         for &(e, d) in jobs {
             let Dst::Landing(i) = d else { panic!("a prompt call reads no record into a pinned slot") };
@@ -8085,7 +8414,9 @@ impl Mover for PrefillMover<'_> {
         }
         // SAFETY: the destinations are ring records no queued copy reads any more
         let t = unsafe { self.src.fetch(&v) }?;
-        Ok(self.src.wait(t)?.bytes)
+        let r = self.src.wait(t);
+        self.pf.wait_ns += t0.elapsed().as_nanos() as u64;
+        Ok(r?.bytes)
     }
     fn landing_to_stage(&mut self, i: u32) {
         let r = self.landed.iter().find(|&&(s, _)| s == i).expect("a landing is staged after its read").1;
@@ -8453,6 +8784,8 @@ impl ExpertTiers {
             prefetch: None,
             lanes2: false,
             rt2: false,
+            small_prompt: small_prompt_rows(std::env::var(SMALL_PROMPT_ENV).ok().as_deref(), std::env::var(SMALL_PROMPT_ROWS_ENV).ok().as_deref())?,
+            small_stats: SmallPromptStats::default(),
         };
         t.set_lanes2(glm5_flags::lanes2_on());
         t.set_rt2(crate::glm5_moe::lane::rt2_on());
@@ -8510,7 +8843,7 @@ impl ExpertTiers {
         let l = layer.checked_sub(self.first_moe).filter(|&l| l < self.slots.len()).ok_or_else(|| format!("expert tiers: layer {layer} is no MoE layer"))?;
         let ids = distinct_ids(sel, self.cache.experts)?;
         if self.arena.is_some() {
-            return self.table_global(l, sel, &ids, None);
+            return self.table_global(l, sel, &ids, None, false);
         }
         if self.stager.is_some() {
             return self.table_staged(l, sel, &ids, None);
@@ -9710,7 +10043,7 @@ impl ExpertTiers {
         }
         let ids = distinct_ids(sel, self.cache.experts)?;
         if self.arena.is_some() {
-            return self.table_global(l, sel, &ids, Some(CtlReply { word: reply, q, wts, early })).map(|_| ());
+            return self.table_global(l, sel, &ids, Some(CtlReply { word: reply, q, wts, early }), false).map(|_| ());
         }
         self.table_staged(l, sel, &ids, Some(CtlReply { word: reply, q, wts, early })).map(|_| ())
     }
@@ -10122,6 +10455,39 @@ pub struct Glm5Run {
     cur: usize,
     /// `CROW_GLM_MAX_BATCH`: the head buffers of a batched decode step (`None` with one slot)
     bat: Option<BatchHead>,
+    /// #214 `CROW_GLM_KV_LAZY`: the working floor in rows (`None` = off, the caches whole)
+    kv_lazy: Option<usize>,
+    pub kv_stats: KvLazyStats,
+    /// crow-nest #215: the #20 device sampler's buffers (`None` until serve allocates them at
+    /// boot) and whether it is armed: armed, every head draws into `next` behind its argmax
+    dsamp: Option<crate::gen::DevSampler>,
+    dsamp_on: bool,
+    /// crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`): the anchor the running prompt phase captures
+    /// ([`Glm5Run::prefill_anchored`]); `None` outside it
+    anchor: Option<AnchorCut>,
+}
+
+/// crow-nest #217: the prefix anchor of one prompt phase: the position whose KDA states are
+/// copied (the state after rows `0 .. pos`), the device copy of every KDA layer's state there
+/// (`dev`, the layout of the host copy; 0 = none: row by row or no VRAM), and the host copy
+struct AnchorCut {
+    pos: usize,
+    dev: Dev,
+    host: Vec<f32>,
+    done: bool,
+}
+
+/// #214 `CROW_GLM_KV_LAZY`: what the run mapped and released, cumulative since load
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvLazyStats {
+    /// growths that mapped memory, and the bytes they mapped
+    pub grows: u64,
+    pub grown_bytes: u64,
+    /// the bytes the growths asked the elastic arena for (`ExpertTiers::elastic_hand_back`)
+    pub hand_back_bytes: u64,
+    /// shrinks that released memory, and the bytes they released
+    pub trims: u64,
+    pub trimmed_bytes: u64,
 }
 
 /// `CROW_GLM_MAX_BATCH`: one parked sequence: a KDA state per KDA layer, an MLA cache per DSA
@@ -10187,6 +10553,79 @@ impl RowBase {
     }
 }
 
+/// #216 Step 0: the store's counters at a prompt phase's start (`Glm5Run::prefill_with`); the
+/// `[glm5] prompt phase` line is the difference at its end ([`PhaseBase::line`])
+struct PhaseBase {
+    moves: Moves,
+    nvme_reads: u64,
+    nvme_bytes: u64,
+    wait_ns: u64,
+    routing_syncs: u64,
+    sub_batches: u64,
+    elastic: ElasticStats,
+    stage: StageStats,
+    small: SmallPromptStats,
+}
+
+impl PhaseBase {
+    fn moves_of(t: &ExpertTiers) -> Moves {
+        let mut m = Moves::default();
+        for x in &t.moves {
+            m.add(x);
+        }
+        m
+    }
+
+    fn of(t: &ExpertTiers) -> PhaseBase {
+        let stage = t.arena_stage_stats().map(|s| s.0).unwrap_or_default();
+        PhaseBase {
+            moves: PhaseBase::moves_of(t),
+            nvme_reads: t.nvme_reads,
+            nvme_bytes: t.nvme_bytes,
+            wait_ns: t.prompt_nvme_wait_ns() + stage.host_wait_ns,
+            routing_syncs: t.routing_syncs,
+            sub_batches: t.sub_batches,
+            elastic: t.arena_elastic_stats().unwrap_or_default(),
+            stage,
+            small: t.small_prompt_stats(),
+        }
+    }
+
+    /// the phase's split: its route and rows, the walls of the lend-back, the hand-back (and the
+    /// chunks it freed), the prompt calls and `decode_ready` (`ms`), and the counters the phase moved
+    fn line(&self, t: &ExpertTiers, small: bool, rows: usize, pos0: usize, ms: (f64, f64, f64, f64), chunks: usize) -> String {
+        let m = PhaseBase::moves_of(t).since(&self.moves);
+        let e = t.arena_elastic_stats().unwrap_or_default();
+        let st = t.arena_stage_stats().map(|s| s.0).unwrap_or_default();
+        let s = t.small_prompt_stats();
+        let wait = (t.prompt_nvme_wait_ns() + st.host_wait_ns).saturating_sub(self.wait_ns);
+        format!(
+            "route {}, {rows} rows at {pos0}: lend-back {:.1} ms ({} records), hand-back {:.1} ms ({chunks} chunks, {} written back), calls {:.1} ms, decode_ready {:.1} ms; NVMe {} reads {} B, host wait {:.1} ms; pinned->stage {}, landing->stage {}, zero-copy {}, NVMe->pinned {}; routing syncs {}, sub-batches {}; staged calls {}, unfit {}, NVPF calls {}; small calls {}, guess reads {}",
+            if small { "small" } else { "default" },
+            ms.0,
+            e.lend_write_backs - self.elastic.lend_write_backs,
+            ms.1,
+            e.write_backs - self.elastic.write_backs,
+            ms.2,
+            ms.3,
+            t.nvme_reads - self.nvme_reads,
+            t.nvme_bytes - self.nvme_bytes,
+            wait as f64 / 1e6,
+            m.pinned_to_stage,
+            m.landing_to_stage,
+            m.zero_copy,
+            m.nvme_to_pinned,
+            t.routing_syncs - self.routing_syncs,
+            t.sub_batches - self.sub_batches,
+            st.calls - self.stage.calls,
+            st.unfit - self.stage.unfit,
+            st.nvpf_calls - self.stage.nvpf_calls,
+            s.calls - self.small.calls,
+            s.guess_reads - self.small.guess_reads,
+        )
+    }
+}
+
 impl Glm5Run {
     /// Load the dense part of every layer and the head (`cnq`), one KDA state per KDA layer, one
     /// MLA cache of `cap` tokens per DSA layer.
@@ -10212,7 +10651,26 @@ impl Glm5Run {
         ));
         let (kd, md) = (KdaDims::of(g), MlaDims::of(g));
         let kda = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Kda).then(|| KdaState::alloc(&kd))).collect();
-        let mla = (0..g.layers).map(|l| (gm::attn_kind(g, l) == AttnKind::Mla).then(|| MlaCache::new(&md, cap))).collect();
+        // #214 CROW_GLM_KV_LAZY: a malformed value reads as off here (the callers refuse it by
+        // name first, `kv_lazy_from_env`)
+        let kv_lazy = kv_lazy_from_env().ok().flatten();
+        let mla: Vec<Option<MlaCache>> = (0..g.layers)
+            .map(|l| {
+                (gm::attn_kind(g, l) == AttnKind::Mla).then(|| match kv_lazy {
+                    None => MlaCache::new(&md, cap),
+                    Some(w) => MlaCache::new_lazy(&md, cap, w).unwrap_or_else(|e| e.raise()),
+                })
+            })
+            .collect();
+        if let Some(w) = kv_lazy {
+            let n = mla.iter().flatten().count();
+            let mapped: u64 = mla.iter().flatten().map(|c| c.mapped_bytes(&md).iter().sum::<usize>() as u64).sum();
+            let rows = mla.iter().flatten().map(|c| c.rows_mapped(&md)).min().unwrap_or(cap);
+            log(&format!(
+                "[glm5_run] {KV_LAZY_ENV}={w}: MLA latent + DSA indexer VA reserved for {cap} rows x {n} DSA layers ({} B), {rows} rows mapped ({mapped} B); more is mapped as the context grows (the elastic arena hands back what it takes), less after a reset",
+                n as u64 * MlaCache::bytes(&md, cap)
+            ));
+        }
         let row = g.hc_streams * g.hidden;
         // #186: the pass and the residual hold a prompt call of CROW_CHUNK rows (1 = row by row)
         let chunk = prompt_chunk_from_env().clamp(1, cap.max(1));
@@ -10257,6 +10715,11 @@ impl Glm5Run {
             seqs: Vec::new(),
             cur: 0,
             bat: None,
+            kv_lazy,
+            kv_stats: KvLazyStats::default(),
+            dsamp: None,
+            dsamp_on: false,
+            anchor: None,
         };
         let sw = Switches::from_env();
         if sw != Switches::default() {
@@ -10400,6 +10863,11 @@ impl Glm5Run {
         }
         for s in self.kda.iter().flatten() {
             s.reset();
+        }
+        // #214 CROW_GLM_KV_LAZY: the speculative, controlled-lookahead and lookahead paths queue
+        // rows without `row` / `prefill_with`: every row of the run mapped up front
+        if self.kv_lazy.is_some() && (self.spec.is_some() || (self.sw.la && self.pass.ctl.is_some()) || self.feed.is_some()) {
+            self.kv_ensure(tiers, rows)?;
         }
         if self.spec.is_some() {
             return self.generate_spec(cnq, tiers, prompt, n, keep_logits, report);
@@ -10582,6 +11050,20 @@ impl Glm5Run {
     /// # Safety
     /// A CUDA context is current.
     unsafe fn head_row(&mut self) -> Result<(), String> {
+        self.head_greedy()?;
+        // crow-nest #215: armed, the device sampler draws from the row into `next` (the argmax
+        // slot, so the caller's 4-byte readback returns the draw). An eager launch on the legacy
+        // stream behind the head (or its graph), never captured: the head graph is the same
+        // for greedy and sampled requests.
+        self.sample_into_next();
+        Ok(())
+    }
+
+    /// the head of [`Glm5Run::head_row`] without the device sampler: the greedy id into `next`
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn head_greedy(&mut self) -> Result<(), String> {
         let Some(gr) = self.graph.as_mut() else {
             gm::run_head(&self.pass.kn, &self.head, &self.hw, self.x, self.normed, self.logits, self.next, 1);
             return Ok(());
@@ -10595,6 +11077,79 @@ impl Glm5Run {
         gr.head = Some(glm5_graph::end_row().map_err(|e| format!("glm5_run: head: {e}"))?);
         gr.head_captures += 1;
         Ok(())
+    }
+
+    /// crow-nest #215: queue the device sampler's draw from `logits` into `next` when it is armed
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn sample_into_next(&self) {
+        if let (true, Some(ds)) = (self.dsamp_on, self.dsamp.as_ref()) {
+            crate::gen::launch_dev_sampler(&self.pass.kn.k, ds, self.logits, self.next, self.head.vocab_param());
+        }
+    }
+
+    /// crow-nest #215: allocate the #20 device sampler's buffers (`gen::sampler_bytes(vocab)`,
+    /// held until `free`); serve calls it at boot, `glm5_run` never does. Returns the bytes.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn alloc_dev_sampler(&mut self) -> u64 {
+        if self.dsamp.is_none() {
+            self.dsamp = Some(crate::gen::DevSampler::alloc(self.g.vocab));
+        }
+        crate::gen::sampler_bytes(self.g.vocab)
+    }
+
+    /// crow-nest #215: why a sampled id of this run cannot be drawn on the device (`None`: it can)
+    pub fn dev_sampler_refusal(&self) -> Option<&'static str> {
+        if self.dsamp.is_none() {
+            Some("no device sampler buffers (glm5_run allocates none; serve does at boot)")
+        } else if self.mtp_drafts() > 0 {
+            Some("CROW_GLM_MTP > 0 (the verify rows draw on the host; device per-row draws are a follow-up)")
+        } else if self.slots() > 1 {
+            Some("CROW_GLM_MAX_BATCH > 1 (the batched step reads every row back; a follow-up)")
+        } else if self.sw.la {
+            Some("CROW_GLM_LA (a row run ahead would book a draw the host may drop)")
+        } else {
+            None
+        }
+    }
+
+    /// crow-nest #215: arm the device sampler with the profile of `s` (`gen::arm_dev_sampler`,
+    /// the uploads Qwen's `Engine::enable_dev_sampler` makes) and draw the first id from the
+    /// logits row the prompt (or a restored snapshot) left: one eager launch, the twin of Qwen's
+    /// `sample_last`. Every later head draws until [`Glm5Run::park_dev_sampler`].
+    ///
+    /// # Safety
+    /// A CUDA context is current; nothing is ahead (`CROW_GLM_LA` is refused).
+    pub unsafe fn arm_dev_sampler(&mut self, s: &crate::sample::Sampler) -> Result<i64, String> {
+        if let Some(r) = self.dev_sampler_refusal() {
+            return Err(format!("glm5_run: no device sampler: {r}"));
+        }
+        let ds = self.dsamp.as_ref().expect("checked by dev_sampler_refusal");
+        crate::gen::arm_dev_sampler(ds, s, self.g.vocab);
+        self.dsamp_on = true;
+        self.sample_into_next();
+        cuda::sync();
+        Ok(cuda::dtoh_i32(self.next, 1)[0] as i64)
+    }
+
+    /// crow-nest #215: the heads take the greedy id again (a greedy or host-route request, the
+    /// prompt phase); the buffers stay for the next sampled request
+    pub fn park_dev_sampler(&mut self) {
+        self.dsamp_on = false;
+    }
+
+    /// crow-nest #215 (#93): the device sampler booked `drawn`, the host kept `kept` (a tool
+    /// grammar redraw): move the booking (`gen::rebook_dev_sampler`). Not armed: nothing.
+    ///
+    /// # Safety
+    /// A CUDA context is current; between two decode steps.
+    pub unsafe fn rebook_dev_sampler(&self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+        if let (true, Some(ds)) = (self.dsamp_on, self.dsamp.as_ref()) {
+            crate::gen::rebook_dev_sampler(ds, self.g.vocab, drawn, kept, drawn_seen, lastn);
+        }
     }
 
     /// [`Glm5Run::layers`], every launch eager (with a capture open, into its segments).
@@ -10676,6 +11231,10 @@ impl Glm5Run {
         self.kda_bak.clear();
         // CROW_GLM_MAX_BATCH: the parked sequences and the batch head
         self.free_slots();
+        if let Some(mut ds) = self.dsamp.take() {
+            ds.free();
+        }
+        self.dsamp_on = false;
     }
 }
 
@@ -11664,6 +12223,8 @@ impl Glm5Run {
             return Err(format!("glm5_run: token id {tok} outside the vocab of {}", self.g.vocab));
         }
         self.settle_ahead(tiers)?;
+        // #214 CROW_GLM_KV_LAZY: the row's cache rows mapped first (a no-op when off or mapped)
+        self.kv_ensure(tiers, pos + 1)?;
         if self.pass.ctl.is_some() {
             return self.row_ctl(cnq, tiers, tok, pos, head);
         }
@@ -12110,6 +12671,63 @@ impl Glm5Run {
         self.prefill_with(cnq, tiers, ids, pos0, report, &mut |_, _, _, _| Ok(()))
     }
 
+    /// crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`): [`Glm5Run::prefill`], and the KDA state of every
+    /// KDA layer after the first `cut` rows (0 < `cut` < `ids.len()`) copied into `anchor` (the
+    /// layout of a prefix snapshot: per KDA layer S, then the conv window). No extra prompt call:
+    /// the call that holds row `cut` cuts each KDA layer's scan there and copies the state D2D
+    /// into a device buffer taken from the elastic arena with the prompt's scratch, one DtoH after
+    /// the prompt (prompt chunk 1: a DtoH after the row). `Some(ms)` = captured, the wall of the
+    /// whole anchored prefill; `None` = no VRAM for the device copy, the rows are prefilled all
+    /// the same. Not with MTP (the spec head-norm row exists only at the prompt's end).
+    ///
+    /// # Safety
+    /// As [`Glm5Run::prefill`]; `anchor` holds at least the KDA states' floats.
+    pub unsafe fn prefill_anchored(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, ids: &[i64], pos0: usize, cut: usize, anchor: &mut [f32]) -> Result<(i64, Option<f64>), String> {
+        if cut == 0 || cut >= ids.len() {
+            return Err(format!("glm5_run: an anchor after {cut} of {} prompt rows", ids.len()));
+        }
+        if self.mtp_drafts() > 0 {
+            return Err("glm5_run: no prefix anchor with CROW_GLM_MTP (#217)".to_string());
+        }
+        let need = (self.kda_state_bytes() / 4) as usize;
+        if anchor.len() < need {
+            return Err(format!("glm5_run: an anchor of {} floats, the KDA states take {need}", anchor.len()));
+        }
+        self.anchor = Some(AnchorCut { pos: pos0 + cut, dev: 0, host: vec![0.0; need], done: false });
+        let t = std::time::Instant::now();
+        let r = self.prefill(cnq, tiers, ids, pos0, &mut |_| {});
+        let a = self.anchor.take().expect("set above");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let id = r?;
+        if !a.done {
+            return Ok((id, None));
+        }
+        anchor[..need].copy_from_slice(&a.host);
+        Ok((id, Some(ms)))
+    }
+
+    /// crow-nest #217: the device bytes of every KDA layer's state (S + conv window)
+    pub fn kda_state_bytes(&self) -> u64 {
+        self.kda_states().map(|k| k.bytes()).sum()
+    }
+
+    /// crow-nest #217: every KDA layer's state into `into` (per layer S, then the conv window;
+    /// synchronizes)
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    unsafe fn kda_states_to_host(&self, into: &mut [f32]) {
+        let kd = crate::glm5_kda::KdaDims::of(&self.g);
+        cuda::sync();
+        let mut at = 0;
+        for k in self.kda_states() {
+            for (src, n) in [(k.s, kd.state_floats()), (k.conv, kd.conv_floats())] {
+                cuda::ck(cudarc::driver::sys::cuMemcpyDtoH_v2(into[at..at + n].as_mut_ptr() as *mut std::ffi::c_void, src, n * 4));
+                at += n;
+            }
+        }
+    }
+
     /// [`Glm5Run::prefill`], and after every prompt call (prompt chunk 1: every row) `rows`
     /// sees the run, the container and the call's rows `(r0, t)` (indices into `ids`): their
     /// final residuals are the first `t` rows of the residual `x` (`[t][streams][H]`), queued,
@@ -12131,6 +12749,13 @@ impl Glm5Run {
                 let t0 = std::time::Instant::now();
                 let base = RowBase::of(tiers);
                 last = self.row(cnq, tiers, tok, pos0 + i, i + 1 == n)?;
+                // crow-nest #217: the anchor's states after its row, straight to the host
+                if self.anchor.as_ref().is_some_and(|a| a.pos == pos0 + i + 1) {
+                    let mut a = self.anchor.take().expect("checked");
+                    self.kda_states_to_host(&mut a.host);
+                    a.done = true;
+                    self.anchor = Some(a);
+                }
                 rows(self, cnq, i, 1)?;
                 report(&base.report(tiers, pos0 + i, true, last, t0));
             }
@@ -12139,22 +12764,72 @@ impl Glm5Run {
         // CROW_GLM_ARENA elastic: borrow the scratch this prompt's calls need, give it back
         // whatever happens
         let borrow_t = self.borrow.map_or(0, |b| prompt_borrow_rows(n, self.prompt_chunk, b.0));
+        // #216 CROW_GLM_SMALL_PROMPT: a prompt below the small-prompt rows stages nothing: no
+        // lend-back, no staging buffers, a hand-back of only what free VRAM lacks
+        let plan = prompt_phase_plan(tiers.small_prompt_below(), n);
+        let ph = PhaseBase::of(tiers);
+        let t_lend = std::time::Instant::now();
         // #188 CROW_GLM_ARENA_STAGE_LEND: the lent prefill staging set back before the prompt
         // plans on the arena's places (the NVPF read-ahead, the staged forwards)
-        tiers.stage_lend_back()?;
-        // #196 round 3: the staging buffers sized to what the scratch leaves, before it is taken
-        tiers.stage_plan_prompt(self.borrow_bytes(borrow_t));
-        if borrow_t > 0 {
-            self.borrow_scratch(tiers, borrow_t)?;
+        if plan.lend_back {
+            tiers.stage_lend_back()?;
         }
-        let r = self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows);
+        let lend_ms = t_lend.elapsed().as_secs_f64() * 1e3;
+        // #196 round 3: the staging buffers sized to what the scratch leaves, before it is taken
+        // #214 CROW_GLM_KV_LAZY: the prompt's cache rows not mapped yet are handed back with the
+        // scratch (0 when off or mapped)
+        let kv = self.kv_grow_bytes(pos0 + n);
+        // crow-nest #217: the anchor's device copy is handed back with the scratch and freed
+        // after the prompt (never held between requests)
+        let anchor_bytes = self.anchor.as_ref().filter(|a| a.pos > pos0 && a.pos < pos0 + n).map_or(0, |_| self.kda_state_bytes());
+        if plan.stage_plan {
+            tiers.stage_plan_prompt(self.borrow_bytes(borrow_t) + kv + anchor_bytes);
+        }
+        let t_hand = std::time::Instant::now();
+        let live0 = tiers.elastic_live().map_or(0, |e| e.0);
+        if borrow_t > 0 {
+            self.borrow_scratch(tiers, borrow_t, kv + anchor_bytes, plan.small)?;
+        } else if kv + anchor_bytes > 0 {
+            tiers.elastic_hand_back_with(kv + anchor_bytes, plan.small)?;
+        }
+        let hand = (t_hand.elapsed().as_secs_f64() * 1e3, live0.saturating_sub(tiers.elastic_live().map_or(0, |e| e.0)));
+        if plan.small {
+            tiers.small_stats.phases += 1;
+        }
+        if kv > 0 {
+            self.kv_stats.hand_back_bytes += kv;
+        }
+        if anchor_bytes > 0 {
+            // no VRAM for the copy: the anchor is skipped, the prompt runs as without it
+            if let (Some(a), Ok(d)) = (self.anchor.as_mut(), cuda::try_alloc_zeroed("glm5 prefix anchor (KDA states, #217)", anchor_bytes as usize)) {
+                a.dev = d;
+            }
+        }
+        let t_calls = std::time::Instant::now();
+        let r = match self.kv_map_to(pos0 + n) {
+            Ok(()) => self.prompt_calls_with(cnq, tiers, ids, pos0, report, rows),
+            Err(e) => Err(e),
+        };
+        let calls_ms = t_calls.elapsed().as_secs_f64() * 1e3;
+        if let Some(a) = self.anchor.as_mut().filter(|a| a.dev != 0) {
+            if r.is_ok() {
+                cuda::sync();
+                cuda::ck(cudarc::driver::sys::cuMemcpyDtoH_v2(a.host.as_mut_ptr() as *mut std::ffi::c_void, a.dev, anchor_bytes as usize));
+                a.done = true;
+            }
+            cuda::free_dev(&mut a.dev);
+        }
         if borrow_t > 0 {
             self.return_scratch();
         }
         // the staged forward ends and the elastic part grows back here, on the host thread
+        let t_ready = std::time::Instant::now();
         cuda::sync();
         tiers.decode_ready();
         self.lift_elastic(tiers);
+        let ready_ms = t_ready.elapsed().as_secs_f64() * 1e3;
+        // #216 Step 0: where the prompt phase's time went
+        tracing::info!(target: "glm5", "[glm5] prompt phase {}", ph.line(tiers, plan.small, n, pos0, (lend_ms, hand.0, calls_ms, ready_ms), hand.1));
         r
     }
 
@@ -12184,13 +12859,14 @@ impl Glm5Run {
         }
     }
 
-    /// `CROW_GLM_ARENA` elastic: the elastic chunks a scratch of `t` rows takes handed back, the
-    /// pass and the residual at `t` rows; captured row graphs dropped (they hold the old buffers)
+    /// `CROW_GLM_ARENA` elastic: the elastic chunks a scratch of `t` rows (and #214's `kv` bytes of
+    /// cache rows still to be mapped) takes handed back, the pass and the residual at `t` rows;
+    /// captured row graphs dropped (they hold the old buffers)
     ///
     /// # Safety
     /// As [`Glm5Run::prefill`].
-    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers, t: usize) -> Result<(), String> {
-        tiers.elastic_hand_back(self.borrow_bytes(t))?;
+    unsafe fn borrow_scratch(&mut self, tiers: &mut ExpertTiers, t: usize, kv: u64, small: bool) -> Result<(), String> {
+        tiers.elastic_hand_back_with(self.borrow_bytes(t) + kv, small)?;
         self.resize_rows(t);
         Ok(())
     }
@@ -12265,7 +12941,26 @@ impl Glm5Run {
     /// # Safety
     /// A CUDA context is current; `tiers` belongs to this model; `t <= max_t`.
     unsafe fn layers_chunk(&mut self, tiers: &mut ExpertTiers, pos0: usize, t: usize) -> Result<(), String> {
+        // crow-nest #217: the call that holds the anchor's row cuts every KDA layer's scan there
+        let cut = self.anchor.as_ref().filter(|a| a.dev != 0 && a.pos > pos0 && a.pos <= pos0 + t).map(|a| (a.pos - pos0, a.dev));
+        let kd = crate::glm5_kda::KdaDims::of(&self.g);
+        let mut k = 0u64;
+        // #216 CROW_GLM_SMALL_PROMPT: a small call guesses each next MoE layer's experts
+        let small = tiers.small_prompt_call(t);
         for l in 0..self.g.layers {
+            self.pass.prompt_guess = match self.layers.get(l + 1).map(|lw| &lw.ffn) {
+                Some(gm::FfnW::Moe { w, .. }) if small => Some((l + 1, w.router, w.bias)),
+                _ => None,
+            };
+            let kda_layer = self.kda[l].is_some();
+            self.pass.kda_cut = match cut {
+                Some((r, dev)) if kda_layer => {
+                    let at = dev + k * ((kd.state_floats() + kd.conv_floats()) * 4) as u64;
+                    Some((r, at, at + (kd.state_floats() * 4) as u64))
+                }
+                _ => None,
+            };
+            k += kda_layer as u64;
             if let Some(s) = self.kda[l].as_mut() {
                 self.pass.swap_kda_state(s);
             }
@@ -12276,6 +12971,10 @@ impl Glm5Run {
             let picks = t * self.moe.topk;
             let mut hook = |layer: usize, sel: &[i32], run: &mut dyn FnMut(usize, usize, Dev) -> Result<(), String>| tiers.tables_for_prompt(layer, sel, picks, run);
             let r = self.pass.call_with_expert_batches(&self.layers[l], self.x, pos0, t, &mut hook);
+            self.pass.kda_cut = None;
+            self.pass.prompt_guess = None;
+            // a guess the hook did not take (a failed call) is not left for a later one
+            glm5_flags::post_prompt_guess(None);
             // the layer's own state goes back even when the call failed
             if let Some(s) = self.kda[l].as_mut() {
                 self.pass.swap_kda_state(s);
@@ -12286,6 +12985,447 @@ impl Glm5Run {
             r.map_err(|e| format!("glm5_run: prompt rows {pos0}..{} layer {l}: {e}", pos0 + t))?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- #214 CROW_GLM_KV_LAZY
+
+impl Glm5Run {
+    /// #214: the working floor of `CROW_GLM_KV_LAZY` in rows (`None` = off)
+    pub fn kv_lazy(&self) -> Option<usize> {
+        self.kv_lazy
+    }
+
+    /// #214: the rows every MLA cache has mapped (`cap` when off)
+    pub fn kv_rows_mapped(&self) -> usize {
+        let md = MlaDims::of(&self.g);
+        self.mla.iter().flatten().map(|c| c.rows_mapped(&md)).min().unwrap_or(self.cap)
+    }
+
+    /// #214: the KV bytes mapped now and the bytes reserved, over every DSA layer
+    pub fn kv_bytes(&self) -> (u64, u64) {
+        let md = MlaDims::of(&self.g);
+        let n = self.mla.iter().flatten().count() as u64;
+        let mapped = self.mla.iter().flatten().map(|c| c.mapped_bytes(&md).iter().sum::<usize>() as u64).sum();
+        (mapped, n * MlaCache::bytes(&md, self.cap))
+    }
+
+    /// #214: the bytes mapping the cache rows up to `rows` takes (0 when off or mapped)
+    ///
+    /// # Safety
+    /// A CUDA context is current (the VMM granularity is read).
+    pub unsafe fn kv_grow_bytes(&self, rows: usize) -> u64 {
+        if self.kv_lazy.is_none() {
+            return 0;
+        }
+        let (md, g) = (MlaDims::of(&self.g), cuda::vmm_granularity());
+        self.mla.iter().flatten().map(|c| c.grow_bytes(&md, rows, g)).sum()
+    }
+
+    /// #214: map the cache rows up to `rows` in every DSA layer; a refusal names the call and the
+    /// rows (the run never runs on fewer rows). A no-op when off or mapped.
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn kv_map_to(&mut self, rows: usize) -> Result<(), String> {
+        if self.kv_lazy.is_none() {
+            return Ok(());
+        }
+        let md = MlaDims::of(&self.g);
+        let mut grown = 0;
+        for c in self.mla.iter_mut().flatten() {
+            grown += c.grow_to(&md, rows).map_err(|e| format!("glm5_run: {KV_LAZY_ENV}: mapping the cache rows up to {rows}: {}", e.message()))?;
+        }
+        if grown > 0 {
+            self.kv_stats.grows += 1;
+            self.kv_stats.grown_bytes += grown;
+        }
+        Ok(())
+    }
+
+    /// #214: the cache rows up to `rows` mapped, the bytes they take handed back by the elastic
+    /// arena first ([`ExpertTiers::elastic_hand_back`]); a no-op when off or mapped
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch reading the arena is pending.
+    pub unsafe fn kv_ensure(&mut self, tiers: &mut ExpertTiers, rows: usize) -> Result<(), String> {
+        let kv = self.kv_grow_bytes(rows);
+        if kv == 0 {
+            return Ok(());
+        }
+        tiers.elastic_hand_back(kv)?;
+        self.kv_stats.hand_back_bytes += kv;
+        self.kv_map_to(rows)
+    }
+
+    /// #214: the cache rows above `max(keep, CROW_GLM_KV_LAZY)` unmapped (serve's reset and
+    /// rollback; rows `>= keep` are written before they are read again). The elastic arena takes
+    /// the freed VRAM back at its next regrowth (`ExpertTiers::decode_ready`). A no-op when off.
+    ///
+    /// # Safety
+    /// A CUDA context is current; no launch of this run is pending.
+    pub unsafe fn kv_trim(&mut self, keep: usize) {
+        let Some(w) = self.kv_lazy else { return };
+        let md = MlaDims::of(&self.g);
+        let keep = keep.max(w);
+        let mut freed = 0;
+        for c in self.mla.iter_mut().flatten() {
+            freed += c.shrink_to(&md, keep);
+        }
+        if freed > 0 {
+            self.kv_stats.trims += 1;
+            self.kv_stats.trimmed_bytes += freed;
+        }
+    }
+
+    /// #214: the boot invariant ([`kv_lazy_fits`]) on `tiers` as built: `Ok(Some)` = its log
+    /// line, `Err` = the numbers that break it; `Ok(None)` when off
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn kv_boot_check(&self, tiers: &ExpertTiers) -> Result<Option<String>, String> {
+        let Some(w) = self.kv_lazy else { return Ok(None) };
+        let (mapped, all) = self.kv_bytes();
+        let unmapped = all.saturating_sub(mapped);
+        let (live, _, vpl) = tiers.elastic_live().unwrap_or((0, 0, 0));
+        let elastic = (live * vpl) as u64 * tiers.rb;
+        let free = cuda::free_vram_bytes();
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let nums = format!(
+            "KV unmapped {unmapped} B ({:.2} GiB) of {all} B, live elastic chunks {elastic} B ({:.2} GiB), free VRAM {free} B ({:.2} GiB), reserve {ARENA_RESERVE_BYTES} B",
+            gib(unmapped),
+            gib(elastic),
+            gib(free)
+        );
+        if !kv_lazy_fits(unmapped, elastic, free) {
+            return Err(format!("{KV_LAZY_ENV}={w}: a full context cannot be mapped: {nums}; elastic + free above the reserve must hold the unmapped KV"));
+        }
+        Ok(Some(format!("[budget] {KV_LAZY_ENV}={w}: {} rows mapped at boot; {nums}: a full context can be mapped", self.kv_rows_mapped())))
+    }
+
+    /// #214: one line of the mapped KV, the VRAM slots and the elastic counters (serve logs it
+    /// after each request); `None` when off
+    pub fn kv_report(&self, tiers: &ExpertTiers) -> Option<String> {
+        let w = self.kv_lazy?;
+        let (mapped, all) = self.kv_bytes();
+        let k = self.kv_stats;
+        let arena = match (tiers.arena(), tiers.elastic_live(), tiers.arena_elastic_stats()) {
+            (Some(a), Some((live, n, vpl)), Some(e)) => format!(
+                "VRAM slots {} ({live} of {n} elastic chunks x {vpl} live); elastic enter {} exit {} realloc_fail {} write_backs {} regrown {}",
+                a.enabled_vram(),
+                e.enter,
+                e.exit,
+                e.realloc_fail,
+                e.write_backs,
+                e.regrown
+            ),
+            _ => "per-layer arena (no elastic part)".to_string(),
+        };
+        Some(format!(
+            "{KV_LAZY_ENV}={w}: KV {} of {} rows mapped ({mapped} of {all} B); growths {} ({} B, {} B asked of the arena), trims {} ({} B); {arena}",
+            self.kv_rows_mapped(),
+            self.cap,
+            k.grows,
+            k.grown_bytes,
+            k.hand_back_bytes,
+            k.trims,
+            k.trimmed_bytes
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests_216 {
+    //! #216 `CROW_GLM_SMALL_PROMPT` on the host: the switch, the route by rows, the prompt phase's
+    //! plan (no lend-back, no staging buffers), the hand-back sized against free VRAM, and the
+    //! arena step of a small call (NVMe misses into the RAM tier, pinned hits read in place)
+    use super::*;
+
+    const REC: u64 = 9_474_048;
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn small_prompt_switch_is_off_unless_one() {
+        assert_eq!(small_prompt_rows(None, None), Ok(None));
+        assert_eq!(small_prompt_rows(None, Some("512")), Ok(None));
+        assert_eq!(small_prompt_rows(Some("0"), Some("512")), Ok(None));
+        assert_eq!(small_prompt_rows(Some("1"), None), Ok(Some(1024)));
+        assert_eq!(SMALL_PROMPT_ROWS, 1024, "the template's GLM53_EC_STAGE_MIN code default, 8,192 picks at top-8");
+        assert_eq!(small_prompt_rows(Some(" 1 "), Some(" 512 ")), Ok(Some(512)));
+        for bad in ["0", "-1", "1k", ""] {
+            assert!(small_prompt_rows(Some("1"), Some(bad)).unwrap_err().contains(SMALL_PROMPT_ROWS_ENV), "{bad} refused by name");
+        }
+    }
+
+    /// The G5 t1 rows (#216 Evidence, 2026-10-11): row 3's 86 new rows take the route, row 2's
+    /// 2,343 and row 1's 6,438 stay on the default path; off, no call does
+    #[test]
+    fn the_route_is_taken_below_the_rows_only() {
+        let on = small_prompt_rows(Some("1"), None).unwrap();
+        for (rows, small) in [(86, true), (1, true), (1023, true), (1024, false), (2343, false), (6438, false), (0, false)] {
+            assert_eq!(small_prompt_route(on, rows), small, "{rows} rows, switch on");
+            assert!(!small_prompt_route(None, rows), "{rows} rows, switch off");
+        }
+    }
+
+    /// Ticket Evidence 1: the 86-row prompt took the lent staging set back (two syncs, write-backs)
+    /// and sized staging buffers; on the route it does neither, a prompt at the rows does both
+    #[test]
+    fn a_small_phase_lends_nothing_back_and_sizes_no_staging() {
+        let on = Some(SMALL_PROMPT_ROWS);
+        assert_eq!(prompt_phase_plan(on, 86), PromptPhasePlan { small: true, lend_back: false, stage_plan: false });
+        assert_eq!(prompt_phase_plan(on, 2343), PromptPhasePlan { small: false, lend_back: true, stage_plan: true });
+        assert_eq!(prompt_phase_plan(None, 86), PromptPhasePlan { small: false, lend_back: true, stage_plan: true });
+    }
+
+    /// Ticket Evidence 2: free VRAM about 1.12 GiB in decode, chunks of 37 records of 9,474,048 B,
+    /// 22 live, a ~50 MB scratch. The default hand-back tops up the 2.5 GiB reserve: 5 chunks (the
+    /// measured +185 write-backs = 5 x 37). The small phase hands back none (the scratch fits),
+    /// and for a scratch above free VRAM only the chunks free VRAM lacks.
+    #[test]
+    fn a_small_phase_hands_back_only_what_free_vram_lacks() {
+        let cb = 37 * REC;
+        let free = (1.12 * GIB as f64) as u64;
+        let need = 50 << 20;
+        assert_eq!(prompt_hand_back_chunks(false, need, free, cb, 22), 5, "the default phase");
+        assert_eq!(prompt_hand_back_chunks(true, need, free, cb, 22), 0, "the scratch fits in free VRAM");
+        let big = 2 * GIB;
+        let lacks = (big + SMALL_PROMPT_SLACK_BYTES - free).div_ceil(cb) as usize;
+        assert_eq!(lacks, 3);
+        assert_eq!(prompt_hand_back_chunks(true, big, free, cb, 22), lacks, "only what free VRAM lacks");
+        assert!(prompt_hand_back_chunks(false, big, free, cb, 22) > lacks, "the default adds the reserve");
+        assert_eq!(prompt_hand_back_chunks(true, 40 * GIB, 0, cb, 22), 22, "at most the live chunks");
+        assert_eq!(prompt_hand_back_chunks(true, 0, 0, cb, 22), 0, "nothing asked, nothing handed back");
+    }
+
+    /// the host twin of the slots (every slot holds the key `layer x experts + expert` of its
+    /// record), as `arena_tests::GSim`
+    struct Twin {
+        experts: usize,
+        layer: usize,
+        vram: Vec<u32>,
+        pinned: Vec<u32>,
+        stage: Vec<u32>,
+        landing: Vec<u32>,
+        ops: Moves,
+    }
+
+    impl Mover for Twin {
+        fn nvme(&mut self, jobs: &[(u32, Dst)]) -> Result<u64, String> {
+            for &(e, d) in jobs {
+                let key = (self.layer * self.experts) as u32 + e;
+                match d {
+                    Dst::Landing(i) => {
+                        self.landing[i as usize] = key;
+                        self.ops.nvme_to_landing += 1;
+                    }
+                    Dst::Pinned(q) => {
+                        self.pinned[q as usize] = key;
+                        self.ops.nvme_to_pinned += 1;
+                    }
+                }
+            }
+            Ok(jobs.len() as u64 * REC)
+        }
+        fn landing_to_stage(&mut self, i: u32) {
+            self.ops.landing_to_stage += 1;
+            self.stage[i as usize] = self.landing[i as usize];
+        }
+        fn pinned_to_stage(&mut self, q: u32, s: u32) {
+            self.ops.pinned_to_stage += 1;
+            self.stage[s as usize] = self.pinned[q as usize];
+        }
+        fn vram_to_stage(&mut self, v: u32, s: u32) {
+            self.ops.vram_to_stage += 1;
+            self.stage[s as usize] = self.vram[v as usize];
+        }
+        fn barrier(&mut self) {}
+        fn vram_to_pinned(&mut self, v: u32, q: u32) {
+            self.ops.vram_to_pinned += 1;
+            self.pinned[q as usize] = self.vram[v as usize];
+        }
+        fn stage_to_vram(&mut self, s: u32, v: u32) {
+            self.ops.stage_to_vram += 1;
+            self.vram[v as usize] = self.stage[s as usize];
+        }
+    }
+
+    /// two MoE layers of 16 experts, 4 VRAM and 6 pinned slots: layer 0 holds experts 0..4 in
+    /// VRAM and 4..7 in pinned (decode calls placed them), the rest on the NVMe
+    fn warm() -> (GlobalArena, Twin) {
+        let (ex, v, p) = (16usize, 4usize, 6usize);
+        let mut a = GlobalArena::new(2, ex, v, p).unwrap();
+        let mut tw = Twin { experts: ex, layer: 0, vram: vec![u32::MAX; v], pinned: vec![u32::MAX; p], stage: vec![u32::MAX; 8], landing: vec![u32::MAX; 8], ops: Moves::default() };
+        serve_global(&mut a, 0, &[0, 1, 2, 3], true, 8, &mut tw).unwrap();
+        serve_global(&mut a, 0, &[4, 5, 6], false, 8, &mut tw).unwrap();
+        for e in 0..4 {
+            assert!(matches!(a.place(0, e), Place::Vram(_)), "expert {e} in VRAM");
+        }
+        for e in 4..7 {
+            assert!(matches!(a.place(0, e), Place::Ram(_)), "expert {e} pinned");
+        }
+        tw.ops = Moves::default();
+        (a, tw)
+    }
+
+    fn holds(tw: &Twin, e: u32, loc: Loc) -> bool {
+        let key = (tw.layer * tw.experts) as u32 + e;
+        key == match loc {
+            Loc::Vram(v) => tw.vram[v as usize],
+            Loc::Pinned(q) => tw.pinned[q as usize],
+            Loc::Stage(s) => tw.stage[s as usize],
+        }
+    }
+
+    /// A small call of layer 0 selecting VRAM experts 2, 3, pinned 5 and NVMe 9, 12: the NVMe
+    /// misses are read straight into pinned slots (the RAM tier) and every pinned record is read
+    /// in place (zero-copy), nothing is staged or admitted to VRAM, and the next decode call of
+    /// the same experts reads nothing from the NVMe. The default prompt call of the same selection
+    /// ([`serve_chunk_global`], ticket Evidence 4) stages the pinned record and both NVMe records
+    /// through the landing and leaves every place as it was.
+    #[test]
+    fn a_small_call_admits_its_misses_to_the_ram_tier_and_reads_pinned_in_place() {
+        let sel = [2i32, 3, 5, 9, 12, 2, 2, 2];
+        let ids = distinct_ids(&sel, 16).unwrap();
+        let (mut a, mut tw) = warm();
+        let served = serve_small_prompt(&mut a, 0, &ids, 8, &mut tw).unwrap();
+        a.check().unwrap();
+        for &(e, loc) in &served.locs {
+            assert!(holds(&tw, e, loc), "expert {e} at {loc:?} holds its record");
+        }
+        for e in [9, 12] {
+            assert!(matches!(a.place(0, e), Place::Ram(_)), "NVMe miss {e} enters the RAM tier, at {:?}", a.place(0, e));
+        }
+        assert!(served.locs.iter().all(|&(e, loc)| matches!(loc, Loc::Vram(_)) == (e < 4) && (matches!(loc, Loc::Pinned(_)) == (e >= 4))), "VRAM hits in VRAM, the rest read from pinned: {:?}", served.locs);
+        assert_eq!((tw.ops.nvme_to_pinned, tw.ops.nvme_to_landing, tw.ops.pinned_to_stage, tw.ops.landing_to_stage, tw.ops.stage_to_vram), (2, 0, 0, 0, 0), "two reads into pinned, nothing staged: {:?}", tw.ops);
+        assert_eq!((served.nvme_reads, served.moves.zero_copy, served.moves.nvme_to_pinned), (2, 3, 2));
+        let next = serve_global(&mut a, 0, &[9, 12], false, 8, &mut tw).unwrap();
+        assert_eq!(next.nvme_reads, 0, "the next decode call finds the misses in the RAM tier");
+        // the default prompt call of the same selection
+        let (mut a, mut tw) = warm();
+        let mut tables = 0;
+        serve_chunk_global(&mut a, 0, &sel, 8, 8, &mut tw, &mut |_, _, _| {
+            tables += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(tables, 1);
+        for e in [9, 12] {
+            assert_eq!(a.place(0, e), Place::Nvme, "the default prompt call leaves {e} on the NVMe");
+        }
+        assert_eq!((tw.ops.nvme_to_landing, tw.ops.pinned_to_stage, tw.ops.nvme_to_pinned), (2, 1, 0), "{:?}", tw.ops);
+    }
+}
+
+#[cfg(test)]
+mod tests_214 {
+    //! #214 `CROW_GLM_KV_LAZY` on the host: the switch, the bytes a boot maps, the bytes a growth
+    //! asks the elastic arena for, the boot invariant, the refused paths
+    use super::*;
+    use crate::glm5_mla::kv_lazy_mapped_bytes;
+    use crate::manager::Glm5States;
+
+    /// the VMM granularity of the RTX 5090 (`cuda::vmm_granularity`, 2 MiB)
+    const G: usize = 2 << 20;
+
+    #[test]
+    fn kv_lazy_switch_is_off_unless_it_names_rows() {
+        assert_eq!(kv_lazy_from(None), Ok(None));
+        assert_eq!(kv_lazy_from(Some("")), Ok(None));
+        assert_eq!(kv_lazy_from(Some("0")), Ok(None));
+        assert_eq!(kv_lazy_from(Some("4096")), Ok(Some(4096)));
+        assert_eq!(kv_lazy_from(Some(" 16 ")), Ok(Some(16)));
+        for bad in ["on", "-1", "4k"] {
+            assert!(kv_lazy_from(Some(bad)).unwrap_err().contains(KV_LAZY_ENV), "{bad} refused by name");
+        }
+    }
+
+    /// Off, a boot holds the KV the planner books (`Glm5States::plan` at 200,000 rows, the
+    /// 3,383,600,000 B of serve-session.log l.21-22); on at 4,096 rows it maps 4 MiB latent + 4 MiB
+    /// indexer per DSA layer
+    #[test]
+    fn kv_boot_maps_the_floor_not_the_context() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let md = MlaDims::of(&g);
+        let st = Glm5States::plan(&g, 200_000);
+        let off = kv_boot_bytes(&md, 200_000, g.dsa_layers, None, G);
+        assert_eq!(off, st.latent_bytes + st.indexer_bytes, "off: the plan's KV, byte for byte");
+        assert_eq!(off, 3_383_600_000);
+        let on = kv_boot_bytes(&md, 200_000, g.dsa_layers, Some(4096), G);
+        assert_eq!(on, g.dsa_layers as u64 * 8 * (1 << 20), "on: 4 MiB latent + 4 MiB indexer per DSA layer");
+        assert_eq!(kv_lazy_mapped_bytes(&md, 200_000, 4096, G), [4 << 20, 4 << 20]);
+        let r = crate::glm5_mla::kv_lazy_rows_of(&md, 200_000, kv_lazy_mapped_bytes(&md, 200_000, 4096, G));
+        assert_eq!(r, 4096, "4 MiB latent holds 4,096 rows, 4 MiB indexer 8,160");
+    }
+
+    /// A growth asks the arena for the granules it newly maps: nothing within the floor; the
+    /// 8,192-row prompt of the quick decode set 6 MiB latent + 2 MiB indexer per layer; the whole
+    /// context the reservation, at least the plan's KV
+    #[test]
+    fn kv_growth_hands_back_the_granules_it_maps() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let md = MlaDims::of(&g);
+        let grow = |from: usize, to: usize| g.dsa_layers as u64 * crate::glm5_mla::kv_lazy_grow_bytes(&md, 200_000, kv_lazy_mapped_bytes(&md, 200_000, from, G), to, G);
+        assert_eq!(grow(4096, 57 + 128), 0, "the quick decode fits in the floor: nothing handed back");
+        assert_eq!(grow(4096, 8192 + 57), g.dsa_layers as u64 * (8 << 20));
+        let full = kv_lazy_mapped_bytes(&md, 200_000, 200_000, G);
+        assert_eq!(full, [98 * G, 50 * G], "the reservation, whole granules");
+        assert!(grow(4096, 200_000) + kv_boot_bytes(&md, 200_000, g.dsa_layers, Some(4096), G) >= kv_boot_bytes(&md, 200_000, g.dsa_layers, None, G));
+        // the hand-back of the 8,192-row growth at 37 slots per elastic chunk, free VRAM at the reserve
+        let cb = 37 * 9_474_048u64;
+        assert_eq!(elastic_chunks_for(grow(4096, 8192 + 57), ARENA_RESERVE_BYTES, cb, 11), 1);
+        assert_eq!(elastic_chunks_for(grow(4096, 8192 + 57), ARENA_RESERVE_BYTES + (1 << 30), cb, 11), 0);
+    }
+
+    /// The boot invariant: elastic chunks + free VRAM above the reserve hold the unmapped KV
+    #[test]
+    fn kv_lazy_fits_only_with_room_for_a_full_context() {
+        let un = 3_383_600_000 - 92_274_688u64;
+        assert!(kv_lazy_fits(un, 10 << 30, ARENA_RESERVE_BYTES));
+        assert!(kv_lazy_fits(un, 0, ARENA_RESERVE_BYTES + un));
+        assert!(!kv_lazy_fits(un, 0, ARENA_RESERVE_BYTES + un - 1));
+        assert!(!kv_lazy_fits(un, un / 2, ARENA_RESERVE_BYTES), "half of it in chunks, no free VRAM above the reserve");
+        assert!(kv_lazy_fits(0, 0, 0));
+    }
+
+    /// serve with the switch allocates the prefill staging set at boot (prompt calls only); off,
+    /// the path of record (lazily, in the first prompt call) stays
+    #[test]
+    fn kv_lazy_serve_allocates_the_prefill_staging_set_at_boot() {
+        assert!(kv_lazy_stage_at_boot(Some(4096), 8192));
+        assert!(!kv_lazy_stage_at_boot(Some(4096), 1), "row-by-row prompts never stage through the set");
+        assert!(!kv_lazy_stage_at_boot(None, 8192), "off: unchanged");
+    }
+
+    /// The cause on the acceptance run's numbers (RTX 5090, 2026-10-11, `kvlazy-20261011`): 37-slot
+    /// chunks of the 3-bit record, the 128-slot prefill staging set. Allocated inside the first
+    /// prompt, after the hand-back set the floor from the free VRAM before it, the set's bytes are
+    /// missing above the floor at the regrowth: 4 chunks (148 slots, serve 2,324 vs glm5_run B
+    /// 2,472) stay down. Allocated before the floor (glm5_run's order), every chunk comes back.
+    #[test]
+    fn a_staging_set_allocated_after_the_floor_holds_chunks_down() {
+        let rec = 9_474_048u64;
+        let cb = 37 * rec;
+        let set = 128 * rec;
+        let free0 = ARENA_RESERVE_BYTES - (150 << 20); // below the reserve, as both boots were
+        let handed = 6; // the prompt's hand-back
+        // lazily: the floor is the free VRAM before the set; the set stays allocated
+        let floor = regrow_floor(free0);
+        let free_end = free0 + handed * cb - set;
+        assert_eq!(handed as usize - elastic_regrow_chunks(free_end, floor, cb, handed as usize), 4);
+        // at boot: the floor is the free VRAM with the set in place
+        let floor = regrow_floor(free0 - set);
+        let free_end = free0 - set + handed * cb;
+        assert_eq!(elastic_regrow_chunks(free_end, floor, cb, handed as usize), handed as usize);
+    }
+
+    #[test]
+    fn kv_lazy_refuses_the_paths_that_do_not_map_their_rows() {
+        assert_eq!(kv_lazy_refusal(None, 2, true, 4), Ok(()), "off: nothing refused");
+        assert_eq!(kv_lazy_refusal(Some(4096), 0, false, 1), Ok(()));
+        let e = kv_lazy_refusal(Some(4096), 2, true, 4).unwrap_err();
+        assert!(e.contains(KV_LAZY_ENV) && e.contains("CROW_GLM_MTP=2") && e.contains("CROW_GLM_LA") && e.contains("CROW_GLM_MAX_BATCH=4"), "{e}");
+        assert!(kv_lazy_refusal(Some(1), 0, false, 2).is_err());
     }
 }
 

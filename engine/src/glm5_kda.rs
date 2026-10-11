@@ -526,12 +526,39 @@ pub unsafe fn prompt_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &K
 /// As [`prompt_with`], without the `t <= sc.max_t` bound.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn prompt_rows_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, t: usize, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
+    prompt_rows_cut_with(kk, w, st, sc, x, t, out, proj, None);
+}
+
+/// crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`): [`prompt_rows_with`] with the sub-blocks cut at row
+/// `cut.0` (1 ..= `t`) of the call, and the state there (S and the conv window after rows
+/// `0 .. cut.0`) copied into `cut.1` (S, `state_floats` f32) and `cut.2` (conv window,
+/// `conv_floats` f32), D2D on the current stream before the next sub-block runs. The recurrence
+/// runs token by token and every other stage computes a row from that row alone, so the cut
+/// changes no row (`tests_gpu::kda_gpu_a_cut_scan_is_the_scan`).
+/// # Safety
+/// As [`prompt_rows_with`]; `cut.1` / `cut.2` hold a state of these dims.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prompt_rows_cut_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, t: usize, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize), cut: Option<(usize, Dev, Dev)>) {
+    if let Some((c, _, _)) = cut {
+        assert!((1..=t).contains(&c), "#217: a KDA cut at row {c} of a call of {t} rows");
+    }
     let rb = (kk.d.hidden * 4) as u64;
     let mut r = 0;
     while r < t {
-        let n = sc.max_t.min(t - r);
+        let mut n = sc.max_t.min(t - r);
+        if let Some((c, _, _)) = cut {
+            if r < c {
+                n = n.min(c - r);
+            }
+        }
         prompt_with(kk, w, st, sc, x + r as u64 * rb, n, out + r as u64 * rb, proj);
         r += n;
+        if let Some((c, s, conv)) = cut {
+            if r == c {
+                cuda::d2d_async(s, st.s, kk.d.state_floats() * 4);
+                cuda::d2d_async(conv, st.conv, kk.d.conv_floats() * 4);
+            }
+        }
     }
 }
 
@@ -1074,6 +1101,66 @@ extern "C" __global__ void hold(long long ns)
                 KdaProj::Qkv => gemv(kk, sc, w.qkv, xi, yo, P_HIDDEN, kk.d.conv_ch(), P_CONV),
                 KdaProj::O => gemv(kk, sc, w.o_proj, xi, yo, P_WIDTH, kk.d.hidden, P_HIDDEN),
             }
+        }
+    }
+
+    /// `prompt`'s two projections (the BF16 GEMMs) as a `proj` of [`prompt_with`]
+    fn gemm_proj<'a>(kk: &'a KdaKernels, w: &'a KdaWeights, sc: &'a KdaScratch) -> impl FnMut(KdaProj, Dev, Dev, usize) + 'a {
+        move |p, xi, yo, t| unsafe {
+            match p {
+                KdaProj::Qkv => gemm(kk, sc, w.qkv, xi, yo, P_HIDDEN, kk.d.conv_ch(), P_CONV, t),
+                KdaProj::O => gemm(kk, sc, w.o_proj, xi, yo, P_WIDTH, kk.d.hidden, P_HIDDEN, t),
+            }
+        }
+    }
+
+    /// crow-nest #217 A4: the KDA scan cut at a row (`prompt_rows_cut_with`, the prefix anchor's
+    /// capture) is the uncut scan (`prompt_rows_with`): 96 rows on a scratch of 32, cut at row 45
+    /// (sub-blocks 32 | 13 | 32 | 19 against 32 | 32 | 32): every output row, the final S and the
+    /// conv window bit-identical; the copy at the cut bit-identical to the state after a scan of
+    /// the first 45 rows. Red without #217: there is no cut and no copy.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_kda::tests_gpu -- --ignored --nocapture --test-threads 1"]
+    fn kda_gpu_a_cut_scan_is_the_scan() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut l = layer(32);
+            let d = l.kk.d;
+            let (h, t, c) = (d.hidden, 96usize, 45usize);
+            let mut xd = cuda::to_f32_dev(&synth::input(t, h));
+            let (mut o1, mut o2) = (cuda::alloc_zeroed(t * h * 4), cuda::alloc_zeroed(t * h * 4));
+            let mut cut = KdaState::alloc(&d);
+            let bits = |v: Vec<f32>| v.into_iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            let (kk, w, sc) = (&l.kk, &l.w, &l.sc);
+            // the first 45 rows alone: the state the copy must hold
+            l.st.reset();
+            prompt_rows_with(kk, w, &l.st, sc, xd, c, o1, &mut gemm_proj(kk, w, sc));
+            cuda::sync();
+            let (s45, conv45) = (cuda::dtoh(l.st.s, d.state_floats()), cuda::dtoh(l.st.conv, d.conv_floats()));
+            // uncut
+            l.st.reset();
+            prompt_rows_with(kk, w, &l.st, sc, xd, t, o1, &mut gemm_proj(kk, w, sc));
+            cuda::sync();
+            let (out1, s1, conv1) = (cuda::dtoh(o1, t * h), cuda::dtoh(l.st.s, d.state_floats()), cuda::dtoh(l.st.conv, d.conv_floats()));
+            // cut at 45
+            l.st.reset();
+            prompt_rows_cut_with(kk, w, &l.st, sc, xd, t, o2, &mut gemm_proj(kk, w, sc), Some((c, cut.s, cut.conv)));
+            cuda::sync();
+            let (out2, s2, conv2) = (cuda::dtoh(o2, t * h), cuda::dtoh(l.st.s, d.state_floats()), cuda::dtoh(l.st.conv, d.conv_floats()));
+            let rows_off = (0..t).filter(|&r| bits(out1[r * h..(r + 1) * h].to_vec()) != bits(out2[r * h..(r + 1) * h].to_vec())).count();
+            eprintln!("#217 A4 KDA cut at {c} of {t} on a scratch of 32: {rows_off} output rows differ in bits");
+            assert_eq!(rows_off, 0, "the cut changed output rows");
+            assert_eq!(bits(s2), bits(s1), "final S");
+            assert_eq!(bits(conv2), bits(conv1), "final conv window");
+            assert_eq!(bits(cuda::dtoh(cut.s, d.state_floats())), bits(s45), "the copy at the cut is the state after 45 rows (S)");
+            assert_eq!(bits(cuda::dtoh(cut.conv, d.conv_floats())), bits(conv45), "the copy at the cut is the state after 45 rows (conv)");
+            for p in [&mut xd, &mut o1, &mut o2] {
+                cuda::free_dev(p);
+            }
+            cut.free();
+            l.w.free();
+            l.st.free();
+            l.sc.free();
         }
     }
 

@@ -4119,6 +4119,8 @@ and its artefact, like every other number in this document.
 
 ### 8.0 The tree at v0.11.0 (line counts, 2026-10-10)
 
+At v0.12.0 (`2a18fbc`, 2026-10-11, `wc -l`) `engine/src` holds 79 files and 119,250 lines (115,463 at v0.11.0 by the same count); the GLM serve work of #214 to #219 grew `glm5_tiers.rs` 15,174 -> 16,314, `glm5_engine.rs` 1,846 -> 3,135, `bin/serve.rs` 11,836 -> 12,362, `glm5_int_tests.rs` 1,313 -> 1,497, `cuda.rs` 1,664 -> 1,827 (growable VMM buffers, #214), `glm5_mla.rs` 1,713 -> 1,808, `glm5_kda.rs` 1,205 -> 1,292, `bin/glm5_run.rs` 1,245 -> 1,297; no module was added. The table below is the v0.11.0 count.
+
 Counted with `wc -l` at `d3e0d87` (v0.11.0). `engine/src` grew from 53 files and 56,666 lines at
 v0.10.1 to 79 files and 115,461 lines; almost all of it is the GLM-5.3-Flash family (glm5_next,
 #145-#209). The Qwen modules of 8.1 changed where the family dispatch reaches them: `kernels.rs`

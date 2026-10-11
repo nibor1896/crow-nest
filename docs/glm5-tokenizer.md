@@ -300,8 +300,17 @@ Since 2026-10-09 a glm5_next container boots and serves (`engine/src/glm5_engine
    finish rule, `usage` (with `prompt_tokens_details.cached_tokens`) and `timings` (`prompt_n`,
    `prompt_per_second`, `predicted_per_second`, `cache_n`; `crow_expert_selections` = every tier
    access, `crow_expert_cold` = the NVMe-served ones, cumulative). Greedy takes the head's argmax,
-   the id `glm5_run` takes. A sampled request draws on the host from the logits row read back
-   (619,520 B per token): glm5_next has no device sampler.
+   the id `glm5_run` takes. A sampled request draws on the device sampler since #215: crow-nest's
+   #20 kernel pair (`sample_topk_part` + `sample_k`) runs behind the head's argmax and overwrites
+   the id, so the 4-byte readback returns the draw and the logits row stays on the card. The
+   first id after the prompt is one eager draw on the prompt's (or the restored snapshot's) row.
+   The boot holds the buffers (`[budget] device sampler (#215)`, 501,556 B at V 154,880). The host
+   draw (`draw_row`, the logits row read back, 619,520 B per token) stays for the requests Qwen
+   sends there too (`logit_bias`, `top_k` 0 or > 64, DRY and the #92 knobs) and for
+   `CROW_GLM_MTP` > 0, `CROW_GLM_MAX_BATCH` > 1 and `CROW_GLM_LA`, which allocate no device
+   sampler; `[chat] glm5_next draws on the HOST sampler (#215)` names the reason. Inside a tool
+   call the device's id is checked by the grammar; a refused id is redrawn on the host from the
+   same row and the device's presence / window booking moves to the kept id (`rebook_sampler`).
    **MTP** (#192, `CROW_GLM_MTP=N`, default off): `decode_step` runs the speculative decode
    (`Glm5Run::spec_decode`). One verify step feeds the fed id and N drafts. While the next fed id
    equals the draft at that row, `decode_step` returns that row's id and logits row without a

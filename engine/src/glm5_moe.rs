@@ -1850,6 +1850,20 @@ impl GpuMoeGroupedPlan {
         launch_v(gk.router, t as u32, 1, 1, kernels::glm5_moe::ROUTER_THREADS as u32, &[self.logits, w.bias, self.ids, self.wts, self.prm_route, self.prm_f]);
     }
 
+    /// crow-nest #216: [`GpuMoeGroupedPlan::route`] with another layer's router (`router` BF16
+    /// `[E][H]`, `bias` f32 `[E]`) into caller buffers of `t` rows (`logits` `[t][E]` f32, `ids`
+    /// `[t][K]` i32, `wts` `[t][K]` f32): the next layer's guess of a small prompt call. The plan's
+    /// own `logits` / `ids` / `wts` are not touched.
+    ///
+    /// # Safety
+    /// As [`GpuMoeGroupedPlan::route`]; the buffers hold `t` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn route_into(&self, kn: &kernels::Kernels, gk: &kernels::glm5_moe::Kernels, router: CUdeviceptr, bias: CUdeviceptr, x: CUdeviceptr, t: usize, logits: CUdeviceptr, ids: CUdeviceptr, wts: CUdeviceptr) {
+        assert!((1..=self.tokens).contains(&t), "glm5_moe: route {t} rows of a {}-row plan", self.tokens);
+        launch_v(kn.f("gemv_bf16_b"), self.geo.experts as u32, t as u32, 1, 256, &[router, x, logits, self.prm_kh]);
+        launch_v(gk.router, t as u32, 1, 1, kernels::glm5_moe::ROUTER_THREADS as u32, &[logits, bias, ids, wts, self.prm_route, self.prm_f]);
+    }
+
     /// the schedule's combo list and work items to the device (blocking copies)
     ///
     /// # Safety

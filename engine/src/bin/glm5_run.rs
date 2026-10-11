@@ -6,7 +6,7 @@
 //! ```text
 //! glm5_run [-n N] [--cnq PATH] [--ids a,b,c | --prompt TEXT --tokenizer tokenizer.json | --prompt-ids PATH]
 //!          [--prompt-tokens N] [--random-ids SEED] [--stop-eos] [--reps N] [--cold] [--json PATH]   (env: CROW_CHUNK=N, #186)
-//!          [--tokenizer tokenizer.json] [--vram-slots N] [--pinned-slots N] [--readers N]
+//!          [--tokenizer tokenizer.json] [--vram-slots N] [--pinned-slots N] [--readers N] [--kv-rows N|context]
 //! ```
 //!
 //! - container: `--cnq`, else `CROW_CNQ`, else `converter/GLM-5.3-Flash-MUL1K3.cnq` (relative
@@ -31,6 +31,10 @@
 //!   floor 200,000 when unset) and the derived pinned budget (`HOST_PINNED_CAP` 46 GiB or less,
 //!   free RAM - `CROW_RAM_MARGIN_GB`); `--vram-slots` / `--pinned-slots` may only ask for less
 //! - NVMe readers: `--readers`, default 1 (PREREG amendment 5)
+//! - #214 `--kv-rows N` (or `context`): the MLA / DSA caches and the plan's rows hold N rows
+//!   (at least prompt + `-n`, at most the context) instead of prompt + `-n`, so the run holds the
+//!   KV serve holds at its context; `CROW_GLM_KV_LAZY=<rows>` maps only that many of them at boot
+//!   and the rest as the run grows (`glm5_tiers::KV_LAZY_ENV`)
 //! - #186 prompt chunk: `CROW_CHUNK=N` runs the prompt in prompt calls of up to N rows
 //!   (`Glm5Run::prefill`, one routing sync per MoE layer per call, the prefill staging set of
 //!   `glm5_tiers::prefill_stage_slots` slots); unset or 1 = every prompt row one decode call. The
@@ -630,6 +634,20 @@ fn write_json(path: &str, v: &Value) -> Result<(), String> {
 
 // ---------------------------------------------------------------- the run
 
+/// #214 `--kv-rows`: the rows the caches (and the plan) hold: `need` (prompt + `-n`) without the
+/// flag; a whole number from `need` to `context`, or `context`
+fn kv_rows(flag: Option<&str>, need: usize, context: usize) -> Result<usize, String> {
+    let rows = match flag.map(str::trim) {
+        None => return Ok(need),
+        Some("context") => context,
+        Some(v) => v.parse::<usize>().map_err(|_| format!("--kv-rows {v:?} is not a whole number or `context`"))?,
+    };
+    if rows < need || rows > context {
+        return Err(format!("--kv-rows {rows}: the run needs {need} rows (prompt + -n) and the plan books {context} (CROW_CONTEXT)"));
+    }
+    Ok(rows)
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let flag = |n: &str| -> Result<Option<String>, String> {
         match args.iter().position(|a| a == n) {
@@ -710,7 +728,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let exe_mtime = exe.as_ref().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
     // #192: CROW_GLM_MTP=N drafts per step (0 = off); its VRAM comes off the planner's free VRAM
     let drafts = mtp::draft_rows_from_env()?;
-    let cap = prompt.len() + n;
+    // #214: --kv-rows (default prompt + n, the rows of record); CROW_GLM_KV_LAZY refused by name here
+    let kv_flag = flag("--kv-rows")?;
+    let cap = kv_rows(kv_flag.as_deref(), prompt.len() + n, context)?;
+    let kv_lazy = gt::kv_lazy_from_env()?;
     unsafe {
         let _ctx = cuda::Ctx::init();
         let free = cuda::free_vram_bytes();
@@ -720,7 +741,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         let budget = derive_host_pinned_budget(HOST_PINNED_CAP, &mut |s| println!("{s}"));
         // #186: the prompt chunk Glm5Run::load takes (CROW_CHUNK, at most the run's rows), booked by the plan
-        let (_, input, plan) = gt::plan_for_rows(&o.g, context, prompt.len() + n, free.saturating_sub(mtp_reserved), budget, o.spec.bytes)?;
+        let (_, input, plan) = gt::plan_for_rows(&o.g, context, cap, free.saturating_sub(mtp_reserved), budget, o.spec.bytes)?;
         let chunk = input.chunk;
         let sizes = gt::tier_sizes(&plan, num("--vram-slots")?, num("--pinned-slots")?)?;
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -764,6 +785,10 @@ fn run(args: &[String]) -> Result<(), String> {
             tiers.alloc_prefill_stage(gt::prefill_stage_slots(o.g.topk))?;
         }
         let tiers_s = t_tiers.elapsed().as_secs_f64();
+        // #214: the unmapped KV fits in the elastic part + free VRAM above the reserve
+        if let Some(l) = run.kv_boot_check(&tiers)? {
+            println!("{l}");
+        }
         println!(
             "[glm5_run] tiers: {:.2} GiB VRAM (slots, {} decode + {} prefill staging, tables), {:.2} GiB pinned; free VRAM now {:.2} GiB; policy {:?}, cache empty at start; pinned {:?}; arena {:?} {:?}",
             gib(tiers.vram_bytes()),
@@ -798,6 +823,11 @@ fn run(args: &[String]) -> Result<(), String> {
             "clocks": "row seconds: TokenReport::secs, row start to after the row's closing cuda::sync + greedy-id dtoh; ttft and phase wall: on entry of the report callback, after that sync; no sync added",
             "reps_detail": [],
         });
+        // #214: only with --kv-rows or CROW_GLM_KV_LAZY (the JSON of record is unchanged without)
+        if kv_flag.is_some() || kv_lazy.is_some() {
+            let (mapped, all) = run.kv_bytes();
+            doc["kv"] = json!({ "rows": cap, "kv_rows_flag": kv_flag, "lazy_rows": kv_lazy, "mapped_bytes_after_setup": mapped, "reserved_bytes": all, "rows_mapped_after_setup": run.kv_rows_mapped() });
+        }
         let lane = tiers.cpu_lane_clock();
         let pf_clock = tiers.prefetch_clock();
         let ctl_clock = tiers.ctl_clock();
@@ -913,6 +943,10 @@ fn run(args: &[String]) -> Result<(), String> {
             if !arena_rep.is_null() {
                 println!("glm5_run arena after rep {rep}: {}", arena_line(&arena_rep));
             }
+            let kv_rep = run.kv_report(&tiers);
+            if let Some(l) = &kv_rep {
+                println!("glm5_run KV after rep {rep}: {l}");
+            }
             doc["reps_detail"].as_array_mut().expect("reps array").push(json!({
                 "rep": rep, "cache": state, "wall_s": wall, "ids": out.ids, "controller": controller_json(&ctl), "prompt_seed": seed, "eos_at": eos_at, "sweep_aggregate_tok_s": sweep_agg,
                 "prefill": { "timing": timing_json(&pre, Some(ttft)), "counters": counters_json(&pre, rb), "layers": layers_json(&pre, first_moe),
@@ -924,6 +958,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 "machine": m_rep,
                 "arena": arena_rep,
             }));
+            if let Some(l) = kv_rep {
+                let k = run.kv_stats;
+                doc["reps_detail"].as_array_mut().expect("reps array").last_mut().expect("this rep")["kv"] = json!({
+                    "line": l, "rows_mapped": run.kv_rows_mapped(), "mapped_bytes": run.kv_bytes().0, "grows": k.grows, "grown_bytes": k.grown_bytes,
+                    "hand_back_bytes": k.hand_back_bytes, "trims": k.trims, "trimmed_bytes": k.trimmed_bytes });
+            }
             all_ids.push(out.ids);
             per_rep.push((pre, dec, ttft, wall));
             if let Some(p) = &json_path {
@@ -995,6 +1035,18 @@ fn summarize(per_rep: &[(Phase, Phase, f64, f64)], all_ids: &[Vec<i64>], cold: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #214: `--kv-rows` holds the context serve holds; absent, prompt + n as before
+    #[test]
+    fn kv_rows_takes_the_context_and_refuses_what_does_not_fit() {
+        assert_eq!(kv_rows(None, 185, 200_000), Ok(185), "without the flag: prompt + n, the rows of record");
+        assert_eq!(kv_rows(Some("context"), 185, 200_000), Ok(200_000));
+        assert_eq!(kv_rows(Some("4096"), 185, 200_000), Ok(4096));
+        assert_eq!(kv_rows(Some("185"), 185, 200_000), Ok(185));
+        assert!(kv_rows(Some("184"), 185, 200_000).unwrap_err().contains("needs 185 rows"));
+        assert!(kv_rows(Some("200001"), 185, 200_000).is_err(), "above the plan's context");
+        assert!(kv_rows(Some("lots"), 185, 200_000).unwrap_err().contains("--kv-rows"));
+    }
 
     fn moves(nvme: u64) -> Moves {
         Moves { visits: 8, nvme_to_landing: nvme, landing_to_stage: nvme, n2v: 1, v2p: 1, zero_copy: 2, ..Moves::default() }

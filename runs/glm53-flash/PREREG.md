@@ -183,3 +183,141 @@ Written on crow-nest `e476bd6` before the re-run of step 3 exists. Seen when wri
 Written on crow-nest `ed18b8d` before any G1 routing row exists (step 8 not started). Seen when written: both step-3 runs. `20261008T001819Z` (valid): medians 6.994 / 9.765 / 7.811 GB/s at 1 / 2 / 4 readers, spreads 1.003 / 1.232 / 1.430. `20261008T075202Z` (VOID, foreign reads 4.8 > 4.0 MB/s): medians 8.556 / 7.963 / 8.014 GB/s, spreads 1.003 / 1.613 / 1.401, drive 59 → 79 °C. Neither run gives a B under step 3's statistic, because the best reader count's spread exceeds 1.15 each time; 1 reader is flat in both runs, 2 and 4 readers fall within the run (throttling suspected, not measured). robin (2026-10-08): the disk is never idle in practice, and its peak rates are known.
 
 **Decision (robin, 2026-10-08):** B for G1 = **6.994 GB/s**, the 1-reader median of the valid run `20261008T001819Z` (spread 1.003 ≤ 1.15). The reader count binding for step 14 is 1. For G1 this replaces step 3's "median at the best reader count" by "the 1-reader median of the valid run"; the robustness limit 1.15 and every G1 threshold are unchanged. Derived as in that run's table: m* = B / 190.3 = 3.68 %, prefill bound 39.9 × B = 279 tok/s. No further step-3 run is made for G1.
+
+### Amendment 6 — 2026-10-11: no Flash-Next arm in G5 and G6 (crow-nest #151, #152)
+
+Written 2026-10-11 on crow-nest `36b0d9d` (branch `g56-prereg`), before any G5 or G6 row exists. Seen when written: no Crow-window turn and no ten-task run of GLM-5.3-Flash; the GLM speed rows so far are `glm5_run` and `serve` script rows (GLM measurement book, table A; `docs/measurements.md`), which G5 does not count. No Flash-Next row was taken for this series. Nothing below touches G1–G4, G1d (`PREREG-dyn.md`) or any recorded result.
+
+**Reason.** robin, 2026-10-10: GLM-5.3-Flash is accepted like a first model, no Flash-Next comparison.
+
+**Form.** This removes the criteria whose only reference was the Flash-Next arm, on the owner's word and before the first row of either gate (the form of amendment 5, and of robin's 2026-10-08 decision on #152 to adapt G6 by amendment). It sets no new threshold and changes no remaining one.
+
+**What changes.**
+1. **"Fixed for the whole series", line "Comparison arms":** Flash-Next is no arm of G5 or G6. The dense 27B stays what G6 made it: a further arm, reported, no threshold, never in the verdict; it depended on no Flash-Next row and is kept. The sentence on `--scales` that names "the Flash-Next comparison arm" stays as the record of why the recipe was chosen.
+2. **G5.** Question: is decode on Crow's real path fast enough? Data: ≥ 5 real agent turns at 7–10k context in the window and the synthetic cold 31,979-token turn over 3 boots, GLM only; no Flash-Next turns and no order Flash-Next → GLM → Flash-Next. Thresholds that stand unchanged (all must hold): decode median ≥ 40 tok/s in the window (target 60, not a gate); cold prefill at ~32k ≥ 150 tok/s; spread max/min ≤ 1.15 over the 3 boots. **Removed:** "wall clock per task ≤ 2.0 × Flash-Next the same day". Wall clock per task is still recorded per turn, without a threshold. Metric, robustness, consequence and the < 5 tok/s rule are unchanged.
+3. **G6.** Question: is GLM-5.3-Flash good enough on the ten-task run, graded blind? Method, wire body, n ≥ 3 runs, blind grading by robin and the separate report of tasks 5, 7, 8 are unchanged; there is no Flash-Next arm and no order Flash-Next → GLM → Flash-Next. **Removed:** Q1 (median correct ≥ Flash-Next), Q2 (tokens per answer ≤ 1.5 × Flash-Next), Q3 (`length` count ≤ Flash-Next); each was defined only against Flash-Next. Q4's control arm (same engine, 4 instead of 8 active experts) stays in the series; its condition "breaks at least one of Q1–Q3" has no Q1–Q3 left and is open (below).
+   What G6 compares against from now on, as far as the existing documents already fix it without Flash-Next:
+   - each GLM answer against its task's own core requirements, graded pass / partial / fail by the rules of `docs/ten-task-expected.md` §1–2, final acceptance per task by robin (§5); `finish_reason length` stays undecided as written above;
+   - robin's rule of 2026-10-08 (#152, #166): a failed task is judged by its kind of error, and a gross error disqualifies however many tasks pass. **Fixed now: zero S1** (#166 severity class S1) in the GLM arm;
+   - the 4-of-8 control arm and the 27B arm (reported), as above.
+   Until the open points below are answered by a further amendment, G6 can be judged failed (an S1) but not passed, and no G6 row is taken (#152: the #166 adaptation is due before step 17 starts).
+
+**Open for robin (before the first G6 row):**
+1. G6 bar for correct tasks: with Q1 gone, what minimum of correct tasks (median over the runs) counts as good enough, if any?
+2. Tokens per answer and `length` aborts had Flash-Next as their reference: drop them, set absolute bars, or make the 27B (today reported only) their reference?
+3. Control arm: what must the 4-of-8 arm break for G6 to count as answered (an S1, or the bar of point 1)?
+4. #166 adaptation: k, the mild control, the process-error factor over the A/A arm, and #166's open S1 question (does an S1 still disqualify if the A/A arm shows the same S1 on the same task?).
+5. G5 wall clock per task: no threshold, or an absolute bar per task?
+
+### Amendment 7 — 2026-10-11: answers to amendment 6's open points (crow-nest #151, #152, #166)
+
+Written 2026-10-11 on crow-nest `16d24c8` (branch `g56-amend7`), before any G5 or G6 row exists. Seen when written: what amendment 6 saw; since then no Crow-window turn, no ten-task run, no control-arm and no 27B row of this series. Form as amendment 6: owner's word, before the first row of either gate. A point marked **lead's decision** was set by the lead, under robin's guidance where he gave one; robin can overrule it by a further amendment before the first row of its gate.
+
+**G5** (all else as amendment 6 left it):
+1. **Decode bar 40 → 23.7 tok/s**, median over the ≥ 5 window turns in the Crow window. robin, 2026-10-11: 23.7 is, in his view, the most this hardware gives, and below it is no longer really a fail criterion. A median below 23.7 is therefore recorded as "below the bar" with its number; it is not a G5 failure under "Abort rules" and does not by itself stop the series (the < 5 tok/s rule for step 17 stands). Cold prefill at ~32k ≥ 150 tok/s and spread max/min ≤ 1.15 over 3 boots are unchanged and still fail G5.
+2. **Wall clock per task:** recorded per turn, no threshold (robin confirmed, 2026-10-11).
+
+**G6.** The dense 27B becomes G6's reference, "for now" (robin, 2026-10-11); this replaces amendment 6's "reported, no threshold, never in the verdict" for the 27B. Arms: GLM (8 of 8), 27B, 27B A/A, GLM 6 of 8, GLM 4 of 8, each n ≥ 3 runs with the one wire body. G6 passes only if all of 3–6 hold, and is judged only if 7 holds:
+3. **Correct tasks:** GLM's median of correct tasks over its runs ≥ the 27B's median over its runs. robin, 2026-10-11: orient on normal other references; if too many tasks are wrong, it does not ship. **Lead's decision** under that guidance: the reference is the 27B arm, the only other model in the series.
+4. **Tokens per answer and `length`** (reference the 27B, robin): tokens per answer GLM ≤ 1.5 × 27B; `finish_reason length` count GLM ≤ 27B (`length` stays undecided, not correct); the form Q2/Q3 had against Flash-Next. Unit: each arm's own `usage.completion_tokens` (the tokenizers differ), answer characters reported beside, as #152 "Proposed fix" 1 proposed.
+5. **Zero S1** in the GLM arm (amendment 6, unchanged; see the S1 point below).
+6. **Process errors:** GLM's process-error rate ≤ 1.5 × the A/A arm's (#166 item 9; factor below).
+7. **Sensitivity (4-of-8 arm), lead's decision** (robin gave no view): G6 counts as answered only if robin's blind grades score the 4-of-8 arm worse than the GLM 8-of-8 arm, i.e. a lower median of correct tasks or at least one S1. If not, the grading is not sensitive enough and G6 is "not answered", whatever 3–6 show.
+
+**#166 adaptation** (robin, 2026-10-11: yes). #166's defaults are proposals "fixed per series in its PREREG"; fixed here:
+- **k = 3** generations per task and arm in each run: #166 item 4's default, which is the harness's three seeds (`tools/ten-task-run.py:128`, 2101–2103).
+- **A/A arm:** #166 item 1, "the reference again with other seeds": the 27B once more, same wire body and n, seeds 2104–2106 (**lead's decision** on the seeds: the next three after the default, fixed before any run). It is the noise floor for point 6; its correct-task, token and `length` figures are reported beside the 27B's.
+- **Mild control:** 6 of 8 active experts (`CROW_MOE_TOPK=6`, the setting the 4-of-8 arm uses, #152 "Proposed fix" 2), #166 item 1's first example. Reported, not in pass/fail; per #166 item 10, if it does not score worse than GLM 8-of-8 by the test of point 7, the verdict is recorded as resolving only collapses.
+- **Process-error factor 1.5, lead's decision** (#166 names no value): the factor this series already uses for tokens per answer, so no new number enters. Process errors are #166 item 5's as far as the single-turn harness shows them (unclosed think tags, repeated loops; it sends no tools); `length` and tokens count under point 4 only. Rate = generations with ≥ 1 process error / all generations of the arm.
+- **An S1 the reference also shows, lead's decision** (#166 leaves it open): a GLM S1 still disqualifies when the 27B or the A/A arm makes the same S1 on the same task; the row notes it. Reason: robin's rule of 2026-10-08 (a gross error disqualifies however many tasks pass) has no such exception.
+- Not adopted: the rest of #166 (stage 1 KLD, which #166 skips across tokenizers; 20–40 Crow tasks with tools; the CI/margin rule, which point 3 replaces). G6's method stays as amendment 6 left it.
+
+Amendment 6's open points 1–5 are closed by this amendment; G5 and G6 rows may be taken.
+
+### Amendment 8 — 2026-10-11: the G5 turn set, the per-turn record and the run order (crow-nest #151)
+
+Written 2026-10-11 on crow-nest `4bcda60` (branch `g5-tasks`), before any G5 row exists. Seen when written: what amendment 7 saw; since then no Crow-window turn and no G5 boot. GLM `serve` rows seen: the G4 series (`runs/glm53-flash/g3g4-20261011/`, local, not in git: 10 boots, one cold turn of `prompt-33k.txt` each, GLM `prompt_n` 30,986, arm3.env) and that day's serve session (unrelated requests, all COLD; #151 comment of 2026-10-11). Reason: #151 "Proposed fix" 1 asks for the ≥ 5 agent tasks with text, target folder and sha256 fixed in this file, which G5's data clause names but does not fix; the #151 comment of 2026-10-11 adds the prefix-cache record (robin promised its live check publicly). No threshold changes; G5's bars are amendment 7's. Points marked **lead's decision** can be overruled by robin by a further amendment before the first G5 row.
+
+**Language:** English, the language robin types his own Crow tasks in on this machine (the 2026-10-06 sessions under `%LOCALAPPDATA%\Crow\session\`).
+
+**Sources checked for reuse; none fits (empty folder, several tool rounds, 7–10k):**
+- G6's ten tasks (`docs/ten-task-expected.md`, `docs/ten-task-prompts-crowlab.json`): not used. G6 is graded blind by robin; typing its prompts into the window would show him GLM's answers to them before the blind grading. They are also single-turn prompts that the harness sends without tools.
+- The 2026-10-06 todo CLI (robin's typed text in `chat-20261006-165103.json`; the task of the Flash-Next live run `crow-lab/runs/fn-crow-task-win-20261006`): it runs far past the band (Flash-Next: 52 requests, final context 58,519 tokens), and it is G1's held-out file. Not used. Its form (build in "this folder", test, fix until green) is the model for the texts below, and t2 takes its clause "Run the tests and fix every failure until everything is green." verbatim.
+- Crow `docs/acceptance/issue-207.md` (robin's live tests, 2026-09-21): Tests 1 and 2 search an existing repository, so the folder cannot be empty; Test 1b is a 500 MB output bomb, not a task. Not used.
+- `chat-20261006-170158.json`, "how many files are in this folder + subfolder?": one tool round in an empty folder. Not used.
+- The four calibration tasks of amendment 1: not used, because arm4.env's `CROW_GLM_ARENA_WARM` is cut from their routing (`arena-warm/glm53-cal4-decode-counts.json`, `_source`), and a task from them would flatter decode.
+
+The five texts are therefore new, written for this amendment. None shares a task with G6, the G1 corpus or the arena warm set.
+
+**Tasks.** Typed in this order, each in a new chat in its own fresh, empty folder `C:\Users\robin\Desktop\g5-run<k>\<id>` (k = 1 for the first session; a repeated session takes the next k and never reuses a folder). The texts name no path, so the hashes do not depend on k. sha256 is taken over the exact text between the fences, UTF-8, no trailing newline.
+
+1. `t1-wordfreq`: word-frequency script on a sample file. 291 B, sha256 `3d7116ca612053248535aa51ad427c1dee390f5d3575850b0e1148204db7a32a`
+   ```text
+   Create a sample text file in this folder with about ten lines of English prose. Then write a Python script wordfreq.py that prints the ten most frequent words of the text file given as its argument, case-insensitive and ignoring punctuation. Run it on the sample file and show me the output.
+   ```
+2. `t2-roman`: Roman numerals with tests, fix until green. 299 B, sha256 `760946570c4363a97021603df30c852f33d16e8b43c8a7765a14151fba691c3c`
+   ```text
+   Write roman.py in this folder with a function to_roman(n) for 1 to 3999 and a function from_roman(s) that reverses it. Add unittest tests in test_roman.py with at least ten cases, including a round trip over every number from 1 to 3999. Run the tests and fix every failure until everything is green.
+   ```
+3. `t3-inventory`: CSV data and a report script. 258 B, sha256 `31834d40c99ebd064b8499fb397814ea33a6a08d1ba6c1bf5dcafa616b581c06`
+   ```text
+   Create inventory.csv in this folder with twelve rows of name, quantity and unit price. Then write report.py that reads it and prints the total stock value and the three items with the highest value (quantity times unit price). Run it and tell me the numbers.
+   ```
+4. `t4-units`: command-line unit converter with an error path. 308 B, sha256 `238052922297f4b9e46936e7c176070888a8e2d6157ca12b00079c96b5f1a2a5`
+   ```text
+   Write units.py in this folder, a command-line converter between metres, kilometres, feet and miles (units m, km, ft, mi), used like this: python units.py 5 km mi. An unknown unit must print a clear error and exit with code 1. Try three conversions and one unknown unit, and show me what it printed each time.
+   ```
+5. `t5-stats`: hand-written statistics checked against the standard library. 319 B, sha256 `ac02f0a2682e92c15267c8b927a693ea3d153f3124b9144f90d7ab39ccd0f39f`
+   ```text
+   Write mystats.py in this folder with mean, median and sample standard deviation, implemented by hand without the statistics module. Then write check.py that compares all three against Python's statistics module on five random lists and prints for each whether they agree within 1e-9. Run check.py and report the result.
+   ```
+
+**What a turn is and what counts (lead's decision, the reading of G5's "turns at 7–10k context").**
+- A row is one request Crow sends to `serve`, i.e. one round. A task (one typed line) is one G5 turn. Its rounds are the requests from the typed line to the end of Crow's turn; Crow's turn line ("N rounds") gives N. Any other request (Crow's memory review, a digest, a title) is a side row: recorded and labelled, never counted.
+- A row's depth is its rendered prompt, `P` in `[chat] prompt P tok`. A row is in band at 7,000 ≤ P ≤ 10,000.
+- A task's decode tok/s = Σ `predicted_n` / Σ `predicted_ms` over its in-band rows. This is Crow's turn-line formula (`cli/crow_core.py:7412-7417`, Crow `d2a7d0b`) restricted to the band. The G5 decode median is the median over the tasks with ≥ 1 in-band row. G5 needs ≥ 5 such tasks; with fewer, the window part of G5 is "not answered" (abort rules), and new tasks come only by a further amendment before their run. Reported beside it, not judged: Crow's turn line over all rounds of each task, and the median over all in-band rows.
+- Expected depth, derived and not measured. Flash-Next's first Crow round on 2026-10-06 was 7,259 tokens (`crow-lab/runs/fn-crow-task-win-20261006/serve-8099.log`, Crow 3.2.4). GLM's tokenizer counts `prompt-33k.txt` 3.1 % shorter (30,986 vs 31,979). So a first round near 7.0k, which may fall just under the band; the later rounds carry it. Rows above 10,000 are recorded and not counted.
+
+**Per-row record** (#151 "Proposed fix" 3 and its 2026-10-11 comment). Sources: serve's stderr log of the session and its routing JSON lines.
+- Task id, round index, side-row flag, end time (routing JSON `ts`).
+- `prompt_n` = P, the whole rendered prompt (the routing JSON's `prompt_n`; `usage.prompt_tokens` on the wire). `cached_n` = C (routing JSON `cached_n` = `usage.prompt_tokens_details.cached_tokens`). Prefilled F = P − C, which is what the wire's `timings.prompt_n` carries (`engine/src/bin/serve.rs:432`). The two `prompt_n` are named apart here so they are never mixed. Also C / P.
+- The `[cache]` line verbatim: WARM/COLD, L, held, P, snapshots, `prefill n of m tok`, reset ms.
+- Prefill tok/s = F / prefill ms, from the `[chat]` line. On a WARM row this is a small-batch figure (`serve.rs:453-454`) and is never compared with the cold ~32k figure.
+- Decode tok/s = `predicted_n` / `predicted_ms` (`[chat]` line, `timings.predicted_per_second`); `predicted_n`, finish, tool calls, malformed.
+- Wall clock per row = reset + prefill ms + decode ms from the `[chat]` line. Wall clock per task = Crow's turn line `waited`, with its model/tools split, beside the sum of its row walls.
+- m = `cold` / `selections` of the routing JSON line; `bytes_streamed` as logged. RAM/VRAM: `nvidia-smi` memory.used, Windows commit charge and available physical memory at the row's end, from a read-only sampler (period ≤ 5 s, started before t1, the G4 `CommitSampler` form).
+- The request as sent: serve's `[chat] sampling on the device` and `thinking` lines (which value came from the request, which from the data sheet). The row states that Crow sends GLM the floor, since GLM has no manifest entry (#151 Evidence).
+- Per task, reported with no threshold (the prefix-cache live check): rounds, in-band rows, WARM rows among rounds 2..N, and their mean C / P. Expected: rounds 2..N WARM. A COLD row among them is named with its `[cache]` line.
+
+**Run order: one day, one GPU lock window** (`C:\Users\robin\dev\.gpu-lock`, held from `mkdir` to `rmdir`, as `runs/glm53-flash/quick/bundle.sh`).
+1. Take the lock. No other GPU job and no other heavy disk job.
+2. One `serve` boot for all five tasks:
+   - binary built from crow-nest main at or after `732369c` (`CROW_GLM_KV_LAZY` needs it);
+   - `CROW_CNQ` = `converter\GLM-5.3-Flash-MUL1K3.cnq`, `CROW_TOKENIZER` = `models\GLM-5.3-Flash-original\tokenizer.json`;
+   - environment `runs/glm53-flash/quick/arm4.env` and nothing else;
+   - port 8099, `CROW_CONTEXT` unset (floor 200,000);
+   - stderr to `runs/glm53-flash/g5-<date>/serve-tasks.log`.
+3. t1 → t5 in the Crow window (robin's steps below).
+4. Close Crow and stop `serve` (taskkill while idle, #126; VRAM back under 3 GB).
+5. Synthetic row: 3 boots, one after another, each with one cold turn of `crow-lab/runs/2026-08-28-flash-next/prompt-33k.txt`:
+   - prompt: sha256 `62141cb4f43e4151c41bfbc0446821c42ec59509ffae2da8c5c47a9bca1bfcde`; 31,979 tokens with Flash-Next's tokenizer, 30,986 with GLM's in G4;
+   - setup: the same binary, container and arm4.env;
+   - request: G4's (`g4_run.py boots`: temperature 0, `max_tokens` 64, `reasoning_budget_tokens` 0, streamed with timings);
+   - recorded per boot: GLM `prompt_n`, prefill tok/s, 64-token decode tok/s, VRAM after the turn, commit peak, m.
+   - G5's cold prefill = the median of the 3. The 3-boot spread max/min ≤ 1.15 is read on that prefill figure (lead's decision; the boots measure it). The 64-token decode is reported.
+6. Release the lock (`rmdir`).
+
+A serve crash or a void session is a row. The session is then repeated in a new lock window with folders `g5-run<k+1>`; the first one stays in the book.
+
+**robin's steps.**
+1. Before you start: the lead has created the five empty folders `C:\Users\robin\Desktop\g5-run1\t1-wordfreq` … `t5-stats`, `serve` answers `/health`, and the sampler runs.
+2. In `C:\Users\robin\dev\Crow`, start Crow: `python cli\crow_gui.py --base-url http://127.0.0.1:8099/v1`. Leave the release level at `auto` (the default; nothing asks, so no approval wait enters the wall clock). Leave the model/reasoning chip as Crow offers it for this server, the same for all five tasks.
+3. For each task, in order t1 → t5:
+   1. Right-click the empty space of the chat rail, choose new project and pick the task's folder, then open a new chat in it. Before you type, check that the composer's working-directory chip shows that folder.
+   2. Paste the task text from its code block above and press Enter.
+   3. Type nothing else in that chat: no follow-up and no answer to a question. If the turn ends on a question, the task ends there.
+   4. Wait for the turn line (`N rounds | … tok @ X tok/s | … | waited …`) and for 30 s of quiet in serve's log, since Crow's memory review can still send a side request. Note the turn line or take a screenshot.
+   5. Go to the next task with a new project and a new chat. Never reuse a chat.
+4. After t5, close Crow and tell the lead. The lead stops `serve` and runs the 3 synthetic boots, with nobody at the window.
+
+After the session, the lead copies the five session files (`%LOCALAPPDATA%\Crow\session\chat-*.json`). For each task, the lead checks the first user message (trailing whitespace stripped) against its sha256. A task whose text differs is recorded and not counted.

@@ -111,6 +111,12 @@ impl Head {
         }
     }
 
+    /// crow-nest #215: the device i32 {V} the head's launches read (`argmax_k`'s n), for the
+    /// device sampler on the same row
+    pub fn vocab_param(&self) -> CUdeviceptr {
+        self.prm_v
+    }
+
     /// queue `out [rows][H] = norm(mean over the streams of x [rows][S][H])`
     ///
     /// # Safety

@@ -308,8 +308,9 @@ pub fn kernel_geo(g: &Glm5Geo) -> KernelGeo {
     glm5_kda::kernel_geo(g)
 }
 
-/// every `KERNEL_SRC` entry the glm5 path launches from the shared module
-pub const MAIN_NAMES: &[&str] = &["gemv_bf16_b", "gemv_bf16_w", "argmax_k", "qsa_select_fast"];
+/// every `KERNEL_SRC` entry the glm5 path launches from the shared module (crow-nest #215: the
+/// #20 device sampler pair `sample_topk_part` / `sample_k` on the head's logits row)
+pub const MAIN_NAMES: &[&str] = &["gemv_bf16_b", "gemv_bf16_w", "argmax_k", "qsa_select_fast", "sample_topk_part", "sample_k"];
 
 /// The modules of the glm5_next path: `KERNEL_SRC` compiled ONCE at [`kernel_geo`] (KDA's GDN
 /// kernels, the engine kernel table, `qsa_select_fast`), plus the blocks' own NVRTC modules
@@ -842,6 +843,17 @@ pub struct Glm5Pass {
     /// `CROW_GLM_CONTROLLER=1` (set by `Glm5Run`): while `active`, a decode call's MoE layer hands
     /// its routing to the controller's ring and waits for the reply on the device
     pub ctl: Option<crate::glm5_flags::Ctl>,
+    /// crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`, set by `Glm5Run` around one KDA layer's prompt
+    /// call): `(row of the call, S, conv)`: the KDA scan is cut at that row and the state there
+    /// copied D2D (`glm5_kda::prompt_rows_cut_with`); `None` = no cut
+    pub kda_cut: Option<(usize, Dev, Dev)>,
+    /// crow-nest #216 (`CROW_GLM_SMALL_PROMPT`, set by `Glm5Run` around one small prompt call of a
+    /// MoE layer): `(decoder layer, router, bias)` of the next MoE layer, whose router runs on this
+    /// layer's MoE input beside its own and whose ids go to the expert hook
+    /// ([`crate::glm5_flags::post_prompt_guess`]); `None` = no guess
+    pub prompt_guess: Option<(usize, Dev, Dev)>,
+    /// #216: the guess's buffers (logits, ids, weights) and the rows they hold (made on first use)
+    guess_buf: Option<(Dev, Dev, Dev, usize)>,
 }
 
 impl Glm5Pass {
@@ -898,6 +910,9 @@ impl Glm5Pass {
             routed: None,
             overlap: false,
             ctl: None,
+            kda_cut: None,
+            prompt_guess: None,
+            guess_buf: None,
             kn,
         }
     }
@@ -952,7 +967,7 @@ impl Glm5Pass {
                 } else if decode {
                     glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, self.sub, &mut proj);
                 } else {
-                    glm5_kda::prompt_rows_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
+                    glm5_kda::prompt_rows_cut_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj, self.kda_cut);
                 }
             }
             AttnW::Mla(a) => {
@@ -1323,6 +1338,49 @@ impl Glm5Pass {
         for d in [&mut self.ints.dev, &mut self.st2, &mut self.collapsed, &mut self.sub, &mut self.attn] {
             cuda::free_dev(d);
         }
+        self.free_guess_buf();
+    }
+
+    /// #216: the prompt guess's buffers freed
+    ///
+    /// # Safety
+    /// No launch writing them is pending.
+    unsafe fn free_guess_buf(&mut self) {
+        if let Some((mut a, mut b, mut c, _)) = self.guess_buf.take() {
+            for d in [&mut a, &mut b, &mut c] {
+                cuda::free_dev(d);
+            }
+        }
+    }
+
+    /// #216: the next layer's guess of a small prompt call of `t` rows on `x` ([`Glm5Pass::prompt_guess`])
+    /// queued on the current stream into the guess buffers (made or grown here; `None` when VRAM
+    /// refuses them: no guess). Returns the ids buffer.
+    ///
+    /// # Safety
+    /// A CUDA context is current; the grouped plan exists and holds `t` rows; `x` holds `t` rows.
+    unsafe fn queue_prompt_guess(&mut self, t: usize, x: Dev) -> Option<Dev> {
+        let (_, router, bias) = self.prompt_guess?;
+        let (e, k) = (self.moe.experts, self.moe.topk);
+        if self.guess_buf.is_some_and(|b| b.3 < t) {
+            cuda::sync();
+            self.free_guess_buf();
+        }
+        if self.guess_buf.is_none() {
+            let lg = cuda::try_alloc_zeroed("glm5 prompt guess logits (#216)", t * e * 4).ok()?;
+            let id = cuda::try_alloc_zeroed("glm5 prompt guess ids (#216)", t * k * 4).ok();
+            let wt = cuda::try_alloc_zeroed("glm5 prompt guess weights (#216)", t * k * 4).ok();
+            let (Some(id), Some(wt)) = (id, wt) else {
+                for mut d in [lg].into_iter().chain(id).chain(wt) {
+                    cuda::free_dev(&mut d);
+                }
+                return None;
+            };
+            self.guess_buf = Some((lg, id, wt, t));
+        }
+        let (lg, id, wt, _) = self.guess_buf.expect("made above");
+        self.grouped.as_ref().expect("the grouped plan").route_into(&self.kn.k, &self.kn.moe, router, bias, x, t, lg, id, wt);
+        Some(id)
     }
 }
 
@@ -1394,9 +1452,17 @@ impl Glm5Pass {
         // routing sync, the call's schedule; the tiers serve its pseudo-rows (each selected expert
         // in exactly one), and each sub-batch runs every row routed to its experts
         self.grouped_plan();
+        self.grouped.as_ref().unwrap().route(&self.kn.k, &self.kn.moe, w, self.collapsed, t);
+        // #216: a small prompt call's guess of the next MoE layer on the same input, read with
+        // this layer's ids (the routing sync covers both)
+        let guess = self.queue_prompt_guess(t, self.collapsed);
         let gp = self.grouped.as_ref().unwrap();
-        gp.route(&self.kn.k, &self.kn.moe, w, self.collapsed, t);
         let ids = router_ids(None, gp.ids, t * self.moe.topk, lw.layer)?;
+        crate::glm5_flags::post_prompt_guess(None);
+        if let (Some(g), Some((gl, _, _))) = (guess, self.prompt_guess) {
+            let v = cuda::dtoh_i32(g, t * self.moe.topk);
+            crate::glm5_flags::post_prompt_guess(Some(crate::glm5_flags::Hint { layer: gl, ids: v }));
+        }
         let s = ExpertMajor::new(&ids, self.moe.topk, self.moe.experts, GROUP_ROWS).map_err(|e| format!("layer {}: {e}", lw.layer))?;
         gp.upload(&s);
         let (sel, pr, collapsed) = (s.sel(), s.pseudo_rows(), self.collapsed);

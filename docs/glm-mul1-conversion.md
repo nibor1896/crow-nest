@@ -6,6 +6,11 @@ the FP8 originals (`zai-org/GLM-5.3-Flash` @ `eb9eb208`) with Hessians from the 
 inputs. The dense part stays on `cnq4.5-glm5-next`, byte for byte. Nothing on this page has run on
 the real shards yet; every runtime is derived.
 
+Format credit: the experts are quantized with exllamav3's EXL3 (MUL1 codebook, K=3, 3.05 bpw;
+[turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)); its trellis method is from QTIP
+(Tseng et al. 2024, [arXiv:2406.11235](https://arxiv.org/abs/2406.11235)). MUL1 is exllamav3's format, not
+crow-nest's; crow-nest reads and writes it (codec #181, MIT notice in `NOTICE`).
+
 ## Data flow
 
 | stage | interpreter | reads | writes | resumes from |
@@ -142,7 +147,7 @@ converter/target/release/converter.exe --scales mse --source-repo zai-org/GLM-5.
 ## Tests
 
 ```
-cd converter && cargo test --release                                   # 103 passed, 1 ignored (2026-10-09, MTP overlay)
+cd converter && cargo test --release                                   # 105 passed, 1 ignored (2026-10-11, #212)
 python -I tools/test_glm_mul1_quantize.py                              # pure: 10 passed, 4 skipped
 .venv-oracle/Scripts/python.exe -I tools/test_glm_mul1_quantize.py     # + capture vs HF: 12 passed, 2 skipped
 .venv-exl3/Scripts/python.exe -I tools/test_glm_mul1_quantize.py       # + quantize on the GPU and the converter: 12 passed, 2 skipped

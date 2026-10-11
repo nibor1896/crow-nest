@@ -750,8 +750,16 @@ impl Sampler {
                     break;
                 }
             }
-            let keep: std::collections::HashSet<usize> = idx[..last].iter().copied().collect();
-            cand.retain(|c| keep.contains(&c.0));
+            // #218: `idx` holds LIST POSITIONS, so the kept set is a mask over
+            // positions (llama.cpp copies `cur_p->data[idx]`, the entry by
+            // position). Matching these positions against token ids emptied
+            // the list on a real vocabulary and min_p panicked on `cand[0]`.
+            let mut keep = vec![false; cand.len()];
+            for &ix in &idx[..last] {
+                keep[ix] = true;
+            }
+            let mut kept = keep.iter();
+            cand.retain(|_| *kept.next().unwrap());
         }
         // #83: min_p, the log-space tail filter of llama.cpp (PR #3841, paper
         // arXiv:2407.01082): AFTER top-k, BEFORE the temperature softmax, drop
@@ -2060,6 +2068,58 @@ mod tests {
         let mut g = Sampler { typical_p: 0.1, temperature: 0.0, top_p: 1.0, top_k: 3,
             presence_penalty: 0.0, ..Sampler::new(11) };
         assert_eq!(g.sample(&logits), 0, "greedy is the plain penalized argmax, typical included");
+    }
+
+    /// #218: typical_p on a REAL row: every top-k candidate carries a token id far
+    /// above the candidate-list length (a 1000-wide row, the head at ids
+    /// 900..905, a -5 tail at 906..919, top_k 20). The kept set must be
+    /// filtered by token id; matching list positions against ids emptied the
+    /// list and `min_p` then panicked on `cand[0]` - the host route of every
+    /// request with `typical_p < 1`.
+    #[test]
+    fn typical_p_keeps_token_ids_on_a_real_row() {
+        let mut row = vec![-30.0f32; 1000];
+        for (j, l) in [5.0f32, 4.5, 4.0, 3.5, 3.0, 2.5].iter().enumerate() {
+            row[900 + j] = *l;
+        }
+        for l in row[906..920].iter_mut() {
+            *l = -5.0;
+        }
+        let mut s = Sampler { typical_p: 0.9, min_p: 0.01, temperature: 1.0, top_p: 1.0, top_k: 20,
+            presence_penalty: 0.0, ..Sampler::new(5) };
+        for _ in 0..400 {
+            let t = s.sample(&row);
+            assert!((900..906).contains(&t), "drew {t}, outside the head of the row");
+        }
+    }
+
+    /// #218: typical_p's kept set is llama.cpp's on its own `test_typical` cases
+    /// (tests/test-sampling.cpp, ggml-org/llama.cpp @62a6f74), scattered over
+    /// high token ids. By hand, p = 0.5:
+    /// - [0.4, 0.2, 0.2, 0.2]: H = 1.3322, |-ln p - H| = [0.416, 0.277 x3];
+    ///   the three 0.2s come first, cum 0.2/0.4/0.6 > 0.5 -> keep the three
+    ///   0.2s, the argmax 0.4 is OUT (llama.cpp expects {0.2, 0.2, 0.2}).
+    /// - [0.97, 0.01 x3]: H = 0.1677, |diffs| = [0.137, 4.44 x3]; 0.97 alone
+    ///   crosses 0.5 (llama.cpp expects {0.97}).
+    #[test]
+    fn typical_p_kept_set_matches_llama_cpp() {
+        let mk = |ids: [usize; 4], probs: [f32; 4]| {
+            let mut row = vec![-30.0f32; 1000];
+            for (&i, &p) in ids.iter().zip(probs.iter()) {
+                row[i] = p.ln();
+            }
+            let mut s = Sampler { typical_p: 0.5, temperature: 1.0, top_p: 1.0, top_k: 4,
+                presence_penalty: 0.0, ..Sampler::new(17) };
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..600 {
+                seen.insert(s.sample(&row));
+            }
+            seen
+        };
+        assert_eq!(mk([700, 300, 500, 100], [0.4, 0.2, 0.2, 0.2]), [300, 500, 100].into_iter().collect(),
+            "llama.cpp keeps the three 0.2 tokens and drops the 0.4 argmax");
+        assert_eq!(mk([999, 10, 400, 800], [0.97, 0.01, 0.01, 0.01]), [999].into_iter().collect(),
+            "llama.cpp keeps the 0.97 token alone");
     }
 
     /// #92: XTC removes the leading run of `p >= threshold` (renormalized

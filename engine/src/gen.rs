@@ -845,26 +845,7 @@ impl Engine {
     ///   current stream, ahead of the next step's launch.
     pub unsafe fn rebook_sampler(&self, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
         let Some(ds) = self.dev_sampler.as_ref() else { return };
-        if drawn == kept || drawn >= self.d.v || kept >= self.d.v {
-            return;
-        }
-        let (head, cd, ck) = if lastn > 0 {
-            (
-                cuda::dtoh_i32(ds.ring, 1)[0],
-                cuda::dtoh_t::<u16>(ds.counts + (drawn * 2) as u64, 1)[0],
-                cuda::dtoh_t::<u16>(ds.counts + (kept * 2) as u64, 1)[0],
-            )
-        } else {
-            (0, 0, 0)
-        };
-        for (buf, off, bytes) in crate::sample::rebook_plan(drawn, kept, drawn_seen, lastn, head, cd, ck) {
-            let base = match buf {
-                crate::sample::RebookBuf::Mask => ds.mask,
-                crate::sample::RebookBuf::Counts => ds.counts,
-                crate::sample::RebookBuf::Ring => ds.ring,
-            };
-            cuda::upload_into(base + off as u64, &bytes);
-        }
+        rebook_dev_sampler(ds, self.d.v, drawn, kept, drawn_seen, lastn);
     }
     /// #28: a greedy request parks the sampler OUT of the engine, so `decode_step` stops sampling and the buffers survive
     pub fn park_sampler(&mut self, parked: &mut Option<DevSampler>) {
@@ -950,6 +931,169 @@ pub struct DevSampler {
     /// #84: the ring itself - i32 head, i32 fill, then the window ids
     pub ring: Dev,
     pub in_graph: std::cell::Cell<bool>,
+}
+
+impl DevSampler {
+    /// crow-nest #215: the seven buffers at a vocabulary of `vocab` (`sampler_bytes(vocab)`),
+    /// named for the allocation error; `arm_dev_sampler` writes every byte the kernels read
+    ///
+    /// # Safety
+    /// A CUDA context is current.
+    pub unsafe fn alloc(vocab: usize) -> DevSampler {
+        DevSampler {
+            mask: cuda::alloc_named("the sampler presence mask", vocab),
+            rng: cuda::alloc_named("the sampler rng state", 8),
+            params: cuda::alloc_named("the sampler profile", 36),
+            cand_v: cuda::alloc_named("the sampler candidate values", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+            cand_i: cuda::alloc_named("the sampler candidate ids", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
+            counts: cuda::alloc_named("the sampler window counts", 2 * vocab),
+            ring: cuda::alloc_named("the sampler penalty ring", (2 + SAMPLE_RING_MAX) * 4),
+            in_graph: std::cell::Cell::new(false),
+        }
+    }
+
+    /// # Safety
+    /// No launch on these buffers is pending.
+    pub unsafe fn free(&mut self) {
+        for d in [&mut self.mask, &mut self.rng, &mut self.params, &mut self.cand_v, &mut self.cand_i, &mut self.counts, &mut self.ring] {
+            cuda::free_dev(d);
+        }
+    }
+}
+
+/// the 36-byte params block of `sample_k`: {temp, top_p, presence, top_k, min_p, ln_min_p,
+/// repeat, freq, last_n} (f32 except top_k and last_n, i32). #83: ln(min_p) is computed HERE,
+/// once, so the device adds the same threshold constant the host sampler adds. #84:
+/// repeat/freq/last_n - last_n clamped to the ring's depth, as both parse doors already do.
+/// crow-nest #215: pure, the one copy of the layout (Qwen's and glm5_next's arming)
+pub fn sampler_params(s: &crate::sample::Sampler) -> [u8; 36] {
+    let mut pb = [0u8; 36];
+    pb[0..4].copy_from_slice(&s.temperature.to_le_bytes());
+    pb[4..8].copy_from_slice(&s.top_p.to_le_bytes());
+    pb[8..12].copy_from_slice(&s.presence_penalty.to_le_bytes());
+    pb[12..16].copy_from_slice(&(s.top_k as i32).to_le_bytes());
+    pb[16..20].copy_from_slice(&s.min_p.to_le_bytes());
+    pb[20..24].copy_from_slice(&s.ln_min_p().to_le_bytes());
+    pb[24..28].copy_from_slice(&s.repeat_penalty.to_le_bytes());
+    pb[28..32].copy_from_slice(&s.frequency_penalty.to_le_bytes());
+    pb[32..36].copy_from_slice(&(s.penalty_last_n.min(SAMPLE_RING_MAX) as i32).to_le_bytes());
+    pb
+}
+
+/// #111 / #85 / #92: the profile `s` fits the device sampler's params block, or a loud stop
+/// (crow-nest #215: lifted out of `Engine::enable_dev_sampler`, checked before the buffers move)
+pub fn assert_device_profile(s: &crate::sample::Sampler) {
+    // #111: the kernel keeps 1..=SAMPLE_MAXK candidates and would CLAMP any other
+    // top_k (0 = off -> 1 = greedy; 100 -> 64) without a word. serve routes such a
+    // request to the host sampler first; a harness run that reaches here is stopped
+    // loudly instead of drawing from a different distribution than it asked for.
+    assert!(
+        !s.top_k_needs_host(),
+        "top_k {} cannot run on the device sampler (1..={SAMPLE_MAXK}; 0 = off): \
+         set CROW_SAMPLE_HOST=1 for the host sampler",
+        s.top_k
+    );
+    // #85/#92: DRY and the #92 tier have no field in the params block (`sampler_params`); the
+    // harness routes them to the host (decode.rs / parity.rs), serve too
+    // (`draws_on_host`). Reaching here with one armed would drop it silently.
+    assert!(
+        !s.host_route(),
+        "host-only sampler knobs armed ({}): the device sampler has no input for them",
+        s.host_knobs().join(", ")
+    );
+}
+
+/// #20: switch `ds` to device-side sampling with the profile of `s` (mask cleared, rng = the
+/// sampler's seeded state, the params block, the #84 window seeded from the prompt tail).
+/// crow-nest #215: lifted out of `Engine::enable_dev_sampler`, so Qwen and glm5_next arm the
+/// same bytes.
+///
+/// # Safety
+/// A CUDA context is current; `ds` holds buffers of a vocabulary of `vocab`.
+pub unsafe fn arm_dev_sampler(ds: &DevSampler, s: &crate::sample::Sampler, vocab: usize) {
+    assert_device_profile(s);
+    let zero = vec![0u8; vocab];
+    cuda::upload_into(ds.mask, &zero);
+    cuda::to_u64_into(ds.rng, &[s.rng.state()]);
+    cuda::upload_into(ds.params, &sampler_params(s));
+    // #84: the windowed penalties' device twin, seeded per request like
+    // the mask: counts[V] u16 from the sampler's window counts, and the
+    // ring {head, fill, ids} from its prompt-tail ids (oldest first).
+    // A not-armed sampler uploads zeros - `sample_k` will not touch them.
+    let mut cb = vec![0u8; 2 * vocab];
+    if s.win_armed() {
+        for (tok, c) in s.win_counts_nonzero() {
+            cb[tok * 2..tok * 2 + 2].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    cuda::upload_into(ds.counts, &cb);
+    let lastn = s.penalty_last_n.min(SAMPLE_RING_MAX);
+    let mut rb = vec![0u8; (2 + SAMPLE_RING_MAX) * 4];
+    if s.win_armed() && lastn > 0 {
+        let ids: Vec<u32> = s.win_ids().collect();
+        let fill = ids.len().min(lastn);
+        // the tail of the window (a clamped last_n may hold fewer ids
+        // than the sampler does), oldest first; head = fill % lastn is
+        // the next write slot exactly as `sample_k`'s accept advances it
+        let head = (fill % lastn) as i32;
+        rb[0..4].copy_from_slice(&head.to_le_bytes());
+        rb[4..8].copy_from_slice(&(fill as i32).to_le_bytes());
+        for (j, &t) in ids[ids.len() - fill..].iter().enumerate() {
+            rb[8 + j * 4..12 + j * 4].copy_from_slice(&(t as i32).to_le_bytes());
+        }
+    }
+    cuda::upload_into(ds.ring, &rb);
+    cuda::sync();
+    // invariant: in_graph is true only while the CURRENT decode graph carries the
+    // sampler node; arming re-arms for the next capture, so clear it here
+    ds.in_graph.set(false);
+}
+
+/// #20 v2: queue the draw from the logits row `logits` into the i32 slot `out` (the argmax
+/// slot, so the readback behind it is unchanged): 64 blocks pick their slice's top-k, one
+/// block merges and draws. #84: counts rides stage 1 (the windowed penalties bite on the raw
+/// logits), counts+ring ride stage 2 (the post-draw accept). `n_vocab` is a device i32.
+/// crow-nest #215: lifted out of `Engine::launch_sample_at` for glm5_next's head.
+///
+/// # Safety
+/// `k` resolves the two kernels; every pointer is a live device buffer of these shapes.
+pub unsafe fn launch_dev_sampler(k: &Kernels, ds: &DevSampler, logits: Dev, out: Dev, n_vocab: Dev) {
+    launch_v(k.f("sample_topk_part"), SAMPLE_PARTS, 1, 1, SAMPLE_THREADS, &[
+        logits, n_vocab, ds.mask, ds.counts,
+        ds.params, ds.cand_v, ds.cand_i]);
+    launch_v(k.f("sample_k"), 1, 1, 1, SAMPLE_THREADS, &[
+        ds.cand_v, ds.cand_i, out, n_vocab,
+        ds.mask, ds.counts, ds.ring, ds.rng, ds.params]);
+}
+
+/// #93: the device sampler booked `drawn`; the host replaced it with `kept` (a tool-grammar
+/// redraw). Move the booking (`sample::rebook_plan`): a few bytes read, a few written, on a
+/// rejection only. `lastn` = the device window depth, 0 when the window is not armed.
+/// crow-nest #215: lifted out of `Engine::rebook_sampler` for glm5_next.
+///
+/// # Safety
+/// A CUDA context is current; call between two draws (the one that drew `drawn` has landed).
+pub unsafe fn rebook_dev_sampler(ds: &DevSampler, vocab: usize, drawn: usize, kept: usize, drawn_seen: bool, lastn: usize) {
+    if drawn == kept || drawn >= vocab || kept >= vocab {
+        return;
+    }
+    let (head, cd, ck) = if lastn > 0 {
+        (
+            cuda::dtoh_i32(ds.ring, 1)[0],
+            cuda::dtoh_t::<u16>(ds.counts + (drawn * 2) as u64, 1)[0],
+            cuda::dtoh_t::<u16>(ds.counts + (kept * 2) as u64, 1)[0],
+        )
+    } else {
+        (0, 0, 0)
+    };
+    for (buf, off, bytes) in crate::sample::rebook_plan(drawn, kept, drawn_seen, lastn, head, cd, ck) {
+        let base = match buf {
+            crate::sample::RebookBuf::Mask => ds.mask,
+            crate::sample::RebookBuf::Counts => ds.counts,
+            crate::sample::RebookBuf::Ring => ds.ring,
+        };
+        cuda::upload_into(base + off as u64, &bytes);
+    }
 }
 
 /// side stream + events + the swaps in flight of the stream-side trickle
@@ -1452,16 +1596,7 @@ impl Engine {
         // demand.
         // #83: params grew 16 -> 36 B (min_p + the host-computed ln_min_p at
         // [4]/[5]); #84 filled [6..9] (repeat, freq, last_n).
-        let dev_sampler_hold = Some(DevSampler {
-            mask: cuda::alloc_named("the sampler presence mask", d.v),
-            rng: cuda::alloc_named("the sampler rng state", 8),
-            params: cuda::alloc_named("the sampler profile", 36),
-            cand_v: cuda::alloc_named("the sampler candidate values", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
-            cand_i: cuda::alloc_named("the sampler candidate ids", SAMPLE_PARTS as usize * SAMPLE_MAXK * 4),
-            counts: cuda::alloc_named("the sampler window counts", 2 * d.v),
-            ring: cuda::alloc_named("the sampler penalty ring", (2 + SAMPLE_RING_MAX) * 4),
-            in_graph: std::cell::Cell::new(false),
-        });
+        let dev_sampler_hold = Some(DevSampler::alloc(d.v));
 
         // ---- scratch + staging BEFORE the budget: the planner measures free VRAM,
         // so everything chunk-sized must already be resident (C=512 scratch is
@@ -5947,24 +6082,7 @@ impl Engine {
     /// before the first decode_step of the process so the node is captured with
     /// the graph; enabled later it runs as an eager launch behind each replay.
     pub unsafe fn enable_dev_sampler(&mut self, s: &crate::sample::Sampler) {
-        // #111: the kernel keeps 1..=SAMPLE_MAXK candidates and would CLAMP any other
-        // top_k (0 = off -> 1 = greedy; 100 -> 64) without a word. serve routes such a
-        // request to the host sampler first; a harness run that reaches here is stopped
-        // loudly instead of drawing from a different distribution than it asked for.
-        assert!(
-            !s.top_k_needs_host(),
-            "top_k {} cannot run on the device sampler (1..={SAMPLE_MAXK}; 0 = off): \
-             set CROW_SAMPLE_HOST=1 for the host sampler",
-            s.top_k
-        );
-        // #85/#92: DRY and the #92 tier have no field in the params block below; the
-        // harness routes them to the host (decode.rs / parity.rs), serve too
-        // (`draws_on_host`). Reaching here with one armed would drop it silently.
-        assert!(
-            !s.host_route(),
-            "host-only sampler knobs armed ({}): the device sampler has no input for them",
-            s.host_knobs().join(", ")
-        );
+        assert_device_profile(s);
         if self.dev_sampler.is_none() {
             // #72: the buffers come from the boot hold; the fallback allocates, for
             // a bin that built its Engine before the hold existed. Either way they
@@ -5982,56 +6100,8 @@ impl Engine {
             }));
         }
         let ds = self.dev_sampler.as_ref().expect("enable_dev_sampler: just armed");
-        let zero = vec![0u8; self.d.v];
-        cuda::upload_into(ds.mask, &zero);
-        cuda::to_u64_into(ds.rng, &[s.rng.state()]);
-        // the 36-byte params block of `sample_k`: {temp, top_p, presence,
-        // min_p, ln_min_p, repeat, freq} f32 + {top_k, last_n} i32.
-        // #83: ln(min_p) is computed HERE, once, so the device adds the same
-        // threshold constant the host sampler adds. #84: repeat/freq/last_n -
-        // last_n clamped to the ring's depth, as both parse doors already do.
-        let mut pb = [0u8; 36];
-        pb[0..4].copy_from_slice(&s.temperature.to_le_bytes());
-        pb[4..8].copy_from_slice(&s.top_p.to_le_bytes());
-        pb[8..12].copy_from_slice(&s.presence_penalty.to_le_bytes());
-        pb[12..16].copy_from_slice(&(s.top_k as i32).to_le_bytes());
-        pb[16..20].copy_from_slice(&s.min_p.to_le_bytes());
-        pb[20..24].copy_from_slice(&s.ln_min_p().to_le_bytes());
-        pb[24..28].copy_from_slice(&s.repeat_penalty.to_le_bytes());
-        pb[28..32].copy_from_slice(&s.frequency_penalty.to_le_bytes());
-        pb[32..36].copy_from_slice(&(s.penalty_last_n.min(SAMPLE_RING_MAX) as i32).to_le_bytes());
-        cuda::upload_into(ds.params, &pb);
-        // #84: the windowed penalties' device twin, seeded per request like
-        // the mask: counts[V] u16 from the sampler's window counts, and the
-        // ring {head, fill, ids} from its prompt-tail ids (oldest first).
-        // A not-armed sampler uploads zeros - `sample_k` will not touch them.
-        let mut cb = vec![0u8; 2 * self.d.v];
-        if s.win_armed() {
-            for (tok, c) in s.win_counts_nonzero() {
-                cb[tok * 2..tok * 2 + 2].copy_from_slice(&c.to_le_bytes());
-            }
-        }
-        cuda::upload_into(ds.counts, &cb);
-        let lastn = s.penalty_last_n.min(SAMPLE_RING_MAX);
-        let mut rb = vec![0u8; (2 + SAMPLE_RING_MAX) * 4];
-        if s.win_armed() && lastn > 0 {
-            let ids: Vec<u32> = s.win_ids().collect();
-            let fill = ids.len().min(lastn);
-            // the tail of the window (a clamped last_n may hold fewer ids
-            // than the sampler does), oldest first; head = fill % lastn is
-            // the next write slot exactly as `sample_k`'s accept advances it
-            let head = (fill % lastn) as i32;
-            rb[0..4].copy_from_slice(&head.to_le_bytes());
-            rb[4..8].copy_from_slice(&(fill as i32).to_le_bytes());
-            for (j, &t) in ids[ids.len() - fill..].iter().enumerate() {
-                rb[8 + j * 4..12 + j * 4].copy_from_slice(&(t as i32).to_le_bytes());
-            }
-        }
-        cuda::upload_into(ds.ring, &rb);
-        cuda::sync();
-        // invariant: in_graph is true only while the CURRENT decode graph carries the
-        // sampler node; arming re-arms for the next capture, so clear it here
-        ds.in_graph.set(false);
+        // crow-nest #215: the uploads are `arm_dev_sampler`, the one copy glm5_next shares
+        arm_dev_sampler(ds, s, self.d.v);
     }
 
     unsafe fn launch_sample(&self, ds: &DevSampler) {
@@ -6041,15 +6111,7 @@ impl Engine {
     /// `launch_sample` on the logits row `logits` into the i32 slot `out` (crow-nest #95: the
     /// verify's rows; the kernels are the decode's, only the two pointers move)
     unsafe fn launch_sample_at(&self, ds: &DevSampler, logits: Dev, out: Dev) {
-        // v2: 64 blocks pick their slice's top-k, one block merges and draws.
-        // #84: counts rides stage 1 (the windowed penalties bite on the raw
-        // logits), counts+ring ride stage 2 (the post-draw accept).
-        launch_v(self.k.f("sample_topk_part"), SAMPLE_PARTS, 1, 1, SAMPLE_THREADS, &[
-            logits, self.p.n_vocab, ds.mask, ds.counts,
-            ds.params, ds.cand_v, ds.cand_i]);
-        launch_v(self.k.f("sample_k"), 1, 1, 1, SAMPLE_THREADS, &[
-            ds.cand_v, ds.cand_i, out, self.p.n_vocab,
-            ds.mask, ds.counts, ds.ring, ds.rng, ds.params]);
+        launch_dev_sampler(&self.k, ds, logits, out, self.p.n_vocab);
     }
 
     /// #20: draw a token from the logits row currently in `s.logits` (the last
@@ -7103,5 +7165,25 @@ mod tests_lock_pid_reuse {
         assert!(super::is_engine_image(""), "a failed query stays on the safe side");
         assert!(!super::is_engine_image("conhost.exe"));
         assert!(!super::is_engine_image("cmd.exe"));
+    }
+}
+
+#[cfg(test)]
+mod tests_215_params {
+    //! crow-nest #215: the one copy of `sample_k`'s params block (Qwen's and glm5_next's arming)
+    use super::*;
+
+    #[test]
+    fn the_params_block_carries_glms_row_in_sample_ks_layout() {
+        let mut s = crate::sample::Sampler::new(1408639702);
+        (s.temperature, s.top_p, s.top_k, s.min_p, s.presence_penalty) = (1.0, 0.95, 20, 0.01, 0.0);
+        s.penalty_last_n = 5000;
+        let pb = sampler_params(&s);
+        let f = |i: usize| f32::from_le_bytes(pb[4 * i..4 * i + 4].try_into().unwrap());
+        let n = |i: usize| i32::from_le_bytes(pb[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!((f(0), f(1), f(2), n(3), f(4)), (1.0, 0.95, 0.0, 20, 0.01));
+        assert_eq!(f(5).to_bits(), s.ln_min_p().to_bits(), "ln(min_p) is the host's constant");
+        assert_eq!((f(6), f(7)), (1.0, 0.0));
+        assert_eq!(n(8), SAMPLE_RING_MAX as i32, "last_n clamped to the ring");
     }
 }
