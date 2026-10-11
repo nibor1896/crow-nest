@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Added
+
+- **The glm5_next KV can be mapped as the context grows, default off** (#214, 2026-10-11): `CROW_GLM_KV_LAZY=<rows>` reserves the MLA latent and DSA indexer caches for the whole context but maps physical VRAM (CUDA VMM, 2 MiB granules) only for `<rows>` rows at boot and more as a conversation grows; the elastic arena hands back what each growth takes, and serve's reset and rollback unmap down to the floor. At context 200,000 the boot KV goes from 3,383,600,000 B to 92,274,688 B at 4,096 rows (host arithmetic); the difference is free VRAM the elastic expert arena takes until the context needs it. The plan still books the full KV; the boot is refused by name unless the elastic part + free VRAM above the reserve hold the unmapped KV. serve refuses the switch with `CROW_GLM_MTP`, `CROW_GLM_LA` and `CROW_GLM_MAX_BATCH` above 1 and logs a `[chat] KV lazy (#214)` line with the VRAM slots after each request. `glm5_run --kv-rows N|context` holds serve's KV for a like-for-like arm. Not measured yet: VRAM slots, decode ms/token, G4 and greedy identity on the RTX 5090 are #214's acceptance.
+
 ### Fixed
 
 - **Converter tests no longer depend on the build machine's free disk** (#212, 2026-10-11): the MUL1 tests answer the converter's disk check with a fixed volume (16 GiB reserve + 1 GiB) instead of asking the temp drive, so `cargo test --release` in `converter/` no longer fails below 16 GiB free: 95 passed, 8 failed -> 105 passed, 0 failed, 1 ignored with C: at 11.4 GiB free. The conversion itself is unchanged: it still reads the real volume and refuses below bytes to write + `--disk-reserve-gib` (default 16); a new test pins that boundary to the byte.

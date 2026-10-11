@@ -266,7 +266,7 @@ cd engine
 CARGO_BUILD_JOBS=4 cargo build --release --bin glm5_run
 target/release/glm5_run -n 16 [--cnq PATH] [--ids a,b,c | --prompt TEXT --tokenizer tokenizer.json | --prompt-ids PATH]
                         [--prompt-tokens N] [--reps N] [--cold] [--json PATH]
-                        [--vram-slots N] [--pinned-slots N] [--readers N]
+                        [--vram-slots N] [--pinned-slots N] [--readers N] [--kv-rows N|context]
 ```
 
 Without `--ids` / `--prompt` / `--prompt-ids` the prompt is the tokenizer golden `sys_user_default`
@@ -289,6 +289,7 @@ counters are host integers in `serve`, the clocks sit behind syncs the path alre
 | `--prompt-tokens N` | the base prompt (golden, `--ids`, `--prompt` or `--prompt-ids`) repeated cyclically and cut to N ids: synthetic, deterministic, chat markers repeat |
 | `--prompt-ids PATH` | ids from a file, separated by commas, blanks or newlines (`[ ]` ignored) |
 | `--json PATH` | everything below per rep, phase and MoE layer, plus args, `CROW_*` env, machine state, setup times; rewritten after every rep |
+| `--kv-rows N` / `context` | #214: the MLA / DSA caches and the plan's rows hold N rows (at least prompt + `-n`, at most `CROW_CONTEXT`) instead of prompt + `-n`, so the run holds the KV serve holds at its context; `context` = `CROW_CONTEXT`. With `CROW_GLM_KV_LAZY` only the floor is mapped at boot (`docs/env.md`). The JSON gets `kv` only with this flag or the switch |
 
 **Phases.** Prefill = the prompt rows; the last prompt row runs the head and yields the first id.
 Decode = every later row, one generated id each (`-n N` gives N - 1 decode rows). With
