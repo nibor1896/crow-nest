@@ -843,6 +843,10 @@ pub struct Glm5Pass {
     /// `CROW_GLM_CONTROLLER=1` (set by `Glm5Run`): while `active`, a decode call's MoE layer hands
     /// its routing to the controller's ring and waits for the reply on the device
     pub ctl: Option<crate::glm5_flags::Ctl>,
+    /// crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`, set by `Glm5Run` around one KDA layer's prompt
+    /// call): `(row of the call, S, conv)`: the KDA scan is cut at that row and the state there
+    /// copied D2D (`glm5_kda::prompt_rows_cut_with`); `None` = no cut
+    pub kda_cut: Option<(usize, Dev, Dev)>,
 }
 
 impl Glm5Pass {
@@ -899,6 +903,7 @@ impl Glm5Pass {
             routed: None,
             overlap: false,
             ctl: None,
+            kda_cut: None,
             kn,
         }
     }
@@ -953,7 +958,7 @@ impl Glm5Pass {
                 } else if decode {
                     glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, self.sub, &mut proj);
                 } else {
-                    glm5_kda::prompt_rows_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj);
+                    glm5_kda::prompt_rows_cut_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, &mut proj, self.kda_cut);
                 }
             }
             AttnW::Mla(a) => {

@@ -62,6 +62,10 @@ glm5_kda::step(&kk, &w, &st, &sc, x, out);                      // one decode ro
   `glm5_gemv_fp4_x3` launch; `w.qkv`, `w.o_proj`
   unused, 0). `KdaKernels::with_base` takes the
   one shared glm5 `KERNEL_SRC` module instead of compiling its own.
+- crow-nest #217 (`CROW_GLM_PREFIX_ANCHOR`): `prompt_rows_cut_with` is `prompt_rows_with` with the
+  sub-blocks cut at one row of the call and the state there (S and the conv window) copied D2D;
+  serve's prefix anchor is taken this way inside the prompt's own calls. Not run on the GPU yet:
+  `kda_gpu_a_cut_scan_is_the_scan` checks the cut scan against the uncut one bit for bit.
 
 ## 3. Goldens and tests
 
@@ -87,6 +91,7 @@ tensor; the Rust generator matches all 14.
 | `glm5_kda::tests_gpu::kda_gpu_gate_and_recurrence_match_the_f64_reference` | yes | `kda_gate` and 6 tokens of the recurrence (non-zero start state) against f64; persist = step bits |
 | `glm5_kda::tests_gpu::kda_gpu_layer_matches_the_hf_golden` | yes | G3: prompt in one call + 8 decode steps |
 | `glm5_kda::tests_gpu::kda_gpu_chunked_prompt_matches_the_hf_golden` | yes | G3 with the prompt in calls of 40 + 2 + 54, and against the engine's one-call run |
+| `glm5_kda::tests_gpu::kda_gpu_a_cut_scan_is_the_scan` | yes | #217 A4: 96 rows on a scratch of 32 cut at 45: outputs, final S and conv window bit-identical to the uncut scan; the copy at the cut = the state after 45 rows |
 
 ```
 cargo test --release --lib glm5_kda                                    # host tests

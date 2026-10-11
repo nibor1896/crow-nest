@@ -550,6 +550,12 @@ impl ChatTokenizer {
             .is_some_and(|t| t.special)
     }
 
+    /// - crow-nest #219: is `id` an added token, special or not (`<think>`, `</think>`,
+    ///   `<tool_call>`, `<|observation|>`, ...)? A realign never lets text stand in for one
+    pub fn is_added(&self, id: u32) -> bool {
+        self.tok.get_added_vocabulary().get_added_tokens_decoder().contains_key(&id)
+    }
+
     /// - #91: the exact bytes ONE id stands for, the `bytes` of an OpenAI logprobs entry
     /// - an added token (`<tool_call>`, `<|im_end|>`, ...) is its content, verbatim: the
     ///   decoder emits added tokens as their content, special or not
