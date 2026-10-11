@@ -183,3 +183,28 @@ Written on crow-nest `e476bd6` before the re-run of step 3 exists. Seen when wri
 Written on crow-nest `ed18b8d` before any G1 routing row exists (step 8 not started). Seen when written: both step-3 runs. `20261008T001819Z` (valid): medians 6.994 / 9.765 / 7.811 GB/s at 1 / 2 / 4 readers, spreads 1.003 / 1.232 / 1.430. `20261008T075202Z` (VOID, foreign reads 4.8 > 4.0 MB/s): medians 8.556 / 7.963 / 8.014 GB/s, spreads 1.003 / 1.613 / 1.401, drive 59 → 79 °C. Neither run gives a B under step 3's statistic, because the best reader count's spread exceeds 1.15 each time; 1 reader is flat in both runs, 2 and 4 readers fall within the run (throttling suspected, not measured). robin (2026-10-08): the disk is never idle in practice, and its peak rates are known.
 
 **Decision (robin, 2026-10-08):** B for G1 = **6.994 GB/s**, the 1-reader median of the valid run `20261008T001819Z` (spread 1.003 ≤ 1.15). The reader count binding for step 14 is 1. For G1 this replaces step 3's "median at the best reader count" by "the 1-reader median of the valid run"; the robustness limit 1.15 and every G1 threshold are unchanged. Derived as in that run's table: m* = B / 190.3 = 3.68 %, prefill bound 39.9 × B = 279 tok/s. No further step-3 run is made for G1.
+
+### Amendment 6 — 2026-10-11: no Flash-Next arm in G5 and G6 (crow-nest #151, #152)
+
+Written 2026-10-11 on crow-nest `36b0d9d` (branch `g56-prereg`), before any G5 or G6 row exists. Seen when written: no Crow-window turn and no ten-task run of GLM-5.3-Flash; the GLM speed rows so far are `glm5_run` and `serve` script rows (GLM measurement book, table A; `docs/measurements.md`), which G5 does not count. No Flash-Next row was taken for this series. Nothing below touches G1–G4, G1d (`PREREG-dyn.md`) or any recorded result.
+
+**Reason.** robin, 2026-10-10: GLM-5.3-Flash is accepted like a first model, no Flash-Next comparison.
+
+**Form.** This removes the criteria whose only reference was the Flash-Next arm, on the owner's word and before the first row of either gate (the form of amendment 5, and of robin's 2026-10-08 decision on #152 to adapt G6 by amendment). It sets no new threshold and changes no remaining one.
+
+**What changes.**
+1. **"Fixed for the whole series", line "Comparison arms":** Flash-Next is no arm of G5 or G6. The dense 27B stays what G6 made it: a further arm, reported, no threshold, never in the verdict; it depended on no Flash-Next row and is kept. The sentence on `--scales` that names "the Flash-Next comparison arm" stays as the record of why the recipe was chosen.
+2. **G5.** Question: is decode on Crow's real path fast enough? Data: ≥ 5 real agent turns at 7–10k context in the window and the synthetic cold 31,979-token turn over 3 boots, GLM only; no Flash-Next turns and no order Flash-Next → GLM → Flash-Next. Thresholds that stand unchanged (all must hold): decode median ≥ 40 tok/s in the window (target 60, not a gate); cold prefill at ~32k ≥ 150 tok/s; spread max/min ≤ 1.15 over the 3 boots. **Removed:** "wall clock per task ≤ 2.0 × Flash-Next the same day". Wall clock per task is still recorded per turn, without a threshold. Metric, robustness, consequence and the < 5 tok/s rule are unchanged.
+3. **G6.** Question: is GLM-5.3-Flash good enough on the ten-task run, graded blind? Method, wire body, n ≥ 3 runs, blind grading by robin and the separate report of tasks 5, 7, 8 are unchanged; there is no Flash-Next arm and no order Flash-Next → GLM → Flash-Next. **Removed:** Q1 (median correct ≥ Flash-Next), Q2 (tokens per answer ≤ 1.5 × Flash-Next), Q3 (`length` count ≤ Flash-Next); each was defined only against Flash-Next. Q4's control arm (same engine, 4 instead of 8 active experts) stays in the series; its condition "breaks at least one of Q1–Q3" has no Q1–Q3 left and is open (below).
+   What G6 compares against from now on, as far as the existing documents already fix it without Flash-Next:
+   - each GLM answer against its task's own core requirements, graded pass / partial / fail by the rules of `docs/ten-task-expected.md` §1–2, final acceptance per task by robin (§5); `finish_reason length` stays undecided as written above;
+   - robin's rule of 2026-10-08 (#152, #166): a failed task is judged by its kind of error, and a gross error disqualifies however many tasks pass. **Fixed now: zero S1** (#166 severity class S1) in the GLM arm;
+   - the 4-of-8 control arm and the 27B arm (reported), as above.
+   Until the open points below are answered by a further amendment, G6 can be judged failed (an S1) but not passed, and no G6 row is taken (#152: the #166 adaptation is due before step 17 starts).
+
+**Open for robin (before the first G6 row):**
+1. G6 bar for correct tasks: with Q1 gone, what minimum of correct tasks (median over the runs) counts as good enough, if any?
+2. Tokens per answer and `length` aborts had Flash-Next as their reference: drop them, set absolute bars, or make the 27B (today reported only) their reference?
+3. Control arm: what must the 4-of-8 arm break for G6 to count as answered (an S1, or the bar of point 1)?
+4. #166 adaptation: k, the mild control, the process-error factor over the A/A arm, and #166's open S1 question (does an S1 still disqualify if the A/A arm shows the same S1 on the same task?).
+5. G5 wall clock per task: no threshold, or an absolute bar per task?
