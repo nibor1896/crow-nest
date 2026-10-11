@@ -55,7 +55,7 @@ $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe -
 
 **Linux engine without building**: no Linux package at the moment (the v0.9.0 tarball carried NVRTC and is withdrawn); build from source as above, then `tools/fetch-nvrtc.sh --target engine/target/release`.
 
-**GLM-5.3-Flash, measurement only** (3-bit container built locally: [download](docs/glm-download.md), [conversion](docs/glm-mul1-conversion.md); operating set [`arm4.env`](runs/glm53-flash/quick/README.md))
+**GLM-5.3-Flash**, Crow's third operating point (3-bit container: [download](docs/glm-download.md), [conversion](docs/glm-mul1-conversion.md); operating set [`arm4.env`](runs/glm53-flash/quick/README.md))
 
 ```bash
 cd engine && cargo build --release --bin glm5_run && cd ..
