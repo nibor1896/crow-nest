@@ -621,6 +621,7 @@ use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::glm5_engine::{self, Glm5Device, Glm5Engine, Rows};
 use crow_nest_engine::glm5_template;
+use crow_nest_engine::glm5_tiers::CopyCounts;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, resolve_default, Family, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
 use crow_nest_engine::sample::{pos_logprobs, PosLogprobs, Sampler, MAX_TOP_LOGPROBS};
@@ -6012,6 +6013,28 @@ struct GlmSrv<'a, R: Rows> {
     book: std::sync::Mutex<GlmBook>,
 }
 
+/// #30 A8 for glm5_next: the `[chat] counters` line. The cumulative figures since boot (never
+/// reset): expert accesses per tier, NVMe bytes, #222 the H2D and D2H record copy bytes and the
+/// `CROW_GLM_TIERS=unified` refusals; then this request's pinned hit rate (pinned-served share of
+/// its expert accesses) and D2H bytes, the difference to what the previous request left (`prev`,
+/// `prev_copies`). The leading `expert accesses ... NVMe bytes N` text is unchanged (#215 harness).
+fn glm_counters_line(acc: [u64; 3], nvme_bytes: u64, c: CopyCounts, prev: [u64; 3], pc: CopyCounts, layers: usize, ms: f64) -> String {
+    let d: Vec<u64> = (0..3).map(|i| acc[i].saturating_sub(prev[i])).collect();
+    let n = d[0] + d[1] + d[2];
+    let hit = if n == 0 { 0.0 } else { 100.0 * d[1] as f64 / n as f64 };
+    format!(
+        "[chat] counters (cumulative, never reset): expert accesses vram {} pinned {} nvme {}, NVMe bytes {nvme_bytes}, H2D bytes {}, D2H bytes {}, unified pinned refused {} write-backs filtered {}, layers {layers}, counter read {ms:.3} ms; this request: pinned hit {hit:.1} % of {n} expert accesses, D2H bytes {}",
+        acc[0],
+        acc[1],
+        acc[2],
+        c.h2d_bytes,
+        c.d2h_bytes,
+        c.pin_refused,
+        c.wb_filtered,
+        c.d2h_bytes.saturating_sub(pc.d2h_bytes)
+    )
+}
+
 /// - #185 part 2: what the requests of a glm5_next process share; `CROW_GLM_MAX_BATCH`: they
 ///   run on threads of their own, so the book sits behind a lock taken at the start and the end
 ///   of a request only
@@ -6021,20 +6044,22 @@ struct GlmBook {
     /// #13: the cumulative `[vram, pinned, nvme]` expert accesses and NVMe bytes the previous
     /// request left, so the routing line of one request is a difference
     prev_counters: ([u64; 3], u64),
+    /// #222: the cumulative record copies the previous request left (the request's D2H bytes)
+    prev_copies: CopyCounts,
     /// #68: the cross-turn repeat counter's ring
     repeats: RepeatRing,
 }
 
 impl GlmBook {
-    fn new(prev_counters: ([u64; 3], u64)) -> GlmBook {
-        GlmBook { seq: 0, prev_counters, repeats: RepeatRing::default() }
+    fn new(prev_counters: ([u64; 3], u64), prev_copies: CopyCounts) -> GlmBook {
+        GlmBook { seq: 0, prev_counters, prev_copies, repeats: RepeatRing::default() }
     }
 }
 
 impl<'a, R: Rows> GlmSrv<'a, R> {
     fn new(eng: &'a mut Glm5Engine<R>, model_path: &'a str) -> Self {
         let n_ctx = eng.n_ctx();
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let markup = ServeEngine::markup(&*eng);
         GlmSrv { eng, markup, model_path, n_ctx, stream_head_sent: false, book }
     }
@@ -6068,6 +6093,8 @@ trait GlmSeq {
     unsafe fn decode_step(&mut self, id: i64) -> Result<i64, String>;
     /// the cumulative expert tier counters and NVMe bytes since boot
     fn counters(&mut self) -> ([u64; 3], u64);
+    /// #222: the cumulative expert record copies (H2D, D2H) and unified-tier refusals since boot
+    fn copy_counts(&mut self) -> CopyCounts;
     /// decoder layers (`crow_layers`)
     fn layers(&self) -> usize;
     /// crow-nest #215: why this sequence's sampled ids cannot be drawn by the device sampler
@@ -6122,6 +6149,9 @@ impl<R: Rows> GlmSeq for Glm5Engine<R> {
     }
     fn counters(&mut self) -> ([u64; 3], u64) {
         Glm5Engine::counters(self)
+    }
+    fn copy_counts(&mut self) -> CopyCounts {
+        Glm5Engine::copy_counts(self)
     }
     fn layers(&self) -> usize {
         Glm5Engine::layers(self)
@@ -6255,6 +6285,8 @@ enum GlmCmd {
     /// batched step that carried it
     Decode { slot: usize, id: i64, reply: std::sync::mpsc::Sender<Result<i64, GlmFail>> },
     Counters { reply: std::sync::mpsc::Sender<([u64; 3], u64)> },
+    /// #222: the record copies and unified-tier refusals ([`CopyCounts`])
+    Copies { reply: std::sync::mpsc::Sender<CopyCounts> },
     /// `/slots`: the furthest prompt snapshot of any slot
     SnapPos { reply: std::sync::mpsc::Sender<Option<usize>> },
     /// the request is done with its slot (its ids and snapshot stay for the next prompt)
@@ -6334,6 +6366,9 @@ impl GlmSeq for GlmSlotSeq {
     }
     fn counters(&mut self) -> ([u64; 3], u64) {
         self.ask(|reply| GlmCmd::Counters { reply }).unwrap_or_default()
+    }
+    fn copy_counts(&mut self) -> CopyCounts {
+        self.ask(|reply| GlmCmd::Copies { reply }).unwrap_or_default()
     }
     fn layers(&self) -> usize {
         self.layers
@@ -6428,6 +6463,9 @@ fn glm_schedule<R: Rows>(eng: &mut Glm5Engine<R>, rx: std::sync::mpsc::Receiver<
                 }
                 GlmCmd::Counters { reply } => {
                     let _ = reply.send(eng.counters());
+                }
+                GlmCmd::Copies { reply } => {
+                    let _ = reply.send(eng.copy_counts());
                 }
                 GlmCmd::SnapPos { reply } => {
                     let _ = reply.send((0..n).filter_map(|s| eng.snapshot_pos_of(s)).max());
@@ -6761,7 +6799,7 @@ fn glm_batch_serve<R: Rows>(listener: TcpListener, eng: &mut Glm5Engine<R>, mode
         vocab: eng.vocab(),
         layers: eng.layers(),
         markup: ServeEngine::markup(&*eng),
-        book: std::sync::Mutex::new(GlmBook::new(eng.counters())),
+        book: std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts())),
     });
     {
         let tx = tx.clone();
@@ -7365,6 +7403,7 @@ fn glm_generate_on(
     // every access is a selection, an NVMe-served access is a cold one; no PLE
     let t_ctr = Instant::now();
     let (acc, nvme_bytes) = seq.counters();
+    let copies = seq.copy_counts();
     let selections_total = acc[0] + acc[1] + acc[2];
     let cold_total = acc[2];
     let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
@@ -7372,6 +7411,7 @@ fn glm_generate_on(
     let mut bk = book.lock().unwrap_or_else(|p| p.into_inner());
     let rep = bk.repeats.observe(&out, single_token_answer(gen, finish));
     let (prev, prev_bytes) = std::mem::replace(&mut bk.prev_counters, (acc, nvme_bytes));
+    let prev_copies = std::mem::replace(&mut bk.prev_copies, copies);
     drop(bk);
     if let Some(w) = loop_warning(&rep) {
         tracing::warn!(target: "chat", "{w}");
@@ -7409,9 +7449,7 @@ fn glm_generate_on(
         },
         repeat_note(&rep)
     );
-    tracing::info!(target: "chat",
-        "[chat] counters (cumulative, never reset): expert accesses vram {} pinned {} nvme {}, NVMe bytes {nvme_bytes}, layers {}, counter read {counters_ms:.3} ms",
-        acc[0], acc[1], acc[2], seq.layers());
+    tracing::info!(target: "chat", "{}", glm_counters_line(acc, nvme_bytes, copies, prev, prev_copies, seq.layers(), counters_ms));
     let d_sel = selections_total.saturating_sub(prev[0] + prev[1] + prev[2]);
     let d_cold = cold_total.saturating_sub(prev[2]);
     crow_nest_engine::log::routing(&crow_nest_engine::log::Routing {
@@ -9162,6 +9200,22 @@ mod tests {
         }
         // exactly fourteen keys: the nine of A5 plus the five of A8, nothing crept in
         assert_eq!(g.as_object().unwrap().len(), 14, "{g}");
+    }
+
+    /// #222: glm5_next's `[chat] counters` line carries the cumulative H2D / D2H copy bytes and the
+    /// unified tiers' refusals, and this request's pinned hit rate and D2H bytes (differences to
+    /// what the previous request left); the #215 harness's leading text is unchanged
+    #[test]
+    fn glm_counters_line_carries_the_pinned_hit_rate_and_d2h_bytes() {
+        let c = CopyCounts { h2d_bytes: 7_000, d2h_bytes: 5_000, pin_refused: 3, wb_filtered: 2 };
+        let pc = CopyCounts { d2h_bytes: 1_000, ..CopyCounts::default() };
+        let l = glm_counters_line([150, 60, 30], 9_474_048, c, [100, 30, 20], pc, 92, 0.25);
+        assert!(l.starts_with("[chat] counters (cumulative, never reset): expert accesses vram 150 pinned 60 nvme 30, NVMe bytes 9474048, "), "{l}");
+        assert!(l.contains("H2D bytes 7000, D2H bytes 5000, unified pinned refused 3 write-backs filtered 2"), "{l}");
+        // this request: 50 + 30 + 10 accesses, 30 from pinned
+        assert!(l.ends_with("; this request: pinned hit 33.3 % of 90 expert accesses, D2H bytes 4000"), "{l}");
+        let first = glm_counters_line([0; 3], 0, CopyCounts::default(), [0; 3], CopyCounts::default(), 92, 0.0);
+        assert!(first.contains("pinned hit 0.0 % of 0 expert accesses, D2H bytes 0"), "{first}");
     }
 
     /// #30 A8: cumulative means the builder never subtracts and never resets
@@ -11931,7 +11985,7 @@ Red is #FF0000."), "{off}");
         let cands = glm_fake(&tk, 4096).cands;
         let mut eng = Glm5Engine::new(FakeRows::with_slots(4096, GLM_VOCAB, cands, 4), true);
         assert_eq!(eng.slots(), 4);
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let got = glm_batch_wave(&mut eng, &book, &tk, &bodies);
         let mut slots: Vec<usize> = got.iter().map(|g| g.3).collect();
         for (k, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -11968,7 +12022,7 @@ Red is #FF0000."), "{off}");
         let Some(tk) = glm_tk() else { return };
         let cands = glm_fake(&tk, 4096).cands;
         let mut eng = Glm5Engine::new(FakeRows::with_slots(4096, GLM_VOCAB, cands, 2), true);
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8 });
         let mut sse = doc.clone();
         sse["stream"] = serde_json::json!(true);
@@ -12225,7 +12279,7 @@ Red is #FF0000."), "{off}");
         }
         let Some(tk) = glm_tk() else { return };
         let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8 });
         let mut sse = doc.clone();
         sse["stream"] = serde_json::json!(true);
@@ -12273,7 +12327,7 @@ Red is #FF0000."), "{off}");
         }
         let Some(tk) = glm_tk() else { return };
         let mut eng = Glm5Engine::new(glm_fake(&tk, 4096), true);
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         // `crow_force_ids: []` forces nothing but reaches the debug `[chat] prompt ids` line
         let doc = serde_json::json!({ "messages": [{ "role": "user", "content": "hello" }], "temperature": 0, "max_tokens": 8,
             "crow_force_ids": [] });

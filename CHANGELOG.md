@@ -6,8 +6,13 @@
 
 ## Unreleased
 
+### Added
+
+- **The glm5_next expert tiers can run as one policy, default off** (#222, 2026-10-11): `CROW_GLM_TIERS=unified` (needs `CROW_GLM_ARENA=global` and `CROW_GLM_ARENA_FREQ=1`; refused with `CROW_GLM_ARENA_NOADMIT=1`) lets the frequency tiers' decayed routing count gate the pinned tier too. Today every NVMe miss lands in pinned and every VRAM victim is written back by D2H, cold ones included, whatever their count. With the switch an NVMe miss of a decode call enters pinned only into a free slot or above pinned's lowest count (else it is read through staging and evicts nothing), and a VRAM victim, including an elastic hand-back's (in score order), is written back only under the same rule (else it drops to the NVMe with no copy). VRAM admission stays the frequency tiers' 2x gate, so pinned hits are still read zero-copy and not copied up; `ADMIT_MAX`, the write-back ring and `STAGE_MIN` keep their defaults. Placement only. Host tests only; speed **not measured yet** (GPU A/B `arm4.env` vs `arm4.env` + `CROW_GLM_TIERS=unified` on serve, #222).
+
 ### Changed
 
+- **serve's glm5_next `[chat] counters` line carries the copy traffic and the pinned hit rate** (#222, 2026-10-11): after `NVMe bytes N` it now shows the cumulative `H2D bytes` (landing and pinned to staging copies; zero-copy reads not included), `D2H bytes` (VRAM-to-pinned write-backs, including elastic hand-backs) and the unified tiers' refusals, and ends with `this request: pinned hit P % of N expert accesses, D2H bytes D`. The leading text up to `NVMe bytes N` is unchanged, so the #215 harness's pattern still reads it. Logged for every glm5_next request, switch on or off.
 - **serve logs the generated token ids of every request at INFO** (#223, 2026-10-11): the `[chat] ids [...]` line (one per request, after the answer, never per token) was DEBUG since #13, so the default log (`CROW_LOG` unset = `info`) had none and #219 and #221 had to be reconstructed offline (#221: which token closed the think block is not measured). It is INFO again on every generation path: Flash-Next and the 27B (`chat_generate`) and glm5_next (`glm_generate_on`, one-sequence and `CROW_GLM_MAX_BATCH`); the text of the line is unchanged. The prompt ids stay DEBUG (`CROW_LOG=info,chat=debug`). Size (arithmetic, not measured): at most 8 bytes per id, about 8 KB for a 1,000-token answer; the rotation (`CROW_LOG_ROTATE_MB` x `CROW_LOG_KEEP`) bounds the total.
 
 ## 2026-10-11 — v0.12.0

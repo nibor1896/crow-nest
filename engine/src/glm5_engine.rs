@@ -180,6 +180,11 @@ pub trait Rows {
     /// cumulative `[vram, pinned, nvme]` expert accesses over every MoE layer, and the NVMe
     /// bytes read, since boot (never reset)
     fn counters(&self) -> ([u64; 3], u64);
+    /// #222: the expert record copies (H2D, D2H) and the unified tiers' refusals since boot
+    /// (default: none)
+    fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
+        crate::glm5_tiers::CopyCounts::default()
+    }
 
     /// `CROW_GLM_LA`: drop a row enqueued ahead (the state back to the last returned row);
     /// everything that reads or replaces the sequence's state calls this first
@@ -515,6 +520,9 @@ impl Rows for Glm5Device {
         // the tier each access was served from on either path (the global arena keeps its own)
         let a = self.tiers.tier_counters().iter().fold([0u64; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
         (a, self.tiers.nvme_bytes)
+    }
+    fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
+        self.tiers.copy_counts()
     }
     fn slots(&self) -> usize {
         self.run.slots()
@@ -861,6 +869,11 @@ impl<R: Rows> Glm5Engine<R> {
     /// cumulative `[vram, pinned, nvme]` expert accesses and NVMe bytes since boot
     pub fn counters(&self) -> ([u64; 3], u64) {
         self.rows.counters()
+    }
+
+    /// #222: the expert record copies (H2D, D2H) and the unified tiers' refusals since boot
+    pub fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
+        self.rows.copy_counts()
     }
 
     /// The detection rule of `serve` (spec 7.4, #100) for the one snapshot: `L` is the common
