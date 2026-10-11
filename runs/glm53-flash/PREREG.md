@@ -233,3 +233,91 @@ Written 2026-10-11 on crow-nest `16d24c8` (branch `g56-amend7`), before any G5 o
 - Not adopted: the rest of #166 (stage 1 KLD, which #166 skips across tokenizers; 20–40 Crow tasks with tools; the CI/margin rule, which point 3 replaces). G6's method stays as amendment 6 left it.
 
 Amendment 6's open points 1–5 are closed by this amendment; G5 and G6 rows may be taken.
+
+### Amendment 8 — 2026-10-11: the G5 turn set, the per-turn record and the run order (crow-nest #151)
+
+Written 2026-10-11 on crow-nest `4bcda60` (branch `g5-tasks`), before any G5 row exists. Seen when written: what amendment 7 saw; since then no Crow-window turn and no G5 boot. GLM `serve` rows seen: the G4 series (`runs/glm53-flash/g3g4-20261011/`, local, not in git: 10 boots, one cold turn of `prompt-33k.txt` each, GLM `prompt_n` 30,986, arm3.env) and that day's serve session (unrelated requests, all COLD; #151 comment of 2026-10-11). Reason: #151 "Proposed fix" 1 asks for the ≥ 5 agent tasks with text, target folder and sha256 fixed in this file, which G5's data clause names but does not fix; the #151 comment of 2026-10-11 adds the prefix-cache record (robin promised its live check publicly). No threshold changes; G5's bars are amendment 7's. Points marked **lead's decision** can be overruled by robin by a further amendment before the first G5 row.
+
+**Language:** English, the language robin types his own Crow tasks in on this machine (the 2026-10-06 sessions under `%LOCALAPPDATA%\Crow\session\`).
+
+**Sources checked for reuse; none fits (empty folder, several tool rounds, 7–10k):**
+- G6's ten tasks (`docs/ten-task-expected.md`, `docs/ten-task-prompts-crowlab.json`): not used. G6 is graded blind by robin; typing its prompts into the window would show him GLM's answers to them before the blind grading. They are also single-turn prompts that the harness sends without tools.
+- The 2026-10-06 todo CLI (robin's typed text in `chat-20261006-165103.json`; the task of the Flash-Next live run `crow-lab/runs/fn-crow-task-win-20261006`): it runs far past the band (Flash-Next: 52 requests, final context 58,519 tokens), and it is G1's held-out file. Not used. Its form (build in "this folder", test, fix until green) is the model for the texts below, and t2 takes its clause "Run the tests and fix every failure until everything is green." verbatim.
+- Crow `docs/acceptance/issue-207.md` (robin's live tests, 2026-09-21): Tests 1 and 2 search an existing repository, so the folder cannot be empty; Test 1b is a 500 MB output bomb, not a task. Not used.
+- `chat-20261006-170158.json`, "how many files are in this folder + subfolder?": one tool round in an empty folder. Not used.
+- The four calibration tasks of amendment 1: not used, because arm4.env's `CROW_GLM_ARENA_WARM` is cut from their routing (`arena-warm/glm53-cal4-decode-counts.json`, `_source`), and a task from them would flatter decode.
+
+The five texts are therefore new, written for this amendment. None shares a task with G6, the G1 corpus or the arena warm set.
+
+**Tasks.** Typed in this order, each in a new chat in its own fresh, empty folder `C:\Users\robin\Desktop\g5-run<k>\<id>` (k = 1 for the first session; a repeated session takes the next k and never reuses a folder). The texts name no path, so the hashes do not depend on k. sha256 is taken over the exact text between the fences, UTF-8, no trailing newline.
+
+1. `t1-wordfreq`: word-frequency script on a sample file. 291 B, sha256 `3d7116ca612053248535aa51ad427c1dee390f5d3575850b0e1148204db7a32a`
+   ```text
+   Create a sample text file in this folder with about ten lines of English prose. Then write a Python script wordfreq.py that prints the ten most frequent words of the text file given as its argument, case-insensitive and ignoring punctuation. Run it on the sample file and show me the output.
+   ```
+2. `t2-roman`: Roman numerals with tests, fix until green. 299 B, sha256 `760946570c4363a97021603df30c852f33d16e8b43c8a7765a14151fba691c3c`
+   ```text
+   Write roman.py in this folder with a function to_roman(n) for 1 to 3999 and a function from_roman(s) that reverses it. Add unittest tests in test_roman.py with at least ten cases, including a round trip over every number from 1 to 3999. Run the tests and fix every failure until everything is green.
+   ```
+3. `t3-inventory`: CSV data and a report script. 258 B, sha256 `31834d40c99ebd064b8499fb397814ea33a6a08d1ba6c1bf5dcafa616b581c06`
+   ```text
+   Create inventory.csv in this folder with twelve rows of name, quantity and unit price. Then write report.py that reads it and prints the total stock value and the three items with the highest value (quantity times unit price). Run it and tell me the numbers.
+   ```
+4. `t4-units`: command-line unit converter with an error path. 308 B, sha256 `238052922297f4b9e46936e7c176070888a8e2d6157ca12b00079c96b5f1a2a5`
+   ```text
+   Write units.py in this folder, a command-line converter between metres, kilometres, feet and miles (units m, km, ft, mi), used like this: python units.py 5 km mi. An unknown unit must print a clear error and exit with code 1. Try three conversions and one unknown unit, and show me what it printed each time.
+   ```
+5. `t5-stats`: hand-written statistics checked against the standard library. 319 B, sha256 `ac02f0a2682e92c15267c8b927a693ea3d153f3124b9144f90d7ab39ccd0f39f`
+   ```text
+   Write mystats.py in this folder with mean, median and sample standard deviation, implemented by hand without the statistics module. Then write check.py that compares all three against Python's statistics module on five random lists and prints for each whether they agree within 1e-9. Run check.py and report the result.
+   ```
+
+**What a turn is and what counts (lead's decision, the reading of G5's "turns at 7–10k context").**
+- A row is one request Crow sends to `serve`, i.e. one round. A task (one typed line) is one G5 turn. Its rounds are the requests from the typed line to the end of Crow's turn; Crow's turn line ("N rounds") gives N. Any other request (Crow's memory review, a digest, a title) is a side row: recorded and labelled, never counted.
+- A row's depth is its rendered prompt, `P` in `[chat] prompt P tok`. A row is in band at 7,000 ≤ P ≤ 10,000.
+- A task's decode tok/s = Σ `predicted_n` / Σ `predicted_ms` over its in-band rows. This is Crow's turn-line formula (`cli/crow_core.py:7412-7417`, Crow `d2a7d0b`) restricted to the band. The G5 decode median is the median over the tasks with ≥ 1 in-band row. G5 needs ≥ 5 such tasks; with fewer, the window part of G5 is "not answered" (abort rules), and new tasks come only by a further amendment before their run. Reported beside it, not judged: Crow's turn line over all rounds of each task, and the median over all in-band rows.
+- Expected depth, derived and not measured. Flash-Next's first Crow round on 2026-10-06 was 7,259 tokens (`crow-lab/runs/fn-crow-task-win-20261006/serve-8099.log`, Crow 3.2.4). GLM's tokenizer counts `prompt-33k.txt` 3.1 % shorter (30,986 vs 31,979). So a first round near 7.0k, which may fall just under the band; the later rounds carry it. Rows above 10,000 are recorded and not counted.
+
+**Per-row record** (#151 "Proposed fix" 3 and its 2026-10-11 comment). Sources: serve's stderr log of the session and its routing JSON lines.
+- Task id, round index, side-row flag, end time (routing JSON `ts`).
+- `prompt_n` = P, the whole rendered prompt (the routing JSON's `prompt_n`; `usage.prompt_tokens` on the wire). `cached_n` = C (routing JSON `cached_n` = `usage.prompt_tokens_details.cached_tokens`). Prefilled F = P − C, which is what the wire's `timings.prompt_n` carries (`engine/src/bin/serve.rs:432`). The two `prompt_n` are named apart here so they are never mixed. Also C / P.
+- The `[cache]` line verbatim: WARM/COLD, L, held, P, snapshots, `prefill n of m tok`, reset ms.
+- Prefill tok/s = F / prefill ms, from the `[chat]` line. On a WARM row this is a small-batch figure (`serve.rs:453-454`) and is never compared with the cold ~32k figure.
+- Decode tok/s = `predicted_n` / `predicted_ms` (`[chat]` line, `timings.predicted_per_second`); `predicted_n`, finish, tool calls, malformed.
+- Wall clock per row = reset + prefill ms + decode ms from the `[chat]` line. Wall clock per task = Crow's turn line `waited`, with its model/tools split, beside the sum of its row walls.
+- m = `cold` / `selections` of the routing JSON line; `bytes_streamed` as logged. RAM/VRAM: `nvidia-smi` memory.used, Windows commit charge and available physical memory at the row's end, from a read-only sampler (period ≤ 5 s, started before t1, the G4 `CommitSampler` form).
+- The request as sent: serve's `[chat] sampling on the device` and `thinking` lines (which value came from the request, which from the data sheet). The row states that Crow sends GLM the floor, since GLM has no manifest entry (#151 Evidence).
+- Per task, reported with no threshold (the prefix-cache live check): rounds, in-band rows, WARM rows among rounds 2..N, and their mean C / P. Expected: rounds 2..N WARM. A COLD row among them is named with its `[cache]` line.
+
+**Run order: one day, one GPU lock window** (`C:\Users\robin\dev\.gpu-lock`, held from `mkdir` to `rmdir`, as `runs/glm53-flash/quick/bundle.sh`).
+1. Take the lock. No other GPU job and no other heavy disk job.
+2. One `serve` boot for all five tasks:
+   - binary built from crow-nest main at or after `732369c` (`CROW_GLM_KV_LAZY` needs it);
+   - `CROW_CNQ` = `converter\GLM-5.3-Flash-MUL1K3.cnq`, `CROW_TOKENIZER` = `models\GLM-5.3-Flash-original\tokenizer.json`;
+   - environment `runs/glm53-flash/quick/arm4.env` and nothing else;
+   - port 8099, `CROW_CONTEXT` unset (floor 200,000);
+   - stderr to `runs/glm53-flash/g5-<date>/serve-tasks.log`.
+3. t1 → t5 in the Crow window (robin's steps below).
+4. Close Crow and stop `serve` (taskkill while idle, #126; VRAM back under 3 GB).
+5. Synthetic row: 3 boots, one after another, each with one cold turn of `crow-lab/runs/2026-08-28-flash-next/prompt-33k.txt`:
+   - prompt: sha256 `62141cb4f43e4151c41bfbc0446821c42ec59509ffae2da8c5c47a9bca1bfcde`; 31,979 tokens with Flash-Next's tokenizer, 30,986 with GLM's in G4;
+   - setup: the same binary, container and arm4.env;
+   - request: G4's (`g4_run.py boots`: temperature 0, `max_tokens` 64, `reasoning_budget_tokens` 0, streamed with timings);
+   - recorded per boot: GLM `prompt_n`, prefill tok/s, 64-token decode tok/s, VRAM after the turn, commit peak, m.
+   - G5's cold prefill = the median of the 3. The 3-boot spread max/min ≤ 1.15 is read on that prefill figure (lead's decision; the boots measure it). The 64-token decode is reported.
+6. Release the lock (`rmdir`).
+
+A serve crash or a void session is a row. The session is then repeated in a new lock window with folders `g5-run<k+1>`; the first one stays in the book.
+
+**robin's steps.**
+1. Before you start: the lead has created the five empty folders `C:\Users\robin\Desktop\g5-run1\t1-wordfreq` … `t5-stats`, `serve` answers `/health`, and the sampler runs.
+2. In `C:\Users\robin\dev\Crow`, start Crow: `python cli\crow_gui.py --base-url http://127.0.0.1:8099/v1`. Leave the release level at `auto` (the default; nothing asks, so no approval wait enters the wall clock). Leave the model/reasoning chip as Crow offers it for this server, the same for all five tasks.
+3. For each task, in order t1 → t5:
+   1. Right-click the empty space of the chat rail, choose new project and pick the task's folder, then open a new chat in it. Before you type, check that the composer's working-directory chip shows that folder.
+   2. Paste the task text from its code block above and press Enter.
+   3. Type nothing else in that chat: no follow-up and no answer to a question. If the turn ends on a question, the task ends there.
+   4. Wait for the turn line (`N rounds | … tok @ X tok/s | … | waited …`) and for 30 s of quiet in serve's log, since Crow's memory review can still send a side request. Note the turn line or take a screenshot.
+   5. Go to the next task with a new project and a new chat. Never reuse a chat.
+4. After t5, close Crow and tell the lead. The lead stops `serve` and runs the 3 synthetic boots, with nobody at the window.
+
+After the session, the lead copies the five session files (`%LOCALAPPDATA%\Crow\session\chat-*.json`). For each task, the lead checks the first user message (trailing whitespace stripped) against its sha256. A task whose text differs is recorded and not counted.
