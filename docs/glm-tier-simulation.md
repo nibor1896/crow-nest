@@ -105,7 +105,7 @@ The shape is from `config.json` (rev `eb9eb208`): 42 MoE layers (3–44), 288 ro
 - **Leave-one-out.** For each file: cut on all the others, score its generated positions, at
   N ∈ {25, 31, 37}.
 - **Pinned traffic.** p × 190.3 GB/s at 40 tok/s, set against the staging ceilings 51.6 GB/s
-  (`stage_cold_ca` kernel, default; the device-issued ceiling, `docs/architecture.md:1414`) and 54.6 GB/s (copy
+  (`stage_cold_ca` kernel, default; the device-issued ceiling, `docs/architecture.md:1520`) and 54.6 GB/s (copy
   engine, opt-in). The old `stage_cold` kernel (31.5 GB/s) is the `CROW_STAGE_KERNEL=1` fallback. Also the per-token floor
   p × 4.756 GB / R + m × 4.756 GB / B. These are reported and have no threshold.
 - **G1.** At N = 25 and W = 0 the gate holds when the m CI upper bound ≤ m* = B / 190.3 and

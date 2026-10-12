@@ -28,8 +28,8 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 | run-to-run drift of a `serve` rate | 26 % (run 1 30.45, run 6 22.42 tok/s, identical ids) | n/a | n/a | RTX 5090 | 2026-09-10 | issue #38 |
 | run-to-run drift of a `serve` rate on Linux, three chains, one fresh process per run, ids identical per arm | absent: serve within-arm spread 1.0056 over 4 runs (mean 49.82 tok/s) and 1.0009 over 4 consecutive fresh loads (mean 49.86), the adjacent `decode run` arm 1.0012 (mean 39.83); rerun at the #61g default the same day, serve 1.0038 over 4 runs (mean 53.32) against the adjacent `decode run` arm's 1.0010 (mean 42.56); no chain monotonic in run index | n/a | n/a | RTX 5090, Arch Linux | 2026-09-18 | issue #38, `docs/measurement-coverage.md`, `tools/drift-chain.sh`, logs under `decode_out/38/` |
 | `serve` at the engine default of record, the chain form the #38 rule requires (4 counted serve runs, one fresh process each, an adjacent `decode run` arm in the same chain) | 53.32 tok/s mean, spread 1.0038, next to `decode run` 42.56 tok/s mean, spread 1.0010, ids `e7c17e064ea2` and `56305eee11d6` 4 of 4 each | n/a | the two arms are different operating points (N 149 / 142, chunk 2048 / 4096, trickle on / off), so the gap is not a delta | RTX 5090, Arch Linux | 2026-09-18 | issue #38 at HEAD `6c87054`, `decode_out/38/c3-sdsd-61g/chain.log`, `docs/architecture.md` 4.6.1 |
-| cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | n/a | n/a | RTX 5090 | 2026-09-10 | `docs/architecture.md:426` |
-| warm turn after the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % of the prompt reused | n/a | n/a | RTX 5090 | 2026-09-10 | issue #31, `docs/architecture.md:427` |
+| cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | n/a | n/a | RTX 5090 | 2026-09-10 | `docs/architecture.md:528` |
+| warm turn after the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % of the prompt reused | n/a | n/a | RTX 5090 | 2026-09-10 | issue #31, `docs/architecture.md:529` |
 | ten-task quality, sampled, six seeds | gate met in 1 of 6 seeds; 4 Pass / 37 Partial / 19 Fail of 60 answers | n/a | n/a | RTX 5090 | 2026-09-10 | issue #44 |
 | parity, 8 and 512 logit rows | byte-identical against the installed build `d211ab52ad2b` | n/a | n/a | RTX 5090 | 2026-09-10 | issue #43 |
 | decode operating point, t1-read 16,064 ids, 255 timed steps, engine default | 23.52 ms per token = 42.5 tok/s | 22.27 ms per token = 44.9 tok/s | crow-nest 1.06 x the llama.cpp ms per token | RTX 5090, Arch Linux | crow-nest 2026-09-18, llama.cpp 2026-09-11 | issue #61, 61g, `decode_out/61g/` and `decode_out/srv-59b.log` |
@@ -80,7 +80,7 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 
 ### Targets
 
-- Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:18-19`, `:57-58`).
+- Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:105-106`, `:144-145`).
 - Measured against the prefill target on Linux, 2026-09-17: 968 tok/s on the 16,064 id t1-read form (`decode run`, commit 1032bc5). The target names the 32k operating point, which has no Linux reading, so this is not the target met.
 - Measured against the decode target on Linux, 2026-09-18: 42.5 tok/s (23.52 ms per token) at context 16,320 on the same form, at the `CROW_ATTN_LUT` default of issue #61 (61g, commit `6c87054`). The target names a session filled to the 200,000 token floor, which has no Linux reading, so this is not the target met either.
 

@@ -1,14 +1,18 @@
 # Quick checks of GLM-5.3-Flash, 2026-10-10
 
 3-minute checks (`quick.sh`, robin 2026-10-10) on the RTX 5090, Windows 11, real container
-`C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq` (124,591,634,567 B), each arm one run (N=1):
+`<repo>/converter/GLM-5.3-Flash-MUL1K3.cnq` (124,591,634,567 B), each arm one run (N=1):
 
 - prefill: `glm5_run --cold --reps 1 --prompt-ids prefill8192.ids -n 4` (real text: the first 8,192 ids of the held-out
   `todo-1006` session) -> `<arm>/prefill.json`;
-- decode: `glm5_run --cold --reps 1 --prompt "Explain in detail how a modern CPU cache hierarchy works: ..." -n 128`
-  (57 prompt ids, 127 decode tokens) -> `<arm>/decode.json`.
+- decode: `glm5_run --cold --reps 1 --tokenizer <tokenizer.json> --prompt "Explain in detail how a modern CPU cache
+  hierarchy works: ..." -n 128` (57 prompt ids, 127 decode tokens) -> `<arm>/decode.json`.
 
-`bundle.sh` runs several arms back to back under `C:\Users\robin\dev\.gpu-lock`. Each JSON carries the build commit, the
+`quick.sh` runs both from `engine/` with `CROW_CNQ` and `CROW_TOKENIZER` set. By hand, run `glm5_run` from `engine/`
+(its default container `converter/GLM-5.3-Flash-MUL1K3.cnq` resolves as `../converter/...`, `geo::from_engine_dir`;
+`--prompt-ids ../runs/glm53-flash/quick/prefill8192.ids`), or pass `--cnq` / `CROW_CNQ` from anywhere else.
+
+`bundle.sh` runs several arms back to back under a GPU lock directory (`.gpu-lock` beside the checkouts). Each JSON carries the build commit, the
 binary, the full environment and per-token rows. The logs (`*.log`) stay local (`.gitignore`).
 
 Operating sets:
@@ -17,10 +21,18 @@ Operating sets:
 - `arm3.env` = `arm2.env` + `CROW_GLM_RT2=1` + the 13 switches of the evening (`CROW_GLM_ARENA_FREQ`, `_ARENA_REGROW`,
   `_EMBED_GATHER`, `_RT2_TABLE_SM`, `_SIDE_NOJOIN`, `CROW_NVME_DEMAND_FIRST`, `CROW_GLM_GUESS_TRIM`, `_ARENA_STAGE_LEND`,
   `_ARENA_LAZY_REFILL`, `_MUL1_FUSE`, `_ATTN_FUSE`, `_RT2_GATHER_EARLY`, `_ARENA_PROMPT_COUNT`), the environment of
-  `b6-promptcount` (crow-nest v0.11.0 operating set). Run: `quick.sh <label> $(cat arm3.env)`.
+  `b6-promptcount` (crow-nest v0.11.0 operating set). Run (from this directory):
+  `quick.sh <label> $(cat arm3.env) CROW_GLM_ARENA_WARM=../runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json`.
 - `arm4.env` = `arm3.env` + `CROW_GLM_KV_LAZY=4096` (#214), the operating set since 2026-10-11 (robin; the code default
   stays off). Measured in `serve`, not with `quick.sh`: quick request, 3 cold boots per arm, decode 67.19 -> 60.29 ms/token
-  median (build `732369c`, `runs/glm53-flash/kvlazy-20261011/recheck/`, local). Run: `quick.sh <label> $(cat arm4.env)`.
+  median (build `732369c`, `runs/glm53-flash/kvlazy-20261011/recheck/`, local). Run (from this directory):
+  `quick.sh <label> $(cat arm4.env) CROW_GLM_ARENA_WARM=../runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json`.
+
+`arm2.env`, `arm3.env` and `arm4.env` carry `CROW_GLM_ARENA_WARM` as an absolute Git-Bash path of the machine they were
+written on; the override above replaces it with the committed file, relative to `engine/`, where `quick.sh` runs
+`glm5_run` (a later assignment wins in `env`). `quick.sh` and `bundle.sh` are Windows / Git-Bash scripts with that
+machine's paths hard-coded (`W=`, `CROW_CNQ`, the tokenizer, `tasklist`, `.exe`); edit them before running elsewhere.
+For `serve`, which runs from its own working directory, give the file's path relative to that (or absolute).
 
 Figures of record for v0.11.0: start of the day `q6-arm2` / `b1-base`; end of the day `b6-promptcount` (arm3.env):
 prefill 8,192 tokens 1137.54 tok/s (TTFT 7.201 s), decode 127 tokens 16.84 tok/s median over tokens, 16.27 tok/s wall.

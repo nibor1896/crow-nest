@@ -377,7 +377,8 @@ originals (`runs/glm53-flash/PREREG-dyn.md`, amendment 1): the 4.5-bit container
 ```
 
 Defaults: `--container converter/GLM-5.3-Flash-CNQ4.5.cnq` (when `--fp8` is not given; the two are
-mutually exclusive), `--corpus decode_out/glm-step8/corpus`, `--runs decode_out/glm-step8/runs`,
+mutually exclusive; this is still the tool's default, `tools/glm_route_passes.py` `CONTAINER`, but that container was
+deleted on 2026-10-08, `runs/glm53-flash/PREREG-dyn.md` amendment 1, so pass `--fp8` as G1d does, or `--container`), `--corpus decode_out/glm-step8/corpus`, `--runs decode_out/glm-step8/runs`,
 `--prompt-chunk 512`, and `ORACLE_THREADS` from the environment (16 if unset). `--files <name>,...`
 (alias `--only`) limits the run to some files, in the amendment's order.
 

@@ -3,8 +3,12 @@
 crow-nest #182, plan steps 11/12 (root #169). The routed experts of GLM-5.3-Flash become MUL1 trellis
 records at K = 3 (exllamav3's codebook, codec #181), quantized by exllamav3's `quantize_exl3` from
 the FP8 originals (`zai-org/GLM-5.3-Flash` @ `eb9eb208`) with Hessians from the layerwise runner's MoE
-inputs. The dense part stays on `cnq4.5-glm5-next`, byte for byte. Nothing on this page has run on
-the real shards yet; every runtime is derived.
+inputs. The dense part stays on `cnq4.5-glm5-next`, byte for byte. The full run has happened on the real
+shards (2026-10-09, CHANGELOG v0.11.0, Measured): `converter --experts-mul1` wrote `GLM-5.3-Flash-MUL1K3.cnq`,
+file 124,591,634,567 B (payload 124.58 GB, as derived below), 38,398 tensors, 12,384 MUL1 records, in 16,885 s
+(Windows 11, CPU), sha256 `9ce11456c68f…`; G3 on that container passes on all 45 layers and the head, 549 of
+549 rows (2026-10-09; `docs/glm5-model.md` 5, `docs/status.md`). Still derived on this page: the disk peaks and
+the per-stage runtimes (capture, quantize, convert; section Runtime); CHANGELOG records only the total.
 
 Format credit: the experts are quantized with exllamav3's EXL3 (MUL1 codebook, K=3, 3.05 bpw;
 [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)); its trellis method is from QTIP
@@ -64,7 +68,7 @@ files, their sha256 and the FP8 identity in `<work>/calibration.json`; the store
 | order | the dense part first (the 4.5 recipe's units, same bytes), then the records, each on a 4096-B file offset |
 | index entries | dtype `mul1`; gate at the record start, up at + 3,145,728, down at + 6,291,456 (`RecordLayout::tensor_offsets`); `len` 3,145,728 / 3,145,728 / 3,182,592, so "next offset - gate offset" is the record (`engine/src/nvme_source.rs:196`); `mul1: {k, record_offset, record_bytes}` |
 | index top level | `recipe` stays `cnq4.5-glm5-next` (the dense rule); new `expert_codec`: dtype, K, hidden, inter, trellis and record bytes, records, layout, the store's sha256, quantizer and calibration |
-| size | non-expert part 7,250,323,716 B + 12,384 x 9,474,048 B = 124.58 GB = 116.0 GiB (derived from `converter plan` 2026-10-08) |
+| size | non-expert part 7,250,323,716 B + 12,384 x 9,474,048 B = 124.58 GB = 116.0 GiB (derived from `converter plan` 2026-10-08); **measured** 2026-10-09: file 124,591,634,567 B, payload 124.58 GB (CHANGELOG v0.11.0, the full 3-bit conversion) |
 | decode | `converter dequant` and so the oracle's `--weights container` decode `mul1` to the original-basis weight `diag(suh) H W_hat H diag(svh) / 128` in f64, one f32 rounding (#156, 2026-10-09; `converter/README.md`) |
 
 ## MTP overlay
@@ -109,7 +113,7 @@ Each stage checks its own share before it starts: `capture` (states + `--max-ahe
 expert), the converter (the container bytes still to write; `--disk-reserve-gib N`, default 16). All
 refuse with exit 2 and the numbers. `python -I tools/glm_mul1_quantize.py plan` prints the whole verdict.
 
-## Runtime (derived, not measured)
+## Runtime (derived; the one measured figure is the full conversion's 16,885 s, CHANGELOG v0.11.0, not split by stage)
 
 | part | (a) layers 0-3 | (b) full | basis |
 |---|---|---|---|

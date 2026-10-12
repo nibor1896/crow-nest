@@ -7,8 +7,11 @@ shared expert and the dense FFN of layers 0-2 (NVFP4). GPU kernels: `engine/src/
 its own NVRTC module (`kernels::GLM5_MOE_SRC`, `kernels::glm5_moe::Kernels`).
 
 **Status:** module and tests. `glm5_model` (#161) runs `GpuMoePlan` / `GpuFfnPlan` per layer, the
-288 MUL1 records of a layer in one VRAM buffer behind the record table ([glm5-model.md](glm5-model.md)). The host lane is checked against the HF oracle; the GPU
-lane's tests are written and compile, **not run yet** (section 5).
+288 MUL1 records of a layer in one VRAM buffer behind the record table ([glm5-model.md](glm5-model.md)). The host lane is checked against the HF oracle. The GPU
+lane has since run on the real 3-bit container: G3 (`decode glmgolden`, 2026-10-09) passes on all 42 MoE layers,
+routing top-8 overlap 90 / 90 rows on each ([glm5-model.md](glm5-model.md) 5; CHANGELOG v0.11.0). Of the GPU tests,
+`glm5_moe_gpu_layer_matches_the_oracle` is red since `bd52328` (the clamp kernel differs by 1 ULP at index 1; CHANGELOG
+v0.11.0, Known limitations); a run of `glm5_moe_gpu_router_is_the_host_selection` is not recorded (section 5).
 
 ## 1. Commands
 
@@ -93,7 +96,10 @@ Without the clamp the same rows give cosine 0.956 (MoE) and 0.971 (dense).
   router kernel = host selection incl. ties and NaN rows; clamp kernel = `swiglu_clamp` bit for bit;
   MoE from VRAM and pinned RAM equal bits and cosine >= 0.9999 against the same goldens; dense
   likewise) were not run on 2026-10-09: the RTX 5090 was at 97 % for a running conversion. The
-  NVRTC compile of `GLM5_MOE_SRC` is checked on the host.
+  NVRTC compile of `GLM5_MOE_SRC` is checked on the host. Later: `glm5_moe_gpu_layer_matches_the_oracle` is red
+  since `bd52328` (clamp kernel 1 ULP off at index 1; CHANGELOG v0.11.0, Known limitations); no run of the router
+  test is recorded.
 - Speed: not measured (no benchmark in this step).
 - Real weights, the full container, the per-layer `glmgolden` table of the ticket: plan step 9 /
-  13a, not this step.
+  13a, not this step. Since done: G3 on the 3-bit container, all 42 MoE layers, 2026-10-09
+  ([glm5-model.md](glm5-model.md) 5).
