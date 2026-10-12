@@ -9,7 +9,7 @@ the download half of the staged full conversion in step 9 (#157). Data lands in
 ## Commands
 
 Run from the repository root; `-I` because the tool reads downloaded JSON. Outside the main
-checkout (a worktree) pass `--dest C:/Users/robin/dev/crow-nest/models/GLM-5.3-Flash-original`.
+checkout (a worktree) pass `--dest <main checkout>/models/GLM-5.3-Flash-original` (an absolute path).
 
 | command | does |
 |---|---|

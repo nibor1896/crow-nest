@@ -37,7 +37,7 @@ for an engine whose build is a gate.
 
 - One CUDA C++ translation unit, `KERNEL_SRC` (`engine/src/kernels.rs:15`, 4,464 lines),
   NVRTC-compiled once per process at `engine/src/gen.rs:990` for `compute_120a` — plain `sm_120`
-  is rejected by ptxas (`docs/architecture.md:351-352`).
+  is rejected by ptxas (`docs/architecture.md:440-441`).
 - **110 kernels registered** in the launched set (`engine/src/kernels.rs:4509`); six more are
   defined and have no launch site left. Every launch goes through one shim,
   `kernels::launch_v` (`engine/src/kernels.rs:4593`), with scalar arguments passed as device
@@ -104,7 +104,7 @@ needs the full gate battery **and** a decision to re-baseline the parity contrac
   code, not the math.
 - *Architecture portability.* The engine is `compute_120a` only; cuTile infers the target from
   the device and `tileiras` accepts `sm_80 … sm_121`. Relevant only if the Ampere/Ada stage
-  (`docs/architecture.md:478`) is ever opened.
+  (`docs/architecture.md:580`) is ever opened.
 - *Versioned codegen against driver-JIT drift.* This is the argument the Windows/Linux drift
   invites, and it does **not** survive contact: cuTile's cache key already contains
   `compiler_version` and `tileiras_fingerprint` (the cuTile JIT guide, "Kernel Cache Key"), which

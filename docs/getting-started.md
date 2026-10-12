@@ -6,9 +6,9 @@ Full build, run and check instructions, moved out of the README on 2026-09-23. T
 
 - An engine that loads one CNQ container and serves it over HTTP to one client.
 - The client is the Crow repository (`nibor1896/Crow`), which talks to `serve` the way it talks to llama-server.
-- Three product binaries: `serve` (HTTP), `decode` (single run and parity dumps), `parity` (the standing ten-task harness).
+- Three product binaries: `serve` (HTTP), `decode` (single run and parity dumps), `parity` (the standing ten-task harness). `glm5_run` is the GLM-5.3-Flash measurement instrument (#187, section "GLM-5.3-Flash (measurement)" below), not product surface.
 - The engine sees (#VIT, 2026-09-14): Crow's `/image`, drag-and-drop and `read_image` work against `serve` — the container's visual tower loads by default, the f32 tower matches the oracle at cos 1.000000, and the text path stays byte-identical (`decode_out/srv-vit.log`). That verification ran ONE image per process, which is every image it could see: from the second image of a process on, the tower's result was read back before it was finished and the model answered for the PREVIOUS image (issue #73, found by robin and fixed 2026-09-18, commit `bc9cd9b`). Multi-image requests and second-image requests are correct since that commit; the end-to-end guards are `tools/vit-colorprobe.py`, `tools/vit-lag.py` and `tools/vit-imgprobe.py`, run by hand — no image runs inside `tools/gate-linux.sh` (2026-09-18). Since v0.5.0 (2026-09-24) the tower runs llama.cpp's F16 projector `mmproj-F16.gguf` when `CROW_VIT_MMPROJ` finds one (#108, +611 MiB of VRAM; the container's NVFP4 section otherwise), every image gets 1,024 to 1,280 visual tokens (#107, `CROW_VIT_MIN_TOKENS` / `CROW_VIT_MAX_TOKENS`), and a different image of the same size no longer reuses the previous image's cached state (#114).
-- Sixteen further binaries under `engine/src/bin` are probes and gates, not product surface (counted 2026-09-17, `engine/README.md`).
+- 27 binaries build from `engine/src/bin` (counted 2026-10-12 with `cargo metadata`): the 24 `[[bin]]` entries of `engine/Cargo.toml` (`glm5_run` the 24th, `Cargo.toml:139-141`) plus `router_probe`, `ramcheck` and `pin_return_probe`, which Cargo discovers on its own because the manifest does not set `autobins = false`. The 23 besides the three product binaries and `glm5_run` are probes, gates and tools, not product surface (`engine/README.md`).
 - Non-goals from the decision record: no training, no multi-user, no multi-GPU, no arbitrary architectures, no GGUF input, no CPU-only mode.
 
 ## Platform
@@ -29,7 +29,7 @@ Full build, run and check instructions, moved out of the README on 2026-09-23. T
 | CUDA toolkit | CUDA 13.3 (nvcc, NVRTC, ptxas); on Windows `nvrtc64_130_0.dll` and `nvrtc-builtins64_133.dll` (CUDA 13.3's file names, in the toolkit's `bin\x64` or fetched with `tools\fetch-nvrtc.ps1`; there is no `nvrtc64_133_0.dll`) are found beside `serve.exe` or through `PATH`, on Linux the runtime directory needs to be on `LD_LIBRARY_PATH` (never the `lib/stubs` sibling) | `docs/system-landscape.md:22` |
 | Rust | Rust 1.97.0, cargo 1.97.0 on the Windows box; rustc 1.98.1 from rustup stable on the Linux box | `docs/system-landscape.md:23` |
 | cudarc | 0.19.9, features `cuda-13030`, `dynamic-loading`, `nvrtc` | `docs/system-landscape.md:24` |
-| container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B, not in the repository, produced by `converter` | `engine/src/geo.rs:71` |
+| container | `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq`, 104,727,179,972 B, not in the repository, produced by `converter` | `engine/src/geo.rs:75` (`DEFAULT_CNQ`) |
 | hot set | `decode_out/hotsets-M-crow0924-n160.json`, tracked in the repository (since 2026-09-24, [hot-set calibration](hotset-calibration.md)) | `engine/src/geo.rs` `DEFAULT_HOTSETS` |
 
 ## Start
@@ -162,6 +162,7 @@ tools/gate-linux.sh
 - At v0.7.0 (2026-09-27) the pins are `TESTS=458` and `CLIPPY=1494` (the dense 27B, MTP, #122, #123), and all items are
   GREEN on the release head (`decode_out/gate-2026-09-27`); the four numeric values of record are unchanged.
 - At v0.7.1 (2026-09-27) `TESTS=460` (+2 `tokenizer::tests`, #121) and `CLIPPY=1494`; gate `decode_out/gate-2026-09-27-v071`.
+- The script still pins `TESTS="462"` (`tools/gate-linux.sh:285`, raised in `135143e` on 2026-10-02 for #131's two tests) and its cargo-test item compares the summed `N passed` against it (`:613-616`). The last Linux gate run recorded is 2026-09-28 at `97b4e05` (CHANGELOG v0.7.2); every release from v0.8.0 to v0.13.0 says it was not run (CHANGELOG v0.13.0, v0.12.0, v0.11.0, v0.10.0, v0.9.1). The engine now carries 963 `#[test]` and 155 `#[ignore]` attributes (`engine/src`, `engine/tests`, grep 2026-10-12), so the pin is stale for the GLM releases until the next Linux gate run measures it.
 - Engine runs are sequential on purpose: before every engine start the gate asks the engine's own
   `ramcheck --need` (`free_for_pin`, issue #103, `tools/pin-room.sh`) whether the pinned tier fits.
 
@@ -211,3 +212,65 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 - The planner also keeps a **render reserve** FREE for a co-resident GPU client, Crow's `render_page` first (issue #110, 2026-09-25): `CROW_RENDER_RESERVE_MB`, default 0 (off, #110 follow-up), granted best-effort against the VRAM and the host pinned budget and named by one `[budget] render reserve: requested X MiB, granted Y MiB — ...` line; it never refuses the boot. Each granted hot-set unit (126.6 MiB) costs one hot expert per layer. Crow borrows VRAM per render instead (#117). With it off, serve left 73-185 MiB free and every Crow capture fell back to SwiftShader (2026-09-23/24).
 - While idle, serve LENDS about 1.7 GiB of stateless scratch VRAM to a co-resident renderer (issue #117, 2026-09-25): `POST /v1/crow/vram/lend {"mib": N, "ttl_s": T}`, `POST /v1/crow/vram/return` (or the ttl), `GET /v1/crow/vram`; the memory comes back at the same addresses, and an engine request that arrives while it is lent waits and runs after the return. Crow's `render_page` calls lend and return (Crow #297). `CROW_VRAM_LEND=0` turns it off. Measured 2026-09-25: 1698 MiB lendable, lend 1-5 ms, return 1-8 ms live with Crow (endpoint table in `engine/README.md`, `docs/architecture.md` 7.15).
 - A short unrelated request (Crow's judge) PARKS the held conversation instead of dropping its prefix cache (issue #118, 2026-09-25): up to `CROW_PREFIX_PARK_ROWS` KV rows (default 8192) go to host RAM, 108.0 MiB at fp8 KV, allocated at the first park, and the next main turn resumes from its newest snapshot. The `[cache]` lines name `held conversation parked` and `parked conversation restored` with the copy wall (live 2026-09-25: 10.2 ms park, 9.1-10.2 ms restore, `docs/architecture.md` 7.16).
+
+## GLM-5.3-Flash (measurement)
+
+GLM-5.3-Flash (engine family glm5_next) is in measurement: every GLM switch is default off, the operating set is `runs/glm53-flash/quick/arm4.env` (#214, robin 2026-10-11), and G7 is open (`docs/status.md`, `docs/measurements.md`). Flash-Next and the 27B keep their default path.
+
+| item | value | source |
+|---|---|---|
+| container | `converter/GLM-5.3-Flash-MUL1K3.cnq`, 124,591,634,567 B (3-bit MUL1 routed experts), not in the repository | `runs/glm53-flash/quick/README.md:3-4`, `engine/src/glm5_model.rs:57` |
+| MTP overlay, optional | `converter/GLM-5.3-Flash-MTP-overlay.cnq` (164,771,937 B), read only with `CROW_GLM_MTP` > 0; not in `arm4.env` | `docs/env.md` row `CROW_GLM_MTP_OVERLAY`, `docs/glm-mul1-conversion.md` "MTP overlay" |
+| tokenizer | `models/GLM-5.3-Flash-original/tokenizer.json` (with its `tokenizer_config.json` and `chat_template.jinja`): `python -I tools/fetch-glm.py --small` | `docs/glm-download.md:16` |
+| GPU | one RTX 5090; glm5_next keeps 2 GiB VRAM free under a 31.9 GiB cap | `docs/glm-stability.md` |
+| host RAM | the pinned cap is engine-wide, `HOST_PINNED_CAP` 46 GiB, and the derived budget is at most free RAM minus `CROW_RAM_MARGIN_GB`; every GLM number was measured on robin's Windows machine, 63.38 GiB RAM, where G4 bounds commit at RAM + page file 103.38 GiB | `engine/src/geo.rs:42`, `engine/src/bin/glm5_run.rs:30-32`, CHANGELOG v0.9.1, `runs/glm53-flash/PREREG.md:89` |
+| disk | the container is the NVMe tier: decode reads its missing experts from that one drive, 1 reader, B = 6.994 GB/s (PREREG amendment 5), so decode is bound by one NVMe. Building it needs the FP8 download and the staged conversion's disk (the converter refuses below the bytes to write + 16 GiB) | `runs/glm53-flash/PREREG.md:181-185`, `docs/measurements.md`, `docs/glm-mul1-conversion.md` "Disk" |
+| OS | measured on Windows 11 only; Linux is not measured for GLM (every GLM release: "Windows only; `tools/gate-linux.sh` was not run") | CHANGELOG v0.13.0, v0.12.0, v0.11.0 |
+
+### Get the container
+
+No container is published. Build it from the originals: download and verify them with [glm-download.md](glm-download.md) (the staged download, conversion and delete-behind is [glm-staged-conversion.md](glm-staged-conversion.md)), then quantize and convert with [glm-mul1-conversion.md](glm-mul1-conversion.md) ("Commands", run (b)).
+
+### Build
+
+```
+cd engine
+cargo build --release --bin serve --bin glm5_run
+```
+
+### Run
+
+- `serve` picks the engine by the container's family: with `CROW_CNQ` naming the MUL1K3 container it boots glm5_next through `boot::open_glm5` (`engine/src/bin/serve.rs:7649-7669`, `docs/env.md` row `CROW_CNQ`). `CROW_CONTEXT` unset is the glm5_next floor 200,000 (`docs/env.md` row `CROW_CONTEXT`). The tokenizer is found in `models/GLM-5.3-Flash-original/` beside the container (`engine/src/tokenizer.rs:621-636`); setting `CROW_TOKENIZER` names it outright, as the G5 run order does (`runs/glm53-flash/PREREG.md`, amendment 8).
+- `glm5_run` resolves its default container relative to `engine/` (`from_engine_dir`, `engine/src/bin/glm5_run.rs:676`, `engine/src/geo.rs:117`), so from the repository root pass `--cnq converter/GLM-5.3-Flash-MUL1K3.cnq` or set `CROW_CNQ`.
+- `arm4.env` is one line of `NAME=value` pairs. Its `CROW_GLM_ARENA_WARM` is an absolute path on robin's machine, so set it again after the file (the later assignment wins).
+
+From the repository root, bash (Git Bash on Windows; the binaries are `serve.exe` and `glm5_run.exe` there):
+
+```
+env $(cat runs/glm53-flash/quick/arm4.env) \
+  CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json \
+  CROW_CNQ=converter/GLM-5.3-Flash-MUL1K3.cnq \
+  CROW_TOKENIZER=models/GLM-5.3-Flash-original/tokenizer.json \
+  engine/target/release/serve --port 8099
+
+env $(cat runs/glm53-flash/quick/arm4.env) \
+  CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json \
+  engine/target/release/glm5_run --cnq converter/GLM-5.3-Flash-MUL1K3.cnq \
+  --tokenizer models/GLM-5.3-Flash-original/tokenizer.json --cold --reps 1 --prompt "Say hello in five words." -n 32
+```
+
+PowerShell, from the repository root (sets the variables for this shell session):
+
+```
+foreach ($kv in ((Get-Content runs\glm53-flash\quick\arm4.env -Raw).Trim() -split '\s+')) {
+  $name, $value = $kv -split '=', 2
+  Set-Item -Path "env:$name" -Value $value
+}
+$env:CROW_GLM_ARENA_WARM = "runs\glm53-flash\arena-warm\glm53-cal4-decode-counts.json"
+$env:CROW_CNQ = "converter\GLM-5.3-Flash-MUL1K3.cnq"
+$env:CROW_TOKENIZER = "models\GLM-5.3-Flash-original\tokenizer.json"
+engine\target\release\serve.exe --port 8099
+```
+
+- The 3-minute check (`quick.sh`, one cold 8,192-token prefill and 127 cold decode tokens) and every arm's figures are in `runs/glm53-flash/quick/README.md`; the measured figures are in `docs/measurements.md`.
+- The prefill switches `CROW_GLM_SMALL_PROMPT`, `CROW_GLM_PREFIX_ANCHOR` and `CROW_GLM_ANSWER_REUSE` are not part of `arm4.env`: with all three on, serve stopped logging mid-decode once on 2026-10-11, cause unknown (CHANGELOG v0.12.0).

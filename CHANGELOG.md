@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **Docs: GLM-5.3-Flash named measurement only everywhere** (doc audit of 2026-10-12, commits `273c3ef` onward): README and the front image no longer call GLM-5.3-Flash an operating point (no G7 decision is recorded, `runs/glm53-flash/PREREG.md` G7) and no longer claim a published container or a start script; the README GLM block passes `--cnq` (glm5_run resolves its default container relative to `engine/`), adds serve for Linux and Windows and the tokenizer step. `docs/measurements.md` and `docs/status.md` carry the 23.7 tok/s G5 bar of amendment 7, the G4 series and the G5 window sessions without verdicts, and the 2026-10-11 mid-decode stop; `docs/getting-started.md` gets a GLM section. `docs/env.md`: the GLM and NVMe rows move into their own sections (section counts now sum to 190), a `glm-set` mode for the `arm4.env` switches, a GLM operating set section, and the `CROW_GLM_MTP` row names the 2026-10-09 measurement (MTP=1 −7.0 %, MTP=2 −19.1 %, MTP stays off, #192). `docs/architecture.md` gets a table of contents and its glm5_next status lines (boot door, stager, tiers) are brought up to date; line references into it are re-pointed. Binary counts are 27 (24 `[[bin]]` + 3 discovered, 2026-10-12). New `docs/README.md` indexes every page. Personal paths leave the docs; stale "not run yet" lines and the deleted CNQ4.5 container defaults are corrected.
+
 ## 2026-10-12 — v0.13.0
 
 **GLM-5.3-Flash's reasoning box closes on the `</think>` token id, serve logs the generated ids of every request by default, and the glm5_next expert tiers can run as one policy behind a switch, default off.** v0.13.0 carries 3 changes since v0.12.0 (`6161c6b`, `67dbf79`, `e374bc5` merged as `eae8b8a`) and the release commit:

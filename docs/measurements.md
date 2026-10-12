@@ -28,8 +28,8 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 | run-to-run drift of a `serve` rate | 26 % (run 1 30.45, run 6 22.42 tok/s, identical ids) | n/a | n/a | RTX 5090 | 2026-09-10 | issue #38 |
 | run-to-run drift of a `serve` rate on Linux, three chains, one fresh process per run, ids identical per arm | absent: serve within-arm spread 1.0056 over 4 runs (mean 49.82 tok/s) and 1.0009 over 4 consecutive fresh loads (mean 49.86), the adjacent `decode run` arm 1.0012 (mean 39.83); rerun at the #61g default the same day, serve 1.0038 over 4 runs (mean 53.32) against the adjacent `decode run` arm's 1.0010 (mean 42.56); no chain monotonic in run index | n/a | n/a | RTX 5090, Arch Linux | 2026-09-18 | issue #38, `docs/measurement-coverage.md`, `tools/drift-chain.sh`, logs under `decode_out/38/` |
 | `serve` at the engine default of record, the chain form the #38 rule requires (4 counted serve runs, one fresh process each, an adjacent `decode run` arm in the same chain) | 53.32 tok/s mean, spread 1.0038, next to `decode run` 42.56 tok/s mean, spread 1.0010, ids `e7c17e064ea2` and `56305eee11d6` 4 of 4 each | n/a | the two arms are different operating points (N 149 / 142, chunk 2048 / 4096, trickle on / off), so the gap is not a delta | RTX 5090, Arch Linux | 2026-09-18 | issue #38 at HEAD `6c87054`, `decode_out/38/c3-sdsd-61g/chain.log`, `docs/architecture.md` 4.6.1 |
-| cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | n/a | n/a | RTX 5090 | 2026-09-10 | `docs/architecture.md:426` |
-| warm turn after the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % of the prompt reused | n/a | n/a | RTX 5090 | 2026-09-10 | issue #31, `docs/architecture.md:427` |
+| cold prefill of a 16,064 id prompt on `serve` | 21.6 to 22.0 s | n/a | n/a | RTX 5090 | 2026-09-10 | `docs/architecture.md:528` |
+| warm turn after the prefix cache | 404 ms for 95 of 16,159 ids, 99.41 % of the prompt reused | n/a | n/a | RTX 5090 | 2026-09-10 | issue #31, `docs/architecture.md:529` |
 | ten-task quality, sampled, six seeds | gate met in 1 of 6 seeds; 4 Pass / 37 Partial / 19 Fail of 60 answers | n/a | n/a | RTX 5090 | 2026-09-10 | issue #44 |
 | parity, 8 and 512 logit rows | byte-identical against the installed build `d211ab52ad2b` | n/a | n/a | RTX 5090 | 2026-09-10 | issue #43 |
 | decode operating point, t1-read 16,064 ids, 255 timed steps, engine default | 23.52 ms per token = 42.5 tok/s | 22.27 ms per token = 44.9 tok/s | crow-nest 1.06 x the llama.cpp ms per token | RTX 5090, Arch Linux | crow-nest 2026-09-18, llama.cpp 2026-09-11 | issue #61, 61g, `decode_out/61g/` and `decode_out/srv-59b.log` |
@@ -61,7 +61,11 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 
 ### GLM-5.3-Flash (glm5_next), measurement only
 
-- Not an operating point: every GLM switch is default off, G3 with the operating set, G4 (200k boot), G5 (Crow) and G6 are not run (#149, #151, #169). The PREREG G5 bar is decode ≥ 40 tok/s (`runs/glm53-flash/PREREG.md`).
+- Not an operating point: every GLM switch is default off, the operating set is `runs/glm53-flash/quick/arm4.env`, and no G7 decision is recorded (G7 is robin's decision on the recorded verdicts G1-G6, `runs/glm53-flash/PREREG.md:121-125`). State of the gates on 2026-10-12 (#149, #151, #169):
+  - G3 with the operating set and G6 are not run.
+  - G4 (200k boot): a 10-boot series ran on 2026-10-11 with `arm3.env` (`runs/glm53-flash/g3g4-20261011/`, local, not in git; one cold turn of `prompt-33k.txt` per boot, GLM `prompt_n` 30,986; named in amendment 8, `PREREG.md:239`), and the #214 acceptance on `045bfa0` notes "G4 10/10" (CHANGELOG v0.12.0); no G4 verdict with VRAM, commit and m is recorded.
+  - G5 (Crow): robin's Crow-window sessions exist: 2026-10-11, the G5 session with `arm4.env` (CHANGELOG v0.12.0; its t1 turn decoded 8.29 tok/s on the host sampler) and a t3 turn at 14.17 tok/s on the #215 device-sampler build (N=1 each, different turns, CHANGELOG v0.12.0) and 2026-10-12 (one 3-round task, decode 14.03 tok/s, with the three prefill switches on, CHANGELOG v0.13.0). No G5 verdict is recorded.
+  - The G5 decode bar is ≥ 23.7 tok/s, median over the ≥ 5 window tasks (amendment 7, `PREREG.md:217`, 2026-10-11; 40 tok/s in the original PREREG). Under amendment 7 a median below 23.7 is recorded as "below the bar" with its number and is not a G5 failure; cold prefill at ~32k ≥ 150 tok/s and the 3-boot spread ≤ 1.15 still fail G5.
 - One RTX 5090, Windows 11, container `GLM-5.3-Flash-MUL1K3.cnq` (3-bit MUL1 routed experts, 124,591,634,567 B), `glm5_run --cold --reps 1`, real text, N=1 per arm, raw data `runs/glm53-flash/quick/` (`README.md` there lists every arm).
 
 | arm | prefill, 8,192 tokens | TTFT | decode, 127 tokens, median over tokens | decode wall | date | source |
@@ -76,7 +80,7 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 
 ### Targets
 
-- Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:18-19`, `:57-58`).
+- Targets are goals the engine aims at, never pass or fail gates (`docs/architecture.md:105-106`, `:144-145`).
 - Measured against the prefill target on Linux, 2026-09-17: 968 tok/s on the 16,064 id t1-read form (`decode run`, commit 1032bc5). The target names the 32k operating point, which has no Linux reading, so this is not the target met.
 - Measured against the decode target on Linux, 2026-09-18: 42.5 tok/s (23.52 ms per token) at context 16,320 on the same form, at the `CROW_ATTN_LUT` default of issue #61 (61g, commit `6c87054`). The target names a session filled to the 200,000 token floor, which has no Linux reading, so this is not the target met either.
 

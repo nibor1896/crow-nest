@@ -14,7 +14,8 @@ step by step.
 
 **Status:** kernels, CPU twin and tests. The layer driver, the loader of
 `layers.L.hc_{attn,ffn}_{fn,base,scale}` and the `decode glmgolden` harness are `glm5_model`
-(#161, [glm5-model.md](glm5-model.md)); its GPU run awaits robin's Go.
+(#161, [glm5-model.md](glm5-model.md)); its GPU run on the 3-bit container passed G3 on 2026-10-09 (549 of 549 rows,
+glm5-model.md 5).
 
 ## 1. Commands
 
@@ -100,5 +101,7 @@ except the column normalisation, on the kernel).
   `coeffs` now spreads it over (24, T) blocks with the record's per-thread order (no split-K, so
   the bits stay). Micro-bench numbers: #191 and `glm5_mhc_gpu_coeffs_time_per_site`.
 - G3 on the real model (every layer, both sites, against the layerwise runner's goldens) is the
-  `decode glmgolden` table ([glm5-model.md](glm5-model.md)); not run yet. `pre` cannot be compared:
+  `decode glmgolden` table ([glm5-model.md](glm5-model.md)); run 2026-10-09 on the 3-bit container: ALL PASS,
+  0 of 549 G3 rows failed, `collapsed` and `expanded` judged at both sites of all 45 layers (glm5-model.md 5,
+  CHANGELOG v0.11.0). `pre` cannot be compared:
   HF's hyper-connection does not return it.

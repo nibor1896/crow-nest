@@ -2,7 +2,7 @@
   <source media="(max-width: 700px) and (prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-mobile-dark.svg?v=20261012">
   <source media="(max-width: 700px)" srcset="docs/images/readme/crow-nest-mobile-light.svg?v=20261012">
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-dark.svg?v=20261012">
-  <img src="docs/images/readme/crow-nest-light.svg?v=20261012" width="100%" alt="crow-nest: one GPU, its own quant, three model families. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5 with MTP and its own F16 vision projector, OpenAI-compatible, the engine behind Crow.">
+  <img src="docs/images/readme/crow-nest-light.svg?v=20261012" width="100%" alt="crow-nest: one GPU, its own quant, three model families. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M, the dense Qwen3.8-27B as CNQ4.5 with MTP and its own F16 vision projector, and GLM-5.3-Flash in measurement as MUL1K3 (EXL3 3.05 bpw experts), OpenAI-compatible, the engine behind Crow.">
 </picture>
 
 **Build** (Flash-Next container: 104.7 GB from Hugging Face)
@@ -55,11 +55,21 @@ $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe -
 
 **Linux engine without building**: no Linux package at the moment (the v0.9.0 tarball carried NVRTC and is withdrawn); build from source as above, then `tools/fetch-nvrtc.sh --target engine/target/release`.
 
-**GLM-5.3-Flash**, Crow's third operating point (3-bit container: [download](docs/glm-download.md), [conversion](docs/glm-mul1-conversion.md); operating set [`arm4.env`](runs/glm53-flash/quick/README.md))
+**GLM-5.3-Flash**, in measurement, not an operating point (PREREG G7 open: [docs/measurements.md](docs/measurements.md#glm-53-flash-glm5_next-measurement-only)); operating set [`arm4.env`](runs/glm53-flash/quick/README.md). No published container: build the 3-bit container yourself from the 328 GB FP8 originals ([download the originals](docs/glm-download.md), then [convert](docs/glm-mul1-conversion.md): capture, quantize and converter side by side about 5 h wall, capture about 48 GiB host RAM, both derived; staged disk plan in [glm-staged-conversion.md](docs/glm-staged-conversion.md)); the result is `converter/GLM-5.3-Flash-MUL1K3.cnq` (124,591,634,567 B). The tokenizer comes with `fetch-glm.py --small` ([glm-download.md](docs/glm-download.md)) into `models/GLM-5.3-Flash-original/`. Measured on Windows 11 only; Linux is unmeasured for GLM. `arm*.env` carry a machine-specific `CROW_GLM_ARENA_WARM`, overridden below.
 
 ```bash
-cd engine && cargo build --release --bin glm5_run && cd ..
-env $(cat runs/glm53-flash/quick/arm4.env) CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json   engine/target/release/glm5_run --cold --reps 1 --tokenizer models/GLM-5.3-Flash-original/tokenizer.json --prompt "Explain how a CPU cache works." -n 128
+cd engine && cargo build --release --bin serve --bin glm5_run && cd ..
+# one prompt, from the repository root
+env $(cat runs/glm53-flash/quick/arm4.env) CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json   engine/target/release/glm5_run --cnq converter/GLM-5.3-Flash-MUL1K3.cnq --cold --reps 1 --tokenizer models/GLM-5.3-Flash-original/tokenizer.json --prompt "Explain how a CPU cache works." -n 128
+# serve (Linux unmeasured)
+env $(cat runs/glm53-flash/quick/arm4.env) CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json CROW_CNQ=converter/GLM-5.3-Flash-MUL1K3.cnq tools/serve-linux.sh --port 8099
+```
+
+**Run GLM-5.3-Flash, Windows** (from the repository root)
+
+```powershell
+Get-Content runs\glm53-flash\quick\arm4.env | ForEach-Object { $_ -split '\s+' } | Where-Object { $_ } | ForEach-Object { $k, $v = $_ -split '=', 2; Set-Item "env:$k" $v }
+$env:CROW_GLM_ARENA_WARM = "runs\glm53-flash\arena-warm\glm53-cal4-decode-counts.json"; $env:CROW_CNQ = "converter\GLM-5.3-Flash-MUL1K3.cnq"; engine\target\release\serve.exe --port 8099
 ```
 
 | GLM-5.3-Flash container | format |
@@ -80,7 +90,8 @@ crow --base-url http://127.0.0.1:8099/v1
 <a href="docs/measurements.md">Measurements</a> ·
 <a href="docs/repository.md">Repository</a> ·
 <a href="docs/status.md">Status</a> ·
-<a href="docs/model-card.md">Model card</a> ·
+<a href="docs/model-card.md">Model card (Flash-Next)</a> ·
+<a href="docs/README.md">All docs</a> ·
 <a href="CHANGELOG.md">Changelog</a> ·
 <a href="docs/archive/README-v0.6.0.md">Previous README</a>
 </p>
@@ -89,6 +100,7 @@ crow --base-url http://127.0.0.1:8099/v1
 Apache-2.0 · <a href="https://github.com/nibor1896/crow-nest">nibor1896/crow-nest</a> ·
 Model: <a href="https://huggingface.co/nibor1896/Qwen3.8-Flash-Next-CNQ4.5-M">Qwen3.8-Flash-Next CNQ4.5-M</a> (Qwen Community License 1.0) ·
 <a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen3.8-27B</a> (Apache-2.0) ·
+In measurement: <a href="https://huggingface.co/zai-org/GLM-5.3-Flash">zai-org/GLM-5.3-Flash</a> (license: see its model card) ·
 Client: <a href="https://github.com/nibor1896/Crow">Crow</a>
 </sub></p>
 

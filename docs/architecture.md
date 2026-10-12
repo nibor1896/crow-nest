@@ -2,6 +2,93 @@
 
 **Status: fully approved by robin on 2026-09-02 (all six sections, issue crow-nest #4).**
 
+**Contents** (the `##` sections and `###` subsections; 4th-level headings are not listed):
+
+- [Section 0 — goals and operating points (APPROVED by robin 2026-09-02, with the prefill provenance integrated)](#section-0--goals-and-operating-points-approved-by-robin-2026-09-02-with-the-prefill-provenance-integrated)
+  - [0.1 Status of the goals](#01-status-of-the-goals)
+  - [0.2 Context](#02-context)
+  - [0.3 Throughput targets, with their measurement points](#03-throughput-targets-with-their-measurement-points)
+  - [0.4 Latency metrics](#04-latency-metrics)
+  - [0.5 Measurement discipline (binding)](#05-measurement-discipline-binding)
+- [Section 1 — model format and streaming converter (APPROVED by robin 2026-09-02: BF16 keep-set as proposed; 551 GB free NVMe confirmed)](#section-1--model-format-and-streaming-converter-approved-by-robin-2026-09-02-bf16-keep-set-as-proposed-551-gb-free-nvme-confirmed)
+  - [1.1 Input](#11-input)
+  - [1.2 Output format (own container, no GGUF)](#12-output-format-own-container-no-gguf)
+  - [1.3 Stage 1 — calibration-free RTN](#13-stage-1--calibration-free-rtn)
+  - [1.4 Stage 2 — per-expert calibration (separate ticket, later)](#14-stage-2--per-expert-calibration-separate-ticket-later)
+  - [1.5 Acceptance](#15-acceptance)
+  - [1.6 Resolved (robin, 2026-09-02)](#16-resolved-robin-2026-09-02)
+  - [1.7 Container index v2 and the per-model recipe (Crow #300 phase 1, C6, 2026-09-26)](#17-container-index-v2-and-the-per-model-recipe-crow-300-phase-1-c6-2026-09-26)
+- [Section 2 — memory layout: residency, PLE window, three-state manager (APPROVED by robin 2026-09-02)](#section-2--memory-layout-residency-ple-window-three-state-manager-approved-by-robin-2026-09-02)
+  - [2.1 VRAM budget at the default operating point (262k context, FP8-KV)](#21-vram-budget-at-the-default-operating-point-262k-context-fp8-kv)
+  - [2.2 Expert residency (per layer, data-driven)](#22-expert-residency-per-layer-data-driven)
+  - [2.3 Cold path (variant A; stager built for C from day 1)](#23-cold-path-variant-a-stager-built-for-c-from-day-1)
+  - [2.4 PLE (one layer, 128 tables of \[2,500,012, 160\])](#24-ple-one-layer-128-tables-of-2500012-160)
+  - [2.5 Three-state manager](#25-three-state-manager)
+  - [2.6 Acceptance](#26-acceptance)
+- [Section 3 — scheduler: job ring, routing-gated skip, cold-path policy (APPROVED by robin 2026-09-02)](#section-3--scheduler-job-ring-routing-gated-skip-cold-path-policy-approved-by-robin-2026-09-02)
+  - [3.1 The constraint the scheduler exists for](#31-the-constraint-the-scheduler-exists-for)
+  - [3.2 Job ring (the handoff)](#32-job-ring-the-handoff)
+  - [3.3 Routing-gated skip](#33-routing-gated-skip)
+  - [3.4 Cold-path policy (AMENDED 2026-09-02, robin approved: zero-copy replaces stream-weights as primary)](#34-cold-path-policy-amended-2026-09-02-robin-approved-zero-copy-replaces-stream-weights-as-primary)
+  - [3.5 PLE in the loop](#35-ple-in-the-loop)
+  - [3.6 Acceptance](#36-acceptance)
+- [Section 4 — kernel path: sm_120a FP4 (APPROVED by robin 2026-09-02)](#section-4--kernel-path-sm_120a-fp4-approved-by-robin-2026-09-02)
+  - [4.1 Target and probe-pinned facts](#41-target-and-probe-pinned-facts)
+  - [4.2 Kernel families the model needs](#42-kernel-families-the-model-needs)
+  - [4.3 Kernel hygiene](#43-kernel-hygiene)
+  - [4.4 Ampere/Ada fallback](#44-ampereada-fallback)
+  - [4.5 Acceptance](#45-acceptance)
+  - [4.6 The decode kernel decomposition at the Linux operating point (#61, 2026-09-18)](#46-the-decode-kernel-decomposition-at-the-linux-operating-point-61-2026-09-18)
+  - [4.7 The GDN row, per kernel (#62, 2026-09-18)](#47-the-gdn-row-per-kernel-62-2026-09-18)
+  - [4.8 The cold-expert staging row: 11.7 ms per decode token, and all but 0.3 of it is the PCIe link (#19, 2026-09-18)](#48-the-cold-expert-staging-row-117-ms-per-decode-token-and-all-but-03-of-it-is-the-pcie-link-19-2026-09-18)
+- [Section 5 — correctness: oracle, parity gates, ten-task gate (APPROVED by robin 2026-09-02)](#section-5--correctness-oracle-parity-gates-ten-task-gate-approved-by-robin-2026-09-02)
+  - [5.1 Oracles](#51-oracles)
+  - [5.2 Gates per stage](#52-gates-per-stage)
+  - [5.3 Honesty rules (binding)](#53-honesty-rules-binding)
+  - [5.4 The router GEMM second probe, and what the ten-task gate can and cannot decide (#10 10e, 2026-09-18)](#54-the-router-gemm-second-probe-and-what-the-ten-task-gate-can-and-cannot-decide-10-10e-2026-09-18)
+- [Section 6 — stages and timeboxes (APPROVED by robin 2026-09-02 — boxes are guards, not deadlines)](#section-6--stages-and-timeboxes-approved-by-robin-2026-09-02--boxes-are-guards-not-deadlines)
+  - [6.1 Sequencing](#61-sequencing)
+  - [6.2 The cut rule (constant 5)](#62-the-cut-rule-constant-5)
+  - [6.3 Definition of done](#63-definition-of-done)
+- [Section 7: server and prefix cache (approved by robin 2026-09-09 at M1. Sections 0-6 unchanged)](#section-7-server-and-prefix-cache-approved-by-robin-2026-09-09-at-m1-sections-0-6-unchanged)
+  - [7.1 What the server is, and the one question this section answers](#71-what-the-server-is-and-the-one-question-this-section-answers)
+  - [7.2 What the engine does today (read from the code, 2026-09-09)](#72-what-the-engine-does-today-read-from-the-code-2026-09-09)
+  - [7.3 The four states](#73-the-four-states)
+  - [7.4 Detection: the longest common id prefix](#74-detection-the-longest-common-id-prefix)
+  - [7.5 The invariant (binding)](#75-the-invariant-binding)
+  - [7.6 Snapshot and rollback (GDN, PLE conv, QSA ring)](#76-snapshot-and-rollback-gdn-ple-conv-qsa-ring)
+  - [7.7 Memory cost of a snapshot](#77-memory-cost-of-a-snapshot)
+  - [7.8 What a cache miss actually costs](#78-what-a-cache-miss-actually-costs)
+  - [7.9 Acceptance](#79-acceptance)
+  - [7.10 M1 decisions (answered by robin 2026-09-09, issue #1)](#710-m1-decisions-answered-by-robin-2026-09-09-issue-1)
+  - [7.11 The endpoint contract as built (stage A, #24 to #32)](#711-the-endpoint-contract-as-built-stage-a-24-to-32)
+  - [7.12 The stage A gate table (what was measured, and where the artefact is)](#712-the-stage-a-gate-table-what-was-measured-and-where-the-artefact-is)
+  - [7.13 The image path (#VIT, 2026-09-14)](#713-the-image-path-vit-2026-09-14)
+  - [7.14 The PLE row path, and what a warm turn actually pays (TASK H, 2026-09-17)](#714-the-ple-row-path-and-what-a-warm-turn-actually-pays-task-h-2026-09-17)
+  - [7.15 VRAM lending to a co-resident renderer (#117, 2026-09-25)](#715-vram-lending-to-a-co-resident-renderer-117-2026-09-25)
+  - [7.16 Parking the held conversation for a short unrelated request (#118, 2026-09-25)](#716-parking-the-held-conversation-for-a-short-unrelated-request-118-2026-09-25)
+- [Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2, C5 family switches in 8.11, 8.12 the dense path with Crow #300 phase 2)](#section-8--the-code-map-2026-09-17-89-and-810-added-2026-09-18-logrs-2026-09-18-with-13-re-read-at-8bad310-v031-2026-09-18-811-added-2026-09-26-with-crow-300-c1c2-c4-kernel-rule-amended-in-82-c5-family-switches-in-811-812-the-dense-path-with-crow-300-phase-2)
+  - [8.0 The tree at v0.11.0 (line counts, 2026-10-10)](#80-the-tree-at-v0110-line-counts-2026-10-10)
+  - [8.1 The module graph](#81-the-module-graph)
+  - [8.2 The modules](#82-the-modules)
+  - [8.3 The `Engine` API surface (`7ddd296`, re-counted at `487128d`)](#83-the-engine-api-surface-7ddd296-re-counted-at-487128d)
+  - [8.4 The boot path](#84-the-boot-path)
+  - [8.5 The request path](#85-the-request-path)
+  - [8.6 The sources of truth](#86-the-sources-of-truth)
+  - [8.7 The numeric contract on Linux](#87-the-numeric-contract-on-linux)
+  - [8.8 The host-memory model as built](#88-the-host-memory-model-as-built)
+  - [8.9 The oracle children of the `parity` harness (#65, 2026-09-18)](#89-the-oracle-children-of-the-parity-harness-65-2026-09-18)
+  - [8.10 The package self-test (F5, issue #64, 2026-09-18; the layer-3 check, issue #69, 2026-09-18)](#810-the-package-self-test-f5-issue-64-2026-09-18-the-layer-3-check-issue-69-2026-09-18)
+  - [8.11 Model families and the runtime `Geo` (Crow #300 phase 1, C1 to C7, 2026-09-26)](#811-model-families-and-the-runtime-geo-crow-300-phase-1-c1-to-c7-2026-09-26)
+  - [8.12 The dense path (Crow #300 phase 2, 2026-09-26)](#812-the-dense-path-crow-300-phase-2-2026-09-26)
+- [Section 9 — logging, telemetry and the operating-point report (#13, 2026-09-18)](#section-9--logging-telemetry-and-the-operating-point-report-13-2026-09-18)
+  - [9.1 What it replaced, and the one rule that shaped the design](#91-what-it-replaced-and-the-one-rule-that-shaped-the-design)
+  - [9.2 The design](#92-the-design)
+  - [9.3 The two structured lines](#93-the-two-structured-lines)
+  - [9.4 The measurements](#94-the-measurements)
+  - [9.5 The unit tests (10, in `engine/src/log.rs`, no GPU and no model)](#95-the-unit-tests-10-in-enginesrclogrs-no-gpu-and-no-model)
+  - [9.6 What this section does not claim](#96-what-this-section-does-not-claim)
+
 Approved section by section (issue crow-nest #4; a section is truth only after robin's
 approval is recorded there). Environment for every number: `docs/system-landscape.md`.
 Methodology: Crow #159. No north star in the record's sense — misses are measured
@@ -56,9 +143,11 @@ is a pass/fail gate.
 - **Mean inter-token latency** is implied by the decode goal: 42 tok/s ⇔ ~23.8 ms.
 - "Minimal latency" as a design constraint is already decided and needs no number: no
   host in the hot loop, no kernel launch for synchronization (job ring, stream memops).
-  *Status (#167, 2026-10-08): the job ring and the stream memops are not built in the engine; only
-  `probes/src/bin/p9_job_ring.rs` (#7) exists. The decode path uses zero-copy/`CROW_STAGE` staging and the
-  residency counters are drained by the host between tokens (`residency.rs`).*
+  *Status (#167, 2026-10-08, Flash-Next and the 27B): the job ring and the stream memops are not built in
+  their engine; only `probes/src/bin/p9_job_ring.rs` (#7) exists. Their decode path uses zero-copy/`CROW_STAGE`
+  staging and the residency counters are drained by the host between tokens (`residency.rs`). glm5_next
+  (GLM-5.3-Flash, measurement only) has its own stager since 2026-10-09: `CROW_GLM_STAGER=1` (#149, default off,
+  needs `CROW_GLM_FLAGS=1`) waits on NVMe landed flags with `cuStreamWaitValue64` (3.2); still no job ring.*
 
 ### 0.5 Measurement discipline (binding)
 
@@ -174,7 +263,7 @@ and which indexes the engine accepts.
 | `format_version` | `2`. Replaces v1's `version: 1`; its presence is what makes an index v2 |
 | `recipe` | the family row that decided every tensor's dtype: `cnq4.5-flash-next`, `cnq4.5-qwen35-dense` or (converter only, #155) `cnq4.5-glm5-next` |
 | `scales` | the sub-block scale policy, `ceil` or `mse` |
-| `model.family` | the engine's family name (`meta::Family`): `FlashNext`, `Qwen35Dense` or `Glm5Next` (#159: the gate parses it, the boot refuses it at its first unbuilt arm) |
+| `model.family` | the engine's family name (`meta::Family`): `FlashNext`, `Qwen35Dense` or `Glm5Next` (#159: the gate parses it; the generic `Engine` door `boot::open_model` still refuses `Glm5Next` at its first unbuilt arm, test `a_glm_v2_container_is_refused_at_the_boot_door_by_its_first_unbuilt_arm` in `engine/src/boot.rs`, while `serve` boots a glm5_next container through its own door `boot::open_glm5` since #185, v0.11.0) |
 | `model.model_type` | `text_config.model_type` of the config |
 | `model.config_json`, `model.generation_config_json` | the checkpoint's two files **verbatim**, as JSON strings: a string survives the round trip byte for byte, a re-serialized object would not (key order, number format, whitespace) |
 | `model.config_json_sha256`, `model.generation_config_json_sha256` | the sha256 of those bytes; the engine refuses a v2 whose stored config no longer hashes to it |
@@ -413,7 +502,20 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > the launches between two routers replay as one CUDA graph (`docs/glm5-model.md` 6.3). Flash-Next and the 27B do not reach
 > it (gate R). The A9 requirement for this path is that the cache size never changes the output:
 > `glm5_tiers_gpu_cache_size_is_invisible_in_the_logits` (ids and logits bit-identical at the plan's
-> sizes, 1 + 7 and 0 + 0), built, not run on the real container yet. `docs/glm5-model.md` section 6.
+> sizes, 1 + 7 and 0 + 0), built, not run on the real container yet (no run of it is recorded in
+> CHANGELOG or `runs/` up to v0.13.0). `docs/glm5-model.md` section 6.
+>
+> **The GLM operating set is not these defaults.** `runs/glm53-flash/quick/arm4.env` (since 2026-10-11, measurement
+> only, no G7 decision) sets `CROW_GLM_ARENA=global` (one VRAM and one pinned pool over all MoE layers instead of the
+> per-layer arenas, with `CROW_GLM_ARENA_WARM`, `_ELASTIC_GB=10`, `_STAGE_GB=2.6`, `_FREQ=1` (frequency tiers instead of
+> LRU / CLOCK victims), `_REGROW=1`, `_STAGE_LEND=1`, `_LAZY_REFILL=1`, `_PROMPT_COUNT=1`), `CROW_GLM_PINNED=zerocopy`,
+> `CROW_GLM_CPU_LANE=split`, `CROW_GLM_FLAGS=1`, `CROW_GLM_STAGER=1`, `CROW_GLM_RT2=1` (with `_RT2_TABLE_SM`,
+> `_RT2_GATHER_EARLY`), the router prefetch (`CROW_GLM_PREFETCH`, `_PREFETCH_SIDE`, `_SIDE_NOJOIN`, `_GUESS_TRIM`,
+> `CROW_NVME_DEMAND_FIRST`), the fused and tensor-core kernels (`CROW_GLM_HCFUSE`, `_ATTN_FUSE`, `_MUL1_FUSE`,
+> `_DENSE_GEMM`, `_MOE_TC=2`, `_ATTN2`, `_SHARED_OVERLAP`, `_EMBED_GATHER`), prompt calls (`CROW_CHUNK=8192`,
+> `CROW_GLM_STAGE_OVERLAP`, `_PREFILL_NVPF`), `CROW_GLM_KV_LAZY=4096` and `CROW_PINNED_ALLOC=host`. It keeps one NVMe
+> reader (`CROW_GLM_NVME_READERS` unset). Figures per arm: `runs/glm53-flash/quick/README.md`; every switch:
+> `docs/env.md` (Mode `glm-set`, section GLM operating set).
 
 - GPU publishes cold jobs (expert IDs per layer) into the pinned job ring via
   `cuStreamWriteValue32`; the stager gathers weights (RAM tier) into pinned staging
@@ -566,7 +668,10 @@ experts via the job ring → `shared_expert_gate` combine.
 > (a stager-stream sync before an NVMe read into a pinned slot phase A still copies from). Synthetic
 > 8-layer model (5 MoE layers, V 3 + P 4): `cuStreamSynchronize` per decode row 24.75 → 5.50, with
 > `CROW_GLM_GRAPH=1` 22.75 → 3.50, ids and logits bit-identical. The waits are eager between the
-> graph segments, not captured. Not run on the real container. `docs/glm5-model.md` 6.2.
+> graph segments, not captured. On the real container (clean block on `9025e9f`, 2026-10-09 22:37–22:57,
+> `glm5_run -n 64 --reps 3`, `CROW_GLM_PINNED=zerocopy`, `runs/glm53-flash/block-20261010/`): warm decode
+> base 9.732 tok/s, flags 9.837, flags + stager 10.735 (+10.3 %), ids identical to base (CHANGELOG v0.11.0,
+> Measured); the stager is part of the GLM operating set `runs/glm53-flash/quick/arm4.env`. `docs/glm5-model.md` 6.2.
 
 - Pinned host-memory ring, job descriptors 64-byte aligned (exl3 `moe_handoff.h`
   pattern): layer id, job kind, cold expert ids (≤ 10), sequence number, flag slots.
@@ -605,10 +710,11 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   NVMe-tier staging (variant C), refresh, telemetry — off the decode critical path.
   Variant B (CPU compute) stays reserved; variant A (stream-weights) is retired from
   the primary path (kept behind the ring interface for tier transitions).
-  **Status (#167, 2026-10-08): the job ring and the stager are not built in the engine.** Only
-  `probes/src/bin/p9_job_ring.rs` (#7) exists; the decode path uses zero-copy/`CROW_STAGE` staging and the
-  residency counters are drained by the host between tokens (`residency.rs`). The bullet above is the
-  approved design for the control plane, not a description of the engine.
+  **Status (#167, 2026-10-08, Flash-Next and the 27B): the job ring and the stager are not built in their
+  engine.** Only `probes/src/bin/p9_job_ring.rs` (#7) exists; their decode path uses zero-copy/`CROW_STAGE`
+  staging and the residency counters are drained by the host between tokens (`residency.rs`). The bullet
+  above is the approved design for the control plane, not a description of the engine. glm5_next has its
+  own stager since 2026-10-09 (`CROW_GLM_STAGER=1`, #149, default off; 3.2), no job ring.
 - Policy is still per layer, chosen at load, fixed per session.
 - **Decode staging as built (`CROW_STAGE`, default on)**: after `router_top10` the
   staging kernel pulls every COLD combo of the layer into a VRAM staging slot and
@@ -2626,7 +2732,7 @@ Therefore:
 
 **Rule for this section: every row names the crow-nest anchor AND the `crow_core.py` reader.**
 
-- Crow's readers were read on 2026-09-09 from `C:\Users\robin\dev\Crow\cli\crow_core.py`
+- Crow's readers were read on 2026-09-09 from `<Crow checkout>/cli/crow_core.py`
   (worktrees under `.claude/worktrees/` excluded).
 - Line numbers are of that reading.
 

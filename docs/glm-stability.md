@@ -48,7 +48,9 @@ container: `h_scales[127]` is 0 on every NVFP4 line of its sidecar.
 
 ## The 2-hour soak (a measurement, not run yet)
 
-Runs once a GLM container boots (#149, #159). Every run, also a false start, goes into the GLM measurement book.
+Runs once a GLM container boots (#149, #159). A GLM container boots in `serve` since #185 (v0.11.0, 2026-10-10); the
+soak has still not been run (none recorded in CHANGELOG up to v0.13.0). Every run, also a false start, goes into the GLM
+measurement book.
 
 1. Fresh `serve` on the GLM container, nothing else on the GPU but the desktop. Record
    `nvidia-smi --query-gpu=memory.used,memory.total --format=csv` and the `[budget]` and headroom boot lines.

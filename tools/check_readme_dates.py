@@ -3,7 +3,7 @@
 
 The rule
 --------
-- Record rule (spec section 0.5, ``docs/architecture.md:58``): performance is a
+- Record rule (spec section 0.5, ``docs/architecture.md:145``): performance is a
   measurement, not a condition. A measured number without its date is not a
   measurement, it reads as a property of the product.
 - So: every README line that carries a digit run of two or more digits must

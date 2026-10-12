@@ -25,8 +25,10 @@ is deleted by then.
 
 ## Commands
 
-From the crow-nest root (`C:/Users/robin/dev/crow-nest`); `D` = `models/GLM-5.3-Flash-original`,
-`OUT` = `converter/GLM-5.3-Flash-CNQ4.5.cnq`. Use absolute paths for `OUT` in both commands: the
+From the crow-nest root (`<repo>`); `D` = `models/GLM-5.3-Flash-original`,
+`OUT` = `converter/GLM-5.3-Flash-CNQ4.5.cnq` (the historical output of this step: that container was deleted on
+2026-10-08, `runs/glm53-flash/PREREG-dyn.md` amendment 1, and only its sidecar `OUT.sidecar.jsonl` is kept in the
+repository; the engine runs the 3-bit `converter/GLM-5.3-Flash-MUL1K3.cnq` of `docs/glm-mul1-conversion.md`). Use absolute paths for `OUT` in both commands: the
 supervisor compares the `out` the converter writes into `.done` with its own `--out`.
 
 | step | command |

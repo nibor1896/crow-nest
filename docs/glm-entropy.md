@@ -13,6 +13,7 @@ the converter or a container. Results of record: `runs/glm53-flash/step10/README
 
 ```
 # the census; the G2 line only on a finished container (exit 0), else PROVISIONAL numbers (exit 3)
+# (the CNQ4.5 container was deleted on 2026-10-08, runs/glm53-flash/PREREG-dyn.md amendment 1; its sidecar is committed)
 python -I tools/glm_entropy_report.py census converter/GLM-5.3-Flash-CNQ4.5.cnq.sidecar.jsonl \
     --decoder-draft runs/glm53-flash/step10/decoder-draft.json [--block 3:0] [--json out.json]
 

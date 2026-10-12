@@ -158,7 +158,7 @@ Source (read 2026-10-08): `zai-org/GLM-5.3-Flash` rev `eb9eb208eb0d988989d07a6a1
 - Computed during quantization by dequantizing in place, so it costs no second pass.
 - It is gate 0 of the measurement ladder.
 - Exit code 1 on any bound violation, in the mode that has a bound.
-- The converter never judges its own output beyond that bound; FP8-KV and PLE-NVFP4 quality are oracle comparisons (`../docs/architecture.md:119-120`, and section 5 for the gates).
+- The converter never judges its own output beyond that bound; FP8-KV and PLE-NVFP4 quality are oracle comparisons (`../docs/architecture.md:208-209`, and section 5 for the gates).
 
 ## Scale policy `--scales`
 

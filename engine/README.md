@@ -11,9 +11,9 @@
 
 ## Binaries
 
-- One row per binary: the 23 `[[bin]]` entries of `Cargo.toml` plus the three files in `src/bin/` that Cargo discovers on its own (`router_probe`, `ramcheck`, `pin_return_probe`), counted 2026-09-23 (it was eighteen entries on 2026-09-17).
+- One row per binary: the 24 `[[bin]]` entries of `Cargo.toml` (`glm5_run` the 24th, `Cargo.toml:139-141`) plus the three files in `src/bin/` that Cargo discovers on its own (`router_probe`, `ramcheck`, `pin_return_probe`), 27 in all, counted 2026-10-12 with `cargo metadata` (23 entries on 2026-09-23, eighteen on 2026-09-17).
 - The product binaries are named `serve`, `decode` and `parity` on Linux and `serve.exe`, `decode.exe` and `parity.exe` on Windows; every command below prints the Linux name.
-- Every binary that opens the container defaults to `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` and lets `CROW_CNQ` override it; `plecheck` and `states` were the last two to be brought over (issue #60, 2026-09-18).
+- Every binary that opens the container lets `CROW_CNQ` override its default. The Flash-Next binaries default to `converter/Qwen3.8-Flash-Next-CNQ4.5-M.cnq` (`geo::DEFAULT_CNQ`); `plecheck` and `states` were the last two to be brought over (issue #60, 2026-09-18). `glm5_run` defaults to `../converter/GLM-5.3-Flash-MUL1K3.cnq`, relative to `engine/` (`from_engine_dir(GLM5_MUL1K3_CNQ)`, `src/bin/glm5_run.rs:676`), after `--cnq` and `CROW_CNQ`; `serve` boots a glm5_next container when `CROW_CNQ` names one (#185).
 
 | binary | purpose | kind |
 |---|---|---|
@@ -43,6 +43,7 @@
 | `attn_path_probe` | prefill-vs-decode QSA attention row equality (issue #89) | probe |
 | `rope_table_probe` | RoPE table bit provenance (issue #89) | probe |
 | `gdn_chunk_probe` | the GDN prefill numerics against the chunked HF form (issue #89) | probe |
+| `glm5_run` | GLM-5.3-Flash (glm5_next) greedy generation with the routed experts in VRAM, pinned RAM and NVMe; prefill and decode timed and counted apart, `--reps`, `--cold`, `--prompt` / `--ids` / `--prompt-ids` / `--random-ids`, `--kv-rows`, `--json`; the instrument of the 3-minute check `runs/glm53-flash/quick/` (#175, #149, #187) | measurement |
 
 ## Build
 

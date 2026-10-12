@@ -170,6 +170,7 @@ body::after{
   box-shadow:var(--shadow-card);
   animation:rise .8s var(--ease) both;
 }
+.archive-note{margin:14px auto 0;max-width:560px;font-family:var(--font-mono);font-size:12px;line-height:1.6;color:var(--warn)}
 .pulse-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);position:relative;flex:none}
 .pulse-dot::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:1px solid var(--ok);opacity:.5;animation:pulse 2s ease-out infinite}
 @keyframes pulse{from{transform:scale(.5);opacity:.7}to{transform:scale(1.5);opacity:0}}
@@ -446,6 +447,7 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
 </style>
 </head>
 <body>
+<!-- Archived design mockup, last changed 2026-09-18 (Flash-Next only). Current state: README.md and docs/status.md. -->
 
 <!-- ================= NAV ================= -->
 <header class="nav" id="nav">
@@ -486,6 +488,7 @@ footer{border-top:1px solid var(--border);padding:70px 0 0;overflow:hidden}
   <div class="gridlines" aria-hidden="true"></div>
   <div class="wrap">
     <div class="hero-badge"><span class="pulse-dot"></span>work in progress · 360B on a single RTX 5090</div>
+    <p class="archive-note">Archived design mockup of 2026-09-18, Flash-Next only. The current state is in the repository's README and docs/status.md.</p>
     <h1>
       <span class="line"><span>360B parameters.</span></span>
       <span class="line"><span class="grad">One GPU.</span></span>

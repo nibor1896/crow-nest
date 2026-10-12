@@ -4,7 +4,7 @@
 The rule
 --------
 - Same record rule as ``tools/check_readme_dates.py`` (spec section 0.5,
-  ``docs/architecture.md:58``): performance is a measurement, not a condition. A
+  ``docs/architecture.md:145``): performance is a measurement, not a condition. A
   measured number without its date is not a measurement, it reads as a property
   of the product. The card must not present the 972/42 targets or any perf
   number as a property (decision record, spec section 0.1).
