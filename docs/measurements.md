@@ -61,7 +61,11 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 
 ### GLM-5.3-Flash (glm5_next), measurement only
 
-- Not an operating point: every GLM switch is default off, G3 with the operating set, G4 (200k boot), G5 (Crow) and G6 are not run (#149, #151, #169). The PREREG G5 bar is decode ≥ 40 tok/s (`runs/glm53-flash/PREREG.md`).
+- Not an operating point: every GLM switch is default off, the operating set is `runs/glm53-flash/quick/arm4.env`, and no G7 decision is recorded (G7 is robin's decision on the recorded verdicts G1-G6, `runs/glm53-flash/PREREG.md:121-125`). State of the gates on 2026-10-12 (#149, #151, #169):
+  - G3 with the operating set and G6 are not run.
+  - G4 (200k boot): a 10-boot series ran on 2026-10-11 with `arm3.env` (`runs/glm53-flash/g3g4-20261011/`, local, not in git; one cold turn of `prompt-33k.txt` per boot, GLM `prompt_n` 30,986; named in amendment 8, `PREREG.md:239`), and the #214 acceptance on `045bfa0` notes "G4 10/10" (CHANGELOG v0.12.0); no G4 verdict with VRAM, commit and m is recorded.
+  - G5 (Crow): robin's Crow-window sessions exist: 2026-10-11, the G5 session with `arm4.env` (CHANGELOG v0.12.0; its t1 turn decoded 8.29 tok/s on the host sampler) and a t3 turn at 14.17 tok/s on the #215 device-sampler build (N=1 each, different turns, CHANGELOG v0.12.0) and 2026-10-12 (one 3-round task, decode 14.03 tok/s, with the three prefill switches on, CHANGELOG v0.13.0). No G5 verdict is recorded.
+  - The G5 decode bar is ≥ 23.7 tok/s, median over the ≥ 5 window tasks (amendment 7, `PREREG.md:217`, 2026-10-11; 40 tok/s in the original PREREG). Under amendment 7 a median below 23.7 is recorded as "below the bar" with its number and is not a G5 failure; cold prefill at ~32k ≥ 150 tok/s and the 3-boot spread ≤ 1.15 still fail G5.
 - One RTX 5090, Windows 11, container `GLM-5.3-Flash-MUL1K3.cnq` (3-bit MUL1 routed experts, 124,591,634,567 B), `glm5_run --cold --reps 1`, real text, N=1 per arm, raw data `runs/glm53-flash/quick/` (`README.md` there lists every arm).
 
 | arm | prefill, 8,192 tokens | TTFT | decode, 127 tokens, median over tokens | decode wall | date | source |
