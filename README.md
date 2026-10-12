@@ -1,8 +1,8 @@
 <picture>
-  <source media="(max-width: 700px) and (prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-mobile-dark.svg">
-  <source media="(max-width: 700px)" srcset="docs/images/readme/crow-nest-mobile-light.svg">
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-dark.svg">
-  <img src="docs/images/readme/crow-nest-light.svg" width="100%" alt="crow-nest: one GPU, its own quant, two model families. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5 with MTP and its own F16 vision projector, OpenAI-compatible, the engine behind Crow.">
+  <source media="(max-width: 700px) and (prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-mobile-dark.svg?v=20261012">
+  <source media="(max-width: 700px)" srcset="docs/images/readme/crow-nest-mobile-light.svg?v=20261012">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-dark.svg?v=20261012">
+  <img src="docs/images/readme/crow-nest-light.svg?v=20261012" width="100%" alt="crow-nest: one GPU, its own quant, three model families. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M and the dense Qwen3.8-27B as CNQ4.5 with MTP and its own F16 vision projector, OpenAI-compatible, the engine behind Crow.">
 </picture>
 
 **Build** (Flash-Next container: 104.7 GB from Hugging Face)
