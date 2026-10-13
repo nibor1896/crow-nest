@@ -1,8 +1,8 @@
 # docs index
 
 Every page under `docs/`, grouped; one line each, taken from the page's own title and opening lines. The repository's
-front page is [`../README.md`](../README.md). GLM-5.3-Flash (glm5_next) is a third model family **in measurement only**
-(no G7 decision, `runs/glm53-flash/PREREG.md`); its operating set is `runs/glm53-flash/quick/arm4.env`.
+front page is [`../README.md`](../README.md). GLM-5.3-Flash (glm5_next) is the third model family and
+Crow's third operating point (robin, 2026-10-11, Crow #365); its operating set is `runs/glm53-flash/quick/arm4.env`.
 
 ## Getting started and status
 

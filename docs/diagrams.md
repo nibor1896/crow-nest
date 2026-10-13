@@ -13,7 +13,7 @@ branch `release-2026-09-23` (`ebcd780`): diagrams 1, 2, 4 and 5 for the launcher
 default, the `CROW_QFUSE` default, the flat PLE row read, the registered cold tier and the #100
 zero-prefill reuse (changelog entry of that date); 3, 6, 7 and 8 were not re-read.
 
-Scope (2026-10-12): the diagrams draw Flash-Next's path. GLM-5.3-Flash (glm5_next: the MUL1K3 container, `boot::open_glm5`, the expert tiers in VRAM, pinned RAM and NVMe, `glm5_run`) is not drawn. It is in measurement, operating set `runs/glm53-flash/quick/arm4.env`, with G7 open (`docs/status.md`), and stays out of scope here until G7; its layer path is written in `docs/glm5-model.md`.
+Scope (2026-10-12): the diagrams draw Flash-Next's path. GLM-5.3-Flash (glm5_next: the MUL1K3 container, `boot::open_glm5`, the expert tiers in VRAM, pinned RAM and NVMe, `glm5_run`) is not drawn yet. It is Crow's third operating point (operating set `runs/glm53-flash/quick/arm4.env`); its layer path is written in `docs/glm5-model.md`.
 
 ## 1 · System overview, from originals to served tokens
 
@@ -386,4 +386,4 @@ Spec: 5.1, 5.2, 5.3, 7.11.16 to 7.11.18, 8.7, 8.9, 8.10.
 - 2026-09-25, #110: **1, system overview:** the loader box names the render reserve. **3, VRAM pie:** one new slice, the render reserve (1.5 GiB, kept free for a co-resident renderer, `CROW_RENDER_RESERVE_MB`), taken from the hot-expert slice (21.2 -> 19.7, arithmetic, not a measured boot). **4, residency and load:** the planner box names the render reserve in `pending`. The other diagrams do not show the planner's reserves.
 - 2026-09-25, #110 follow-up: the render reserve defaults to 0 and is granted best-effort. **1** and **4** name the grant, **3** drops the 1.5 GiB slice and restores the hot-expert slice (19.7 -> 21.2, arithmetic).
 - 2026-09-25, v0.6.0 (#117, #118): **5, serve:** the server box names the three `/v1/crow/vram` endpoints of #117; a new PARK node between the prefix decision and the rollback draws #118, the held conversation parked in host RAM for a shorter unrelated request and restored by the next main turn. The other diagrams do not change.
-- 2026-10-12: scope note under the header: GLM-5.3-Flash (glm5_next, v0.11.0 to v0.13.0) is not drawn and stays out of scope until G7; no diagram was redrawn or re-read in this pass.
+- 2026-10-12: scope note under the header: GLM-5.3-Flash (glm5_next, v0.11.0 to v0.13.0) is not drawn yet; no diagram was redrawn or re-read in this pass.

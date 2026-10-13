@@ -215,7 +215,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8099/v1/chat/completions -Method Post -C
 
 ## GLM-5.3-Flash (measurement)
 
-GLM-5.3-Flash (engine family glm5_next) is in measurement: every GLM switch is default off, the operating set is `runs/glm53-flash/quick/arm4.env` (#214, robin 2026-10-11), and G7 is open (`docs/status.md`, `docs/measurements.md`). Flash-Next and the 27B keep their default path.
+GLM-5.3-Flash (engine family glm5_next) is Crow's third operating point (robin's decision of 2026-10-11, Crow #365; PREREG amendment 10). Every GLM switch is default off in the code; the operating set is `runs/glm53-flash/quick/arm4.env` (#214, robin 2026-10-11). Flash-Next and the 27B keep their default path.
 
 | item | value | source |
 |---|---|---|
@@ -229,7 +229,14 @@ GLM-5.3-Flash (engine family glm5_next) is in measurement: every GLM switch is d
 
 ### Get the container
 
-No container is published. Build it from the originals: download and verify them with [glm-download.md](glm-download.md) (the staged download, conversion and delete-behind is [glm-staged-conversion.md](glm-staged-conversion.md)), then quantize and convert with [glm-mul1-conversion.md](glm-mul1-conversion.md) ("Commands", run (b)).
+The container is on Hugging Face since 2026-10-12 (`nibor1896/GLM-5.3-Flash-MUL1K3`, 124,591,634,567 B, sha256 `9ce11456…`; Crow #365):
+
+```
+hf download nibor1896/GLM-5.3-Flash-MUL1K3 GLM-5.3-Flash-MUL1K3.cnq --local-dir converter
+hf download zai-org/GLM-5.3-Flash tokenizer.json tokenizer_config.json chat_template.jinja --local-dir models/GLM-5.3-Flash-original
+```
+
+To build it yourself instead: download and verify the originals with [glm-download.md](glm-download.md) (the staged download, conversion and delete-behind is [glm-staged-conversion.md](glm-staged-conversion.md)), then quantize and convert with [glm-mul1-conversion.md](glm-mul1-conversion.md) ("Commands", run (b)).
 
 ### Build
 

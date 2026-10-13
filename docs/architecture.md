@@ -146,7 +146,7 @@ is a pass/fail gate.
   *Status (#167, 2026-10-08, Flash-Next and the 27B): the job ring and the stream memops are not built in
   their engine; only `probes/src/bin/p9_job_ring.rs` (#7) exists. Their decode path uses zero-copy/`CROW_STAGE`
   staging and the residency counters are drained by the host between tokens (`residency.rs`). glm5_next
-  (GLM-5.3-Flash, measurement only) has its own stager since 2026-10-09: `CROW_GLM_STAGER=1` (#149, default off,
+  (GLM-5.3-Flash) has its own stager since 2026-10-09: `CROW_GLM_STAGER=1` (#149, default off,
   needs `CROW_GLM_FLAGS=1`) waits on NVMe landed flags with `cuStreamWaitValue64` (3.2); still no job ring.*
 
 ### 0.5 Measurement discipline (binding)
@@ -505,8 +505,8 @@ units, about 12 hot experts per layer), and the post-plan check below requires
 > sizes, 1 + 7 and 0 + 0), built, not run on the real container yet (no run of it is recorded in
 > CHANGELOG or `runs/` up to v0.13.0). `docs/glm5-model.md` section 6.
 >
-> **The GLM operating set is not these defaults.** `runs/glm53-flash/quick/arm4.env` (since 2026-10-11, measurement
-> only, no G7 decision) sets `CROW_GLM_ARENA=global` (one VRAM and one pinned pool over all MoE layers instead of the
+> **The GLM operating set is not these defaults.** `runs/glm53-flash/quick/arm4.env` (since 2026-10-11, Crow's third
+> operating point) sets `CROW_GLM_ARENA=global` (one VRAM and one pinned pool over all MoE layers instead of the
 > per-layer arenas, with `CROW_GLM_ARENA_WARM`, `_ELASTIC_GB=10`, `_STAGE_GB=2.6`, `_FREQ=1` (frequency tiers instead of
 > LRU / CLOCK victims), `_REGROW=1`, `_STAGE_LEND=1`, `_LAZY_REFILL=1`, `_PROMPT_COUNT=1`), `CROW_GLM_PINNED=zerocopy`,
 > `CROW_GLM_CPU_LANE=split`, `CROW_GLM_FLAGS=1`, `CROW_GLM_STAGER=1`, `CROW_GLM_RT2=1` (with `_RT2_TABLE_SM`,
