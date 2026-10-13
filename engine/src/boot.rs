@@ -390,6 +390,15 @@ mod tests {
         assert_eq!(nvme_tier_refusal(Some("x.cold3.bin"), Some(" ")), None);
     }
 
+    /// `docs/env.md` is compiled into serve.exe, so `tools/pack-engine.ps1`'s privacy scan
+    /// reads it too: the owner's name in a row refused the v0.13.1 pack (8 hits, 2026-10-13).
+    /// Rows say "the owner", as the rest of the shipped code does (#131).
+    #[test]
+    fn the_compiled_in_env_doc_names_no_person() {
+        let lower = ENV_DOC.to_lowercase();
+        assert!(!lower.contains("robin"), "docs/env.md names the owner; it ships inside serve.exe");
+    }
+
     #[test]
     fn the_env_doc_rows_are_the_names_the_engine_reads() {
         let known = documented_crow_names();
