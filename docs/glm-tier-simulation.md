@@ -159,8 +159,9 @@ included. It checks the tool only; no number from it describes GLM.
 
 - **Not run on GLM routing.** The routing passes wait for the full container (step 9). The runner
   takes the prompt in 512-row calls against an in-place DSA cache (`--prompt-chunk`, crow-nest #147);
-  `tools/glm_route_passes.py` drives the five passes. About 1.8 h per pass, about 9 h for the corpus
-  (derived, not measured; the first pass measures it), against about 16 h per pass for the runner
+  `tools/glm_route_passes.py` drives the five passes. One pass took 4,732.0 s (measured: FP8 back end,
+  32,768 positions of the held-out todo-1006, 2026-10-09, crow-nest #179; the 1.8 h derived before it
+  was for the container back end), against about 16 h per pass for the runner
   before the chunk option, which had to feed 28,672 of the 32,768 rows one at a time while HF's
   `DynamicCache` concatenated the expanded MLA K/V on every row. Amendment 1 derived 1.4 h; the
   difference is KDA's chunk form (`docs/glm5-reference-runner.md` section 8).

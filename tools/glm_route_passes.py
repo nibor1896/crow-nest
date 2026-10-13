@@ -4,13 +4,16 @@ through the layerwise runner (oracle/glm5_layerwise.py, #158) on the full CNQ co
 the FP8 originals.
 
   .venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py [--dry-run]
-      [--container converter/GLM-5.3-Flash-CNQ4.5.cnq | --fp8 models/GLM-5.3-Flash-original]
+      (--fp8 models/GLM-5.3-Flash-original | --container <file.cnq>)
       [--corpus decode_out/glm-step8/corpus] [--runs decode_out/glm-step8/runs] [--files <name>,...]
       [--prompt-chunk 512]
 
 --files (alias --only) runs only the named files, in the amendment's order. PREREG-dyn amendment 2: the four
 calibration files' routing comes from the conversion's capture (#182, `tools/glm_tier_sim.py dyn --capture`),
 so G1d needs one pass: --fp8 models/GLM-5.3-Flash-original --files todo-1006.
+The routing source has no default (#232): the CNQ4.5 container that was the default was deleted 2026-10-08
+and is not rebuilt (#179); without --fp8 or --container the call exits 2. PREREG-dyn amendment 1 names the
+FP8 originals as the source of record.
 
 Before anything runs (exit 2 with the reason otherwise):
   - the container is complete: no `<cnq>.journal.jsonl` beside it (the converter deletes it only after
@@ -61,7 +64,6 @@ fg = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fg)
 
 RUNNER = os.path.join(ROOT, "oracle", "glm5_layerwise.py")
-CONTAINER = os.path.join(ROOT, "converter", "GLM-5.3-Flash-CNQ4.5.cnq")
 FP8 = os.path.join(ROOT, "models", "GLM-5.3-Flash-original")
 CORPUS = os.path.join(ROOT, "decode_out", "glm-step8", "corpus")
 RUNS = os.path.join(ROOT, "decode_out", "glm-step8", "runs")
@@ -382,11 +384,18 @@ def run_passes(names, ids_paths, weights, runs_dir, index_sha, tokens=TOKENS, pr
     return 0
 
 
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):  # #232: a missing source is refused by name, with the source of record
+        if "--container" in message and "--fp8" in message and "required" in message:
+            message = ("name the routing source: --fp8 <dir> (PREREG-dyn amendment 1, the source of record) or "
+                       "--container <file.cnq>; there is no default (the CNQ4.5 container was deleted 2026-10-08)")
+        super().error(message)
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    src = ap.add_mutually_exclusive_group()
-    src.add_argument("--container", default=None, help="the full CNQ container (default %s)" % os.path.relpath(
-        CONTAINER, ROOT))
+    ap = _Parser(description=__doc__.split("\n")[0])
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--container", default=None, metavar="FILE.cnq", help="a full CNQ container")
     src.add_argument("--fp8", default=None, metavar="DIR",
                      help="#179: the FP8 originals as tools/fetch-glm.py verified them (e.g. %s)" % os.path.relpath(
                          FP8, ROOT))
@@ -416,7 +425,7 @@ def main(argv=None):
                    "identity %s" % (a.fp8, len(identity["shards"]), REVISION[:8], index_sha,
                                     identity["identity_sha256"])
         else:
-            container = a.container or CONTAINER
+            container = a.container
             _, index_sha = container_index(container)
             identity, weights = container_identity(index_sha), ("container", container)
             seen = "container %s: complete, index sha256 %s" % (container, index_sha)

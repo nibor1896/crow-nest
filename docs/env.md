@@ -237,7 +237,7 @@ the four sha256 values of `tools/gate-linux.sh` are identical with the logging a
 ## GLM-5.3-Flash (glm5_next) (57 rows)
 
 Read only on the glm5_next path (`serve` through `boot::open_glm5` since #185, v0.11.0, and `glm5_run`) or by its tests;
-Flash-Next and the 27B never reach them. GLM-5.3-Flash is measurement only (no G7 decision, `runs/glm53-flash/PREREG.md`).
+Flash-Next and the 27B never reach them. GLM-5.3-Flash is Crow's third operating point (robin's decision of 2026-10-11, Crow #365; PREREG amendment 10); Crow's `glm53-flash` point sets the operating set.
 Every default keeps the path without the switch; the rows with Mode `glm-set` are what the GLM operating set `runs/glm53-flash/quick/arm4.env` turns on
 (section GLM operating set). The two prefix-cache switches of glm5_next (`CROW_GLM_ANSWER_REUSE`, `CROW_GLM_PREFIX_ANCHOR`)
 are in section Server.

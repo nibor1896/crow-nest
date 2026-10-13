@@ -321,3 +321,19 @@ A serve crash or a void session is a row. The session is then repeated in a new 
 4. After t5, close Crow and tell the lead. The lead stops `serve` and runs the 3 synthetic boots, with nobody at the window.
 
 After the session, the lead copies the five session files (`%LOCALAPPDATA%\Crow\session\chat-*.json`). For each task, the lead checks the first user message (trailing whitespace stripped) against its sha256. A task whose text differs is recorded and not counted.
+
+### Amendment 9 — 2026-10-13: the G4 verdict as robin accepted it (crow-nest #149)
+
+Written 2026-10-13 on crow-nest `8e4ee79` (branch `claude/serene-cannon-n57rq2`), after the G4 series and robin's acceptance; it records a verdict and changes no threshold, metric, data set or method. Seen when written: the G4 series (#149 comment of 2026-10-11), robin's acceptance (#149 comment of 2026-10-12, issue closed) and what amendment 8 saw; no G5 verdict (#151) and no G6 row (#152). Reason: the abort rules record every verdict with its number, and G7 judges recorded verdicts; until now the G4 verdict stood only in #149, `docs/measurements.md` and `docs/status.md`.
+
+**Series.** 2026-10-11 08:04–08:14 CEST, robin's GPU go, `.gpu-lock` held. crow-nest local main `298092b` (engine tree = `36b0d9d` v0.11.0), `engine/target/release/serve.exe` built 07:51 from that tree. Container `converter/GLM-5.3-Flash-MUL1K3.cnq`, env `runs/glm53-flash/quick/arm3.env` (33 variables), `serve --port 8099`, `[serve] n_ctx 200000`, tiers per MoE layer VRAM 37 / pinned 118 / NVMe 133. Each boot: one streamed greedy turn of `crow-lab/runs/2026-08-28-flash-next/prompt-33k.txt` (sha256 `62141cb4…bcde`, GLM `prompt_n` 30,986), `max_tokens` 64, thinking closed; commit charge sampled every 0.5 s from serve start to the end of the turn. n = 10. Run dir `runs/glm53-flash/g3g4-20261011/` (local, not in git: `g4-boots.{json,out}`, `boot01..10.log`).
+
+**Per clause (G4 threshold, all must hold):**
+- 10/10 boots: **met**, 10/10 with `/health` and a finished turn.
+- VRAM < 31.9 GiB after the turn: **met**, 29,472 MiB = 28.78 GiB every boot.
+- commit under 103.38 GiB: **met**, peak 91.999–92.102 GiB (system-wide, other processes included).
+- engine m inside the step-8 95 % CI [0.4948, 0.5500] (`step08/20261008-g1.md`, N 25, W 0): **not met**, m = 0.3343–0.3344 (21,342–21,350 cold of 63,848 selections), below the CI. The robustness line covers only m above the CI. Stated, not judged (#149): the engine m is over the prompt-33k prefill (30,986 prompt rows + 64 decode rows) with VRAM 37 / pinned 118 and the global arena; the CI is over generated positions of `todo-1006` at N 25.
+
+**Verdict: accepted by robin, 2026-10-12** (#149). By the letter of the threshold G4 is not passed on its m clause; #149 left how that clause counts to robin. His decision, #149 acceptance comment of 2026-10-12, verbatim: "robin's live check on 2026-10-12: accepted (G4 and his Crow sessions on GLM-5.3-Flash)." Its conditions line names the boot, VRAM and commit clauses ("G4 2026-10-11, 10/10 boots at 200k, VRAM 28.78 GiB (< 31.9), commit peak 92.1 of 103.38 GiB") and gives no separate rule for m. Build of that live check: installed crow-nest v0.12.0 serve in robin's Crow (`%LOCALAPPDATA%\Crow\bin`), arm4.env, 200k context. For G7 the verdict is carried as written here, "accepted by robin, m clause not met by the letter (0.3343 below [0.4948, 0.5500])"; it is not rewritten as "passed".
+
+**Administrative, no criterion changed.** G7's consequence line says "the ~180 GB upload". That size is the 4.5-bit container `converter/GLM-5.3-Flash-CNQ4.5.cnq` (178,490,593,097 B, #144), deleted 2026-10-08 ~21:20 and not rebuilt (#144, #179). The container of record is `converter/GLM-5.3-Flash-MUL1K3.cnq`, 124,591,634,567 B (sha256 `9ce11456c68f80926e1fe8289888a3571309a1f8558bc73d1578f0db2b30213e`, #156), the one G4 ran on. The G7 text above is not edited.

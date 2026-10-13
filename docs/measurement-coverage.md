@@ -5,7 +5,7 @@ Source: Crow's own routing logs — 15 `print_locality` blocks from 15 server ru
 UD-Q2_K_XL quant, 48 expert layers × 512 experts, 10 routed + 1 shared). Read-only;
 analysis script: `tools/coverage-curve.py`.
 
-Scope (2026-10-12): every section of this page is Flash-Next (and its `serve` / `decode run` chains). GLM-5.3-Flash (glm5_next) is not covered here: it is in measurement, operating set `runs/glm53-flash/quick/arm4.env`, G7 open (`docs/status.md`), and stays out of scope for this page until G7. Its routing and tier figures are in `docs/glm-tier-simulation.md` and `docs/measurements.md`.
+Scope (2026-10-12): every section of this page is Flash-Next (and its `serve` / `decode run` chains). GLM-5.3-Flash (glm5_next) is not covered here (operating set `runs/glm53-flash/quick/arm4.env`). Its routing and tier figures are in `docs/glm-tier-simulation.md` and `docs/measurements.md`.
 
 ## Measured (per block: fraction of experts covering 50/80/95 % of routed selections)
 

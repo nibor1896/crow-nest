@@ -61,8 +61,9 @@ shows what each choice changes. Threads: `ORACLE_THREADS` (default 16).
 .venv-oracle/Scripts/python.exe -I oracle/glm5_layerwise.py selftest [--shapes small|real] [--hf-experts eager|grouped_mm] \
     [--prompt-chunk 40] [--T 96] [--D 4]
 
-# step 8: the five routing passes of PREREG amendment 1 (section 8)
-.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py [--dry-run]
+# step 8: the routing passes of PREREG amendment 1 (section 8); the source is required, the FP8
+# originals are the one of record (PREREG-dyn amendment 1, #232); --files todo-1006 for G1d (amendment 2)
+.venv-oracle/Scripts/python.exe -I tools/glm_route_passes.py --fp8 models/GLM-5.3-Flash-original [--dry-run]
 
 # the tests (about 1 min; the container suite needs the converter binary, or CROW_CONVERTER)
 .venv-oracle/Scripts/python.exe -I -m unittest discover -s oracle -p "test_glm5_*.py" -v
