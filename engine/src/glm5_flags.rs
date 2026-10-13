@@ -960,7 +960,11 @@ impl Routed {
     /// scored against the guess an earlier call made for `layer`, and this call's guess (when the
     /// device made one) goes to [`take_hint`] for `ExpertTiers::table_for`.
     pub fn wait_layer(&mut self, layer: usize) -> Result<Vec<i32>, String> {
+        // #227: serve's watchdog names it (the overlap path reaches here without `router_ids`)
+        crate::hostwait::at_layer(layer);
+        let w = crate::hostwait::open(crate::hostwait::Wait::RouterFlag, Some(layer), 0);
         let ids = self.wait()?;
+        drop(w);
         let Some(p) = self.pred.as_ref() else { return Ok(ids) };
         // #202 S: a self-published guess is scored as the host read it ([`take_guess`])
         if let Some((gl, g)) = self.last_guess.take().or_else(take_side_read) {
@@ -1874,6 +1878,7 @@ impl RingReader {
         let e = unsafe { self.ring.0.add((s as usize % CTL_RING) * CTL_ENTRY) };
         let t0 = std::time::Instant::now();
         let mut spins = 0u32;
+        let _w = crate::hostwait::open(crate::hostwait::Wait::CtlRequest, None, s);
         while unsafe { std::ptr::read_volatile(e as *const u64) } != s {
             spins = spins.wrapping_add(1);
             if spins % 1024 == 0 {
@@ -1965,7 +1970,10 @@ impl Ctl {
         let t0 = std::time::Instant::now();
         let mut spins = 0u32;
         // SAFETY: the live mapped reply word
-        while unsafe { std::ptr::read_volatile(self.reply.host as *const u64) } < want {
+        let up = || unsafe { std::ptr::read_volatile(self.reply.host as *const u64) } >= want;
+        // #227: serve's watchdog names it (only when the reply is not there yet)
+        let _w = (!up()).then(|| crate::hostwait::open(crate::hostwait::Wait::CtlReply, None, want));
+        while !up() {
             spins = spins.wrapping_add(1);
             if spins % 64 == 0 {
                 let q = self.timed_out();
@@ -2262,6 +2270,7 @@ impl LaneCtx {
             if ready.is_empty() {
                 let tw = std::time::Instant::now();
                 let mut spins = 0u32;
+                let w = crate::hostwait::open(crate::hostwait::Wait::LaneLanding, None, job.q);
                 while !left.iter().any(|p| p.ready.landed()) {
                     spins = spins.wrapping_add(1);
                     if spins % 64 == 0 {
@@ -2274,6 +2283,7 @@ impl LaneCtx {
                     }
                     std::hint::spin_loop();
                 }
+                drop(w);
                 wait += tw.elapsed();
                 if !ok {
                     break;
@@ -2479,6 +2489,7 @@ impl<T: Send + 'static> Worker<T> {
     pub fn wait(&mut self) -> Result<T, String> {
         assert!(self.pending > 0, "glm5 controller: no job to wait for");
         self.pending -= 1;
+        let _w = crate::hostwait::open(crate::hostwait::Wait::CtlJob, None, 0);
         self.rx.recv().map_err(|_| format!("{ENV_CONTROLLER}: the controller thread is gone"))?
     }
 
@@ -2604,6 +2615,7 @@ impl Readback {
     /// # Safety
     /// [`Readback::enqueue_marked`] ran.
     pub unsafe fn wait_marked(&self) {
+        let _w = crate::hostwait::open(crate::hostwait::Wait::EventSync, None, 0);
         cuda::ck(sys::cuEventSynchronize(self.ev));
     }
 
