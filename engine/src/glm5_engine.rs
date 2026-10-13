@@ -185,10 +185,6 @@ pub trait Rows {
     fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
         crate::glm5_tiers::CopyCounts::default()
     }
-    /// #228: the next-layer guesses' counters since boot (`CROW_GLM_PREFETCH`; default: off)
-    fn prefetch_stats(&self) -> Option<crate::glm5_flags::PrefetchStats> {
-        None
-    }
 
     /// `CROW_GLM_LA`: drop a row enqueued ahead (the state back to the last returned row);
     /// everything that reads or replaces the sequence's state calls this first
@@ -527,9 +523,6 @@ impl Rows for Glm5Device {
     }
     fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
         self.tiers.copy_counts()
-    }
-    fn prefetch_stats(&self) -> Option<crate::glm5_flags::PrefetchStats> {
-        self.tiers.prefetch_stats()
     }
     fn slots(&self) -> usize {
         self.run.slots()
@@ -881,11 +874,6 @@ impl<R: Rows> Glm5Engine<R> {
     /// #222: the expert record copies (H2D, D2H) and the unified tiers' refusals since boot
     pub fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
         self.rows.copy_counts()
-    }
-
-    /// #228: the next-layer guesses' counters since boot (`None` when `CROW_GLM_PREFETCH` is off)
-    pub fn prefetch_stats(&self) -> Option<crate::glm5_flags::PrefetchStats> {
-        self.rows.prefetch_stats()
     }
 
     /// The detection rule of `serve` (spec 7.4, #100) for the one snapshot: `L` is the common

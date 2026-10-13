@@ -621,7 +621,6 @@ use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::glm5_engine::{self, Glm5Device, Glm5Engine, Rows};
 use crow_nest_engine::glm5_template;
-use crow_nest_engine::glm5_flags::PrefetchStats;
 use crow_nest_engine::glm5_tiers::CopyCounts;
 use crow_nest_engine::gen::{DevSampler, Engine};
 use crow_nest_engine::geo::{apply_adapt_policy, resolve_default, Family, Geo, DEFAULT_CNQ, DEFAULT_HOTSETS, TRICKLE_CHUNK_THRESHOLD};
@@ -6112,29 +6111,6 @@ fn glm_counters_line(acc: [u64; 3], nvme_bytes: u64, c: CopyCounts, prev: [u64; 
     )
 }
 
-/// #228: the tail of glm5_next's `[chat] counters` line: the next-layer guesses (`CROW_GLM_PREFETCH`)
-/// of this request, the difference to what the previous request left (`prev`; `None` = zero), as
-/// totals and per decode token (`steps`, the request's decode steps), the fields of `glm5_run`'s
-/// `prefetch` block: issued (records read on a guess), used (a demand took one), wasted (dropped
-/// unused), dropped (taken out of the reader queue before the drive, `CROW_GLM_GUESS_TRIM`)
-fn glm_guess_note(now: Option<PrefetchStats>, prev: Option<PrefetchStats>, steps: usize) -> String {
-    let Some(c) = now else { return ", guesses off (CROW_GLM_PREFETCH)".to_string() };
-    let p = prev.unwrap_or_default();
-    let d = [c.issued.saturating_sub(p.issued), c.used.saturating_sub(p.used), c.wasted.saturating_sub(p.wasted), c.dropped.saturating_sub(p.dropped)];
-    let t = steps.max(1) as f64;
-    format!(
-        ", guesses issued {} used {} wasted {} dropped {} (per decode token {:.2} / {:.2} / {:.2} / {:.2} over {steps})",
-        d[0],
-        d[1],
-        d[2],
-        d[3],
-        d[0] as f64 / t,
-        d[1] as f64 / t,
-        d[2] as f64 / t,
-        d[3] as f64 / t
-    )
-}
-
 /// - #185 part 2: what the requests of a glm5_next process share; `CROW_GLM_MAX_BATCH`: they
 ///   run on threads of their own, so the book sits behind a lock taken at the start and the end
 ///   of a request only
@@ -6146,28 +6122,20 @@ struct GlmBook {
     prev_counters: ([u64; 3], u64),
     /// #222: the cumulative record copies the previous request left (the request's D2H bytes)
     prev_copies: CopyCounts,
-    /// #228: the guesses' counters the previous request left (`None`: off, or zero at boot)
-    prev_prefetch: Option<PrefetchStats>,
     /// #68: the cross-turn repeat counter's ring
     repeats: RepeatRing,
 }
 
 impl GlmBook {
     fn new(prev_counters: ([u64; 3], u64), prev_copies: CopyCounts) -> GlmBook {
-        GlmBook { seq: 0, prev_counters, prev_copies, prev_prefetch: None, repeats: RepeatRing::default() }
-    }
-
-    /// #228: the guesses' counters at boot
-    fn with_prefetch(mut self, p: Option<PrefetchStats>) -> GlmBook {
-        self.prev_prefetch = p;
-        self
+        GlmBook { seq: 0, prev_counters, prev_copies, repeats: RepeatRing::default() }
     }
 }
 
 impl<'a, R: Rows> GlmSrv<'a, R> {
     fn new(eng: &'a mut Glm5Engine<R>, model_path: &'a str) -> Self {
         let n_ctx = eng.n_ctx();
-        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()).with_prefetch(eng.prefetch_stats()));
+        let book = std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()));
         let markup = ServeEngine::markup(&*eng);
         GlmSrv { eng, markup, model_path, n_ctx, stream_head_sent: false, book }
     }
@@ -6203,8 +6171,6 @@ trait GlmSeq {
     fn counters(&mut self) -> ([u64; 3], u64);
     /// #222: the cumulative expert record copies (H2D, D2H) and unified-tier refusals since boot
     fn copy_counts(&mut self) -> CopyCounts;
-    /// #228: the cumulative next-layer guess counters since boot (`None`: `CROW_GLM_PREFETCH` off)
-    fn prefetch_stats(&mut self) -> Option<PrefetchStats>;
     /// decoder layers (`crow_layers`)
     fn layers(&self) -> usize;
     /// crow-nest #215: why this sequence's sampled ids cannot be drawn by the device sampler
@@ -6262,9 +6228,6 @@ impl<R: Rows> GlmSeq for Glm5Engine<R> {
     }
     fn copy_counts(&mut self) -> CopyCounts {
         Glm5Engine::copy_counts(self)
-    }
-    fn prefetch_stats(&mut self) -> Option<PrefetchStats> {
-        Glm5Engine::prefetch_stats(self)
     }
     fn layers(&self) -> usize {
         Glm5Engine::layers(self)
@@ -6400,8 +6363,6 @@ enum GlmCmd {
     Counters { reply: std::sync::mpsc::Sender<([u64; 3], u64)> },
     /// #222: the record copies and unified-tier refusals ([`CopyCounts`])
     Copies { reply: std::sync::mpsc::Sender<CopyCounts> },
-    /// #228: the next-layer guesses' counters ([`PrefetchStats`])
-    Prefetch { reply: std::sync::mpsc::Sender<Option<PrefetchStats>> },
     /// `/slots`: the furthest prompt snapshot of any slot
     SnapPos { reply: std::sync::mpsc::Sender<Option<usize>> },
     /// the request is done with its slot (its ids and snapshot stay for the next prompt)
@@ -6484,9 +6445,6 @@ impl GlmSeq for GlmSlotSeq {
     }
     fn copy_counts(&mut self) -> CopyCounts {
         self.ask(|reply| GlmCmd::Copies { reply }).unwrap_or_default()
-    }
-    fn prefetch_stats(&mut self) -> Option<PrefetchStats> {
-        self.ask(|reply| GlmCmd::Prefetch { reply }).flatten()
     }
     fn layers(&self) -> usize {
         self.layers
@@ -6584,9 +6542,6 @@ fn glm_schedule<R: Rows>(eng: &mut Glm5Engine<R>, rx: std::sync::mpsc::Receiver<
                 }
                 GlmCmd::Copies { reply } => {
                     let _ = reply.send(eng.copy_counts());
-                }
-                GlmCmd::Prefetch { reply } => {
-                    let _ = reply.send(eng.prefetch_stats());
                 }
                 GlmCmd::SnapPos { reply } => {
                     let _ = reply.send((0..n).filter_map(|s| eng.snapshot_pos_of(s)).max());
@@ -6920,7 +6875,7 @@ fn glm_batch_serve<R: Rows>(listener: TcpListener, eng: &mut Glm5Engine<R>, mode
         vocab: eng.vocab(),
         layers: eng.layers(),
         markup: ServeEngine::markup(&*eng),
-        book: std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts()).with_prefetch(eng.prefetch_stats())),
+        book: std::sync::Mutex::new(GlmBook::new(eng.counters(), eng.copy_counts())),
     });
     {
         let tx = tx.clone();
@@ -7298,8 +7253,6 @@ fn glm_generate_on(
     let mut finish = "length";
     let mut args_acc: Vec<String> = Vec::new();
     let mut decode_ms = 0.0f64;
-    // #228: the decode steps, the denominator of the guesses per decode token
-    let mut steps = 0usize;
     let mut lp_gap = (f64::INFINITY, 0usize);
     let mut lp_ms = 0.0f64;
     // #81 the reasoning budget and #91 the forced ids, as in `chat_generate`
@@ -7441,7 +7394,6 @@ fn glm_generate_on(
             // unsafe: the engine's device state, this thread's
             // crow-nest #215: on the device route the id is the device sampler's draw
             next = unsafe { seq.decode_step(next as i64)? } as usize;
-            steps += 1;
             if host {
                 if let Some(s) = sampler.as_mut() {
                     next = draw_row(unsafe { seq.logits() }, s, &req.logit_bias, gate.as_mut());
@@ -7543,7 +7495,6 @@ fn glm_generate_on(
     let t_ctr = Instant::now();
     let (acc, nvme_bytes) = seq.counters();
     let copies = seq.copy_counts();
-    let guesses = seq.prefetch_stats();
     let selections_total = acc[0] + acc[1] + acc[2];
     let cold_total = acc[2];
     let counters_ms = t_ctr.elapsed().as_secs_f64() * 1e3;
@@ -7552,7 +7503,6 @@ fn glm_generate_on(
     let rep = bk.repeats.observe(&out, single_token_answer(gen, finish));
     let (prev, prev_bytes) = std::mem::replace(&mut bk.prev_counters, (acc, nvme_bytes));
     let prev_copies = std::mem::replace(&mut bk.prev_copies, copies);
-    let prev_guesses = std::mem::replace(&mut bk.prev_prefetch, guesses);
     drop(bk);
     if let Some(w) = loop_warning(&rep) {
         tracing::warn!(target: "chat", "{w}");
@@ -7590,7 +7540,7 @@ fn glm_generate_on(
         },
         repeat_note(&rep)
     );
-    tracing::info!(target: "chat", "{}{}", glm_counters_line(acc, nvme_bytes, copies, prev, prev_copies, seq.layers(), counters_ms), glm_guess_note(guesses, prev_guesses, steps));
+    tracing::info!(target: "chat", "{}", glm_counters_line(acc, nvme_bytes, copies, prev, prev_copies, seq.layers(), counters_ms));
     let d_sel = selections_total.saturating_sub(prev[0] + prev[1] + prev[2]);
     let d_cold = cold_total.saturating_sub(prev[2]);
     crow_nest_engine::log::routing(&crow_nest_engine::log::Routing {
@@ -9527,26 +9477,6 @@ mod tests {
         assert!(l.ends_with("; this request: pinned hit 33.3 % of 90 expert accesses, D2H bytes 4000"), "{l}");
         let first = glm_counters_line([0; 3], 0, CopyCounts::default(), [0; 3], CopyCounts::default(), 92, 0.0);
         assert!(first.contains("pinned hit 0.0 % of 0 expert accesses, D2H bytes 0"), "{first}");
-    }
-
-    /// #228: the tail of the `[chat] counters` line: this request's guesses (the difference to
-    /// what the previous request left) as totals and per decode token; off says so
-    #[test]
-    fn glm_guess_note_carries_issued_used_wasted_dropped_per_request_and_per_token() {
-        let now = PrefetchStats { issued: 3_914, used: 1_969, wasted: 1_183, dropped: 772, joins: 9, ..PrefetchStats::default() };
-        let prev = PrefetchStats { issued: 100, used: 50, wasted: 50, dropped: 10, ..PrefetchStats::default() };
-        // b6-promptcount's decode (#228 Evidence): 3,814 / 1,919 / 1,133 / 762 over 127 tokens
-        assert_eq!(
-            glm_guess_note(Some(now), Some(prev), 127),
-            ", guesses issued 3814 used 1919 wasted 1133 dropped 762 (per decode token 30.03 / 15.11 / 8.92 / 6.00 over 127)"
-        );
-        // the first request after boot: the counters since boot; no decode step divides by 1
-        assert_eq!(glm_guess_note(Some(prev), None, 0), ", guesses issued 100 used 50 wasted 50 dropped 10 (per decode token 100.00 / 50.00 / 50.00 / 10.00 over 0)");
-        assert_eq!(glm_guess_note(None, None, 127), ", guesses off (CROW_GLM_PREFETCH)");
-        // appended to the counters line, its leading text unchanged (#215 harness)
-        let l = format!("{}{}", glm_counters_line([150, 60, 30], 9_474_048, CopyCounts::default(), [100, 30, 20], CopyCounts::default(), 92, 0.25), glm_guess_note(None, None, 1));
-        assert!(l.starts_with("[chat] counters (cumulative, never reset): expert accesses vram 150 pinned 60 nvme 30, NVMe bytes 9474048, "), "{l}");
-        assert!(l.ends_with("D2H bytes 0, guesses off (CROW_GLM_PREFETCH)"), "{l}");
     }
 
     /// #30 A8: cumulative means the builder never subtracts and never resets
