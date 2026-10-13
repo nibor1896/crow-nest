@@ -6,6 +6,16 @@
 
 ## Unreleased
 
+## 2026-10-13 — v0.13.1
+
+**serve on glm5_next names the next-layer guesses of every request and logs which host wait a stalled decode row is in.** v0.13.1 carries the log-only changes merged since v0.13.0 (PR #234's #232 fix and docs, PR #235 `b77adc2` and `56c6573`, merge `2145f7b`) and the release commit:
+
+- the `[chat] counters` line ends with the request's guesses issued / used / wasted / dropped, per request and per decode token (#228 step 1);
+- a decode watchdog, `CROW_GLM_WATCHDOG_S` (default 30 s, `0` off), logs one WARN line naming the open host waits when a decode row stalls, log only (#227 step 2);
+- `tools/glm_route_passes.py` refuses to run without a source instead of defaulting to the deleted CNQ4.5 container (#232).
+
+No default, switch or operating set changes; ids unchanged. Windows only; `tools/gate-linux.sh` was not run.
+
 ### Added
 
 - **serve on glm5_next: a decode watchdog** (#227, step 2, 2026-10-13): every host wait a glm5_next decode row can block in (router flag, device / stream / event sync, NVMe batch, deferred NVMe read, controller request / reply / job, CPU lane landing) records its kind, layer and start in `engine/src/hostwait.rs`; when a decode row runs longer than `CROW_GLM_WATCHDOG_S` (default 30 s, the router-flag wait's own limit; `0` off; anything else refused at boot), a `glm5-watchdog` thread logs one WARN line per stalled row (`[watchdog] decode row at pos P (row N) still running after S s ...`) with the last layer handed off, every open wait with its layer and age, and start and now in UTC, and one more line if that row ends. Log only: no abort, ids unchanged; off, each site costs one relaxed atomic load. `docs/glm-stability.md` gains "What to capture at the next stop (#227)". Not yet seen on a GPU.
