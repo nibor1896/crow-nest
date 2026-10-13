@@ -6,10 +6,6 @@
 
 ## Unreleased
 
-### Added
-
-- **serve on glm5_next: a decode watchdog** (#227, step 2, 2026-10-13): every host wait a glm5_next decode row can block in (router flag, device / stream / event sync, NVMe batch, deferred NVMe read, controller request / reply / job, CPU lane landing) records its kind, layer and start in `engine/src/hostwait.rs`; when a decode row runs longer than `CROW_GLM_WATCHDOG_S` (default 30 s, the router-flag wait's own limit; `0` off; anything else refused at boot), a `glm5-watchdog` thread logs one WARN line per stalled row (`[watchdog] decode row at pos P (row N) still running after S s ...`) with the last layer handed off, every open wait with its layer and age, and start and now in UTC, and one more line if that row ends. Log only: no abort, ids unchanged; off, each site costs one relaxed atomic load. `docs/glm-stability.md` gains "What to capture at the next stop (#227)". Not yet seen on a GPU.
-
 ### Changed
 
 - **serve on glm5_next: the `[chat] counters` line ends with the request's next-layer guesses** (#228, step 1, 2026-10-13): `guesses issued I used U wasted W dropped D (per decode token i / u / w / d over N)`, the fields of `glm5_run`'s `prefetch` block; with `CROW_GLM_PREFETCH` off it ends with `guesses off (CROW_GLM_PREFETCH)`. The leading text of the line is unchanged (#215 harness). Log only; ids unchanged. Not yet seen on a GPU.

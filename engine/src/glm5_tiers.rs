@@ -3138,10 +3138,7 @@ impl<'a, M: Mover + Rebase<'a>> ChunkMover<'a, '_, M> {
     }
     /// the host reads pinned slot `q` (the CPU lane): every write-back into it landed
     fn wait_host(&mut self, q: u32) {
-        let pending = self.pending(q);
-        // #227: serve's watchdog names it
-        let _w = (!pending.is_empty()).then(|| crate::hostwait::open(crate::hostwait::Wait::EventSync, None, 0));
-        for r in pending {
+        for r in self.pending(q) {
             let e = self.ring.as_ref().expect("pending entries come from the ring").wb[r];
             unsafe { cuda::ck(sys::cuEventSynchronize(e)) };
         }
@@ -9621,8 +9618,6 @@ impl Stager {
         loop {
             let want = block && (self.defer.out_pending > 0 || (all && self.defer.out_flying > 0));
             let got = if want {
-                // #227: serve's watchdog names it
-                let _w = crate::hostwait::open(crate::hostwait::Wait::DeferredRead, None, (self.defer.out_pending + self.defer.out_flying) as u64);
                 match self.defer.rx.recv() {
                     Ok(x) => x,
                     Err(_) => {
@@ -12576,7 +12571,6 @@ fn ctl_job(t: &mut ExpertTiers, mut rd: glm5_flags::RingReader, n: usize, score:
                 return Err(e);
             }
         };
-        crate::hostwait::at_layer(rq.layer);
         if let Ok(mut s) = score.lock() {
             s.see(rq.layer, &rq.ids, rq.guess.as_ref());
         }

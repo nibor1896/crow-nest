@@ -621,7 +621,6 @@ use crow_nest_engine::boot;
 use crow_nest_engine::cnq::Cnq;
 use crow_nest_engine::glm5_engine::{self, Glm5Device, Glm5Engine, Rows};
 use crow_nest_engine::glm5_template;
-use crow_nest_engine::hostwait;
 use crow_nest_engine::glm5_flags::PrefetchStats;
 use crow_nest_engine::glm5_tiers::CopyCounts;
 use crow_nest_engine::gen::{DevSampler, Engine};
@@ -6725,21 +6724,12 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
     let answer_reuse = glm5_engine::cache_switch(&env, glm5_engine::ANSWER_REUSE_ENV);
     // crow-nest #217: CROW_GLM_PREFIX_ANCHOR, the same rule
     let prefix_anchor = glm5_engine::cache_switch(&env, glm5_engine::PREFIX_ANCHOR_ENV);
-    // crow-nest #227: CROW_GLM_WATCHDOG_S, the same rule
-    let watchdog = hostwait::watchdog_secs(env(hostwait::WATCHDOG_ENV).as_deref());
     let mut eng = Glm5Engine::new(dev, cache_on);
     let (answer_reuse, prefix_anchor) = match (answer_reuse, prefix_anchor) {
         (Ok(a), Ok(p)) => (a, p),
         (Err(why), _) | (_, Err(why)) => {
             drop(eng);
             die(&format!("[boot] refused: {why} (#219, #217) - refusing to boot"));
-        }
-    };
-    let watchdog = match watchdog {
-        Ok(w) => w,
-        Err(why) => {
-            drop(eng);
-            die(&format!("[boot] refused: {why} (#227) - refusing to boot"));
         }
     };
     eng.set_prefix_anchor(prefix_anchor);
@@ -6784,7 +6774,6 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
     if cli.slot_save_path.is_some() {
         tracing::warn!(target: "serve", "[serve] --slot-save-path is not built for glm5_next: POST /slots/0 refuses save and restore (#185)");
     }
-    glm_watchdog(watchdog);
     let addr = format!("127.0.0.1:{}", cli.port);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
@@ -6834,47 +6823,6 @@ fn glm_main(cli: &ServeArgs, cnq_path: &str, meta: &crow_nest_engine::meta::Mode
     drop(ctx);
     crow_nest_engine::log::shutdown();
     std::process::exit(0);
-}
-
-/// crow-nest #227: the decode watchdog of glm5_next (`CROW_GLM_WATCHDOG_S`, default 30 s, `0` off).
-/// The wait sites record which host wait a decode row is in (`hostwait`); this thread reads them
-/// once a second and logs one WARN line when a row has run `secs` (the open waits, layer, row,
-/// UTC times) and one when that row ended. Log only: no abort, no id changes.
-fn glm_watchdog(secs: u64) {
-    if secs == 0 {
-        tracing::info!(target: "serve", "[serve] decode watchdog off ({}=0, #227)", hostwait::WATCHDOG_ENV);
-        return;
-    }
-    hostwait::arm(true);
-    let spawned = std::thread::Builder::new().name("glm5-watchdog".into()).spawn(move || {
-        let mut w = hostwait::Watch::new(secs);
-        let utc = |back_ns: u64| {
-            let t = SystemTime::now().checked_sub(Duration::from_nanos(back_ns)).unwrap_or(UNIX_EPOCH);
-            let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-            crow_nest_engine::log::iso8601(d.as_secs() as i64, d.subsec_millis())
-        };
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let s = hostwait::snapshot();
-            match w.check(&s) {
-                Some(hostwait::Event::Stall) => {
-                    let age = s.row.map_or(0, |r| s.now.saturating_sub(r.since));
-                    tracing::warn!(target: "serve", "{}", hostwait::stall_line(&s, secs, &utc(age), &utc(0)));
-                }
-                Some(hostwait::Event::Ended { seq, pos, upper_ns }) => {
-                    tracing::warn!(target: "serve", "{}", hostwait::ended_line(seq, pos, upper_ns, &utc(0)));
-                }
-                None => {}
-            }
-        }
-    });
-    match spawned {
-        Ok(_) => tracing::info!(target: "serve", "[serve] decode watchdog {secs} s ({}, #227): one WARN line naming the open host waits when a decode row runs longer; log only", hostwait::WATCHDOG_ENV),
-        Err(e) => {
-            hostwait::arm(false);
-            tracing::warn!(target: "serve", "[serve] decode watchdog not started: {e} (#227)");
-        }
-    }
 }
 
 /// - `CROW_GLM_MAX_BATCH`: what `glm_dispatch` reads of the server: the one-sequence `GlmSrv`,

@@ -1391,7 +1391,6 @@ impl Glm5Pass {
 /// # Safety
 /// A CUDA context is current; `ids` holds `n` i32 written by work queued before; no capture is open.
 pub unsafe fn router_ids(routed: Option<&mut crate::glm5_flags::Routed>, ids: Dev, n: usize, layer: usize) -> Result<Vec<i32>, String> {
-    crate::hostwait::at_layer(layer);
     match routed {
         None => {
             cuda::sync();

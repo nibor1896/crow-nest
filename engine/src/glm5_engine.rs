@@ -444,8 +444,6 @@ impl Rows for Glm5Device {
         self.run.prefill_anchored(&mut self.o.cnq, &mut self.tiers, ids, pos0, cut, anchor)
     }
     unsafe fn decode(&mut self, tok: i64, pos: usize) -> Result<i64, String> {
-        // #227: serve's watchdog sees the row open (one load when it is off)
-        let _row = crate::hostwait::row(pos, 1);
         if self.run.mtp_drafts() > 0 {
             return self.run.spec_decode(&mut self.o.cnq, &mut self.tiers, tok, pos);
         }
@@ -545,7 +543,6 @@ impl Rows for Glm5Device {
         self.run.use_slot(s)
     }
     unsafe fn decode_batch(&mut self, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
-        let _row = crate::hostwait::row(rows.first().map_or(0, |r| r.2), rows.len());
         self.run.settle_ahead(&mut self.tiers)?;
         self.run.decode_batch(&mut self.o.cnq, &mut self.tiers, rows)
     }
