@@ -248,6 +248,7 @@ pub unsafe fn memcpy_async_on(dst: CUdeviceptr, src: CUdeviceptr, bytes: usize, 
 }
 /// synchronize one explicit stream (side streams; `sync()` covers the active one)
 pub unsafe fn stream_sync(s: CUstream) {
+    let _w = crate::hostwait::open(crate::hostwait::Wait::StreamSync, None, 0);
     ck(sys::cuStreamSynchronize(s));
 }
 
@@ -719,6 +720,8 @@ pub unsafe fn sync() {
     // synchronize the ACTIVE stream: legacy default in normal operation,
     // the graph/capture stream when CROW_GRAPH is active (0 = legacy)
     let s = CUR_STREAM.load(Ordering::Relaxed);
+    // #227: serve's watchdog names it (one load when off)
+    let _w = crate::hostwait::open(crate::hostwait::Wait::DeviceSync, None, 0);
     ck(sys::cuStreamSynchronize(s as CUstream));
 }
 

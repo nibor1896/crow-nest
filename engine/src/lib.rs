@@ -67,6 +67,8 @@
 // tools parse, the boot line and the per-request routing line. L0: it depends on
 // no other module of this crate, and every other module depends on it.
 pub mod log;
+// #227: which host wait a glm5_next decode row is in (serve's watchdog); std only, `cuda` calls it
+pub mod hostwait;
 pub mod cuda;
 pub mod cnq;
 pub mod geo;

@@ -185,6 +185,10 @@ pub trait Rows {
     fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
         crate::glm5_tiers::CopyCounts::default()
     }
+    /// #228: the next-layer guesses' counters since boot (`CROW_GLM_PREFETCH`; default: off)
+    fn prefetch_stats(&self) -> Option<crate::glm5_flags::PrefetchStats> {
+        None
+    }
 
     /// `CROW_GLM_LA`: drop a row enqueued ahead (the state back to the last returned row);
     /// everything that reads or replaces the sequence's state calls this first
@@ -440,6 +444,8 @@ impl Rows for Glm5Device {
         self.run.prefill_anchored(&mut self.o.cnq, &mut self.tiers, ids, pos0, cut, anchor)
     }
     unsafe fn decode(&mut self, tok: i64, pos: usize) -> Result<i64, String> {
+        // #227: serve's watchdog sees the row open (one load when it is off)
+        let _row = crate::hostwait::row(pos, 1);
         if self.run.mtp_drafts() > 0 {
             return self.run.spec_decode(&mut self.o.cnq, &mut self.tiers, tok, pos);
         }
@@ -524,6 +530,9 @@ impl Rows for Glm5Device {
     fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
         self.tiers.copy_counts()
     }
+    fn prefetch_stats(&self) -> Option<crate::glm5_flags::PrefetchStats> {
+        self.tiers.prefetch_stats()
+    }
     fn slots(&self) -> usize {
         self.run.slots()
     }
@@ -536,6 +545,7 @@ impl Rows for Glm5Device {
         self.run.use_slot(s)
     }
     unsafe fn decode_batch(&mut self, rows: &[(usize, i64, usize)]) -> Result<Vec<i64>, String> {
+        let _row = crate::hostwait::row(rows.first().map_or(0, |r| r.2), rows.len());
         self.run.settle_ahead(&mut self.tiers)?;
         self.run.decode_batch(&mut self.o.cnq, &mut self.tiers, rows)
     }
@@ -874,6 +884,11 @@ impl<R: Rows> Glm5Engine<R> {
     /// #222: the expert record copies (H2D, D2H) and the unified tiers' refusals since boot
     pub fn copy_counts(&self) -> crate::glm5_tiers::CopyCounts {
         self.rows.copy_counts()
+    }
+
+    /// #228: the next-layer guesses' counters since boot (`None` when `CROW_GLM_PREFETCH` is off)
+    pub fn prefetch_stats(&self) -> Option<crate::glm5_flags::PrefetchStats> {
+        self.rows.prefetch_stats()
     }
 
     /// The detection rule of `serve` (spec 7.4, #100) for the one snapshot: `L` is the common
