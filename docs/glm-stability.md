@@ -60,6 +60,37 @@ measurement book.
 4. Pass: decode spread (max/min, same task) <= 1.15; free VRAM never below 2 GiB; shared GPU memory flat
    (growth <= 64 MiB); no request below 0.5x the median.
 
+## What to capture at the next stop (#227)
+
+serve on glm5_next stopped in the middle of a decode at least three times on 2026-10-10/11 with no error line; the cause
+is not known (#227). Before anything is killed or restarted, capture in this order:
+
+1. The last 200 lines of `engine.log` (the file lines carry ISO-8601 UTC times; `CROW_LOG_DIR`, default
+   `%LOCALAPPDATA%\crow\logs`). Look for the watchdog line below.
+2. Whether the process is alive (`tasklist /fi "imagename eq serve.exe"`) and its CPU time twice, 10 s apart
+   (`Get-Process serve | Select-Object CPU`): a spin burns a core, an idle wait does not.
+3. `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv` twice, 10 s apart.
+4. A full user dump of `serve.exe` before any kill: Task Manager, Details, right click, "Create dump file", or
+   `procdump -ma <pid>`. `taskkill /F` leaves none (serve has no console-control handler on Windows, #126).
+5. Crow's last request body and the time of the last SSE chunk Crow received.
+6. The `CROW_*` environment of the process, the build commit (the `[boot]` line), and the last `[chat] counters` and
+   `[chat] KV lazy (#214)` lines.
+
+The decode watchdog (`CROW_GLM_WATCHDOG_S`, default 30 s, the router-flag wait's own limit; `0` turns it off; #227) logs
+one WARN line per stalled decode row on target `serve`, log only (no abort, ids unchanged):
+
+```
+[watchdog] decode row at pos 75 (row 7) still running after 31.0 s (limit 30 s, CROW_GLM_WATCHDOG_S): started 2026-10-13T10:00:00.000Z, now 2026-10-13T10:00:31.000Z; last layer handed off 12; open host waits, oldest first: device sync layer 12 for 30.0 s; NVMe batch layer 12 (parts 3) for 11.0 s (#227, log only)
+```
+
+and, if the row ends after all, `[watchdog] the stalled decode row at pos 75 (row 7) ended within 42.5 s of its start,
+seen at ... (#227)`. The waits it names (`engine/src/hostwait.rs`): router flag (`CROW_GLM_FLAGS`), device sync and
+stream sync (a landed flag is a device-side wait, `cuStreamWaitValue64`: a stall on one shows as a sync here), event sync
+(write-back, LA readback), NVMe batch (a reader ticket), deferred NVMe read (the stager's deferred reads), controller
+request / reply / job (`CROW_GLM_CONTROLLER`), CPU lane landing. "none" means the host thread is in none of them
+(compute, a lock, or a wait not instrumented). No line at all while serve is silent means no decode row is open: the stop
+is outside the decode (prompt phase, HTTP, between requests).
+
 ## Tests
 
 ```

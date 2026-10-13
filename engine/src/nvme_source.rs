@@ -426,6 +426,8 @@ impl Ticket {
     }
 
     fn drain(&mut self) -> Result<FetchReport, String> {
+        // #227: serve's watchdog names it (a spent ticket opens nothing)
+        let _w = (!self.parts.is_empty()).then(|| crate::hostwait::open(crate::hostwait::Wait::NvmeBatch, None, self.parts.len() as u64));
         for rx in std::mem::take(&mut self.parts) {
             self.take(rx.recv().map_err(|_| ()));
         }
