@@ -14,10 +14,14 @@
 - #179, the FP8 originals as weights: a directory is accepted only when tools/fetch-glm.py's record
   (hf-revision.json of rev eb9eb208) and a matching `.verified` marker stand behind config, index and
   all 62 shards; a missing or wrong marker, another revision or a changed index is refused by name; the
-  pass dir records the weights' identity, resumes under it and refuses other weights.
+  pass dir records the weights' identity, resumes under it and refuses other weights;
+- #232, no default source: a call without --fp8 or --container exits 2 naming both flags and PREREG-dyn
+  amendment 1, before any weights are opened.
 """
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -189,6 +193,21 @@ class FilesFlag(unittest.TestCase):
         five = [r[0] for r in R.AMENDMENT_1]
         self.assertEqual(self.main(), (0, five, 5, five))
         self.assertEqual(self.main("--files", "todo-1006,nope")[0], 2)
+
+
+class Source(unittest.TestCase):
+    """#232: no default routing source (the CNQ4.5 container was deleted 2026-10-08); a call without
+    --fp8 or --container exits 2 naming both flags and PREREG-dyn amendment 1, before any file is opened"""
+
+    def test_no_source_exits_2_naming_both_flags(self):
+        err = io.StringIO()
+        with mock.patch.object(R, "container_index", side_effect=AssertionError("opened a container")), \
+                mock.patch.object(R, "fp8_identity", side_effect=AssertionError("opened FP8 originals")), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            R.main([])
+        self.assertEqual(cm.exception.code, 2)
+        for s in ("--fp8", "--container", "PREREG-dyn amendment 1"):
+            self.assertIn(s, err.getvalue())
 
 
 def mark_verified(d, revision=R.REVISION):
