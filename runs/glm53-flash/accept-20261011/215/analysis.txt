@@ -1,0 +1,45 @@
+== P1: prompt 57
+  before G: median 53.313 ms/token; runs [53.313, 53.005, 53.644]; gen [512, 512, 512]; nvme/token [8.256, 8.146, 8.426]; finish ['length', 'length', 'length']
+  before H: median 54.024 ms/token; runs [54.055, 53.488, 54.024]; gen [512, 512, 512]; nvme/token [8.117, 7.967, 8.135]; finish ['length', 'length', 'length']
+  after  G: median 52.154 ms/token; runs [52.154, 53.083, 50.729]; gen [512, 512, 512]; nvme/token [7.994, 8.291, 7.623]; finish ['length', 'length', 'length']
+  after  S: median 53.205 ms/token; runs [53.156, 53.824, 53.205]; gen [512, 512, 512]; nvme/token [7.883, 8.07, 8.162]; finish ['length', 'length', 'length']
+  after  F: median 51.908 ms/token; runs [52.39, 51.908, 51.496]; gen [512, 512, 512]; nvme/token [8.047, 8.008, 7.924]; finish ['length', 'length', 'length']
+  after  D: median 53.087 ms/token; runs [53.718, 52.482, 53.087]; gen [512, 512, 512]; nvme/token [8.402, 8.141, 8.186]; finish ['length', 'length', 'length']
+  ids Dcap vs Scap: differ at 31 (len 512 vs 512) | Gcap after vs before: differ at 28 (len 512 vs 512)
+  texts S: 3 distinct over 3 runs; equal to Scap: [False, False, False]
+  texts D: 3 distinct over 3 runs; equal to Dcap: [False, False, False]
+  texts G: 3 distinct over 3 runs; equal to Gcap: [False, False, False]
+  texts F: 1 distinct over 3 runs; equal to Scap: [True, True, True]
+  G text before == after: False
+  D <= F x 1.01: 53.087 <= 52.427 -> False; D < S: 53.087 < 53.205 -> True; S - D = 0.118; step0 H - G (6944330) = 0.711; G after/before = 0.9783
+  route lines: {"S": ["[chat] glm5_next draws on the HOST sampler (#215): logit_bias, 1 entries (#86); one logits row read back per token", "[chat] sampling on the HOST: temperature 1 (request) top_p 0.95 (request) top_k 20 (request) min_p 0.01 (request) presence_penalty 0 (data sheet) repe"], "D": ["[chat] sampling on the device: temperature 1 (request) top_p 0.95 (request) top_k 20 (request) min_p 0.01 (request) presence_penalty 0 (data sheet) re"]}
+== P2: prompt 3985
+  before G: median 68.733 ms/token; runs [68.733, 68.938, 68.016]; gen [512, 512, 512]; nvme/token [14.43, 14.074, 14.373]; finish ['length', 'length', 'length']
+  before H: median 69.677 ms/token; runs [69.677, 69.515, 69.855]; gen [512, 512, 512]; nvme/token [14.559, 14.277, 14.375]; finish ['length', 'length', 'length']
+  after  G: median 68.272 ms/token; runs [68.66, 67.652, 68.272]; gen [512, 512, 512]; nvme/token [14.273, 13.895, 14.289]; finish ['length', 'length', 'length']
+  after  S: median 73.148 ms/token; runs [73.738, 72.859, 73.148]; gen [512, 512, 512]; nvme/token [16.424, 15.941, 16.301]; finish ['length', 'length', 'length']
+  after  F: median 71.668 ms/token; runs [71.65, 71.909, 71.668]; gen [512, 512, 512]; nvme/token [15.643, 15.867, 15.688]; finish ['length', 'length', 'length']
+  after  D: median 71.478 ms/token; runs [70.0, 72.511, 71.478]; gen [512, 512, 512]; nvme/token [15.055, 16.402, 15.979]; finish ['length', 'length', 'length']
+  ids Dcap vs Scap: differ at 387 (len 512 vs 512) | Gcap after vs before: differ at 302 (len 512 vs 512)
+  texts S: 3 distinct over 3 runs; equal to Scap: [False, False, False]
+  texts D: 3 distinct over 3 runs; equal to Dcap: [False, False, False]
+  texts G: 3 distinct over 3 runs; equal to Gcap: [False, False, False]
+  texts F: 1 distinct over 3 runs; equal to Scap: [True, True, True]
+  G text before == after: False
+  D <= F x 1.01: 71.478 <= 72.385 -> True; D < S: 71.478 < 73.148 -> True; S - D = 1.67; step0 H - G (6944330) = 0.944; G after/before = 0.9933
+  route lines: {"S": ["[chat] glm5_next draws on the HOST sampler (#215): logit_bias, 1 entries (#86); one logits row read back per token", "[chat] sampling on the HOST: temperature 1 (request) top_p 0.95 (request) top_k 20 (request) min_p 0.01 (request) presence_penalty 0 (data sheet) repe"], "D": ["[chat] sampling on the device: temperature 1 (request) top_p 0.95 (request) top_k 20 (request) min_p 0.01 (request) presence_penalty 0 (data sheet) re"]}
+== P3: prompt 6438
+  before G: median 68.168 ms/token; runs [68.168, 66.974, 69.904]; gen [878, 1024, 815]; nvme/token [13.677, 12.767, 14.33]; finish ['tool_calls', 'length', 'tool_calls']
+  before H: median 71.33 ms/token; runs [73.029, 71.33, 70.154]; gen [850, 770, 790]; nvme/token [14.886, 14.339, 13.761]; finish ['tool_calls', 'tool_calls', 'tool_calls']
+  after  G: median 71.035 ms/token; runs [71.035, 70.378, 75.788]; gen [760, 896, 510]; nvme/token [14.72, 14.388, 15.745]; finish ['tool_calls', 'tool_calls', 'tool_calls']
+  after  S: median 69.357 ms/token; runs [72.582, 69.357, 67.302]; gen [706, 610, 1024]; nvme/token [14.365, 13.493, 12.521]; finish ['tool_calls', 'tool_calls', 'length']
+  after  F: median 67.189 ms/token; runs [68.047, 65.769, 67.189]; gen [926, 926, 926]; nvme/token [13.348, 12.582, 13.012]; finish ['tool_calls', 'tool_calls', 'tool_calls']
+  after  D: median 67.093 ms/token; runs [64.577, 67.093, 68.808]; gen [1024, 754, 1024]; nvme/token [12.206, 12.924, 13.904]; finish ['length', 'tool_calls', 'length']
+  ids Dcap vs Scap: differ at 79 (len 1024 vs 926) | Gcap after vs before: differ at 129 (len 846 vs 1024)
+  texts S: 3 distinct over 3 runs; equal to Scap: [False, False, False]
+  texts D: 3 distinct over 3 runs; equal to Dcap: [False, False, False]
+  texts G: 3 distinct over 3 runs; equal to Gcap: [False, False, False]
+  texts F: 1 distinct over 3 runs; equal to Scap: [True, True, True]
+  G text before == after: False
+  D <= F x 1.01: 67.093 <= 67.861 -> True; D < S: 67.093 < 69.357 -> True; S - D = 2.264; step0 H - G (6944330) = 3.162; G after/before = 1.0421
+  route lines: {"S": ["[chat] glm5_next draws on the HOST sampler (#215): logit_bias, 1 entries (#86); one logits row read back per token", "[chat] sampling on the HOST: temperature 1 (request) top_p 0.95 (request) top_k 20 (request) min_p 0.01 (request) presence_penalty 0 (data sheet) repe"], "D": ["[chat] sampling on the device: temperature 1 (request) top_p 0.95 (request) top_k 20 (request) min_p 0.01 (request) presence_penalty 0 (data sheet) re"]}

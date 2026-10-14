@@ -1,0 +1,45 @@
+off-r1  r1 P 6456 C 0 F 6456 prefill 6702.9 gen 7546 ms/tok 68.194 finish tool_calls | nvme 5314 staged 0
+         [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6456 of 6456 tok, reset 0.775 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+off-r1  r2 P 14066 C 6456 F 7610 prefill 7455.6 gen 1891 ms/tok 80.485 finish tool_calls | nvme 5314 staged 0
+         [cache] WARM L 13125 (held 14002), P 6456, snapshots [Some(6456)], prefill 7610 of 14066 tok, reset 18.077 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+on-r2   r1 P 6456 C 0 F 6456 prefill 6691.8 gen 7546 ms/tok 68.376 finish tool_calls | nvme 5314 staged 0
+         [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6456 of 6456 tok, reset 0.738 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+on-r2   r2 P 14067 C 14002 F 65 prefill 7713.4 gen 1939 ms/tok 79.703 finish tool_calls | nvme 5610 staged 42
+         [cache] realigned: ids 13125..14001 of the prompt replaced by the held ids 13125..14002 (same 3028 bytes, non-canonical split), walk 0.046 ms
+         [cache] LIVE L 14002 (held 14002), P 14002, snapshots [Some(6456)], prefill 65 of 14067 tok, reset 0.000 ms (glm5_next: the live state continues, nothing restored)
+off-r3  r1 P 6456 C 0 F 6456 prefill 6840.5 gen 7546 ms/tok 68.396 finish tool_calls | nvme 5314 staged 0
+         [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6456 of 6456 tok, reset 2.062 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+off-r3  r2 P 14066 C 6456 F 7610 prefill 7401.4 gen 1938 ms/tok 79.026 finish tool_calls | nvme 5314 staged 0
+         [cache] WARM L 13125 (held 14002), P 6456, snapshots [Some(6456)], prefill 7610 of 14066 tok, reset 17.089 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+on-r4   r1 P 6456 C 0 F 6456 prefill 6684.0 gen 7546 ms/tok 68.401 finish tool_calls | nvme 5314 staged 0
+         [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6456 of 6456 tok, reset 0.785 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+on-r4   r2 P 14067 C 14002 F 65 prefill 6821.3 gen 1938 ms/tok 77.2 finish tool_calls | nvme 5610 staged 42
+         [cache] realigned: ids 13125..14001 of the prompt replaced by the held ids 13125..14002 (same 3028 bytes, non-canonical split), walk 0.031 ms
+         [cache] LIVE L 14002 (held 14002), P 14002, snapshots [Some(6456)], prefill 65 of 14067 tok, reset 0.000 ms (glm5_next: the live state continues, nothing restored)
+off-r5  r1 P 6456 C 0 F 6456 prefill 6785.0 gen 7546 ms/tok 68.472 finish tool_calls | nvme 5314 staged 0
+         [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6456 of 6456 tok, reset 2.105 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+off-r5  r2 P 14066 C 6456 F 7610 prefill 7385.0 gen 1938 ms/tok 78.257 finish tool_calls | nvme 5314 staged 0
+         [cache] WARM L 13125 (held 14002), P 6456, snapshots [Some(6456)], prefill 7610 of 14066 tok, reset 18.416 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+on-r6   r1 P 6456 C 0 F 6456 prefill 6660.0 gen 7546 ms/tok 68.987 finish tool_calls | nvme 5314 staged 0
+         [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6456 of 6456 tok, reset 0.727 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+on-r6   r2 P 14067 C 14002 F 65 prefill 9716.4 gen 1971 ms/tok 81.535 finish tool_calls | nvme 5573 staged 42
+         [cache] realigned: ids 13125..14001 of the prompt replaced by the held ids 13125..14002 (same 3028 bytes, non-canonical split), walk 0.036 ms
+         [cache] LIVE L 14002 (held 14002), P 14002, snapshots [Some(6456)], prefill 65 of 14067 tok, reset 0.000 ms (glm5_next: the live state continues, nothing restored)
+B3 median prefill off 7401.4 on 7713.4
+B2 off-r1 vs on-r2 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 107, 'lens': (1891, 1939), 'lp': (0.9988287, (True, 18))}
+B2 off-r1 vs on-r4 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 755, 'lens': (1891, 1938), 'lp': (0.9999947, (True, 18))}
+B2 off-r1 vs on-r6 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 107, 'lens': (1891, 1971), 'lp': (0.999966, (True, 19))}
+B2 off-r3 vs on-r2 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 107, 'lens': (1938, 1939), 'lp': (0.9988287, (True, 18))}
+B2 off-r3 vs on-r4 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 135, 'lens': (1938, 1938), 'lp': (0.9999947, (True, 18))}
+B2 off-r3 vs on-r6 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 107, 'lens': (1938, 1971), 'lp': (0.999966, (True, 19))}
+B2 off-r5 vs on-r2 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 136, 'lens': (1938, 1939), 'lp': (0.9988287, (True, 18))}
+B2 off-r5 vs on-r4 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 107, 'lens': (1938, 1938), 'lp': (0.9999947, (True, 18))}
+B2 off-r5 vs on-r6 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 136, 'lens': (1938, 1971), 'lp': (0.999966, (True, 19))}
+within off-r1 off-r3 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 135, 'lens': (1891, 1938), 'lp': (1.0, (True, 20))}
+within on-r2 on-r4 {'finish': True, 'calls': False, 'content': True, 'first_diff_id': 107, 'lens': (1939, 1938), 'lp': (0.9989767, (True, 19))}
+off-r1 calls [{"name": "goal_step", "arguments": "{\"step\":1,\"status\":\"running\"}"}, {"name": "write_file", "arguments": "{\"path\":\"roman.py\",\"content\":\"\\\"\\\"\\\"Roman numeral conversion helpers.\\n\\
+off-r3 calls [{"name": "goal_step", "arguments": "{\"step\":1,\"status\":\"running\"}"}, {"name": "write_file", "arguments": "{\"path\":\"roman.py\",\"content\":\"\\\"\\\"\\\"Roman numeral conversion helpers.\\n\\
+off-r5 calls [{"name": "goal_step", "arguments": "{\"step\":1,\"status\":\"running\"}"}, {"name": "write_file", "arguments": "{\"path\":\"roman.py\",\"content\":\"\\\"\\\"\\\"Roman numeral conversion helpers.\\n\\
+on-r2 calls [{"name": "goal_step", "arguments": "{\"step\":1,\"status\":\"running\"}"}, {"name": "write_file", "arguments": "{\"path\":\"roman.py\",\"content\":\"\\\"\\\"\\\"Roman numeral conversion helpers.\\n\\
+on-r4 calls [{"name": "goal_step", "arguments": "{\"step\":1,\"status\":\"running\"}"}, {"name": "write_file", "arguments": "{\"path\":\"roman.py\",\"content\":\"\\\"\\\"\\\"Roman numeral conversion helpers.\\n\\
+on-r6 calls [{"name": "goal_step", "arguments": "{\"step\":1,\"status\":\"running\"}"}, {"name": "write_file", "arguments": "{\"path\":\"roman.py\",\"content\":\"\\\"\\\"\\\"Roman numeral conversion helpers.\\n\\

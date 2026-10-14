@@ -1,0 +1,189 @@
+{
+ "card": "rtx5090",
+ "config": "298092b arm3.env (runs/glm53-flash/quick/arm3.env), serve, 2026-10-11 G4 session",
+ "started": "2026-10-11T07:53:36+0200",
+ "ctx_len": 200000,
+ "protocol": "bench/sweep.py v1 (sybil-solutions/glm53-flash-offload 6769b27) via tools/glm_sweep.py",
+ "api": "crow-nest serve /v1/chat/completions",
+ "served_model": "GLM-5.3-Flash-MUL1K3",
+ "template": "glm",
+ "server_props": {
+  "model_path": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+  "model": "GLM-5.3-Flash-MUL1K3",
+  "n_ctx": 200000,
+  "default_generation_settings": {
+   "n_ctx": 200000
+  },
+  "modalities": {
+   "vision": false
+  },
+  "prompt_chunk": 1,
+  "build": "crow-nest-engine 0.1.0"
+ },
+ "prefill_prompt": "random single-token vocabulary words (56789 candidates)",
+ "decode_prompt": "his question text; serve's GLM template; reasoning_budget_tokens 0",
+ "prefill": {
+  "8192": {
+   "median": 1096.3,
+   "min": 1096.3,
+   "max": 1096.3,
+   "n": 1,
+   "all": [
+    1096.3
+   ]
+  }
+ },
+ "decode": {
+  "C1": {
+   "aggregate": {
+    "median": 15.65,
+    "min": 15.65,
+    "max": 15.65,
+    "n": 1,
+    "all": [
+     15.65
+    ]
+   },
+   "per_stream_mean": {
+    "median": 15.65,
+    "min": 15.65,
+    "max": 15.65,
+    "n": 1,
+    "all": [
+     15.65
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 15.65,
+     "per_stream_mean": 15.65,
+     "per_stream_min": 15.65,
+     "tokens": 3682,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 3.14,
+     "serial": false,
+     "streams": [
+      {
+       "t0": 2105.9694192,
+       "first": 2109.1142223,
+       "last": 2344.3483853,
+       "tokens": 3682,
+       "finish": "stop",
+       "response": "# The History of the Printing Press\n\n## Introduction\n\nThe printing press stands as one of the most transformative inventions in human history. Before its arrival, the production of books was a slow, labor-intensive process that made written knowledge a scarce commodity. The printing press changed that fundamentally: it made possible the mass production of texts, the spread of literacy, the standardization of languages, the acceleration of religious and scientific revolutions, and the democratization of information itself. What follows is a detailed account of printing's origins, its revolutionary spread across Europe, its evolution through the centuries, and its enduring legacy.\n\n## Before the Press: The World of the Manuscript\n\nTo appreciate the printing press, one must first understand what came before it. In medieval Europe, books were produced by hand in scriptoria—writing rooms often attached to monasteries. Trained scribes copied texts letter by letter, a process that could take months or years for a single volume. Because of this, books were extraordinarily expensive and rare. A Bible could take a scribe about two years to copy; a single book could cost as much as a farm or a vineyard.\n\nPaper was itself a relatively recent import to Europe. Invented in China around the 1st–2nd century CE, papermaking traveled westward through the Islamic world—reaching Baghdad by the late 8th century, and arriving in Europe via Spain and Italy in the 12th–13th centuries. By the 15th typographic revolution's context was set: there was demand for books, growing literacy, universities, and a rising merchant class hungry for indulgences, romances, and religious works.\n\n## Printing Before Gutenberg: East Asian Origins\n\nAlthough Gutenberg is often credited as the inventor of printing, printing itself is much older, with deep roots in East Asia.\n\n**Woodblock printing (China, ~7th century CE).** The earliest form of printing on paper was woodblock printing, likely developed during the Tang dynasty. The *Diamond Sutra* of 868 CE—found at Dunhuang and now in the movable-type era's shadow—found at Dunhuang and now in the British Library, is the world's Chinese Buddhist texts, is the corrupted... is the world's oldest surviving dated printed book. It was made by carving an entire page of text (mirrored) into a wooden block, inking it, and pressing paper onto it. Woodblock printing was well suited to Chinese, which has thousands of ideographic characters, and it flourished for centuries: it produced Buddhist scriptures, calendars, and later, during the Song dynasty (960–1279), a thriving commercial print culture with newspapers, documents, Sichuan, and later, during the corrupted... it produced Buddhist scriptures, corrupted... it produced Buddhist scriptures, calendars, and later, during the corrupted... it produced Buddhist scriptures, calendars, and later, during the bolded subheadings, a thriving commercial print culture with newspapers, documents, and popular fiction.\n\n**Movable type in China and Korea.** The commoner Bi Sheng invented movable type around 1040 CE, using porcelain/ceramic type. In 1297–1298, Wang Zhen arranged movable type in rotating tablecase, rotating tables and developed a technique for wooden type. In Korea, the world's first metal movable type is credited to the world's first metal movable type is credited to the world's id... the world's first metal movable type is credited to press books printed from cast bronze type, press books printed from cast *Jikji* (1377), a Buddhist text now held in the Goryeo dynasty (1234) — the oldest extant book printed with cast metal type—predates Gutenberg by decades. So why didn't printing \"take off\" in East Asia as it did in Europe? Historians point to several factors: the sheer number of Chinese characters (tens of thousands of sorts), the prestige of calligraphy, and social structures that limited the technology's disruptive potential.\n\n## Gutenberg and the Invention of the Movable-Type Printing Press\n\n### The Man and the Moment\n\nJohannes Gutenberg (c. 1400–1468), a goldsmith by training from Mainz, Germany, did not invent printing ex nihilo. Rather, he synthesized existing elements—paper, oil-based ink, the wine press, and the concept of 42-line Bible (c. 1454–55), the first major book printed in the West, roughly 180 copies of the 1,282-page Bible, roughly 180 copies of the 1,282-page Bible, roughly  press books printed from cast bronze type, press books printed from compositors' cases, and the concept of the screw press—into a system. His key innovations were:\n\n1. **The type mold (hand mould), c. 1450.** The hand mould was the true breakthrough: an adjustable mold that allowed the rapid casting of identical metal type. The type itself was an alloy of lead, tin, and antimony—soft enough to take fine detail, hard enough to be durable, and low-melting-point alloy of lead, low-melting-point alloy of lead, low-melting-p... low-m metal type is credited to the world's first metal movable type is credited to the corrupted... low-melting-point alloy of lead, tin, and antimony—soft enough to in... soft enough to take fine detail, corruption... soft enough to some... soft enough to take fine detail, hard enough to be durable, and low-mcorruption... low-melting alloy of lead, tin, and antimony—soft enough to take fine detail, hard enough platen, and low-melting (so it could be cast quickly and repeatedly). \n\n1. **The type mold (hand mould), c. 145 Incunabula, the first major book printed in the West, roughly 180 copies of the 2,282-page Bible, roughly 180 copies of the 1,282 pages, roughly 180 copies of the 42-line Bible (c.  Incunab books printed from cast bronze type, corrupted... books printed from cast bronze type, press books printed from compositors' cases, and the concept of the screw press—into an integrated system. His key innovations were:\n\n1. partnerships with Johann Fust and Peter Schöffer, partnerships with Johann F 42-line Bible (c.  corrupted... 42-line two columns of 42 lines each, in two columns of 42 lines each, in two columns of # The History of the Printing Press\n\n## Introduction\n\nThe printing press stands as one of the most transformative inventions in human history. Before its arrival, the production of books was a slow, labor-intensive process that made written knowledge a scarce commodity. The printing press changed that fundamentally: it made possible the mass production of texts, the spread of literacy, the standardization of languages, the acceleration of religious and scientific revolutions, and the democratization of information itself. What follows is a detailed account of printing's origins, its revolutionary spread across Europe, its evolution through the centuries, and its enduring legacy.\n\n## Before the Press: The World of the Manuscript\n\nTo appreciate the printing press, one must first understand what came before it. In medieval Europe, books were produced by hand in scriptoria—writing rooms often attached to monasteries. Trained scribes copied texts letter by letter, a process that could take months or years for a single volume. Because of this, books were extraordinarily expensive and rare. A Bible could take a scribe about two years to copy; a single book could cost as much as a farm or a vineyard.\n\nPaper was itself a relatively recent import to Europe. Invented in China around the 1st–2nd century CE, papermaking traveled westward through the Islamic world—reaching Baghdad by the late 8th century, and arriving in Europe via Spain and Italy in the 12th–13th centuries. By the 15th century, the context was set: there was demand for books, growing literacy, universities, and a rising merchant class hungry for religious works, romances, and practical manuals.\n\n## Printing Before Gutenberg: East Asian Origins\n\nAlthough Gutenberg is often credited as the inventor of printing, printing itself is much older, with deep roots in East Asia.\n\n**Woodblock printing (China, ~7th century CE).** The earliest form of printing on paper was woodblock printing, likely developed during the Tang dynasty. The *Diamond Sutra* of 868 CE—found at Dunhuang and now held in the British Library—is the world's oldest surviving dated printed book. It was made by carving an entire page of text (mirrored) into a wooden block, inking it, and pressing paper onto it. Woodblock printing was well suited to Chinese, which uses thousands of ideographic characters, and it flourished for centuries: it produced Buddhist scriptures, calendars, and—during the Song dynasty (960–1279)—a thriving commercial print culture with newspapers, documents, and popular fiction.\n\n**Movable type in China and Korea.** The commoner Bi Sheng invented movable type around 1040 CE, using fired ceramic type. In 1297–1298, Wang Zhen arranged movable type in rotating tables and developed techniques for wooden type. In Korea, artisans of the Goryeo dynasty produced books printed from cast bronze type; the *Jikji* (1377), a Buddhist text now held in the Bibliothèque nationale de France, is the oldest extant book printed with cast metal type—predating Gutenberg by decades. So why didn't printing \"take off\" in East Asia as it did in Europe? Historians point to several factors: the sheer number of Chinese characters (tens of thousands of sorts), the prestige of calligraphy, and social structures that limited the technology's disruptive potential.\n\n## Gutenberg and the Invention of the Movable-Type Printing Press\n\n### The Man and the Moment\n\nJohannes Gutenberg (c. 1400–1468), a goldsmith by training from Mainz, Germany, did not invent printing ex nihilo. Rather, he synthesized existing elements—paper, oil-based ink, the wine press, and the concept of movable type—into an integrated system. His key innovations were:\n\n1. **The type mold (hand mould), c. 1450.** The hand mould was the true breakthrough: an adjustable mold that allowed the rapid casting of identical metal type. The type itself was an alloy of lead, tin, and antimony—soft enough to take fine detail, hard enough to be durable, and low-melting (so it could be cast quickly and repeatedly).\n\n2. **A durable metal type.** Each letter was a \"sort\": a piece of type with a raised, reversed letter (the face) on one end and a shank (the body) on the other.\n\n3. **Oil-based ink.** Gutenberg formulated a sticky, viscous ink—unlike the water-based inks used for woodblocks—that adhered to metal type and transferred cleanly to paper.\n\n4. **The press.** Adapted from the screw press used in winemaking and papermaking, it applied firm, even pressure to produce sharp impressions.\n\n### The Gutenberg Bible\n\nWith financial backing from the businessman Johann Fust, Gutenberg printed his masterpiece: the 42-line Bible (c. 1454–55), the first major book printed in the West. Roughly 180 copies were produced, each with some 1,282 pages, in two columns. Though the Bible was a triumph of craftsmanship, the venture ended in dispute: Fust sued Gutenberg in 1455, won the equipment and stock, and continued printing with Peter Schöffer. Gutenberg died in relative obscurity, though later generations restored his reputation.\n\n## The Spread of Printing Across Europe\n\nPrinting spread with astonishing speed—faster, historians note, than almost any later technology.\n\n- **1460s–1470s:** Printers carried the craft to Italy (Subiaco and Venice, 1465), Germany's neighbors, and France (Paris, 1470). Venice became a printing capital; the Aldine Press, founded by Aldus Manutius, introduced italic type and portable, affordable editions of the classics.\n- **1470s–1480s:** Printing reached Spain, England (William Caxton set up in Westminster in 1476), the Low Countries, and Central Europe.\n- **By 1500:** Presses operated in more than 250 European towns. Scholars estimate that some 27,000–30,000 distinct editions had been produced—books from this era are called *incunabula* (\"from the cradle\").\n\nThe trade developed a professional culture: type founders, compositors, pressmen, and correctors formed an international guild of craftsmen who carried secrets (and typefaces) from city to city.\n\n## The Impact of the Printing Press\n\n### Religious Upheaval: The Reformation\n\nThe press made the Protestant Reformation possible—and perhaps inevitable. Martin Luther's *Ninety-five Theses* (1517) spread across Germany within weeks and across Europe within months, thanks to cheap pamphlets and broadsheets. Luther proved a master of the new medium: his vernacular Bible and polemical tracts flooded Europe. Without the press, a theological dispute might have remained a local quarrel; with it, it became a continental movement.\n\n### The Scientific Revolution\n\nPrinting standardized knowledge. Scientific works—Copernicus's *De revolutionibus* (1543), Vesalius's anatomy with its detailed woodcut illustrations (1543), and later Galileo's writings—could circulate in identical copies, allowing scholars from Prague to Padua to check each other's claims. Tables, diagrams, and mathematical notation could be reproduced accurately, a crucial precondition for cumulative science.\n\n### Language, Literacy, and Nationhood\n\nPrinters chose vernacular languages as well as Latin, and repeated printing helped fix spelling, grammar, and usage. Books became cheaper, literacy rose, and reading shifted from a communal, aloud activity to a private, silent one. Print also enabled newspapers (the first appeared in the early 17th century), the novel, and eventually the public sphere that underpinned modern democratic politics.\n\n### Social and Economic Change\n\nThe press created new professions—publishers, booksellers, journalists—and new institutions: libraries, universities expanded their collections, and copyright concepts eventually emerged from the economics of print. Authorities both embraced and feared the medium: the Catholic Church's *Index Librorum Prohibitorum* (1559) listed banned books, an early chapter in the long history of censorship.\n\n## The Evolution of Printing Technology\n\n### The Hand-Press Era (c. 1450–1800)\n\nFor 350 years, printing remained essentially Gutenberg's craft: wooden hand presses, cast type, and manual inking. Output was limited—perhaps 200–250 sheets per hour on a good day.\n\n### The Industrial Revolution of Print (19th Century)\n\n- **Steam power:** Friedrich Koenig's steam-driven press (1810s) printed the first issue of *The Times* of London in 1814 at unprecedented speed.\n- **Cylinder and rotary presses:** Replacing flat platens with cylinders allowed continuous motion. Richard March Hoe's rotary press (1840s) multiplied output again.\n- **Paper from wood pulp (1840s–60s):** Paper ceased to depend on rag supplies, slashing costs.\n- **Stereotyping and typesetting:** Composing machines and, later, Ottmar Mergenthaler's Linotype (1886) cast whole lines of type mechanically, revolutionizing newspaper production.\n\n### Lithography and Offset\n\nInvented by Alois Senefelder (1796–98), lithography used a flat stone and the repulsion of oil and water to print—opening the door to color printing and, in the 20th century, offset lithography, still the dominant commercial method today.\n\n### The Digital Revolution (20th–21st Centuries)\n\nPhototypesetting replaced hot metal in the mid-20th century; then, in the 1970s–80s, laser printing (notably Xerox and Hewlett-Packard's laser printers) and desktop publishing (Apple's Macintosh, 1984, with software like PageMaker) put \"typesetting\" on everyone's desk. Digital printing now allows books printed on demand in single copies, while 3D printing extends \"printing\" into the fabrication of physical objects. The internet, ironically, is both print's heir and its rival.\n\n## Legacy\n\nThe printing press did more than make books cheap. It created the conditions for mass literacy, modern science, religious pluralism, national literatures, and the free flow of ideas that underpins contemporary notions of human rights and democracy. As the historian Elizabeth Eisenstein argued, print culture fixed and standardized knowledge in ways manuscript culture never could—enabling scholars to build systematically upon one another's work. Every era of information revolution since—from telegraph to radio to internet—has been measured against the standard set by Gutenberg's press.\n\n## Conclusion\n\nFrom carved wooden blocks in Tang China to laser printers and e-books, the story of printing is the story of humanity's long effort to copy, share, and preserve knowledge. Gutenberg's synthesis of movable metal type, ink, paper, and press in mid-15th-century Mainz marks the hinge of that story: the moment when the written word became truly mass-produced. Five and a half centuries later, in an age of screens and digital text, the press's legacy endures—in the very idea that information should be abundant, affordable, and available to all.",
+       "prompt_tokens": 60,
+       "cached_tokens": 0,
+       "server_timings": {
+        "prompt_n": 60,
+        "prompt_ms": 3126.795,
+        "prompt_per_second": 19.189,
+        "prompt_per_token_ms": 52.113,
+        "predicted_n": 3682,
+        "predicted_ms": 235233.232,
+        "predicted_per_second": 15.653,
+        "predicted_per_token_ms": 63.887,
+        "cache_n": 0,
+        "crow_expert_selections": 1264664,
+        "crow_expert_cold": 58967,
+        "crow_ple_rows": 0,
+        "crow_ple_misses": 0,
+        "crow_layers": 45
+       },
+       "frames": 3681
+      }
+     ]
+    }
+   ],
+   "gpu_power_w_mean": null,
+   "serial": false
+  },
+  "C1@32k": {
+   "aggregate": {
+    "median": 13.02,
+    "min": 13.02,
+    "max": 13.02,
+    "n": 1,
+    "all": [
+     13.02
+    ]
+   },
+   "rounds": [
+    {
+     "aggregate": 13.02,
+     "per_stream_mean": 13.02,
+     "per_stream_min": 13.02,
+     "tokens": 2426,
+     "finish": [
+      "stop"
+     ],
+     "ttft_max": 36.31,
+     "serial": false,
+     "streams": [
+      {
+       "t0": 2344.3587122,
+       "first": 2380.6694212,
+       "last": 2566.9673296,
+       "tokens": 2426,
+       "finish": "stop",
+       "response": "# How Compilers Optimise Loops\n\nLoops are where programs spend most of their time, so compilers invest heavily in making them faster. Below is a structured overview of the major loop optimisations, why they work, and what trade-offs they involve.\n\n## 1. Loop-Invariant Code Motion (LICM)\n\n**Idea:** If a computation inside a loop produces the same result on every iteration, hoist it out.\n\n```c\nfor (i = 0; i < n; i++) {\n    x = a[i] * b;      // b never changes\n}\n```\n\nbecomes:\n\n```c\nt = a * b;  // hoisted\nfor (i = 0; i < n; i++) {\n    x = a[i] + t;\n}\n```\n\n**Safety:** The compiler must prove the hoisted expression is *dominated* by the loop header and that no intervening store could change `b` (alias analysis). If it can't prove safety, it may only speculatively hoist if the expression is cheap and side-effect-free.\n\n## 2. Induction Variable Optimisation / Strength Reduction\n\n**Idea:** Variables whose values are linear functions of the loop counter (induction variables) can be rewritten in terms of a single \"canonical\" induction variable, replacing multiplications with additions.\n\n```c\nfor (i = 0; i < n; i++)\n    a[3*i] = 7*i;\n```\n\nbecomes something like:\n\n```c\nj = 0; k = 0;\nfor (i = 0; i < n; i++, j += 3, k += 7)\n    a[j] = k;\n```\n\n**Why it matters:** On hardware without fast multipliers (DSPs, older CPUs), replacing `4*i` with `i << 2` or an increment is a big win. Modern CPUs have fast multipliers, but the transformation still simplifies the loop body and enables further optimisations.\n\n## 3. Loop Unrolling\n\n**Idea:** Replicate the loop body several times and reduce the number of iterations accordingly.\n\n```c\nfor (i = 0; < n; i++) {\n    a[i] = b[i] + c[i];\n}\n```\n\nunrolled by 4:\n\n```c\nfor (i = 0; i + 3 < n; i += 4) {\n    a[i]   = b[i]   + c[i];\n    a[i+1] = b[i+1] + c[i+1];\n    a[i+1] = b[i+1] + c[i+1];   // oops — careful!\n}\n```\n\n**Benefits:**\n- Fewer branch instructions per unit of work.\n- Exposes instruction-level parallelism (ILP) — independent operations can be pipelined, superscalar-dispatched, or vectorised.\n- Reduces loop overhead (increment, compare, jump).\n\n**Costs:** Code bloat (instruction-cache pressure), and the compiler must handle *loop-remainder* (epilogue) iterations when `n` is not a multiple of the unroll factor.\n\n## 4. Loop Jamming (Loop Fusion / Fission)\n\n**Fusion** merges two loops over the same range into one, halving loop overhead and improving locality:\n\n```c\nfor (i = 0; i < n; i++) a[i] = b[i] + 1;\nfor (i  = 0; i < n; i++) c[i] = a[i] * 2;\n```\n\n**Fission** splits one loop into several, e.g. to reduce register pressure or enable vectorisation of one part.\n\n**Risk:** Fusion can hurt if the fused body exceeds register capacity, causing spills.\n\n##  pass ordering\n\n## 5. Vectorisation (SIMD)\n\n**Idea:** Use SIMD instructions (SSE/AVX, NEON, AVX-512) to process multiple data elements per instruction.\n\n```c\nfor (i = 0; i < 8; i++)\n    c[i] = a[i] + b[i];\n```\n\ncan become a single 512-bit `vaddps` on AVX-512.\n\n**Requirements:**\n- No loop-carried dependencies between iterations (or the compiler must prove absence).\n- Contiguous, aligned access patterns (or the compiler must use gather/scatter, which is slower).\n- The trip count must be known or the loop must be peelable.\n\n**Cost model:** The compiler estimates whether vectorisation is profitable given alignment unknowns, remainder handling, and register pressure.\n\n## 6. Loop-Invariant Conditions and Branch Removal\n\nIf a condition inside the loop doesn't depend on the induction variable, the branch can be hoisted and the loop *unswitched*:\n\n```c\nfor (i = 0; i < n; i++) {\n    if (s) a[i] = 1; else a[i] = 2;\n```\n\nbecomes two specialised loops selected once before the loop.\n\n## 7. Loop Reversal / Interchange / Skewing\n\nFor nested loops, the order of iteration can be changed to improve memory locality. Consider:\n\n```c\nfor (i = 0; i < C; i++)\n  for (j = 0; j < R; j++)\n    a[i][C-1-j] = ...;\n```\n\n**Loop interchange** swaps the loop order so that the innermost loop walks memory in address order, improving cache hit rates. Legality depends on dependencies (direction vectors, like `>` or `*` anti-dependencies) — the compiler computes these from dependence analysis.\n\n## 8. Loop-Closed SSA and Canonicalisation\n\nBefore optimising, compilers canonicalise loops into a single back-edge with a single latch block, and induction variables are rewritten into a canonical form (SCEV in LLVM, IVs in GCC). This makes dependence analysis and vectorisation much more tractable. After vectorisation, the compiler must repair the loop-closed SSA form so that values used after the loop take their final values.\n\n## 9. Pragmas and `restrict`\n\nCompilers can't vectorise a loop if pointers may alias:\n\n```c\nvoid f(float *a, *b, float s) {\n    for (i =  pragmas\n```\n\nThe `restrict` keyword (C99) is a programmer promise that `a` and `b` must not overlap, unlocking vectorisation.\n\n## 10. Runtime Checks and Multiversioning\n\nWhen the compiler cannot statically prove safety, it can emit *runtime checks* — e.g., that `a + i` and `b + aliasing` don't memcheck — and generate two versions of the vectorised and scalar fallback, selecting at runtime. This is called **multiversioning** with runtime alias checks.\n\n## 11. Loop Rerolling\n\nThe inverse of unrolling: the source may be manually unrolled (common in old code), and the compiler can *reroll* it back into a compact loop so that the vectoriser can then re-unroll it to the machine's vector width. This is a nice example of optimisation pipelines: one pass undoes a manual optimisation so another pass can apply a *machine-specific* one.\n\n## 12. Counting Down to Zero\n\nA classic trick: loops counting *down* to zero allow the compiler to use the flags register (e dec/jnz) rather than a separate compare. Compilers do this automatically when the loop counts down to zero, freeing a register.\n\n```c\nfor (i = n; i != 0; i--)\n```\n\n## 13. Loop Unswitching\n\nAlready mentioned above — hoisting loop-invariant conditionals by cloning the loop body under each branch outcome.\n\n## 14. Profitability vs. Legality\n\nEvery optimisation has two questions:\n\n- **Legality:** Is the transformation semantics-preserving? (Dependence analysis, alias analysis, SSA properties.)\n**Profitability:** Is it worth it? (Code size, register pressure, I-cache pressure, vector width, branch prediction.)\n\nA transformation can be legal but unprofitable (e.g., unrolling a loop with a large body bloats code and evicts other code from I-cache).\n\n## 15. How to Help the Compiler\n\n- Use `restrict` in C/C++ for non-aliasing pointers.\n- Write loops with simple, straight-line bodies.\n- Avoid function calls in loop bodies (unless inlined).\n- Prefer `<=`/`<` with unit-stride access patterns.\n- Count down to zero when possible (minor, but free).\n- Let the compiler see the trip count: avoid opaque barriers like opaque function calls, opaque function calls, opaque function unrolling... opaque function calls, opaque function calls, opaque function calls, degenerate repetition in my output — I should not do that. Let me continue writing the actual article properly.\n\n## 15. How to Help the Compiler (continued)\n\n- Let the compiler see the trip count: avoid opaque barriers like opaque function calls in the loop condition.\n- Compile with `-O2`/`-O3` and use `-ftree-vectorize` (GCC) or `-O3 -Rpass=loop-vectorize` (Clang optimisation remarks).\n- Use `#pragma clang loop vectorize_width(8)` or `#pragma omp simd` to give hints.\n- Inspect the generated assembly (`-S`) or use **Compiler Explorer** (godbolt.org) to verify vectorisation happened.\n\n## 16. Interaction Between Optimisations\n\nThese optimisations don't operate in isolation. A typical pipeline might:\n\n1. Canonicalise the loop (SCEV/IV canonicalisation).\n2. LICM hoists invariant code out.\n3. Unswitching clones the loop for invariant branches.\n4. Unrolling replicates the body.\n5. Vectorisation converts the loop to SIMD form.\n6. Strength reduction simplifies address computations.\n7. Peeling handles the remainder iterations.\n\nEach pass can enable or disable the others. This is why compilers run passes multiple times in a pipeline, and why the order matters enormously.\n\n## 17. Summary Table\n\n| Optimisation | What it does | Main risk |\n|---|---|---|---|\n| LICM | Hoists invariant computation | Needs alias analysis |\n| Strength reduction | Replaces mults with adds | Minor |\n| Unrolling | Replicates body, fewer branches | Code bloat |\n| Fusion/fission | Merges/splits loops | Register pressure |\n| Vectorisation | SIMD processing | Aliasing, dependencies |\n| Interchange | Reorders nested loops | Dependence violations |\n| Unswitching | Hoists invariant branches | Code bloat |\n| Rerolling | Undoes manual unrolling | Minor |\n\n## 18. Closing Note\n\nLoop optimisation is one of the most mature areas of compiler engineering. The transformations themselves are conceptually simple, but proving *legality* — that the transformation preserves program semantics for all possible inputs — is where the real difficulty lies. Modern compilers like GCC, Clang/LLVM, and MSVC run dozens of loop-related passes in carefully ordered pipelines, and the difference between `-O0` and `-O3` output for a simple dot product can be dramatic: from a simple scalar loop to fully unrolled, vectorised code with runtime alias checks and remainder handling.\n\n---\n\n*If you'd like, I can walk through a concrete example — say, a matrix multiply — and show how several of these optimisations compose on the same loop nest.*",
+       "prompt_tokens": 32830,
+       "cached_tokens": 0,
+       "server_timings": {
+        "prompt_n": 32830,
+        "prompt_ms": 36206.32,
+        "prompt_per_second": 906.748,
+        "prompt_per_token_ms": 1.103,
+        "predicted_n": 2426,
+        "predicted_ms": 186297.229,
+        "predicted_per_second": 13.022,
+        "predicted_per_token_ms": 76.792,
+        "cache_n": 0,
+        "crow_expert_selections": 2130792,
+        "crow_expert_cold": 123912,
+        "crow_ple_rows": 0,
+        "crow_ple_misses": 0,
+        "crow_layers": 45
+       },
+       "frames": 2425
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "status": "DONE",
+ "template_overhead_tokens": 12,
+ "prefill_prompt_receipts": [
+  {
+   "tokens": 8192,
+   "rep": 0,
+   "prompt_tokens": 8192,
+   "cached_tokens": 0,
+   "prompt_sha256": "84abe346024c81f9d504bfea10292421c6b62abc5ee02c1cfd17812d0a335ca3",
+   "ttft_s": 7.472420900000088,
+   "server_timings": {
+    "prompt_n": 8192,
+    "prompt_ms": 7426.189,
+    "prompt_per_second": 1103.123,
+    "prompt_per_token_ms": 0.907,
+    "predicted_n": 1,
+    "predicted_ms": 0.0,
+    "predicted_per_second": 0.0,
+    "predicted_per_token_ms": 0.0,
+    "cache_n": 0,
+    "crow_expert_selections": 21303,
+    "crow_expert_cold": 9900,
+    "crow_ple_rows": 0,
+    "crow_ple_misses": 0,
+    "crow_layers": 45
+   }
+  }
+ ],
+ "prompt_sha256": [
+  "5d5548152df3ddbd1cc0c5e689bd2cad0f4bf8f3beedb88e189ed06b776edbf8",
+  "9ee109bc2d69aaa7930545c72bcb15884675c5e5a7635a54bd5ddcadaeec7260"
+ ],
+ "nonce_prefix": "a6077b493177720232c654608cbe174b",
+ "finished": "2026-10-11T08:01:31+0200"
+}

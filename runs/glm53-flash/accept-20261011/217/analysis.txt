@@ -1,0 +1,111 @@
+-- off-r1 boot 21.3 s 
+    [budget] device sampler (#215): 501556 B (mask, window counts, ring, candidates, profile) held from boot
+    [serve] prefix cache on, 153252864 B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt
+    [serve] glm5_next: device sampler on (sampled requests draw on the device unless logit_bias, top_k 0 / > 64 or a host-only knob sends them to the host) (#215), MTP off (CROW_GLM_MTP unset or 0) (#192), no vision tower, no slot files, no VRAM lending (#185)
+   t1r1   P 6438 C 0 F 6438 gen 64 prefill 6975.4 ms decode 12.8 tok/s ms/tok 76.858 finish length err None
+       [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6438 of 6438 tok, reset 1.968 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 0.0 ms (0 records), hand-back 428.3 ms (14 chunks, 484 written back), calls 6496.7 ms, decode_ready 38.7 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4927, landing->stage 5282, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 35.333 ms
+   t2r1   P 6456 C 0 F 6456 gen 64 prefill 6833.3 ms decode 14.3 tok/s ms/tok 68.865 finish length err None
+       [cache] COLD L 6043 (held 6501), P 0, snapshots [Some(6438)], prefill 6456 of 6456 tok, reset 1.914 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6456 rows at 0: lend-back 32.2 ms (128 records), hand-back 145.7 ms (13 chunks, 481 written back), calls 6608.2 ms, decode_ready 37.0 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4933, landing->stage 5270, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6456, DtoH 16.075 ms
+   third  P 6438 C 0 F 6438 gen 64 prefill 6894.3 ms decode 17.3 tok/s ms/tok 56.82 finish length err None
+       [cache] COLD L 6043 (held 6519), P 0, snapshots [Some(6456)], prefill 6438 of 6438 tok, reset 1.976 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 32.0 ms (128 records), hand-back 145.4 ms (13 chunks, 481 written back), calls 6672.1 ms, decode_ready 34.3 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4932, landing->stage 5261, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 16.191 ms
+    {'event': 'stop', 'tag': 'off-r1', 'rc': 1}
+-- on-r2 boot 21.2 s 
+    [budget] device sampler (#215): 501556 B (mask, window counts, ring, candidates, profile) held from boot
+    [serve] prefix cache on, 153252864 B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt + 1 anchor of 152633344 B (CROW_GLM_PREFIX_ANCHOR, #217)
+    [serve] CROW_GLM_PREFIX_ANCHOR=1 (#217): + 1 anchor snapshot per sequence slot, 152633344 B in HOST RAM (KDA states, no logits row), at the first <|user|> or at L of a cold prompt with L >= 1024, captured inside the prefill by cutting the KDA scan (device copy from the prompt's elastic hand-back, fr
+    [serve] glm5_next: device sampler on (sampled requests draw on the device unless logit_bias, top_k 0 / > 64 or a host-only knob sends them to the host) (#215), MTP off (CROW_GLM_MTP unset or 0) (#192), no vision tower, no slot files, no VRAM lending (#185)
+   t1r1   P 6438 C 0 F 6438 gen 64 prefill 6772.6 ms decode 12.9 tok/s ms/tok 76.208 finish length err None
+       [cache] COLD L 0 (held 0), P 0, snapshots [None], anchor None, prefill 6438 of 6438 tok, reset 0.799 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 0.0 ms (0 records), hand-back 149.3 ms (14 chunks, 484 written back), calls 6484.5 ms, decode_ready 41.3 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4927, landing->stage 5282, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] anchor at pos 6376 (the first <|user|>), 152633344 B in HOST RAM, captured inside the prefill (KDA scan cut there), anchored prefill 6722.250 ms
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 38.474 ms
+   t2r1   P 6456 C 0 F 6456 gen 64 prefill 6894.4 ms decode 14.4 tok/s ms/tok 68.426 finish length err None
+       [cache] COLD L 6043 (held 6501), P 0, snapshots [Some(6438)], anchor Some(6376), prefill 6456 of 6456 tok, reset 1.917 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6456 rows at 0: lend-back 32.0 ms (128 records), hand-back 155.2 ms (14 chunks, 518 written back), calls 6591.3 ms, decode_ready 40.5 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4935, landing->stage 5270, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] anchor at pos 6043 (L of a cold prompt), 152633344 B in HOST RAM, captured inside the prefill (KDA scan cut there), anchored prefill 6875.189 ms
+       [cache] snapshot point 1 (after prompt) at pos 6456, DtoH 16.251 ms
+   third  P 6438 C 6043 F 395 gen 64 prefill 5499.9 ms decode 17.8 tok/s ms/tok 55.311 finish length err None
+       [cache] WARM L 6043 (held 6519), P 6043, snapshots [Some(6456)], anchor Some(6043) (P), prefill 395 of 6438 tok, reset 13.340 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 395 rows at 6043: lend-back 32.0 ms (128 records), hand-back 77.6 ms (7 chunks, 259 written back), calls 5363.9 ms, decode_ready 22.7 ms; NVMe 4314 reads 40871043072 B, host wait 4941.9 ms; pinned->stage 4769, landing->stage 4314, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 182; staged calls 0, unfit 42, NVPF calls 0; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 16.398 ms
+    {'event': 'stop', 'tag': 'on-r2', 'rc': 1}
+-- off-r3 boot 21.3 s 
+    [budget] device sampler (#215): 501556 B (mask, window counts, ring, candidates, profile) held from boot
+    [serve] prefix cache on, 153252864 B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt
+    [serve] glm5_next: device sampler on (sampled requests draw on the device unless logit_bias, top_k 0 / > 64 or a host-only knob sends them to the host) (#215), MTP off (CROW_GLM_MTP unset or 0) (#192), no vision tower, no slot files, no VRAM lending (#185)
+   t1r1   P 6438 C 0 F 6438 gen 64 prefill 6720.4 ms decode 12.9 tok/s ms/tok 76.354 finish length err None
+       [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6438 of 6438 tok, reset 0.767 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 0.0 ms (0 records), hand-back 154.3 ms (14 chunks, 484 written back), calls 6510.5 ms, decode_ready 41.8 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4927, landing->stage 5282, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 37.820 ms
+   t2r1   P 6456 C 0 F 6456 gen 64 prefill 6825.2 ms decode 14.3 tok/s ms/tok 68.717 finish length err None
+       [cache] COLD L 6043 (held 6501), P 0, snapshots [Some(6438)], prefill 6456 of 6456 tok, reset 2.246 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6456 rows at 0: lend-back 32.2 ms (128 records), hand-back 154.5 ms (14 chunks, 518 written back), calls 6587.5 ms, decode_ready 40.5 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4937, landing->stage 5270, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6456, DtoH 16.359 ms
+   third  P 6438 C 0 F 6438 gen 64 prefill 6893.0 ms decode 17.9 tok/s ms/tok 55.066 finish length err None
+       [cache] COLD L 6043 (held 6519), P 0, snapshots [Some(6456)], prefill 6438 of 6438 tok, reset 2.775 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 32.1 ms (128 records), hand-back 154.9 ms (14 chunks, 518 written back), calls 6655.3 ms, decode_ready 40.4 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4936, landing->stage 5261, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 15.839 ms
+    {'event': 'stop', 'tag': 'off-r3', 'rc': 1}
+-- on-r4 boot 21.2 s 
+    [budget] device sampler (#215): 501556 B (mask, window counts, ring, candidates, profile) held from boot
+    [serve] prefix cache on, 153252864 B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt + 1 anchor of 152633344 B (CROW_GLM_PREFIX_ANCHOR, #217)
+    [serve] CROW_GLM_PREFIX_ANCHOR=1 (#217): + 1 anchor snapshot per sequence slot, 152633344 B in HOST RAM (KDA states, no logits row), at the first <|user|> or at L of a cold prompt with L >= 1024, captured inside the prefill by cutting the KDA scan (device copy from the prompt's elastic hand-back, fr
+    [serve] glm5_next: device sampler on (sampled requests draw on the device unless logit_bias, top_k 0 / > 64 or a host-only knob sends them to the host) (#215), MTP off (CROW_GLM_MTP unset or 0) (#192), no vision tower, no slot files, no VRAM lending (#185)
+   t1r1   P 6438 C 0 F 6438 gen 64 prefill 6792.6 ms decode 12.9 tok/s ms/tok 76.45 finish length err None
+       [cache] COLD L 0 (held 0), P 0, snapshots [None], anchor None, prefill 6438 of 6438 tok, reset 0.824 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 0.0 ms (0 records), hand-back 148.6 ms (14 chunks, 484 written back), calls 6512.3 ms, decode_ready 37.3 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4927, landing->stage 5282, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] anchor at pos 6376 (the first <|user|>), 152633344 B in HOST RAM, captured inside the prefill (KDA scan cut there), anchored prefill 6745.309 ms
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 38.169 ms
+   t2r1   P 6456 C 0 F 6456 gen 64 prefill 6885.1 ms decode 14.2 tok/s ms/tok 69.298 finish length err None
+       [cache] COLD L 6043 (held 6501), P 0, snapshots [Some(6438)], anchor Some(6376), prefill 6456 of 6456 tok, reset 2.276 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6456 rows at 0: lend-back 32.1 ms (128 records), hand-back 144.7 ms (13 chunks, 481 written back), calls 6594.7 ms, decode_ready 38.4 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4934, landing->stage 5270, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] anchor at pos 6043 (L of a cold prompt), 152633344 B in HOST RAM, captured inside the prefill (KDA scan cut there), anchored prefill 6868.419 ms
+       [cache] snapshot point 1 (after prompt) at pos 6456, DtoH 15.631 ms
+   third  P 6438 C 6043 F 395 gen 64 prefill 5483.7 ms decode 18.1 tok/s ms/tok 54.373 finish length err None
+       [cache] WARM L 6043 (held 6519), P 6043, snapshots [Some(6456)], anchor Some(6043) (P), prefill 395 of 6438 tok, reset 13.228 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 395 rows at 6043: lend-back 32.0 ms (128 records), hand-back 67.7 ms (6 chunks, 222 written back), calls 5364.5 ms, decode_ready 15.8 ms; NVMe 4316 reads 40889991168 B, host wait 4936.9 ms; pinned->stage 4774, landing->stage 4316, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 183; staged calls 0, unfit 42, NVPF calls 0; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 15.694 ms
+    {'event': 'stop', 'tag': 'on-r4', 'rc': 1}
+-- off-r5 boot 21.3 s 
+    [budget] device sampler (#215): 501556 B (mask, window counts, ring, candidates, profile) held from boot
+    [serve] prefix cache on, 153252864 B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt
+    [serve] glm5_next: device sampler on (sampled requests draw on the device unless logit_bias, top_k 0 / > 64 or a host-only knob sends them to the host) (#215), MTP off (CROW_GLM_MTP unset or 0) (#192), no vision tower, no slot files, no VRAM lending (#185)
+   t1r1   P 6438 C 0 F 6438 gen 64 prefill 6703.8 ms decode 12.9 tok/s ms/tok 76.418 finish length err None
+       [cache] COLD L 0 (held 0), P 0, snapshots [None], prefill 6438 of 6438 tok, reset 0.807 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 0.0 ms (0 records), hand-back 147.7 ms (14 chunks, 484 written back), calls 6507.3 ms, decode_ready 37.8 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4927, landing->stage 5282, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 37.408 ms
+   t2r1   P 6456 C 0 F 6456 gen 64 prefill 6833.5 ms decode 14.3 tok/s ms/tok 68.935 finish length err None
+       [cache] COLD L 6043 (held 6501), P 0, snapshots [Some(6438)], prefill 6456 of 6456 tok, reset 1.871 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6456 rows at 0: lend-back 32.0 ms (128 records), hand-back 144.4 ms (13 chunks, 481 written back), calls 6608.9 ms, decode_ready 37.7 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4935, landing->stage 5270, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6456, DtoH 16.080 ms
+   third  P 6438 C 0 F 6438 gen 64 prefill 6874.7 ms decode 17.4 tok/s ms/tok 56.498 finish length err None
+       [cache] COLD L 6043 (held 6519), P 0, snapshots [Some(6456)], prefill 6438 of 6438 tok, reset 2.681 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 32.1 ms (128 records), hand-back 145.1 ms (13 chunks, 481 written back), calls 6649.0 ms, decode_ready 37.8 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4934, landing->stage 5260, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 15.637 ms
+    {'event': 'stop', 'tag': 'off-r5', 'rc': 1}
+-- on-r6 boot 21.3 s 
+    [budget] device sampler (#215): 501556 B (mask, window counts, ring, candidates, profile) held from boot
+    [serve] prefix cache on, 153252864 B per snapshot in HOST RAM (KDA state + conv of every KDA layer, the logits row; MLA latent and DSA indexer rows truncate), 1 snapshot after each prompt + 1 anchor of 152633344 B (CROW_GLM_PREFIX_ANCHOR, #217)
+    [serve] CROW_GLM_PREFIX_ANCHOR=1 (#217): + 1 anchor snapshot per sequence slot, 152633344 B in HOST RAM (KDA states, no logits row), at the first <|user|> or at L of a cold prompt with L >= 1024, captured inside the prefill by cutting the KDA scan (device copy from the prompt's elastic hand-back, fr
+    [serve] glm5_next: device sampler on (sampled requests draw on the device unless logit_bias, top_k 0 / > 64 or a host-only knob sends them to the host) (#215), MTP off (CROW_GLM_MTP unset or 0) (#192), no vision tower, no slot files, no VRAM lending (#185)
+   t1r1   P 6438 C 0 F 6438 gen 64 prefill 6953.0 ms decode 12.8 tok/s ms/tok 76.626 finish length err None
+       [cache] COLD L 0 (held 0), P 0, snapshots [None], anchor None, prefill 6438 of 6438 tok, reset 2.052 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6438 rows at 0: lend-back 0.0 ms (0 records), hand-back 336.2 ms (14 chunks, 484 written back), calls 6488.5 ms, decode_ready 37.8 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4927, landing->stage 5282, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] anchor at pos 6376 (the first <|user|>), 152633344 B in HOST RAM, captured inside the prefill (KDA scan cut there), anchored prefill 6908.375 ms
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 36.865 ms
+   t2r1   P 6456 C 0 F 6456 gen 64 prefill 6861.8 ms decode 14.2 tok/s ms/tok 69.203 finish length err None
+       [cache] COLD L 6043 (held 6501), P 0, snapshots [Some(6438)], anchor Some(6376), prefill 6456 of 6456 tok, reset 1.946 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 6456 rows at 0: lend-back 32.1 ms (128 records), hand-back 145.3 ms (13 chunks, 481 written back), calls 6592.3 ms, decode_ready 34.4 ms; NVMe 5314 reads 50345091072 B, host wait 0.0 ms; pinned->stage 4932, landing->stage 5270, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 210; staged calls 0, unfit 42, NVPF calls 42; small calls 0, guess reads 0
+       [cache] anchor at pos 6043 (L of a cold prompt), 152633344 B in HOST RAM, captured inside the prefill (KDA scan cut there), anchored prefill 6850.461 ms
+       [cache] snapshot point 1 (after prompt) at pos 6456, DtoH 16.558 ms
+   third  P 6438 C 6043 F 395 gen 64 prefill 6876.6 ms decode 17.4 tok/s ms/tok 56.709 finish length err None
+       [cache] WARM L 6043 (held 6519), P 6043, snapshots [Some(6456)], anchor Some(6043) (P), prefill 395 of 6438 tok, reset 12.816 ms (glm5_next: KDA states restored, MLA/DSA rows truncated)
+       [glm5] prompt phase route default, 395 rows at 6043: lend-back 32.5 ms (128 records), hand-back 56.3 ms (5 chunks, 740 written back), calls 6710.5 ms, decode_ready 73.8 ms; NVMe 5610 reads 53149409280 B, host wait 0.0 ms; pinned->stage 4954, landing->stage 5609, zero-copy 0, NVMe->pinned 0; routing syncs 42, sub-batches 42; staged calls 42, unfit 0, NVPF calls 0; small calls 0, guess reads 0
+       [cache] snapshot point 1 (after prompt) at pos 6438, DtoH 16.350 ms
+    {'event': 'stop', 'tag': 'on-r6', 'rc': 1}

@@ -1,0 +1,8 @@
+{"ts": "2026-10-11T12:30:43", "vram_mib": 1078, "commit_gib": 15.679, "commit_limit_gib": 103.38, "avail_phys_gib": 52.136}
+{"ts": "2026-10-11T12:30:45", "vram_mib": 3753, "commit_gib": 18.803, "commit_limit_gib": 103.38, "avail_phys_gib": 52.083}
+{"ts": "2026-10-11T12:30:48", "vram_mib": 6580, "commit_gib": 22.703, "commit_limit_gib": 103.38, "avail_phys_gib": 50.855}
+{"ts": "2026-10-11T12:30:50", "vram_mib": 13680, "commit_gib": 45.402, "commit_limit_gib": 103.38, "avail_phys_gib": 35.666}
+{"ts": "2026-10-11T12:30:52", "vram_mib": 20437, "commit_gib": 73.086, "commit_limit_gib": 103.38, "avail_phys_gib": 14.603}
+{"ts": "2026-10-11T12:30:55", "vram_mib": 29916, "commit_gib": 90.22, "commit_limit_gib": 103.38, "avail_phys_gib": 6.434}
+{"ts": "2026-10-11T12:30:57", "vram_mib": 29878, "commit_gib": 90.194, "commit_limit_gib": 103.38, "avail_phys_gib": 6.546}
+{"ts": "2026-10-11T12:30:59", "vram_mib": 29876, "commit_gib": 90.199, "commit_limit_gib": 103.38, "avail_phys_gib": 6.527}

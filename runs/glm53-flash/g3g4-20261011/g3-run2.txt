@@ -1,0 +1,1151 @@
+[log] file C:\Users\robin\AppData\Local\crow\logs\engine.log (rotate at 64.000 MiB, keep 8, gzip on rotation), stderr mirror on, filter info
+[glmgolden] golden C:/Users/robin/dev/crow-nest/models/GLM-5.3-Flash-step06/ref-mul1-all: 90 rows (T 86 + D 4), prompt in calls of 512 (5 calls), layers [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44], golden-fed (G3: cosine >= 0.9999 per layer, site and row group)
+[glmgolden] container C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq: 38 constants verified, routed experts 288 x 9474048 B (12096 records, codec mul1)
+[glmgolden] l0 kda+dense loaded in 0.1 s: 169280500 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l0 computed in 0.02 s (taps synchronize: not a speed figure)
+glmgolden l0  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l0  attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l0  attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l0  attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l0  attn comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l0  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 32 1.000000000)  max_abs 7.451e-9  rel_rms 4.855e-8  PASS
+glmgolden l0  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.451e-9  rel_rms 1.298e-7  PASS
+glmgolden l0  attn out        prompt rows    0..85   cosine 0.999999967 (worst row 81 0.999999956)  max_abs 1.177e-5  rel_rms 2.564e-4  PASS
+glmgolden l0  attn out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.004e-7  rel_rms 7.642e-6  PASS
+glmgolden l0  attn expanded   prompt rows    0..85   cosine 0.999999959 (worst row 28 0.999999941)  max_abs 2.328e-5  rel_rms 2.879e-4  PASS
+glmgolden l0  attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 5.709e-7  rel_rms 8.836e-6  PASS
+glmgolden l0  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l0  ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l0  ffn  post       decode rows   86..89   max_abs 2.682e-7  (coefficients, reported)
+glmgolden l0  ffn  comb       prompt rows    0..85   max_abs 3.874e-7  (coefficients, reported)
+glmgolden l0  ffn  comb       decode rows   86..89   max_abs 5.662e-7  (coefficients, reported)
+glmgolden l0  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 39 1.000000000)  max_abs 5.960e-8  rel_rms 2.057e-7  PASS
+glmgolden l0  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 7.451e-8  rel_rms 4.819e-7  PASS
+glmgolden l0  ffn  out        prompt rows    0..85   cosine 0.999999961 (worst row 54 0.999999950)  max_abs 2.766e-5  rel_rms 2.789e-4  PASS
+glmgolden l0  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.470e-8  rel_rms 6.251e-7  PASS
+glmgolden l0  ffn  expanded   prompt rows    0..85   cosine 0.999999980 (worst row 85 0.999999965)  max_abs 3.192e-5  rel_rms 1.995e-4  PASS
+glmgolden l0  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.470e-8  rel_rms 4.865e-7  PASS
+[glmgolden] l1 kda+dense loaded in 0.1 s: 169280500 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l1 computed in 0.02 s (taps synchronize: not a speed figure)
+glmgolden l1  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l1  attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l1  attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l1  attn comb       prompt rows    0..85   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l1  attn comb       decode rows   86..89   max_abs 6.557e-7  (coefficients, reported)
+glmgolden l1  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 74 1.000000000)  max_abs 2.794e-8  rel_rms 1.639e-7  PASS
+glmgolden l1  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 4.470e-8  rel_rms 1.011e-6  PASS
+glmgolden l1  attn out        prompt rows    0..85   cosine 0.999999980 (worst row 14 0.999999974)  max_abs 4.400e-6  rel_rms 1.984e-4  PASS
+glmgolden l1  attn out        decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999998)  max_abs 1.114e-6  rel_rms 4.874e-5  PASS
+glmgolden l1  attn expanded   prompt rows    0..85   cosine 0.999999992 (worst row 29 0.999999981)  max_abs 8.347e-6  rel_rms 1.295e-4  PASS
+glmgolden l1  attn expanded   decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999998)  max_abs 2.120e-6  rel_rms 3.252e-5  PASS
+glmgolden l1  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l1  ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l1  ffn  post       decode rows   86..89   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l1  ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l1  ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l1  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 70 1.000000000)  max_abs 1.863e-8  rel_rms 1.876e-7  PASS
+glmgolden l1  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.490e-8  rel_rms 2.306e-7  PASS
+glmgolden l1  ffn  out        prompt rows    0..85   cosine 0.999999954 (worst row 41 0.999999919)  max_abs 1.449e-5  rel_rms 3.044e-4  PASS
+glmgolden l1  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.490e-8  rel_rms 6.543e-7  PASS
+glmgolden l1  ffn  expanded   prompt rows    0..85   cosine 0.999999994 (worst row 49 0.999999985)  max_abs 1.419e-5  rel_rms 1.124e-4  PASS
+glmgolden l1  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.164e-8  rel_rms 2.431e-7  PASS
+[glmgolden] l2 kda+dense loaded in 0.1 s: 169280500 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l2 computed in 0.02 s (taps synchronize: not a speed figure)
+glmgolden l2  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l2  attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l2  attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l2  attn comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l2  attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l2  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 25 1.000000000)  max_abs 3.353e-8  rel_rms 2.332e-7  PASS
+glmgolden l2  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.912e-8  rel_rms 7.011e-7  PASS
+glmgolden l2  attn out        prompt rows    0..85   cosine 0.999999984 (worst row 46 0.999999978)  max_abs 4.254e-6  rel_rms 1.784e-4  PASS
+glmgolden l2  attn out        decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999998)  max_abs 1.181e-6  rel_rms 4.316e-5  PASS
+glmgolden l2  attn expanded   prompt rows    0..85   cosine 0.999999995 (worst row 71 0.999999991)  max_abs 8.341e-6  rel_rms 9.952e-5  PASS
+glmgolden l2  attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 0.999999999)  max_abs 2.047e-6  rel_rms 2.332e-5  PASS
+glmgolden l2  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l2  ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l2  ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l2  ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l2  ffn  comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l2  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 81 1.000000000)  max_abs 1.490e-8  rel_rms 2.283e-7  PASS
+glmgolden l2  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.353e-8  rel_rms 7.004e-7  PASS
+glmgolden l2  ffn  out        prompt rows    0..85   cosine 0.999999991 (worst row 59 0.999999984)  max_abs 2.912e-5  rel_rms 1.375e-4  PASS
+glmgolden l2  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.416e-7  rel_rms 7.160e-7  PASS
+glmgolden l2  ffn  expanded   prompt rows    0..85   cosine 0.999999991 (worst row 53 0.999999985)  max_abs 5.695e-5  rel_rms 1.308e-4  PASS
+glmgolden l2  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.533e-7  rel_rms 7.030e-7  PASS
+[glmgolden] l3 dsa+moe loaded in 1.2 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14942625 of 16777216 values inexact (RNE)
+[glmgolden] l3 computed in 0.04 s (taps synchronize: not a speed figure)
+glmgolden l3  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l3  attn post       prompt rows    0..85   max_abs 1.164e-8  (coefficients, reported)
+glmgolden l3  attn post       decode rows   86..89   max_abs 4.843e-8  (coefficients, reported)
+glmgolden l3  attn comb       prompt rows    0..85   max_abs 2.682e-7  (coefficients, reported)
+glmgolden l3  attn comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l3  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 17 1.000000000)  max_abs 1.304e-8  rel_rms 2.597e-7  PASS
+glmgolden l3  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.909e-8  rel_rms 5.889e-7  PASS
+glmgolden l3  attn out        prompt rows    0..85   cosine 0.999997971 (worst row 1 0.999997010)  max_abs 4.196e-3  rel_rms 2.025e-3  PASS
+glmgolden l3  attn out        decode rows   86..89   cosine 0.999998523 (worst row 86 0.999998221)  max_abs 2.146e-3  rel_rms 1.719e-3  PASS
+glmgolden l3  attn expanded   prompt rows    0..85   cosine 0.999999996 (worst row 49 0.999999985)  max_abs 4.829e-5  rel_rms 8.488e-5  PASS
+glmgolden l3  attn expanded   decode rows   86..89   cosine 0.999999997 (worst row 87 0.999999993)  max_abs 2.660e-5  rel_rms 8.292e-5  PASS
+glmgolden l3  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l3  ffn  post       prompt rows    0..85   max_abs 6.706e-8  (coefficients, reported)
+glmgolden l3  ffn  post       decode rows   86..89   max_abs 7.078e-8  (coefficients, reported)
+glmgolden l3  ffn  comb       prompt rows    0..85   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l3  ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l3  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 22 1.000000000)  max_abs 9.313e-9  rel_rms 1.474e-7  PASS
+glmgolden l3  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.863e-8  rel_rms 8.510e-7  PASS
+glmgolden l3  ffn  out        prompt rows    0..85   cosine 0.999999996 (worst row 0 0.999999989)  max_abs 2.333e-3  rel_rms 8.593e-5  PASS
+glmgolden l3  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 5.245e-6  rel_rms 1.078e-6  PASS
+glmgolden l3  ffn  expanded   prompt rows    0..85   cosine 0.999999997 (worst row 0 0.999999990)  max_abs 3.418e-4  rel_rms 7.642e-5  PASS
+glmgolden l3  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 7.749e-7  rel_rms 1.114e-6  PASS
+glmgolden l3  routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l3  dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l4 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l4 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l4  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l4  attn post       prompt rows    0..85   max_abs 1.639e-7  (coefficients, reported)
+glmgolden l4  attn post       decode rows   86..89   max_abs 3.427e-7  (coefficients, reported)
+glmgolden l4  attn comb       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l4  attn comb       decode rows   86..89   max_abs 7.749e-7  (coefficients, reported)
+glmgolden l4  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 79 1.000000000)  max_abs 4.098e-8  rel_rms 3.544e-7  PASS
+glmgolden l4  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.049e-8  rel_rms 6.030e-7  PASS
+glmgolden l4  attn out        prompt rows    0..85   cosine 0.999999977 (worst row 59 0.999999970)  max_abs 2.597e-5  rel_rms 2.144e-4  PASS
+glmgolden l4  attn out        decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999995)  max_abs 3.962e-6  rel_rms 4.227e-5  PASS
+glmgolden l4  attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 1 1.000000000)  max_abs 6.594e-6  rel_rms 5.185e-6  PASS
+glmgolden l4  attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.027e-7  rel_rms 1.360e-6  PASS
+glmgolden l4  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l4  ffn  post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l4  ffn  post       decode rows   86..89   max_abs 1.490e-7  (coefficients, reported)
+glmgolden l4  ffn  comb       prompt rows    0..85   max_abs 4.768e-7  (coefficients, reported)
+glmgolden l4  ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l4  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 59 1.000000000)  max_abs 9.313e-9  rel_rms 1.084e-7  PASS
+glmgolden l4  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 9.313e-9  rel_rms 2.780e-7  PASS
+glmgolden l4  ffn  out        prompt rows    0..85   cosine 0.999999998 (worst row 79 0.999999989)  max_abs 7.165e-5  rel_rms 6.377e-5  PASS
+glmgolden l4  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.310e-7  rel_rms 7.160e-7  PASS
+glmgolden l4  ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 19 1.000000000)  max_abs 1.023e-5  rel_rms 6.359e-6  PASS
+glmgolden l4  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.043e-7  rel_rms 1.494e-7  PASS
+glmgolden l4  routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l5 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l5 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l5  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l5  attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l5  attn post       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l5  attn comb       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l5  attn comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l5  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 83 1.000000000)  max_abs 5.215e-8  rel_rms 4.084e-7  PASS
+glmgolden l5  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.980e-8  rel_rms 1.004e-6  PASS
+glmgolden l5  attn out        prompt rows    0..85   cosine 0.999999974 (worst row 57 0.999999962)  max_abs 6.653e-6  rel_rms 2.261e-4  PASS
+glmgolden l5  attn out        decode rows   86..89   cosine 0.999999998 (worst row 86 0.999999994)  max_abs 1.003e-6  rel_rms 6.047e-5  PASS
+glmgolden l5  attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 3 1.000000000)  max_abs 5.754e-6  rel_rms 4.975e-6  PASS
+glmgolden l5  attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 6.729e-7  rel_rms 1.453e-6  PASS
+glmgolden l5  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l5  ffn  post       prompt rows    0..85   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l5  ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l5  ffn  comb       prompt rows    0..85   max_abs 1.937e-7  (coefficients, reported)
+glmgolden l5  ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l5  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 65 1.000000000)  max_abs 1.024e-8  rel_rms 1.558e-7  PASS
+glmgolden l5  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 2.328e-8  rel_rms 6.294e-7  PASS
+glmgolden l5  ffn  out        prompt rows    0..85   cosine 0.999999998 (worst row 60 0.999999988)  max_abs 5.603e-5  rel_rms 6.105e-5  PASS
+glmgolden l5  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 3.576e-7  rel_rms 9.372e-7  PASS
+glmgolden l5  ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 50 1.000000000)  max_abs 1.339e-5  rel_rms 7.800e-6  PASS
+glmgolden l5  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.043e-7  rel_rms 2.079e-7  PASS
+glmgolden l5  routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l6 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l6 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l6  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l6  attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l6  attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l6  attn comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l6  attn comb       decode rows   86..89   max_abs 1.360e-7  (coefficients, reported)
+glmgolden l6  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 63 1.000000000)  max_abs 5.215e-8  rel_rms 4.165e-7  PASS
+glmgolden l6  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.328e-8  rel_rms 7.132e-7  PASS
+glmgolden l6  attn out        prompt rows    0..85   cosine 0.999999976 (worst row 59 0.999999959)  max_abs 5.025e-6  rel_rms 2.195e-4  PASS
+glmgolden l6  attn out        decode rows   86..89   cosine 0.999999998 (worst row 86 0.999999995)  max_abs 8.950e-7  rel_rms 6.008e-5  PASS
+glmgolden l6  attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 3 1.000000000)  max_abs 7.221e-6  rel_rms 5.931e-6  PASS
+glmgolden l6  attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 9.066e-7  rel_rms 1.733e-6  PASS
+glmgolden l6  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l6  ffn  post       prompt rows    0..85   max_abs 1.043e-7  (coefficients, reported)
+glmgolden l6  ffn  post       decode rows   86..89   max_abs 2.086e-7  (coefficients, reported)
+glmgolden l6  ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l6  ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l6  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 62 1.000000000)  max_abs 1.304e-8  rel_rms 1.414e-7  PASS
+glmgolden l6  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.676e-8  rel_rms 5.022e-7  PASS
+glmgolden l6  ffn  out        prompt rows    0..85   cosine 0.999999998 (worst row 79 0.999999991)  max_abs 7.899e-4  rel_rms 6.965e-5  PASS
+glmgolden l6  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 2.980e-7  rel_rms 6.669e-7  PASS
+glmgolden l6  ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 6 0.999999999)  max_abs 8.518e-5  rel_rms 2.203e-5  PASS
+glmgolden l6  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.012e-7  rel_rms 3.200e-7  PASS
+glmgolden l6  routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l7 dsa+moe loaded in 1.2 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 13992709 of 16777216 values inexact (RNE)
+[glmgolden] l7 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l7  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l7  attn post       prompt rows    0..85   max_abs 1.490e-8  (coefficients, reported)
+glmgolden l7  attn post       decode rows   86..89   max_abs 1.397e-8  (coefficients, reported)
+glmgolden l7  attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l7  attn comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l7  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 65 1.000000000)  max_abs 1.192e-7  rel_rms 1.723e-7  PASS
+glmgolden l7  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.446e-8  rel_rms 1.443e-6  PASS
+glmgolden l7  attn out        prompt rows    0..85   cosine 0.999995970 (worst row 0 0.999986739)  max_abs 4.527e-3  rel_rms 2.840e-3  PASS
+glmgolden l7  attn out        decode rows   86..89   cosine 0.999995978 (worst row 89 0.999995350)  max_abs 2.016e-3  rel_rms 2.837e-3  PASS
+glmgolden l7  attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 67 0.999999994)  max_abs 5.811e-5  rel_rms 4.874e-5  PASS
+glmgolden l7  attn expanded   decode rows   86..89   cosine 0.999999999 (worst row 87 0.999999999)  max_abs 1.637e-5  rel_rms 3.609e-5  PASS
+glmgolden l7  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l7  ffn  post       prompt rows    0..85   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l7  ffn  post       decode rows   86..89   max_abs 1.043e-7  (coefficients, reported)
+glmgolden l7  ffn  comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l7  ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l7  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 43 1.000000000)  max_abs 5.960e-8  rel_rms 2.099e-7  PASS
+glmgolden l7  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 9.313e-9  rel_rms 2.835e-7  PASS
+glmgolden l7  ffn  out        prompt rows    0..85   cosine 0.999999996 (worst row 1 0.999999983)  max_abs 4.246e-4  rel_rms 1.180e-4  PASS
+glmgolden l7  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.682e-7  rel_rms 7.907e-7  PASS
+glmgolden l7  ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 0 0.999999999)  max_abs 6.551e-5  rel_rms 2.018e-5  PASS
+glmgolden l7  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.043e-7  rel_rms 1.669e-7  PASS
+glmgolden l7  routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l7  dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l8 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l8 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l8  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l8  attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l8  attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l8  attn comb       prompt rows    0..85   max_abs 5.960e-7  (coefficients, reported)
+glmgolden l8  attn comb       decode rows   86..89   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l8  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 74 1.000000000)  max_abs 5.215e-8  rel_rms 2.583e-7  PASS
+glmgolden l8  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.098e-8  rel_rms 7.231e-7  PASS
+glmgolden l8  attn out        prompt rows    0..85   cosine 0.999999974 (worst row 52 0.999999957)  max_abs 3.606e-6  rel_rms 2.280e-4  PASS
+glmgolden l8  attn out        decode rows   86..89   cosine 0.999999997 (worst row 86 0.999999994)  max_abs 5.568e-7  rel_rms 7.104e-5  PASS
+glmgolden l8  attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 7 1.000000000)  max_abs 6.028e-6  rel_rms 7.550e-6  PASS
+glmgolden l8  attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 9.695e-7  rel_rms 2.331e-6  PASS
+glmgolden l8  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l8  ffn  post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l8  ffn  post       decode rows   86..89   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l8  ffn  comb       prompt rows    0..85   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l8  ffn  comb       decode rows   86..89   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l8  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 38 1.000000000)  max_abs 2.794e-8  rel_rms 1.510e-7  PASS
+glmgolden l8  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.118e-8  rel_rms 2.437e-7  PASS
+glmgolden l8  ffn  out        prompt rows    0..85   cosine 0.999999995 (worst row 44 0.999999989)  max_abs 5.274e-5  rel_rms 1.028e-4  PASS
+glmgolden l8  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.129e-7  rel_rms 7.043e-7  PASS
+glmgolden l8  ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 13 0.999999999)  max_abs 1.482e-5  rel_rms 1.063e-5  PASS
+glmgolden l8  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.192e-7  rel_rms 1.938e-7  PASS
+glmgolden l8  routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l9 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l9 computed in 0.06 s (taps synchronize: not a speed figure)
+glmgolden l9  attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l9  attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l9  attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l9  attn comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l9  attn comb       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l9  attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 36 1.000000000)  max_abs 5.960e-8  rel_rms 2.208e-7  PASS
+glmgolden l9  attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.353e-8  rel_rms 5.166e-7  PASS
+glmgolden l9  attn out        prompt rows    0..85   cosine 0.999999974 (worst row 21 0.999999964)  max_abs 4.099e-6  rel_rms 2.294e-4  PASS
+glmgolden l9  attn out        decode rows   86..89   cosine 0.999999997 (worst row 86 0.999999994)  max_abs 7.752e-7  rel_rms 7.878e-5  PASS
+glmgolden l9  attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 10 1.000000000)  max_abs 7.777e-6  rel_rms 9.238e-6  PASS
+glmgolden l9  attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.308e-6  rel_rms 3.499e-6  PASS
+glmgolden l9  ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l9  ffn  post       prompt rows    0..85   max_abs 8.196e-8  (coefficients, reported)
+glmgolden l9  ffn  post       decode rows   86..89   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l9  ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l9  ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l9  ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 14 1.000000000)  max_abs 2.980e-8  rel_rms 1.998e-7  PASS
+glmgolden l9  ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.912e-8  rel_rms 6.156e-7  PASS
+glmgolden l9  ffn  out        prompt rows    0..85   cosine 0.999999996 (worst row 55 0.999999987)  max_abs 4.943e-5  rel_rms 8.914e-5  PASS
+glmgolden l9  ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.874e-7  rel_rms 8.699e-7  PASS
+glmgolden l9  ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 62 0.999999999)  max_abs 1.387e-5  rel_rms 1.287e-5  PASS
+glmgolden l9  ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 7.451e-8  rel_rms 1.731e-7  PASS
+glmgolden l9  routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l10 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l10 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l10 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l10 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l10 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l10 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l10 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l10 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 60 1.000000000)  max_abs 1.192e-7  rel_rms 3.472e-7  PASS
+glmgolden l10 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.341e-7  rel_rms 1.417e-6  PASS
+glmgolden l10 attn out        prompt rows    0..85   cosine 0.999999975 (worst row 28 0.999999964)  max_abs 1.018e-5  rel_rms 2.235e-4  PASS
+glmgolden l10 attn out        decode rows   86..89   cosine 0.999999998 (worst row 86 0.999999996)  max_abs 1.869e-6  rel_rms 5.639e-5  PASS
+glmgolden l10 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 7 0.999999998)  max_abs 2.021e-5  rel_rms 2.592e-5  PASS
+glmgolden l10 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.129e-6  rel_rms 7.878e-6  PASS
+glmgolden l10 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l10 ffn  post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l10 ffn  post       decode rows   86..89   max_abs 1.043e-7  (coefficients, reported)
+glmgolden l10 ffn  comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l10 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l10 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 80 1.000000000)  max_abs 4.470e-8  rel_rms 1.913e-7  PASS
+glmgolden l10 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 3.912e-8  rel_rms 5.217e-7  PASS
+glmgolden l10 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 79 0.999999988)  max_abs 2.372e-3  rel_rms 1.114e-4  PASS
+glmgolden l10 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.172e-7  rel_rms 6.992e-7  PASS
+glmgolden l10 ffn  expanded   prompt rows    0..85   cosine 0.999999995 (worst row 0 0.999999995)  max_abs 1.135e-3  rel_rms 9.524e-5  PASS
+glmgolden l10 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.211e-7  rel_rms 2.950e-7  PASS
+glmgolden l10 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l11 dsa+moe loaded in 1.4 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14976565 of 16777216 values inexact (RNE)
+[glmgolden] l11 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l11 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l11 attn post       prompt rows    0..85   max_abs 2.794e-8  (coefficients, reported)
+glmgolden l11 attn post       decode rows   86..89   max_abs 2.887e-8  (coefficients, reported)
+glmgolden l11 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l11 attn comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l11 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 48 1.000000000)  max_abs 7.153e-7  rel_rms 2.332e-7  PASS
+glmgolden l11 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 5.215e-8  rel_rms 7.520e-7  PASS
+glmgolden l11 attn out        prompt rows    0..85   cosine 0.999992777 (worst row 33 0.999989515)  max_abs 5.142e-3  rel_rms 3.803e-3  PASS
+glmgolden l11 attn out        decode rows   86..89   cosine 0.999992950 (worst row 86 0.999991637)  max_abs 4.345e-3  rel_rms 3.769e-3  PASS
+glmgolden l11 attn expanded   prompt rows    0..85   cosine 0.999999995 (worst row 79 0.999999914)  max_abs 1.299e-4  rel_rms 1.025e-4  PASS
+glmgolden l11 attn expanded   decode rows   86..89   cosine 0.999999980 (worst row 87 0.999999974)  max_abs 7.480e-5  rel_rms 2.007e-4  PASS
+glmgolden l11 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l11 ffn  post       prompt rows    0..85   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l11 ffn  post       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l11 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l11 ffn  comb       decode rows   86..89   max_abs 1.285e-7  (coefficients, reported)
+glmgolden l11 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 11 1.000000000)  max_abs 3.725e-8  rel_rms 1.696e-7  PASS
+glmgolden l11 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.608e-8  rel_rms 3.037e-7  PASS
+glmgolden l11 ffn  out        prompt rows    0..85   cosine 0.999999993 (worst row 59 0.999999985)  max_abs 6.661e-5  rel_rms 1.164e-4  PASS
+glmgolden l11 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.012e-7  rel_rms 6.936e-7  PASS
+glmgolden l11 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 59 0.999999999)  max_abs 1.884e-5  rel_rms 9.749e-6  PASS
+glmgolden l11 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.192e-7  rel_rms 1.843e-7  PASS
+glmgolden l11 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l11 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l12 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l12 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l12 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l12 attn post       prompt rows    0..85   max_abs 4.768e-7  (coefficients, reported)
+glmgolden l12 attn post       decode rows   86..89   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l12 attn comb       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l12 attn comb       decode rows   86..89   max_abs 5.066e-7  (coefficients, reported)
+glmgolden l12 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 9 1.000000000)  max_abs 5.215e-8  rel_rms 1.497e-7  PASS
+glmgolden l12 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.608e-8  rel_rms 2.429e-7  PASS
+glmgolden l12 attn out        prompt rows    0..85   cosine 0.999999969 (worst row 12 0.999999957)  max_abs 4.262e-6  rel_rms 2.488e-4  PASS
+glmgolden l12 attn out        decode rows   86..89   cosine 0.999999995 (worst row 86 0.999999991)  max_abs 1.012e-6  rel_rms 9.638e-5  PASS
+glmgolden l12 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 9 0.999999999)  max_abs 7.786e-6  rel_rms 6.434e-6  PASS
+glmgolden l12 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.690e-6  rel_rms 4.479e-6  PASS
+glmgolden l12 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l12 ffn  post       prompt rows    0..85   max_abs 1.043e-7  (coefficients, reported)
+glmgolden l12 ffn  post       decode rows   86..89   max_abs 1.639e-7  (coefficients, reported)
+glmgolden l12 ffn  comb       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l12 ffn  comb       decode rows   86..89   max_abs 4.768e-7  (coefficients, reported)
+glmgolden l12 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 65 1.000000000)  max_abs 4.768e-7  rel_rms 1.396e-7  PASS
+glmgolden l12 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 4.470e-8  rel_rms 6.557e-7  PASS
+glmgolden l12 ffn  out        prompt rows    0..85   cosine 0.999999993 (worst row 75 0.999999986)  max_abs 4.534e-5  rel_rms 1.187e-4  PASS
+glmgolden l12 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.055e-7  rel_rms 8.483e-7  PASS
+glmgolden l12 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 12 0.999999999)  max_abs 1.882e-5  rel_rms 7.123e-6  PASS
+glmgolden l12 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 6.706e-8  rel_rms 1.563e-7  PASS
+glmgolden l12 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l13 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l13 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l13 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l13 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l13 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l13 attn comb       prompt rows    0..85   max_abs 5.066e-7  (coefficients, reported)
+glmgolden l13 attn comb       decode rows   86..89   max_abs 1.252e-6  (coefficients, reported)
+glmgolden l13 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 36 1.000000000)  max_abs 2.235e-8  rel_rms 5.869e-8  PASS
+glmgolden l13 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 5.960e-8  rel_rms 5.609e-7  PASS
+glmgolden l13 attn out        prompt rows    0..85   cosine 0.999999967 (worst row 9 0.999999959)  max_abs 6.783e-6  rel_rms 2.581e-4  PASS
+glmgolden l13 attn out        decode rows   86..89   cosine 0.999999995 (worst row 86 0.999999992)  max_abs 1.704e-6  rel_rms 9.677e-5  PASS
+glmgolden l13 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 30 0.999999999)  max_abs 1.309e-5  rel_rms 9.710e-6  PASS
+glmgolden l13 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.192e-6  rel_rms 7.060e-6  PASS
+glmgolden l13 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l13 ffn  post       prompt rows    0..85   max_abs 7.451e-8  (coefficients, reported)
+glmgolden l13 ffn  post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l13 ffn  comb       prompt rows    0..85   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l13 ffn  comb       decode rows   86..89   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l13 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 72 1.000000000)  max_abs 2.235e-8  rel_rms 7.068e-8  PASS
+glmgolden l13 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.118e-8  rel_rms 1.215e-7  PASS
+glmgolden l13 ffn  out        prompt rows    0..85   cosine 0.999999993 (worst row 50 0.999999986)  max_abs 6.980e-5  rel_rms 1.160e-4  PASS
+glmgolden l13 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.874e-7  rel_rms 6.173e-7  PASS
+glmgolden l13 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 79 0.999999999)  max_abs 1.407e-5  rel_rms 9.514e-6  PASS
+glmgolden l13 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 8.941e-8  rel_rms 1.771e-7  PASS
+glmgolden l13 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l14 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l14 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l14 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l14 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l14 attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l14 attn comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l14 attn comb       decode rows   86..89   max_abs 5.066e-7  (coefficients, reported)
+glmgolden l14 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 67 1.000000000)  max_abs 1.490e-7  rel_rms 1.888e-7  PASS
+glmgolden l14 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.490e-8  rel_rms 1.586e-7  PASS
+glmgolden l14 attn out        prompt rows    0..85   cosine 0.999999971 (worst row 8 0.999999958)  max_abs 9.187e-6  rel_rms 2.410e-4  PASS
+glmgolden l14 attn out        decode rows   86..89   cosine 0.999999996 (worst row 86 0.999999992)  max_abs 2.819e-6  rel_rms 8.710e-5  PASS
+glmgolden l14 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 11 0.999999998)  max_abs 1.709e-5  rel_rms 1.452e-5  PASS
+glmgolden l14 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 4.808e-6  rel_rms 1.128e-5  PASS
+glmgolden l14 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l14 ffn  post       prompt rows    0..85   max_abs 7.451e-8  (coefficients, reported)
+glmgolden l14 ffn  post       decode rows   86..89   max_abs 1.118e-7  (coefficients, reported)
+glmgolden l14 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l14 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l14 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 16 1.000000000)  max_abs 8.196e-8  rel_rms 1.610e-7  PASS
+glmgolden l14 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 7.451e-8  rel_rms 5.324e-7  PASS
+glmgolden l14 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 75 0.999999985)  max_abs 9.272e-5  rel_rms 1.066e-4  PASS
+glmgolden l14 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 6.557e-7  rel_rms 8.323e-7  PASS
+glmgolden l14 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 39 0.999999999)  max_abs 1.662e-5  rel_rms 9.995e-6  PASS
+glmgolden l14 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.006e-7  rel_rms 2.274e-7  PASS
+glmgolden l14 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l15 dsa+moe loaded in 1.3 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14974409 of 16777216 values inexact (RNE)
+[glmgolden] l15 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l15 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l15 attn post       prompt rows    0..85   max_abs 2.608e-8  (coefficients, reported)
+glmgolden l15 attn post       decode rows   86..89   max_abs 4.284e-8  (coefficients, reported)
+glmgolden l15 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l15 attn comb       decode rows   86..89   max_abs 2.980e-8  (coefficients, reported)
+glmgolden l15 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 55 1.000000000)  max_abs 1.192e-7  rel_rms 5.503e-8  PASS
+glmgolden l15 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 8.196e-8  rel_rms 5.344e-7  PASS
+glmgolden l15 attn out        prompt rows    0..85   cosine 0.999994024 (worst row 71 0.999991174)  max_abs 7.887e-3  rel_rms 3.459e-3  PASS
+glmgolden l15 attn out        decode rows   86..89   cosine 0.999994062 (worst row 88 0.999992189)  max_abs 5.772e-3  rel_rms 3.448e-3  PASS
+glmgolden l15 attn expanded   prompt rows    0..85   cosine 0.999999987 (worst row 50 0.999999871)  max_abs 4.055e-4  rel_rms 1.620e-4  PASS
+glmgolden l15 attn expanded   decode rows   86..89   cosine 0.999999949 (worst row 87 0.999999934)  max_abs 9.320e-5  rel_rms 3.203e-4  PASS
+glmgolden l15 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l15 ffn  post       prompt rows    0..85   max_abs 1.490e-7  (coefficients, reported)
+glmgolden l15 ffn  post       decode rows   86..89   max_abs 2.161e-7  (coefficients, reported)
+glmgolden l15 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l15 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l15 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 34 1.000000000)  max_abs 7.451e-8  rel_rms 2.025e-7  PASS
+glmgolden l15 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 4.470e-8  rel_rms 3.702e-7  PASS
+glmgolden l15 ffn  out        prompt rows    0..85   cosine 0.999999993 (worst row 50 0.999999987)  max_abs 2.362e-4  rel_rms 1.230e-4  PASS
+glmgolden l15 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.502e-7  rel_rms 6.923e-7  PASS
+glmgolden l15 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 34 0.999999998)  max_abs 5.060e-5  rel_rms 1.741e-5  PASS
+glmgolden l15 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 8.941e-8  rel_rms 2.606e-7  PASS
+glmgolden l15 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l15 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l16 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l16 computed in 0.09 s (taps synchronize: not a speed figure)
+glmgolden l16 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l16 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l16 attn post       decode rows   86..89   max_abs 5.364e-7  (coefficients, reported)
+glmgolden l16 attn comb       prompt rows    0..85   max_abs 5.364e-7  (coefficients, reported)
+glmgolden l16 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l16 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 63 1.000000000)  max_abs 5.960e-8  rel_rms 2.017e-7  PASS
+glmgolden l16 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 6.706e-8  rel_rms 7.855e-7  PASS
+glmgolden l16 attn out        prompt rows    0..85   cosine 0.999999962 (worst row 4 0.999999944)  max_abs 9.930e-6  rel_rms 2.757e-4  PASS
+glmgolden l16 attn out        decode rows   86..89   cosine 0.999999996 (worst row 86 0.999999991)  max_abs 2.462e-6  rel_rms 8.740e-5  PASS
+glmgolden l16 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 25 0.999999999)  max_abs 1.781e-5  rel_rms 1.668e-5  PASS
+glmgolden l16 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.368e-6  rel_rms 1.023e-5  PASS
+glmgolden l16 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l16 ffn  post       prompt rows    0..85   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l16 ffn  post       decode rows   86..89   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l16 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l16 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l16 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 0 1.000000000)  max_abs 8.941e-8  rel_rms 1.373e-7  PASS
+glmgolden l16 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.980e-8  rel_rms 1.888e-7  PASS
+glmgolden l16 ffn  out        prompt rows    0..85   cosine 0.999999996 (worst row 63 0.999999988)  max_abs 5.151e-5  rel_rms 8.838e-5  PASS
+glmgolden l16 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.974e-7  rel_rms 6.185e-7  PASS
+glmgolden l16 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 7 0.999999998)  max_abs 2.398e-5  rel_rms 1.266e-5  PASS
+glmgolden l16 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 5.215e-8  rel_rms 1.458e-7  PASS
+glmgolden l16 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l17 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l17 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l17 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l17 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l17 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l17 attn comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l17 attn comb       decode rows   86..89   max_abs 3.278e-7  (coefficients, reported)
+glmgolden l17 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 36 1.000000000)  max_abs 1.788e-7  rel_rms 1.305e-7  PASS
+glmgolden l17 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 3.725e-8  rel_rms 3.804e-7  PASS
+glmgolden l17 attn out        prompt rows    0..85   cosine 0.999999962 (worst row 2 0.999999950)  max_abs 1.574e-5  rel_rms 2.771e-4  PASS
+glmgolden l17 attn out        decode rows   86..89   cosine 0.999999995 (worst row 86 0.999999990)  max_abs 3.855e-6  rel_rms 1.042e-4  PASS
+glmgolden l17 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 41 0.999999998)  max_abs 3.113e-5  rel_rms 2.228e-5  PASS
+glmgolden l17 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.136e-6  rel_rms 1.633e-5  PASS
+glmgolden l17 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l17 ffn  post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l17 ffn  post       decode rows   86..89   max_abs 2.086e-7  (coefficients, reported)
+glmgolden l17 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l17 ffn  comb       decode rows   86..89   max_abs 1.267e-7  (coefficients, reported)
+glmgolden l17 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 85 1.000000000)  max_abs 2.384e-7  rel_rms 1.123e-7  PASS
+glmgolden l17 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 3.725e-8  rel_rms 2.136e-7  PASS
+glmgolden l17 ffn  out        prompt rows    0..85   cosine 0.999999993 (worst row 9 0.999999987)  max_abs 5.330e-5  rel_rms 1.141e-4  PASS
+glmgolden l17 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.751e-7  rel_rms 5.717e-7  PASS
+glmgolden l17 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 9 0.999999998)  max_abs 4.649e-5  rel_rms 2.272e-5  PASS
+glmgolden l17 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 9.686e-8  rel_rms 2.236e-7  PASS
+glmgolden l17 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l18 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l18 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l18 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l18 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l18 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l18 attn comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l18 attn comb       decode rows   86..89   max_abs 1.013e-6  (coefficients, reported)
+glmgolden l18 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 45 1.000000000)  max_abs 5.960e-8  rel_rms 6.457e-8  PASS
+glmgolden l18 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 3.725e-8  rel_rms 2.446e-7  PASS
+glmgolden l18 attn out        prompt rows    0..85   cosine 0.999999967 (worst row 50 0.999999956)  max_abs 2.609e-5  rel_rms 2.578e-4  PASS
+glmgolden l18 attn out        decode rows   86..89   cosine 0.999999995 (worst row 86 0.999999991)  max_abs 4.361e-6  rel_rms 9.817e-5  PASS
+glmgolden l18 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 59 0.999999995)  max_abs 5.227e-5  rel_rms 3.566e-5  PASS
+glmgolden l18 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.493e-6  rel_rms 1.866e-5  PASS
+glmgolden l18 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l18 ffn  post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l18 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l18 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l18 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l18 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 15 1.000000000)  max_abs 2.384e-7  rel_rms 2.473e-8  PASS
+glmgolden l18 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.490e-8  rel_rms 7.420e-8  PASS
+glmgolden l18 ffn  out        prompt rows    0..85   cosine 1.000000000 (worst row 17 0.999999984)  max_abs 1.192e-4  rel_rms 1.591e-5  PASS
+glmgolden l18 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.129e-7  rel_rms 5.735e-7  PASS
+glmgolden l18 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 76 0.999999998)  max_abs 7.153e-5  rel_rms 8.343e-6  PASS
+glmgolden l18 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.490e-7  rel_rms 2.515e-7  PASS
+glmgolden l18 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l19 dsa+moe loaded in 1.2 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14959468 of 16777216 values inexact (RNE)
+[glmgolden] l19 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l19 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l19 attn post       prompt rows    0..85   max_abs 4.470e-8  (coefficients, reported)
+glmgolden l19 attn post       decode rows   86..89   max_abs 2.980e-8  (coefficients, reported)
+glmgolden l19 attn comb       prompt rows    0..85   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l19 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l19 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 82 1.000000000)  max_abs 1.907e-6  rel_rms 6.515e-8  PASS
+glmgolden l19 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.788e-7  rel_rms 5.787e-7  PASS
+glmgolden l19 attn out        prompt rows    0..85   cosine 0.999992206 (worst row 0 0.999987238)  max_abs 1.104e-2  rel_rms 3.952e-3  PASS
+glmgolden l19 attn out        decode rows   86..89   cosine 0.999993616 (worst row 86 0.999993101)  max_abs 9.410e-3  rel_rms 3.602e-3  PASS
+glmgolden l19 attn expanded   prompt rows    0..85   cosine 0.999999973 (worst row 22 0.999998492)  max_abs 1.775e-3  rel_rms 2.313e-4  PASS
+glmgolden l19 attn expanded   decode rows   86..89   cosine 0.999999265 (worst row 87 0.999999128)  max_abs 6.396e-4  rel_rms 1.214e-3  PASS
+glmgolden l19 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l19 ffn  post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l19 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l19 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l19 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l19 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 50 1.000000000)  max_abs 7.153e-7  rel_rms 1.619e-7  PASS
+glmgolden l19 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.639e-7  rel_rms 4.940e-7  PASS
+glmgolden l19 ffn  out        prompt rows    0..85   cosine 0.999999990 (worst row 34 0.999999983)  max_abs 1.328e-4  rel_rms 1.404e-4  PASS
+glmgolden l19 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.086e-7  rel_rms 5.808e-7  PASS
+glmgolden l19 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 76 0.999999996)  max_abs 1.426e-4  rel_rms 1.457e-5  PASS
+glmgolden l19 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.788e-7  rel_rms 2.861e-7  PASS
+glmgolden l19 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l19 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l20 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l20 computed in 0.08 s (taps synchronize: not a speed figure)
+glmgolden l20 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l20 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l20 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l20 attn comb       prompt rows    0..85   max_abs 4.768e-7  (coefficients, reported)
+glmgolden l20 attn comb       decode rows   86..89   max_abs 6.557e-7  (coefficients, reported)
+glmgolden l20 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 80 1.000000000)  max_abs 2.384e-7  rel_rms 1.220e-7  PASS
+glmgolden l20 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.980e-8  rel_rms 2.242e-7  PASS
+glmgolden l20 attn out        prompt rows    0..85   cosine 0.999999962 (worst row 2 0.999999948)  max_abs 2.627e-5  rel_rms 2.763e-4  PASS
+glmgolden l20 attn out        decode rows   86..89   cosine 0.999999994 (worst row 86 0.999999992)  max_abs 8.880e-6  rel_rms 1.088e-4  PASS
+glmgolden l20 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 46 0.999999993)  max_abs 5.085e-5  rel_rms 1.513e-5  PASS
+glmgolden l20 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 0.999999999)  max_abs 1.652e-5  rel_rms 2.810e-5  PASS
+glmgolden l20 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l20 ffn  post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l20 ffn  post       decode rows   86..89   max_abs 1.825e-7  (coefficients, reported)
+glmgolden l20 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l20 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l20 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 0 1.000000000)  max_abs 8.941e-8  rel_rms 6.512e-8  PASS
+glmgolden l20 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.490e-7  rel_rms 4.325e-7  PASS
+glmgolden l20 ffn  out        prompt rows    0..85   cosine 0.999999992 (worst row 43 0.999999984)  max_abs 5.643e-5  rel_rms 1.252e-4  PASS
+glmgolden l20 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.431e-7  rel_rms 6.318e-7  PASS
+glmgolden l20 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 59 0.999999997)  max_abs 4.883e-5  rel_rms 1.269e-5  PASS
+glmgolden l20 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.639e-7  rel_rms 3.102e-7  PASS
+glmgolden l20 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l21 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l21 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l21 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l21 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l21 attn post       decode rows   86..89   max_abs 1.513e-9  (coefficients, reported)
+glmgolden l21 attn comb       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l21 attn comb       decode rows   86..89   max_abs 4.321e-7  (coefficients, reported)
+glmgolden l21 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 67 1.000000000)  max_abs 4.768e-7  rel_rms 1.081e-7  PASS
+glmgolden l21 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.980e-8  rel_rms 1.189e-7  PASS
+glmgolden l21 attn out        prompt rows    0..85   cosine 0.999999959 (worst row 4 0.999999951)  max_abs 3.420e-5  rel_rms 2.858e-4  PASS
+glmgolden l21 attn out        decode rows   86..89   cosine 0.999999995 (worst row 86 0.999999992)  max_abs 1.135e-5  rel_rms 1.041e-4  PASS
+glmgolden l21 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 46 0.999999991)  max_abs 6.570e-5  rel_rms 2.285e-5  PASS
+glmgolden l21 attn expanded   decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999999)  max_abs 2.254e-5  rel_rms 3.600e-5  PASS
+glmgolden l21 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l21 ffn  post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l21 ffn  post       decode rows   86..89   max_abs 4.470e-8  (coefficients, reported)
+glmgolden l21 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l21 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l21 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 27 1.000000000)  max_abs 9.537e-7  rel_rms 2.688e-7  PASS
+glmgolden l21 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 8.941e-8  rel_rms 1.617e-7  PASS
+glmgolden l21 ffn  out        prompt rows    0..85   cosine 0.999999996 (worst row 7 0.999999974)  max_abs 8.130e-5  rel_rms 8.378e-5  PASS
+glmgolden l21 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.937e-7  rel_rms 5.723e-7  PASS
+glmgolden l21 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 7 0.999999994)  max_abs 1.055e-4  rel_rms 2.106e-5  PASS
+glmgolden l21 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.937e-7  rel_rms 2.998e-7  PASS
+glmgolden l21 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l22 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l22 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l22 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l22 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l22 attn post       decode rows   86..89   max_abs 2.608e-8  (coefficients, reported)
+glmgolden l22 attn comb       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l22 attn comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l22 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 22 1.000000000)  max_abs 4.768e-7  rel_rms 8.141e-8  PASS
+glmgolden l22 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.470e-8  rel_rms 1.807e-7  PASS
+glmgolden l22 attn out        prompt rows    0..85   cosine 0.999999962 (worst row 78 0.999999955)  max_abs 5.108e-5  rel_rms 2.749e-4  PASS
+glmgolden l22 attn out        decode rows   86..89   cosine 0.999999997 (worst row 86 0.999999995)  max_abs 1.265e-5  rel_rms 7.605e-5  PASS
+glmgolden l22 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 46 0.999999989)  max_abs 1.016e-4  rel_rms 3.743e-5  PASS
+glmgolden l22 attn expanded   decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999999)  max_abs 2.503e-5  rel_rms 3.389e-5  PASS
+glmgolden l22 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l22 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l22 ffn  post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l22 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l22 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l22 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 72 1.000000000)  max_abs 1.192e-7  rel_rms 1.008e-7  PASS
+glmgolden l22 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.192e-7  rel_rms 2.174e-7  PASS
+glmgolden l22 ffn  out        prompt rows    0..85   cosine 0.999999992 (worst row 19 0.999999984)  max_abs 1.116e-4  rel_rms 1.243e-4  PASS
+glmgolden l22 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.714e-7  rel_rms 6.098e-7  PASS
+glmgolden l22 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 30 0.999999997)  max_abs 1.729e-4  rel_rms 3.020e-5  PASS
+glmgolden l22 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.384e-7  rel_rms 3.176e-7  PASS
+glmgolden l22 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l23 dsa+moe loaded in 1.4 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14968127 of 16777216 values inexact (RNE)
+[glmgolden] l23 computed in 0.10 s (taps synchronize: not a speed figure)
+glmgolden l23 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l23 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l23 attn post       decode rows   86..89   max_abs 1.341e-7  (coefficients, reported)
+glmgolden l23 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l23 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l23 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 17 1.000000000)  max_abs 7.153e-7  rel_rms 3.058e-7  PASS
+glmgolden l23 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.768e-7  rel_rms 1.036e-6  PASS
+glmgolden l23 attn out        prompt rows    0..85   cosine 0.999990060 (worst row 0 0.999977776)  max_abs 8.832e-3  rel_rms 4.464e-3  PASS
+glmgolden l23 attn out        decode rows   86..89   cosine 0.999992454 (worst row 86 0.999991319)  max_abs 5.878e-3  rel_rms 3.888e-3  PASS
+glmgolden l23 attn expanded   prompt rows    0..85   cosine 0.999999450 (worst row 25 0.999995308)  max_abs 9.133e-3  rel_rms 1.049e-3  PASS
+glmgolden l23 attn expanded   decode rows   86..89   cosine 0.999998705 (worst row 89 0.999998303)  max_abs 1.475e-3  rel_rms 1.609e-3  PASS
+glmgolden l23 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l23 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l23 ffn  post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l23 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l23 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l23 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 34 1.000000000)  max_abs 2.533e-7  rel_rms 3.859e-7  PASS
+glmgolden l23 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.788e-7  rel_rms 6.201e-7  PASS
+glmgolden l23 ffn  out        prompt rows    0..85   cosine 0.999999990 (worst row 0 0.999999980)  max_abs 5.811e-5  rel_rms 1.407e-4  PASS
+glmgolden l23 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.831e-7  rel_rms 7.769e-7  PASS
+glmgolden l23 ffn  expanded   prompt rows    0..85   cosine 0.999999999 (worst row 25 0.999999994)  max_abs 1.009e-4  rel_rms 3.564e-5  PASS
+glmgolden l23 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.619e-7  rel_rms 4.023e-7  PASS
+glmgolden l23 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l23 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l24 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l24 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l24 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l24 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l24 attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l24 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l24 attn comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l24 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 30 1.000000000)  max_abs 2.086e-7  rel_rms 6.149e-8  PASS
+glmgolden l24 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.490e-7  rel_rms 3.104e-7  PASS
+glmgolden l24 attn out        prompt rows    0..85   cosine 0.999999956 (worst row 20 0.999999944)  max_abs 6.444e-5  rel_rms 2.977e-4  PASS
+glmgolden l24 attn out        decode rows   86..89   cosine 0.999999996 (worst row 86 0.999999994)  max_abs 1.367e-5  rel_rms 9.138e-5  PASS
+glmgolden l24 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 41 0.999999990)  max_abs 1.289e-4  rel_rms 4.761e-5  PASS
+glmgolden l24 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 0.999999999)  max_abs 2.733e-5  rel_rms 2.895e-5  PASS
+glmgolden l24 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l24 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l24 ffn  post       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l24 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l24 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l24 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 77 1.000000000)  max_abs 4.768e-7  rel_rms 6.919e-8  PASS
+glmgolden l24 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.427e-7  rel_rms 1.156e-6  PASS
+glmgolden l24 ffn  out        prompt rows    0..85   cosine 0.999999990 (worst row 62 0.999999981)  max_abs 7.719e-5  rel_rms 1.383e-4  PASS
+glmgolden l24 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 3.800e-7  rel_rms 9.132e-7  PASS
+glmgolden l24 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 59 0.999999996)  max_abs 1.099e-4  rel_rms 2.819e-5  PASS
+glmgolden l24 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.384e-7  rel_rms 2.938e-7  PASS
+glmgolden l24 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l25 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l25 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l25 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l25 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l25 attn post       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l25 attn comb       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l25 attn comb       decode rows   86..89   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l25 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 69 1.000000000)  max_abs 4.768e-7  rel_rms 1.140e-7  PASS
+glmgolden l25 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.490e-7  rel_rms 6.920e-7  PASS
+glmgolden l25 attn out        prompt rows    0..85   cosine 0.999999967 (worst row 0 0.999999920)  max_abs 1.163e-4  rel_rms 2.582e-4  PASS
+glmgolden l25 attn out        decode rows   86..89   cosine 0.999999997 (worst row 86 0.999999995)  max_abs 3.176e-5  rel_rms 7.524e-5  PASS
+glmgolden l25 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 12 0.999999994)  max_abs 1.533e-4  rel_rms 4.341e-5  PASS
+glmgolden l25 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 0.999999999)  max_abs 3.272e-5  rel_rms 2.539e-5  PASS
+glmgolden l25 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l25 ffn  post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l25 ffn  post       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l25 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l25 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l25 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 25 1.000000000)  max_abs 4.768e-7  rel_rms 1.416e-7  PASS
+glmgolden l25 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.451e-8  rel_rms 3.703e-7  PASS
+glmgolden l25 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 59 0.999999981)  max_abs 7.912e-5  rel_rms 1.079e-4  PASS
+glmgolden l25 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.831e-7  rel_rms 7.007e-7  PASS
+glmgolden l25 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 26 0.999999998)  max_abs 6.288e-5  rel_rms 2.170e-5  PASS
+glmgolden l25 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.086e-7  rel_rms 2.017e-7  PASS
+glmgolden l25 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l26 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l26 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l26 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l26 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l26 attn post       decode rows   86..89   max_abs 1.341e-7  (coefficients, reported)
+glmgolden l26 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l26 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l26 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 64 1.000000000)  max_abs 5.960e-8  rel_rms 2.981e-8  PASS
+glmgolden l26 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 8.941e-8  rel_rms 4.093e-7  PASS
+glmgolden l26 attn out        prompt rows    0..85   cosine 0.999999951 (worst row 1 0.999999933)  max_abs 7.859e-5  rel_rms 3.116e-4  PASS
+glmgolden l26 attn out        decode rows   86..89   cosine 0.999999995 (worst row 86 0.999999994)  max_abs 1.692e-5  rel_rms 1.047e-4  PASS
+glmgolden l26 attn expanded   prompt rows    0..85   cosine 0.999999998 (worst row 46 0.999999989)  max_abs 1.547e-4  rel_rms 5.949e-5  PASS
+glmgolden l26 attn expanded   decode rows   86..89   cosine 0.999999999 (worst row 89 0.999999999)  max_abs 3.347e-5  rel_rms 3.530e-5  PASS
+glmgolden l26 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l26 ffn  post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l26 ffn  post       decode rows   86..89   max_abs 1.490e-7  (coefficients, reported)
+glmgolden l26 ffn  comb       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l26 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l26 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 38 1.000000000)  max_abs 5.960e-7  rel_rms 2.813e-7  PASS
+glmgolden l26 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 8.196e-8  rel_rms 6.460e-7  PASS
+glmgolden l26 ffn  out        prompt rows    0..85   cosine 0.999999995 (worst row 46 0.999999983)  max_abs 1.416e-4  rel_rms 1.002e-4  PASS
+glmgolden l26 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.353e-7  rel_rms 6.545e-7  PASS
+glmgolden l26 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 25 0.999999999)  max_abs 2.437e-4  rel_rms 2.319e-5  PASS
+glmgolden l26 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.788e-7  rel_rms 1.899e-7  PASS
+glmgolden l26 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l27 dsa+moe loaded in 1.4 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14022155 of 16777216 values inexact (RNE)
+[glmgolden] l27 computed in 0.10 s (taps synchronize: not a speed figure)
+glmgolden l27 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l27 attn post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l27 attn post       decode rows   86..89   max_abs 8.941e-8  (coefficients, reported)
+glmgolden l27 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l27 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l27 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 55 1.000000000)  max_abs 4.768e-7  rel_rms 2.036e-7  PASS
+glmgolden l27 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.384e-7  rel_rms 3.242e-7  PASS
+glmgolden l27 attn out        prompt rows    0..85   cosine 0.999991589 (worst row 1 0.999973067)  max_abs 6.940e-3  rel_rms 4.115e-3  PASS
+glmgolden l27 attn out        decode rows   86..89   cosine 0.999993476 (worst row 86 0.999990151)  max_abs 4.779e-3  rel_rms 3.612e-3  PASS
+glmgolden l27 attn expanded   prompt rows    0..85   cosine 0.999999733 (worst row 43 0.999998376)  max_abs 2.317e-3  rel_rms 7.308e-4  PASS
+glmgolden l27 attn expanded   decode rows   86..89   cosine 0.999999379 (worst row 86 0.999999232)  max_abs 1.093e-3  rel_rms 1.115e-3  PASS
+glmgolden l27 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l27 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l27 ffn  post       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l27 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l27 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l27 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 70 1.000000000)  max_abs 2.384e-7  rel_rms 3.328e-7  PASS
+glmgolden l27 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.341e-7  rel_rms 8.496e-7  PASS
+glmgolden l27 ffn  out        prompt rows    0..85   cosine 0.999999991 (worst row 52 0.999999980)  max_abs 4.346e-4  rel_rms 1.363e-4  PASS
+glmgolden l27 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 4.172e-7  rel_rms 6.410e-7  PASS
+glmgolden l27 ffn  expanded   prompt rows    0..85   cosine 0.999999999 (worst row 34 0.999999999)  max_abs 7.010e-4  rel_rms 4.236e-5  PASS
+glmgolden l27 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 3.278e-7  rel_rms 2.217e-7  PASS
+glmgolden l27 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l27 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l28 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l28 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l28 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l28 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l28 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l28 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l28 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l28 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 73 1.000000000)  max_abs 3.576e-7  rel_rms 2.780e-7  PASS
+glmgolden l28 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.118e-7  rel_rms 5.727e-7  PASS
+glmgolden l28 attn out        prompt rows    0..85   cosine 0.999999959 (worst row 80 0.999999945)  max_abs 6.455e-5  rel_rms 2.861e-4  PASS
+glmgolden l28 attn out        decode rows   86..89   cosine 0.999999996 (worst row 86 0.999999993)  max_abs 1.294e-5  rel_rms 8.793e-5  PASS
+glmgolden l28 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 66 0.999999993)  max_abs 1.287e-4  rel_rms 5.076e-5  PASS
+glmgolden l28 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.568e-5  rel_rms 2.390e-5  PASS
+glmgolden l28 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l28 ffn  post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l28 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l28 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l28 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l28 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 17 1.000000000)  max_abs 4.768e-7  rel_rms 2.919e-7  PASS
+glmgolden l28 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.192e-7  rel_rms 5.296e-7  PASS
+glmgolden l28 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 33 0.999999984)  max_abs 8.512e-5  rel_rms 1.132e-4  PASS
+glmgolden l28 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.768e-7  rel_rms 7.268e-7  PASS
+glmgolden l28 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 72 0.999999999)  max_abs 7.963e-5  rel_rms 2.580e-5  PASS
+glmgolden l28 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 3.576e-7  rel_rms 2.718e-7  PASS
+glmgolden l28 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l29 kda+moe loaded in 1.1 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l29 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l29 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l29 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l29 attn post       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l29 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l29 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l29 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 46 1.000000000)  max_abs 1.192e-7  rel_rms 2.525e-7  PASS
+glmgolden l29 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.639e-7  rel_rms 7.122e-7  PASS
+glmgolden l29 attn out        prompt rows    0..85   cosine 0.999999965 (worst row 1 0.999999936)  max_abs 9.339e-5  rel_rms 2.665e-4  PASS
+glmgolden l29 attn out        decode rows   86..89   cosine 0.999999997 (worst row 86 0.999999995)  max_abs 1.449e-5  rel_rms 7.704e-5  PASS
+glmgolden l29 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 72 0.999999991)  max_abs 1.813e-4  rel_rms 5.299e-5  PASS
+glmgolden l29 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.661e-5  rel_rms 2.111e-5  PASS
+glmgolden l29 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l29 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l29 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l29 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l29 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l29 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 64 1.000000000)  max_abs 9.537e-7  rel_rms 2.528e-7  PASS
+glmgolden l29 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.788e-7  rel_rms 2.302e-7  PASS
+glmgolden l29 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 62 0.999999983)  max_abs 1.020e-4  rel_rms 1.057e-4  PASS
+glmgolden l29 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 5.960e-7  rel_rms 7.012e-7  PASS
+glmgolden l29 ffn  expanded   prompt rows    0..85   cosine 0.999999999 (worst row 15 0.999999998)  max_abs 1.155e-4  rel_rms 3.689e-5  PASS
+glmgolden l29 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.013e-6  rel_rms 3.776e-7  PASS
+glmgolden l29 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l30 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l30 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l30 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l30 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l30 attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l30 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l30 attn comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l30 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 1 1.000000000)  max_abs 9.537e-7  rel_rms 1.615e-7  PASS
+glmgolden l30 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 8.941e-8  rel_rms 2.003e-7  PASS
+glmgolden l30 attn out        prompt rows    0..85   cosine 0.999999971 (worst row 1 0.999999960)  max_abs 1.535e-4  rel_rms 2.421e-4  PASS
+glmgolden l30 attn out        decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999998)  max_abs 1.979e-5  rel_rms 4.412e-5  PASS
+glmgolden l30 attn expanded   prompt rows    0..85   cosine 0.999999998 (worst row 65 0.999999992)  max_abs 3.061e-4  rel_rms 6.759e-5  PASS
+glmgolden l30 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.946e-5  rel_rms 1.846e-5  PASS
+glmgolden l30 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l30 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l30 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l30 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l30 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l30 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 64 1.000000000)  max_abs 2.861e-6  rel_rms 3.981e-7  PASS
+glmgolden l30 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 7.153e-7  rel_rms 6.359e-7  PASS
+glmgolden l30 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 35 0.999999984)  max_abs 9.358e-5  rel_rms 1.109e-4  PASS
+glmgolden l30 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 5.215e-7  rel_rms 7.078e-7  PASS
+glmgolden l30 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 51 0.999999999)  max_abs 1.237e-4  rel_rms 2.949e-5  PASS
+glmgolden l30 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 5.662e-7  rel_rms 2.560e-7  PASS
+glmgolden l30 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l31 dsa+moe loaded in 1.4 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14993715 of 16777216 values inexact (RNE)
+[glmgolden] l31 computed in 0.04 s (taps synchronize: not a speed figure)
+glmgolden l31 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l31 attn post       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l31 attn post       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l31 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l31 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l31 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 70 1.000000000)  max_abs 2.980e-7  rel_rms 1.706e-7  PASS
+glmgolden l31 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 5.960e-7  rel_rms 7.655e-7  PASS
+glmgolden l31 attn out        prompt rows    0..85   cosine 0.999986107 (worst row 16 0.999971694)  max_abs 7.365e-3  rel_rms 5.276e-3  PASS
+glmgolden l31 attn out        decode rows   86..89   cosine 0.999987371 (worst row 89 0.999985325)  max_abs 4.425e-3  rel_rms 5.031e-3  PASS
+glmgolden l31 attn expanded   prompt rows    0..85   cosine 0.999999289 (worst row 74 0.999996951)  max_abs 5.663e-3  rel_rms 1.193e-3  PASS
+glmgolden l31 attn expanded   decode rows   86..89   cosine 0.999999018 (worst row 89 0.999998899)  max_abs 2.972e-3  rel_rms 1.401e-3  PASS
+glmgolden l31 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l31 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l31 ffn  post       decode rows   86..89   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l31 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l31 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l31 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 19 1.000000000)  max_abs 9.537e-7  rel_rms 1.798e-7  PASS
+glmgolden l31 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 4.768e-7  rel_rms 4.033e-7  PASS
+glmgolden l31 ffn  out        prompt rows    0..85   cosine 0.999999995 (worst row 44 0.999999984)  max_abs 9.410e-5  rel_rms 1.038e-4  PASS
+glmgolden l31 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.396e-7  rel_rms 6.343e-7  PASS
+glmgolden l31 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 13 0.999999999)  max_abs 1.158e-4  rel_rms 2.461e-5  PASS
+glmgolden l31 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.768e-7  rel_rms 2.100e-7  PASS
+glmgolden l31 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l31 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l32 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l32 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l32 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l32 attn post       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l32 attn post       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l32 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l32 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l32 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 46 1.000000000)  max_abs 2.980e-7  rel_rms 3.129e-7  PASS
+glmgolden l32 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 7.171e-8  rel_rms 4.748e-7  PASS
+glmgolden l32 attn out        prompt rows    0..85   cosine 0.999999966 (worst row 12 0.999999940)  max_abs 6.638e-5  rel_rms 2.598e-4  PASS
+glmgolden l32 attn out        decode rows   86..89   cosine 0.999999998 (worst row 86 0.999999996)  max_abs 8.309e-6  rel_rms 5.710e-5  PASS
+glmgolden l32 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 59 0.999999997)  max_abs 1.323e-4  rel_rms 3.966e-5  PASS
+glmgolden l32 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.519e-5  rel_rms 1.033e-5  PASS
+glmgolden l32 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l32 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l32 ffn  post       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l32 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l32 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l32 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 72 1.000000000)  max_abs 3.815e-6  rel_rms 2.514e-7  PASS
+glmgolden l32 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 2.980e-7  rel_rms 1.951e-7  PASS
+glmgolden l32 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 26 0.999999986)  max_abs 1.205e-4  rel_rms 1.125e-4  PASS
+glmgolden l32 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 5.364e-7  rel_rms 7.147e-7  PASS
+glmgolden l32 ffn  expanded   prompt rows    0..85   cosine 0.999999999 (worst row 27 0.999999997)  max_abs 1.866e-4  rel_rms 3.796e-5  PASS
+glmgolden l32 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.073e-6  rel_rms 3.265e-7  PASS
+glmgolden l32 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l33 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l33 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l33 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l33 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l33 attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l33 attn comb       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l33 attn comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l33 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 74 1.000000000)  max_abs 1.192e-7  rel_rms 1.694e-7  PASS
+glmgolden l33 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 7.451e-8  rel_rms 3.956e-7  PASS
+glmgolden l33 attn out        prompt rows    0..85   cosine 0.999999969 (worst row 2 0.999999946)  max_abs 1.763e-4  rel_rms 2.480e-4  PASS
+glmgolden l33 attn out        decode rows   86..89   cosine 0.999999998 (worst row 86 0.999999994)  max_abs 2.573e-5  rel_rms 6.808e-5  PASS
+glmgolden l33 attn expanded   prompt rows    0..85   cosine 0.999999998 (worst row 59 0.999999992)  max_abs 3.477e-4  rel_rms 5.794e-5  PASS
+glmgolden l33 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.411e-5  rel_rms 1.475e-5  PASS
+glmgolden l33 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l33 ffn  post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l33 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l33 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l33 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l33 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 59 1.000000000)  max_abs 7.153e-7  rel_rms 1.207e-7  PASS
+glmgolden l33 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 7.749e-7  rel_rms 4.075e-7  PASS
+glmgolden l33 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 52 0.999999985)  max_abs 1.134e-4  rel_rms 1.054e-4  PASS
+glmgolden l33 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 5.364e-7  rel_rms 6.519e-7  PASS
+glmgolden l33 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 52 0.999999999)  max_abs 1.552e-4  rel_rms 3.049e-5  PASS
+glmgolden l33 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.749e-7  rel_rms 2.417e-7  PASS
+glmgolden l33 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l34 kda+moe loaded in 1.3 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l34 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l34 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l34 attn post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l34 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l34 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l34 attn comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l34 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 1 1.000000000)  max_abs 3.576e-7  rel_rms 1.274e-7  PASS
+glmgolden l34 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.980e-7  rel_rms 3.089e-7  PASS
+glmgolden l34 attn out        prompt rows    0..85   cosine 0.999999980 (worst row 1 0.999999969)  max_abs 5.781e-4  rel_rms 2.005e-4  PASS
+glmgolden l34 attn out        decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999999)  max_abs 7.068e-5  rel_rms 3.667e-5  PASS
+glmgolden l34 attn expanded   prompt rows    0..85   cosine 0.999999991 (worst row 7 0.999999983)  max_abs 1.154e-3  rel_rms 1.340e-4  PASS
+glmgolden l34 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 0.999999999)  max_abs 1.403e-4  rel_rms 2.682e-5  PASS
+glmgolden l34 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l34 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l34 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l34 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l34 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l34 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 47 1.000000000)  max_abs 3.815e-6  rel_rms 4.033e-7  PASS
+glmgolden l34 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 9.537e-7  rel_rms 5.537e-7  PASS
+glmgolden l34 ffn  out        prompt rows    0..85   cosine 0.999999996 (worst row 77 0.999999991)  max_abs 1.487e-4  rel_rms 9.300e-5  PASS
+glmgolden l34 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.652e-7  rel_rms 5.881e-7  PASS
+glmgolden l34 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 28 0.999999999)  max_abs 1.911e-4  rel_rms 1.964e-5  PASS
+glmgolden l34 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 5.960e-7  rel_rms 1.568e-7  PASS
+glmgolden l34 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l35 dsa+moe loaded in 1.5 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14886281 of 16777216 values inexact (RNE)
+[glmgolden] l35 computed in 0.04 s (taps synchronize: not a speed figure)
+glmgolden l35 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l35 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l35 attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l35 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l35 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l35 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 38 1.000000000)  max_abs 2.384e-7  rel_rms 1.535e-7  PASS
+glmgolden l35 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 2.384e-7  rel_rms 3.939e-7  PASS
+glmgolden l35 attn out        prompt rows    0..85   cosine 0.999988325 (worst row 1 0.999969311)  max_abs 6.689e-3  rel_rms 4.833e-3  PASS
+glmgolden l35 attn out        decode rows   86..89   cosine 0.999992391 (worst row 88 0.999990812)  max_abs 4.672e-3  rel_rms 3.904e-3  PASS
+glmgolden l35 attn expanded   prompt rows    0..85   cosine 0.999999729 (worst row 74 0.999998993)  max_abs 7.915e-3  rel_rms 7.359e-4  PASS
+glmgolden l35 attn expanded   decode rows   86..89   cosine 0.999999787 (worst row 88 0.999999754)  max_abs 2.921e-3  rel_rms 6.522e-4  PASS
+glmgolden l35 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l35 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l35 ffn  post       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l35 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l35 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l35 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 3 1.000000000)  max_abs 2.384e-6  rel_rms 2.285e-7  PASS
+glmgolden l35 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 8.345e-7  rel_rms 4.632e-7  PASS
+glmgolden l35 ffn  out        prompt rows    0..85   cosine 0.999999996 (worst row 53 0.999999989)  max_abs 1.240e-4  rel_rms 9.135e-5  PASS
+glmgolden l35 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 5.066e-7  rel_rms 6.202e-7  PASS
+glmgolden l35 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 7 0.999999999)  max_abs 1.659e-4  rel_rms 1.935e-5  PASS
+glmgolden l35 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 8.345e-7  rel_rms 1.531e-7  PASS
+glmgolden l35 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l35 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l36 kda+moe loaded in 1.3 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l36 computed in 0.04 s (taps synchronize: not a speed figure)
+glmgolden l36 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l36 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l36 attn post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l36 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l36 attn comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l36 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 80 1.000000000)  max_abs 1.431e-6  rel_rms 2.764e-7  PASS
+glmgolden l36 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 2.384e-7  rel_rms 5.864e-7  PASS
+glmgolden l36 attn out        prompt rows    0..85   cosine 0.999999972 (worst row 8 0.999999935)  max_abs 3.923e-4  rel_rms 2.371e-4  PASS
+glmgolden l36 attn out        decode rows   86..89   cosine 0.999999998 (worst row 86 0.999999997)  max_abs 8.026e-5  rel_rms 6.203e-5  PASS
+glmgolden l36 attn expanded   prompt rows    0..85   cosine 0.999999996 (worst row 8 0.999999983)  max_abs 7.840e-4  rel_rms 8.614e-5  PASS
+glmgolden l36 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 0.999999999)  max_abs 1.577e-4  rel_rms 2.606e-5  PASS
+glmgolden l36 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l36 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l36 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l36 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l36 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l36 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 8 1.000000000)  max_abs 3.815e-6  rel_rms 2.637e-7  PASS
+glmgolden l36 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 7.153e-7  rel_rms 4.133e-7  PASS
+glmgolden l36 ffn  out        prompt rows    0..85   cosine 0.999999992 (worst row 70 0.999999980)  max_abs 1.565e-4  rel_rms 1.232e-4  PASS
+glmgolden l36 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 4.619e-7  rel_rms 6.603e-7  PASS
+glmgolden l36 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 51 1.000000000)  max_abs 1.533e-4  rel_rms 1.751e-5  PASS
+glmgolden l36 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 9.537e-7  rel_rms 1.410e-7  PASS
+glmgolden l36 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l37 kda+moe loaded in 1.3 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l37 computed in 0.04 s (taps synchronize: not a speed figure)
+glmgolden l37 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l37 attn post       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l37 attn post       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l37 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l37 attn comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l37 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 43 1.000000000)  max_abs 2.980e-7  rel_rms 4.338e-7  PASS
+glmgolden l37 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.192e-7  rel_rms 5.901e-7  PASS
+glmgolden l37 attn out        prompt rows    0..85   cosine 0.999999960 (worst row 12 0.999999937)  max_abs 7.711e-5  rel_rms 2.841e-4  PASS
+glmgolden l37 attn out        decode rows   86..89   cosine 0.999999996 (worst row 86 0.999999992)  max_abs 2.206e-5  rel_rms 8.585e-5  PASS
+glmgolden l37 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 9 0.999999999)  max_abs 1.499e-4  rel_rms 2.389e-5  PASS
+glmgolden l37 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.369e-5  rel_rms 7.158e-6  PASS
+glmgolden l37 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l37 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l37 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l37 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l37 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l37 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 61 1.000000000)  max_abs 9.537e-7  rel_rms 1.016e-7  PASS
+glmgolden l37 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.576e-7  rel_rms 1.589e-7  PASS
+glmgolden l37 ffn  out        prompt rows    0..85   cosine 0.999999992 (worst row 77 0.999999982)  max_abs 2.028e-4  rel_rms 1.303e-4  PASS
+glmgolden l37 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 6.557e-7  rel_rms 5.831e-7  PASS
+glmgolden l37 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 52 0.999999999)  max_abs 2.047e-4  rel_rms 2.282e-5  PASS
+glmgolden l37 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 8.345e-7  rel_rms 1.294e-7  PASS
+glmgolden l37 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l38 kda+moe loaded in 1.3 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l38 computed in 0.09 s (taps synchronize: not a speed figure)
+glmgolden l38 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l38 attn post       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l38 attn post       decode rows   86..89   max_abs 4.768e-7  (coefficients, reported)
+glmgolden l38 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l38 attn comb       decode rows   86..89   max_abs 1.630e-8  (coefficients, reported)
+glmgolden l38 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 24 1.000000000)  max_abs 5.364e-7  rel_rms 2.313e-7  PASS
+glmgolden l38 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 4.172e-7  rel_rms 3.169e-7  PASS
+glmgolden l38 attn out        prompt rows    0..85   cosine 0.999999965 (worst row 83 0.999999953)  max_abs 6.458e-5  rel_rms 2.652e-4  PASS
+glmgolden l38 attn out        decode rows   86..89   cosine 0.999999997 (worst row 86 0.999999994)  max_abs 1.451e-5  rel_rms 8.077e-5  PASS
+glmgolden l38 attn expanded   prompt rows    0..85   cosine 1.000000000 (worst row 80 0.999999999)  max_abs 1.285e-4  rel_rms 2.304e-5  PASS
+glmgolden l38 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.715e-5  rel_rms 7.203e-6  PASS
+glmgolden l38 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l38 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l38 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l38 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l38 ffn  comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l38 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 13 1.000000000)  max_abs 1.907e-6  rel_rms 2.834e-7  PASS
+glmgolden l38 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.153e-7  rel_rms 4.052e-7  PASS
+glmgolden l38 ffn  out        prompt rows    0..85   cosine 0.999999994 (worst row 40 0.999999985)  max_abs 2.694e-4  rel_rms 1.063e-4  PASS
+glmgolden l38 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.302e-7  rel_rms 6.279e-7  PASS
+glmgolden l38 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 50 1.000000000)  max_abs 2.865e-4  rel_rms 2.193e-5  PASS
+glmgolden l38 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 9.537e-7  rel_rms 1.675e-7  PASS
+glmgolden l38 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l39 dsa+moe loaded in 1.3 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 14919361 of 16777216 values inexact (RNE)
+[glmgolden] l39 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l39 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l39 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l39 attn post       decode rows   86..89   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l39 attn comb       prompt rows    0..85   max_abs 1.937e-7  (coefficients, reported)
+glmgolden l39 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l39 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 83 1.000000000)  max_abs 4.768e-7  rel_rms 9.829e-8  PASS
+glmgolden l39 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.043e-7  rel_rms 1.114e-7  PASS
+glmgolden l39 attn out        prompt rows    0..85   cosine 0.999992474 (worst row 1 0.999975329)  max_abs 4.364e-3  rel_rms 3.883e-3  PASS
+glmgolden l39 attn out        decode rows   86..89   cosine 0.999994847 (worst row 86 0.999994244)  max_abs 2.738e-3  rel_rms 3.212e-3  PASS
+glmgolden l39 attn expanded   prompt rows    0..85   cosine 0.999999821 (worst row 80 0.999999588)  max_abs 4.762e-3  rel_rms 5.991e-4  PASS
+glmgolden l39 attn expanded   decode rows   86..89   cosine 0.999999881 (worst row 86 0.999999863)  max_abs 2.607e-3  rel_rms 4.889e-4  PASS
+glmgolden l39 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l39 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l39 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l39 ffn  comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l39 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l39 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 16 1.000000000)  max_abs 1.192e-6  rel_rms 2.440e-7  PASS
+glmgolden l39 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 9.537e-7  rel_rms 5.230e-7  PASS
+glmgolden l39 ffn  out        prompt rows    0..85   cosine 0.999999989 (worst row 40 0.999999978)  max_abs 2.788e-4  rel_rms 1.506e-4  PASS
+glmgolden l39 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 8.047e-7  rel_rms 7.108e-7  PASS
+glmgolden l39 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 61 0.999999999)  max_abs 2.782e-4  rel_rms 2.705e-5  PASS
+glmgolden l39 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.192e-6  rel_rms 1.635e-7  PASS
+glmgolden l39 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l39 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l40 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l40 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l40 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l40 attn post       prompt rows    0..85   max_abs 4.768e-7  (coefficients, reported)
+glmgolden l40 attn post       decode rows   86..89   max_abs 4.172e-7  (coefficients, reported)
+glmgolden l40 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l40 attn comb       decode rows   86..89   max_abs 1.267e-7  (coefficients, reported)
+glmgolden l40 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 84 1.000000000)  max_abs 8.941e-8  rel_rms 2.539e-7  PASS
+glmgolden l40 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 8.941e-8  rel_rms 6.451e-7  PASS
+glmgolden l40 attn out        prompt rows    0..85   cosine 0.999999961 (worst row 83 0.999999945)  max_abs 1.626e-4  rel_rms 2.807e-4  PASS
+glmgolden l40 attn out        decode rows   86..89   cosine 0.999999996 (worst row 86 0.999999988)  max_abs 2.580e-5  rel_rms 8.387e-5  PASS
+glmgolden l40 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 76 0.999999998)  max_abs 3.142e-4  rel_rms 3.519e-5  PASS
+glmgolden l40 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.856e-5  rel_rms 1.075e-5  PASS
+glmgolden l40 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l40 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l40 ffn  post       decode rows   86..89   max_abs 1.490e-7  (coefficients, reported)
+glmgolden l40 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l40 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l40 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 80 1.000000000)  max_abs 1.431e-6  rel_rms 2.168e-7  PASS
+glmgolden l40 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 4.768e-7  rel_rms 1.607e-7  PASS
+glmgolden l40 ffn  out        prompt rows    0..85   cosine 0.999999993 (worst row 1 0.999999984)  max_abs 2.143e-4  rel_rms 1.171e-4  PASS
+glmgolden l40 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 6.557e-7  rel_rms 6.273e-7  PASS
+glmgolden l40 ffn  expanded   prompt rows    0..85   cosine 1.000000000 (worst row 6 0.999999999)  max_abs 2.825e-4  rel_rms 2.709e-5  PASS
+glmgolden l40 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.013e-6  rel_rms 1.656e-7  PASS
+glmgolden l40 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l41 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l41 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l41 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l41 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l41 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l41 attn comb       prompt rows    0..85   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l41 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l41 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 8 1.000000000)  max_abs 8.941e-8  rel_rms 2.575e-7  PASS
+glmgolden l41 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.490e-8  rel_rms 1.697e-7  PASS
+glmgolden l41 attn out        prompt rows    0..85   cosine 0.999999953 (worst row 63 0.999999928)  max_abs 1.971e-4  rel_rms 3.052e-4  PASS
+glmgolden l41 attn out        decode rows   86..89   cosine 0.999999996 (worst row 86 0.999999990)  max_abs 3.892e-5  rel_rms 9.340e-5  PASS
+glmgolden l41 attn expanded   prompt rows    0..85   cosine 0.999999999 (worst row 76 0.999999994)  max_abs 3.855e-4  rel_rms 4.769e-5  PASS
+glmgolden l41 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 7.635e-5  rel_rms 1.549e-5  PASS
+glmgolden l41 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l41 ffn  post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l41 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l41 ffn  comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l41 ffn  comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l41 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 8 1.000000000)  max_abs 1.431e-6  rel_rms 2.080e-7  PASS
+glmgolden l41 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 1.907e-6  rel_rms 5.969e-7  PASS
+glmgolden l41 ffn  out        prompt rows    0..85   cosine 0.999999990 (worst row 73 0.999999972)  max_abs 3.393e-4  rel_rms 1.382e-4  PASS
+glmgolden l41 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 8.941e-7  rel_rms 6.882e-7  PASS
+glmgolden l41 ffn  expanded   prompt rows    0..85   cosine 0.999999999 (worst row 8 0.999999998)  max_abs 4.311e-4  rel_rms 3.548e-5  PASS
+glmgolden l41 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 9.537e-7  rel_rms 1.987e-7  PASS
+glmgolden l41 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l42 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l42 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l42 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l42 attn post       prompt rows    0..85   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l42 attn post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l42 attn comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l42 attn comb       decode rows   86..89   max_abs 5.960e-8  (coefficients, reported)
+glmgolden l42 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 25 1.000000000)  max_abs 2.623e-6  rel_rms 2.465e-7  PASS
+glmgolden l42 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.192e-6  rel_rms 2.748e-7  PASS
+glmgolden l42 attn out        prompt rows    0..85   cosine 0.999999962 (worst row 72 0.999999933)  max_abs 6.084e-4  rel_rms 2.759e-4  PASS
+glmgolden l42 attn out        decode rows   86..89   cosine 0.999999995 (worst row 86 0.999999988)  max_abs 1.115e-4  rel_rms 1.046e-4  PASS
+glmgolden l42 attn expanded   prompt rows    0..85   cosine 0.999999997 (worst row 76 0.999999980)  max_abs 1.213e-3  rel_rms 7.797e-5  PASS
+glmgolden l42 attn expanded   decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999998)  max_abs 2.227e-4  rel_rms 3.214e-5  PASS
+glmgolden l42 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l42 ffn  post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l42 ffn  post       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l42 ffn  comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l42 ffn  comb       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l42 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 70 1.000000000)  max_abs 3.815e-6  rel_rms 2.525e-7  PASS
+glmgolden l42 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 9.537e-7  rel_rms 1.740e-7  PASS
+glmgolden l42 ffn  out        prompt rows    0..85   cosine 0.999999992 (worst row 43 0.999999978)  max_abs 6.471e-4  rel_rms 1.264e-4  PASS
+glmgolden l42 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.073e-6  rel_rms 5.786e-7  PASS
+glmgolden l42 ffn  expanded   prompt rows    0..85   cosine 0.999999999 (worst row 59 0.999999998)  max_abs 9.341e-4  rel_rms 4.831e-5  PASS
+glmgolden l42 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 1.401e-6  rel_rms 2.331e-7  PASS
+glmgolden l42 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l43 dsa+moe loaded in 1.4 s: 2851778932 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177), kv_b to BF16: 3006083 of 16777216 values inexact (RNE)
+[glmgolden] l43 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l43 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l43 attn post       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l43 attn post       decode rows   86..89   max_abs 3.576e-7  (coefficients, reported)
+glmgolden l43 attn comb       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l43 attn comb       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l43 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 81 1.000000000)  max_abs 3.815e-6  rel_rms 3.055e-7  PASS
+glmgolden l43 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.861e-6  rel_rms 5.734e-7  PASS
+glmgolden l43 attn out        prompt rows    0..85   cosine 0.999993479 (worst row 0 0.999990850)  max_abs 1.310e-2  rel_rms 3.612e-3  PASS
+glmgolden l43 attn out        decode rows   86..89   cosine 0.999994477 (worst row 88 0.999994087)  max_abs 9.108e-3  rel_rms 3.325e-3  PASS
+glmgolden l43 attn expanded   prompt rows    0..85   cosine 0.999999729 (worst row 1 0.999999466)  max_abs 1.080e-2  rel_rms 7.359e-4  PASS
+glmgolden l43 attn expanded   decode rows   86..89   cosine 0.999999758 (worst row 87 0.999999742)  max_abs 5.582e-3  rel_rms 6.961e-4  PASS
+glmgolden l43 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l43 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l43 ffn  post       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l43 ffn  comb       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l43 ffn  comb       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l43 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 49 1.000000000)  max_abs 5.722e-6  rel_rms 2.395e-7  PASS
+glmgolden l43 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 5.722e-6  rel_rms 3.716e-7  PASS
+glmgolden l43 ffn  out        prompt rows    0..85   cosine 0.999999990 (worst row 82 0.999999979)  max_abs 1.952e-3  rel_rms 1.389e-4  PASS
+glmgolden l43 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 87 1.000000000)  max_abs 2.861e-6  rel_rms 5.350e-7  PASS
+glmgolden l43 ffn  expanded   prompt rows    0..85   cosine 0.999999998 (worst row 50 0.999999996)  max_abs 3.441e-3  rel_rms 6.371e-5  PASS
+glmgolden l43 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 3.576e-6  rel_rms 2.470e-7  PASS
+glmgolden l43 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden l43 dsa selection overlap 1.0000 (90 / 90 rows the same set)
+[glmgolden] l44 kda+moe loaded in 1.2 s: 2829387892 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
+[glmgolden] l44 computed in 0.03 s (taps synchronize: not a speed figure)
+glmgolden l44 attn pre        not compared (HF's hyper-connection does not return it)
+glmgolden l44 attn post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l44 attn post       decode rows   86..89   max_abs 4.768e-7  (coefficients, reported)
+glmgolden l44 attn comb       prompt rows    0..85   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l44 attn comb       decode rows   86..89   max_abs 1.192e-7  (coefficients, reported)
+glmgolden l44 attn collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 76 1.000000000)  max_abs 3.576e-7  rel_rms 2.027e-7  PASS
+glmgolden l44 attn collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 2.682e-7  rel_rms 6.597e-7  PASS
+glmgolden l44 attn out        prompt rows    0..85   cosine 0.999999938 (worst row 68 0.999999556)  max_abs 2.107e-3  rel_rms 3.509e-4  PASS
+glmgolden l44 attn out        decode rows   86..89   cosine 0.999999999 (worst row 86 0.999999997)  max_abs 5.484e-5  rel_rms 4.520e-5  PASS
+glmgolden l44 attn expanded   prompt rows    0..85   cosine 0.999999994 (worst row 68 0.999999958)  max_abs 4.170e-3  rel_rms 1.070e-4  PASS
+glmgolden l44 attn expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.094e-4  rel_rms 1.518e-5  PASS
+glmgolden l44 ffn  pre        not compared (HF's hyper-connection does not return it)
+glmgolden l44 ffn  post       prompt rows    0..85   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l44 ffn  post       decode rows   86..89   max_abs 2.384e-7  (coefficients, reported)
+glmgolden l44 ffn  comb       prompt rows    0..85   max_abs 2.980e-7  (coefficients, reported)
+glmgolden l44 ffn  comb       decode rows   86..89   max_abs 1.788e-7  (coefficients, reported)
+glmgolden l44 ffn  collapsed  prompt rows    0..85   cosine 1.000000000 (worst row 11 1.000000000)  max_abs 3.815e-6  rel_rms 1.364e-7  PASS
+glmgolden l44 ffn  collapsed  decode rows   86..89   cosine 1.000000000 (worst row 88 1.000000000)  max_abs 6.676e-6  rel_rms 3.160e-7  PASS
+glmgolden l44 ffn  out        prompt rows    0..85   cosine 0.999999984 (worst row 65 0.999999945)  max_abs 1.495e-2  rel_rms 1.793e-4  PASS
+glmgolden l44 ffn  out        decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 1.287e-5  rel_rms 4.441e-7  PASS
+glmgolden l44 ffn  expanded   prompt rows    0..85   cosine 0.999999991 (worst row 14 0.999999979)  max_abs 2.280e-2  rel_rms 1.367e-4  PASS
+glmgolden l44 ffn  expanded   decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 2.289e-5  rel_rms 3.569e-7  PASS
+glmgolden l44 routing top-8 overlap 1.0000 (90 / 90 rows the same set)
+glmgolden head mean       prompt rows    0..85   cosine 1.000000000  max_abs 3.815e-6  (host mean of the head input, reported)
+glmgolden head mean       decode rows   86..89   cosine 1.000000000  max_abs 9.537e-7  (host mean of the head input, reported)
+glmgolden head norm       prompt rows    0..85   cosine 1.000000000 (worst row 70 1.000000000)  max_abs 2.861e-6  rel_rms 6.735e-8  PASS
+glmgolden head norm       decode rows   86..89   cosine 1.000000000 (worst row 89 1.000000000)  max_abs 1.431e-6  rel_rms 8.690e-8  PASS
+glmgolden head logits     prompt rows    0..85   cosine 1.000000000 (worst row 0 1.000000000)  max_abs 7.629e-6  rel_rms 2.311e-7  PASS
+glmgolden head top-1      prompt rows    0..85   86 / 86 rows agree
+glmgolden head logits     decode rows   86..89   cosine 1.000000000 (worst row 86 1.000000000)  max_abs 4.768e-6  rel_rms 2.144e-7  PASS
+glmgolden head top-1      decode rows   86..89   4 / 4 rows agree
+glmgolden logits anchor 85    cosine 1.000000000  max_abs 3.815e-6  rel_rms 2.199e-7  greedy 16 (golden 16)  PASS
+glmgolden logits anchor 86    cosine 1.000000000  max_abs 4.768e-6  rel_rms 2.526e-7  greedy 271 (golden 271)  PASS
+glmgolden logits anchor 87    cosine 1.000000000  max_abs 3.338e-6  rel_rms 2.590e-7  greedy 817 (golden 817)  PASS
+glmgolden logits anchor 88    cosine 1.000000000  max_abs 3.815e-6  rel_rms 2.040e-7  greedy 4680 (golden 4680)  PASS
+glmgolden logits anchor 89    cosine 1.000000000  max_abs 3.815e-6  rel_rms 2.629e-7  greedy 389 (golden 389)  PASS
+glmgolden 1-cos of the layer output by depth: l0 1.99e-8, l1 6.32e-9, l2 8.53e-9, l3 2.87e-9, l4 2.03e-11, l5 3.06e-11, l6 2.39e-10, l7 2.03e-10, l8 5.67e-11, l9 8.29e-11, l10 4.53e-9, l11 4.76e-11, l12 2.55e-11, l13 4.54e-11, l14 5.01e-11, l15 1.52e-10, l16 8.02e-11, l17 2.58e-10, l18 3.48e-11, l19 1.06e-10, l20 8.07e-11, l21 2.22e-10, l22 4.56e-10, l23 6.35e-10, l24 3.97e-10, l25 2.36e-10, l26 2.64e-10, l27 8.90e-10, l28 3.33e-10, l29 6.81e-10, l30 4.35e-10, l31 3.03e-10, l32 7.21e-10, l33 4.65e-10, l34 1.93e-10, l35 1.87e-10, l36 1.53e-10, l37 2.61e-10, l38 2.41e-10, l39 3.66e-10, l40 3.67e-10, l41 6.30e-10, l42 1.17e-9, l43 2.03e-9, l44 9.34e-9
+glmgolden: ALL PASS (0 of 549 G3 rows failed)
