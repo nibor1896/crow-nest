@@ -48,7 +48,10 @@
 //! to the one-row decode's), so a sampled id is drawn from it as without MTP: on the device sampler
 //! (#215) when armed, drawn only for the rows the caller reaches, else on the host. The block's MLA cache truncates
 //! like the trunk's; its one pending row (the last trunk row's head-norm row, whose next id is not
-//! known yet) is part of the snapshot (`state_floats` + H).
+//! known yet) is part of the snapshot (`state_floats` + H). The prefix switches stay on with MTP:
+//! a LIVE continuation (#219) prefills through `Glm5Run::spec_prefill`, which first drops the
+//! verify rows past the held end and runs the block over the held rows; the anchor (#217) holds
+//! the pending row at its cut (`Glm5Run::prefill_anchored`).
 
 use crate::cuda;
 use crate::geo::{Family, Glm5Geo, HOST_PINNED_CAP};
@@ -442,7 +445,8 @@ impl Rows for Glm5Device {
         self.run.prefill(&mut self.o.cnq, &mut self.tiers, ids, pos0, &mut |_| {})
     }
     unsafe fn prefill_anchored(&mut self, ids: &[i64], pos0: usize, cut: usize, anchor: &mut [f32]) -> Result<(i64, Option<f64>), String> {
-        // crow-nest #217: the KDA scan cut inside the prompt's own calls (`Glm5Run::prefill_anchored`)
+        // crow-nest #217: the KDA scan cut inside the prompt's own calls (`Glm5Run::prefill_anchored`;
+        // #192: with MTP through the spec prefill, + the block's pending row at the cut)
         self.run.prefill_anchored(&mut self.o.cnq, &mut self.tiers, ids, pos0, cut, anchor)
     }
     unsafe fn decode(&mut self, tok: i64, pos: usize) -> Result<i64, String> {
@@ -763,8 +767,8 @@ pub struct Glm5Engine<R: Rows = Glm5Device> {
     /// position, and the realign's vocabulary bytes (`None`: (A) only)
     answer_reuse: bool,
     token_bytes: Option<std::sync::Arc<TokenBytes>>,
-    /// crow-nest #217 `CROW_GLM_PREFIX_ANCHOR`: on, and the current slot's anchor (KDA states only,
-    /// no logits row; its ids are `history[..pos]`)
+    /// crow-nest #217 `CROW_GLM_PREFIX_ANCHOR`: on, and the current slot's anchor (KDA states and,
+    /// with MTP, the block's pending row; no logits row; its ids are `history[..pos]`)
     prefix_anchor: bool,
     anchor: Snapshot,
 }
@@ -789,10 +793,11 @@ impl<R: Rows> Glm5Engine<R> {
         self.prefix_anchor = on;
     }
 
-    /// crow-nest #217: does the engine take anchors? The switch, the cache, and MTP off (the spec
-    /// head-norm row of `state_floats` exists only at the prompt's end)
+    /// crow-nest #217: does the engine take anchors? The switch and the cache. #192: with MTP the
+    /// anchor holds the block's pending head-norm row at the cut too ([`Rows::prefill_anchored`]
+    /// copies `state_floats`), and the block's cache rows below it stay in place like the trunk's
     pub fn prefix_anchor(&self) -> bool {
-        self.cache_on && self.prefix_anchor && self.rows.mtp_drafts() == 0
+        self.cache_on && self.prefix_anchor
     }
 
     /// crow-nest #217: the position of the anchor, `None` while none is held
@@ -800,7 +805,8 @@ impl<R: Rows> Glm5Engine<R> {
         self.anchor.pos
     }
 
-    /// crow-nest #217: host bytes the anchor takes (the KDA states, no logits row)
+    /// crow-nest #217: host bytes the anchor takes (the KDA states, #192: + the MTP block's
+    /// pending head-norm row; no logits row)
     pub fn anchor_bytes(&self) -> usize {
         self.rows.state_floats() * 4
     }
@@ -812,10 +818,12 @@ impl<R: Rows> Glm5Engine<R> {
         self.token_bytes = token_bytes;
     }
 
-    /// crow-nest #219: is the live state a reuse point? The switch, the cache, and MTP off (the
-    /// spec head-norm row of `state_floats` is not proven consistent after a speculative decode)
+    /// crow-nest #219: is the live state a reuse point? The switch and the cache. #192: after a
+    /// speculative decode the device holds verify rows past the last fed id and the block lags
+    /// one row; the prefill that continues the live state settles both first
+    /// (`Glm5Run::spec_prefill`), so the state it leaves is the one-row decode's plus the prefill
     pub fn answer_reuse(&self) -> bool {
-        self.cache_on && self.answer_reuse && self.rows.mtp_drafts() == 0
+        self.cache_on && self.answer_reuse
     }
 
     /// crow-nest #219: does (B) realign re-renders (the switch and the vocabulary bytes)?
@@ -945,7 +953,9 @@ impl<R: Rows> Glm5Engine<R> {
     /// reaches the held end with a tail left: the request becomes `history ++ prompt[j*..]`, so
     /// (A) continues from the live state. `None` otherwise (the prompt stays as rendered): a
     /// realign that stops below the held end reaches no reuse point (none exists above the prompt
-    /// snapshot).
+    /// snapshot). #192: a realign never truncates the held ids (it keeps all of them), so with MTP
+    /// it is (A) on the device; one that stops below the held end rolls back to a snapshot, whose
+    /// restore drops the verify rows ahead and brings the block's pending row back.
     pub fn realign(&self, prompt: &[i64]) -> Option<Realign> {
         self.realign_books(&self.history, prompt)
     }
@@ -975,8 +985,10 @@ impl<R: Rows> Glm5Engine<R> {
     }
 
     /// crow-nest #219 (A): continue from the live state: a row enqueued ahead
-    /// (`CROW_GLM_LA`) is dropped, nothing is restored, the held ids stay. Returns the wall in ms.
-    /// A failure resets the engine.
+    /// (`CROW_GLM_LA`) is dropped, nothing is restored, the held ids stay. #192: verify rows past
+    /// the held end stay until the next prefill, which settles them on the device (the KDA states
+    /// from the snapshot slot of the last held row, the block over the held rows). Returns the
+    /// wall in ms. A failure resets the engine.
     ///
     /// # Safety
     /// As [`Rows::row`].
@@ -1663,12 +1675,17 @@ mod tests_192_serve {
         }
     }
 
-    /// One request as `glm_generate` drives the engine: the decision, rollback or reset, the
-    /// prefill (or the snapshot's row when the whole prompt is held), the snapshot, then `n` ids
-    /// picked from the logits row and fed back. (fed ids, their logits rows, cached rows)
+    /// One request as `glm_generate` drives the engine: the decision, the live state (#219),
+    /// rollback or reset, the prefill (or the snapshot's row when the whole prompt is held), the
+    /// snapshot, then `n` ids picked from the logits row and fed back. (fed ids, their logits
+    /// rows, cached rows)
     unsafe fn turn<R: Rows>(e: &mut Glm5Engine<R>, prompt: &[i64], n: usize, p: Policy) -> (Vec<i64>, Vec<Vec<f32>>, usize) {
         let d = e.decide(prompt);
         let cached = match d.reuse {
+            Some((REUSE_LIVE, q)) => {
+                e.continue_live().unwrap();
+                q
+            }
             Some((_, q)) => {
                 e.rollback(q).unwrap();
                 q
@@ -1862,6 +1879,292 @@ mod tests_192_serve {
             drop((e0, e));
         }
     }
+
+    // ------------------------------------------------ crow-nest #219 / #217 with MTP
+
+    type SeqState = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    /// cosine of two vectors (1 when equal bit for bit: an all-zero buffer too)
+    fn cosf(a: &[f32], b: &[f32]) -> f64 {
+        if a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()) {
+            return 1.0;
+        }
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            ab += x as f64 * y as f64;
+            aa += x as f64 * x as f64;
+            bb += y as f64 * y as f64;
+        }
+        ab / (aa.sqrt() * bb.sqrt())
+    }
+
+    fn f32s(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    fn bf16s(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(2).map(|c| crate::glm5_head::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
+    }
+
+    /// The G3 bar between two [`seq_state`]s over `rows` trunk rows: every KDA state and conv
+    /// window, every trunk MLA latent / indexer row, every block cache row (`rows - 1`) and the
+    /// block's pending head-norm row at cosine >= 0.9999 each; the buffers that differ in bits
+    /// reported (the rows the verify wrote stand in for the one-row decode's)
+    fn assert_state_g3(what: &str, g: &Glm5Geo, a: &SeqState, b: &SeqState, rows: usize) {
+        let md = crate::glm5_mla::MlaDims::of(g);
+        let (lat, idx) = (md.latent_bytes_per_token() as usize, md.indexer_bytes_per_token() as usize);
+        let mut worst = (1f64, String::new());
+        let mut differ = 0usize;
+        let mut see = |name: String, x: Vec<f32>, y: Vec<f32>| {
+            let c = cosf(&x, &y);
+            if c < 1.0 {
+                differ += 1;
+            }
+            if c < worst.0 || c.is_nan() {
+                worst = (c, name);
+            }
+        };
+        for (i, (x, y)) in a.0.iter().zip(&b.0).enumerate() {
+            see(format!("KDA buffer {i}"), f32s(x), f32s(y));
+        }
+        for (i, (x, y)) in a.1.iter().zip(&b.1).enumerate() {
+            let w = if i % 2 == 0 { lat } else { idx };
+            for r in 0..rows {
+                see(format!("trunk MLA buffer {i} row {r}"), bf16s(&x[r * w..(r + 1) * w]), bf16s(&y[r * w..(r + 1) * w]));
+            }
+        }
+        if !a.2.is_empty() {
+            for (i, w) in [(0, lat), (1, idx)] {
+                for r in 0..rows - 1 {
+                    see(format!("block cache buffer {i} row {r}"), bf16s(&a.2[i][r * w..(r + 1) * w]), bf16s(&b.2[i][r * w..(r + 1) * w]));
+                }
+            }
+            see("block pending row".to_string(), f32s(&a.2[2]), f32s(&b.2[2]));
+        }
+        eprintln!("glm5_mtp serve {what}: {differ} buffers / rows differ in bits, worst cosine {:.9} ({})", worst.0, worst.1);
+        assert!(worst.0 >= 0.9999, "{what}: {} at cosine {} under G3's 0.9999", worst.1, worst.0);
+    }
+
+    /// G3 per logits row (cosine >= 0.9999, the same top-1), bits reported
+    fn assert_rows_g3(what: &str, a: &[Vec<f32>], b: &[Vec<f32>]) {
+        assert_eq!(a.len(), b.len(), "{what}: rows");
+        let r: Vec<(f64, f64, bool)> = a.iter().zip(b).map(|(p, q)| crate::glm5_int_tests::g3(q, p)).collect();
+        let cos = r.iter().map(|x| x.0).fold(1.0, f64::min);
+        let kl = r.iter().map(|x| x.1).fold(0.0, f64::max);
+        let top1 = r.iter().filter(|x| x.2).count();
+        eprintln!("glm5_mtp serve {what}: logits cosine min {cos:.9}, KL max {kl:.3e}, top-1 {top1}/{}, bits differ per row {:?}", r.len(), bits(a, b));
+        assert!(cos >= 0.9999, "{what}: logits cosine {cos} under G3's 0.9999");
+        assert_eq!(top1, r.len(), "{what}: top-1");
+    }
+
+    /// crow-nest #219 with MTP on the device (`CROW_CHUNK` = `chunk`): T1 cold (21 ids, 16 ids),
+    /// T2 and T3 LIVE (the held conversation + a 5-id tail each, 16 ids), with
+    /// `CROW_GLM_ANSWER_REUSE` on. Engines: MTP off; N = 3 with the drafts taken from MTP off's
+    /// transcript, wrong when the position % 4 == 1; N = 2 with the block's own drafts. Greedy and
+    /// forced: the ids and cached rows are MTP off's, every logits row within G3 (bits reported:
+    /// the verify's rows are the bar, not the one-row decode's bits); sampled the same while the
+    /// rows are bit-identical (a draw from rows that differ in bits may differ). Then T4 LIVE
+    /// after T3's answer (verified rows still ahead): right after its prefill the KDA states, the
+    /// trunk's and the block's cache rows and the block's pending row are a cold prefill's of the
+    /// same ids within G3, and so is the prompt-end logits row.
+    fn live_turns(chunk: &str) {
+        use super::tests_batch_gpu::EnvGuard;
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let _env = EnvGuard::set(&[("CROW_CHUNK", chunk)]);
+        let p1: Vec<i64> = (0..21).map(|i| (i * 97 + 11) % 2048).collect();
+        let n = 16usize;
+        let tail = |k: i64| -> Vec<i64> { vec![5 + k, 77, 1024 + k, 3, 2000 - k] };
+        let cap = 21 + 4 * (n + 5) + 4;
+        let vocab = g.vocab as i64;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let gold: Arc<Mutex<HashMap<usize, i64>>> = Arc::default();
+            let mut e0 = Glm5Engine::new(device(&s.path, &g, 0, cap, 0), true);
+            let mut e1 = Glm5Engine::new(device(&s.path, &g, 3, cap, 0x0192_2191), true);
+            let mut e2 = Glm5Engine::new(device(&s.path, &g, 2, cap, 0x0192_2192), true);
+            for e in [&mut e0, &mut e1, &mut e2] {
+                e.set_answer_reuse(true, None);
+                assert!(e.answer_reuse(), "CROW_GLM_ANSWER_REUSE stays on with MTP {}", e.rows().mtp_drafts());
+            }
+            let gh = gold.clone();
+            e1.rows_mut().run.set_mtp_hook(Some(Box::new(move |pos, d| match gh.lock().unwrap().get(&pos) {
+                Some(&t) if pos % 4 != 1 => t,
+                Some(&t) => (t + 1) % vocab,
+                None => d,
+            })));
+            for p in [Policy::Greedy, Policy::Forced, Policy::Sampled] {
+                // MTP off: T1 cold, T2 and T3 LIVE; (prompt, turn) per request
+                e0.reset();
+                let mut want = Vec::new();
+                let mut prompt = p1.clone();
+                for k in 0..3 {
+                    let t = turn(&mut e0, &prompt, n, p);
+                    want.push((prompt.clone(), t));
+                    prompt = [e0.history(), &tail(k)].concat();
+                }
+                let cached: Vec<usize> = want.iter().map(|w| w.1 .2).collect();
+                assert_eq!(cached, [0, 21 + n - 1, 21 + 2 * (n - 1) + 5], "{p:?}: MTP off: T2 and T3 continue LIVE");
+                for (name, e) in [("N 3 transcript drafts", &mut e1), ("N 2 own drafts", &mut e2)] {
+                    e.reset();
+                    let _ = e.rows_mut().mtp_report();
+                    for (k, (prompt, w)) in want.iter().enumerate() {
+                        *gold.lock().unwrap() = transcript(prompt, &w.0);
+                        let got = turn(e, prompt, n, p);
+                        let what = format!("{name} {p:?} T{} (chunk {chunk})", k + 1);
+                        assert_eq!(got.2, w.2, "{what}: cached rows");
+                        let exact = bits(&got.1, &w.1).iter().all(|&d| d == 0);
+                        if p == Policy::Sampled && !exact {
+                            eprintln!("glm5_mtp serve {what}: rows differ in bits, sampled ids {} (not gated)", if got.0 == w.0 { "equal" } else { "differ" });
+                            break;
+                        }
+                        assert_eq!(got.0, w.0, "{what}: ids vs MTP off");
+                        assert_rows_g3(&what, &got.1, &w.1);
+                    }
+                    let st = e.rows_mut().run.mtp_take_stats().unwrap();
+                    eprintln!("glm5_mtp serve live {name} {p:?}: {}", st.summary());
+                    assert!(st.steps > 0 && st.drafts > 0, "{name} {p:?}: the verify ran: {st:?}");
+                }
+            }
+            // T4 LIVE after T3's greedy answer (verified rows ahead) vs a cold prefill
+            for (name, e) in [("N 3", &mut e1), ("N 2", &mut e2)] {
+                e.rows_mut().run.set_mtp_hook(None);
+                let mut prompt = p1.clone();
+                for k in 0..3 {
+                    turn(e, &prompt, n, Policy::Greedy);
+                    prompt = [e.history(), &tail(k)].concat();
+                }
+                let held = e.history().len();
+                assert_eq!(e.decide(&prompt).reuse, Some((REUSE_LIVE, held)), "{name}: T4 LIVE");
+                e.continue_live().unwrap();
+                let id_live = e.prefill(&prompt[held..]).unwrap();
+                let row_live = e.logits();
+                let live = seq_state(e.rows(), prompt.len());
+                e.reset();
+                let id_cold = e.prefill(&prompt).unwrap();
+                let row_cold = e.logits();
+                let cold = seq_state(e.rows(), prompt.len());
+                let what = format!("{name} T4 LIVE vs cold (chunk {chunk})");
+                assert_eq!(id_live, id_cold, "{what}: the greedy id");
+                assert_rows_g3(&what, &[row_live], &[row_cold]);
+                assert_state_g3(&what, &g, &live, &cold, prompt.len());
+            }
+            drop((e0, e1, e2));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the GPU (about 6 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_serve_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_serve_gpu_live_turns_are_the_turns_without_mtp_row_by_row() {
+        live_turns("1");
+    }
+
+    #[test]
+    #[ignore = "needs the GPU (about 6 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_serve_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_serve_gpu_live_turns_are_the_turns_without_mtp_in_prompt_calls() {
+        live_turns("12");
+    }
+
+    /// crow-nest #217 with MTP on the device (`CROW_CHUNK` = `chunk`; at 12 the cut falls inside
+    /// the second call): a 40-id prompt anchored at 17, then 6 greedy ids (verified rows ahead),
+    /// then a new prompt that shares the first 17 ids rolled back to the anchor, against its cold
+    /// prefill. Engines: MTP off and N = 3 (the block's own drafts), `CROW_GLM_PREFIX_ANCHOR` on.
+    /// With MTP the anchored prefill is the plain one (ids, row and state with the pending row,
+    /// bit for bit); the anchor is the KDA states and the pending row a 17-row prefill leaves
+    /// (bit for bit row by row, G3 in prompt calls); from the anchor, the greedy id, the
+    /// prompt-end row, the KDA states, the trunk's and the block's cache rows and the pending row
+    /// are the cold prefill's within G3; the ids are MTP off's.
+    fn anchor_turns(chunk: &str) {
+        use super::tests_batch_gpu::EnvGuard;
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let _env = EnvGuard::set(&[("CROW_CHUNK", chunk)]);
+        let p1: Vec<i64> = (0..40).map(|i| (i * 37 + 5) % 2048).collect();
+        let mut p2 = p1[..17].to_vec();
+        p2.extend((0..14).map(|i| (i * 91 + 11) % 2048));
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut ids = Vec::new();
+            for nd in [0usize, 3] {
+                let mut e = Glm5Engine::new(device(&s.path, &g, nd, 64, 0x0192_2171), true);
+                e.set_prefix_anchor(true);
+                assert!(e.prefix_anchor(), "CROW_GLM_PREFIX_ANCHOR stays on with MTP {nd}");
+                let what = format!("MTP {nd} (chunk {chunk})");
+                // the state after the first 17 rows, plain
+                e.reset();
+                e.prefill(&p1[..17]).unwrap();
+                let mut s17 = vec![0f32; e.rows().state_floats()];
+                e.rows().save_state(&mut s17);
+                // plain vs anchored prefill of p1
+                e.reset();
+                let id_plain = e.prefill(&p1).unwrap();
+                let (row_plain, mut st_plain) = (e.logits(), vec![0f32; s17.len()]);
+                e.rows().save_state(&mut st_plain);
+                e.reset();
+                let (id_anch, ms) = e.prefill_anchored(&p1, 17).unwrap();
+                assert!(ms.is_some(), "{what}: the anchor was not captured");
+                assert_eq!(e.anchor_pos(), Some(17));
+                let row_anch = e.logits();
+                let mut st_anch = vec![0f32; s17.len()];
+                e.rows().save_state(&mut st_anch);
+                assert_eq!(id_anch, id_plain, "{what}: anchored vs plain id");
+                assert!(bits(&[row_anch], &[row_plain])[0] == 0 && bits(&[st_anch], &[st_plain])[0] == 0, "{what}: the cut changed the prefill");
+                let kda = s17.len() - e.rows().run.spec_state_floats();
+                let (ca, cp) = (cosf(&e.anchor.state[..kda], &s17[..kda]), cosf(&e.anchor.state[kda..], &s17[kda..]));
+                eprintln!("glm5_mtp serve anchor {what}: anchor vs the 17-row prefill: KDA cosine {ca:.9}, pending row cosine {cp:.9}, {} of {} floats differ in bits", bits(&[e.anchor.state.clone()], &[s17.clone()])[0], s17.len());
+                if chunk == "1" {
+                    assert_eq!(bits(&[e.anchor.state.clone()], &[s17.clone()])[0], 0, "{what}: row by row the anchor is the 17-row state, bit for bit");
+                } else {
+                    assert!(ca >= 0.9999 && cp >= 0.9999, "{what}: the anchor vs the 17-row state");
+                }
+                // greedy ids: with MTP verified rows are ahead when the request ends
+                e.snapshot(id_anch);
+                let mut next = id_anch;
+                for _ in 0..6 {
+                    next = e.decode_step(next).unwrap();
+                }
+                // the new chat from the anchor vs its cold prefill
+                assert_eq!(e.decide(&p2).reuse, Some((REUSE_ANCHOR, 17)), "{what}");
+                e.rollback(17).unwrap();
+                let warm_id = e.prefill(&p2[17..]).unwrap();
+                let warm_row = e.logits();
+                let warm = seq_state(e.rows(), p2.len());
+                let mut w = vec![warm_id];
+                for _ in 0..8 {
+                    w.push(e.decode_step(*w.last().unwrap()).unwrap());
+                }
+                e.reset();
+                let cold_id = e.prefill(&p2).unwrap();
+                let cold_row = e.logits();
+                let cold = seq_state(e.rows(), p2.len());
+                let mut c = vec![cold_id];
+                for _ in 0..8 {
+                    c.push(e.decode_step(*c.last().unwrap()).unwrap());
+                }
+                let what = format!("anchor {what}: from the anchor vs cold");
+                assert_eq!(warm_id, cold_id, "{what}: the greedy id");
+                assert_rows_g3(&what, &[warm_row], &[cold_row]);
+                assert_state_g3(&what, &g, &warm, &cold, p2.len());
+                eprintln!("glm5_mtp serve {what}: greedy ids warm {w:?} cold {c:?} (reported, not gated)");
+                ids.push((id_anch, w));
+                drop(e);
+            }
+            assert_eq!(ids[0].0, ids[1].0, "chunk {chunk}: the anchored prefill's id, MTP vs off");
+            assert_eq!(ids[0].1, ids[1].1, "chunk {chunk}: the ids from the anchor, MTP vs off");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_serve_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_serve_gpu_anchor_new_chat_is_the_chat_without_mtp_row_by_row() {
+        anchor_turns("1");
+    }
+
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_serve_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_serve_gpu_anchor_new_chat_is_the_chat_without_mtp_in_prompt_calls() {
+        anchor_turns("12");
+    }
 }
 
 /// The host twin of [`Rows`]: the cache shapes of glm5_next in miniature, for the engine's
@@ -1935,6 +2238,35 @@ pub mod fake {
         /// draws the twin made, and every `rebook_sampler` call `(drawn, kept, drawn_seen, lastn)`
         pub dev_draws: usize,
         pub rebooks: Vec<(usize, usize, bool, usize)>,
+        /// #192: the speculative decode's twin (`FakeRows::with_mtp`; `None` = off). The draft
+        /// for the id at a position: `mtp_draft(pos, greedy id of the row before)`; unset, the
+        /// greedy id (a block that always agrees with the trunk)
+        spec: Option<FakeSpec>,
+        pub mtp_draft: Option<Box<dyn FnMut(usize, i64) -> i64>>,
+    }
+
+    /// #192: the host twin of `glm5_mtp::Spec` in serve: `n` drafts per verify; the verified
+    /// rows ahead of the caller (`Spec::ahead`: per verify row the state after it, its logits
+    /// row and its head-norm value); the block's cache, one value per position (a function of
+    /// the row's head-norm value and its NEXT id); the pending head-norm value of the last
+    /// trunk row (`Spec::hp`); verifies run and KDA restores
+    struct FakeSpec {
+        n: usize,
+        ahead: Option<FakeAhead>,
+        blk: Vec<u64>,
+        hp: u64,
+        verifies: usize,
+        restores: usize,
+    }
+
+    struct FakeAhead {
+        p0: usize,
+        fed: Vec<i64>,
+        ids: Vec<i64>,
+        taken: usize,
+        states: Vec<u64>,
+        logits: Vec<Vec<f32>>,
+        hn: Vec<u64>,
     }
 
     impl FakeRows {
@@ -1945,7 +2277,128 @@ pub mod fake {
         /// `slots` sequences (`CROW_GLM_MAX_BATCH`)
         pub fn with_slots(n_ctx: usize, vocab: usize, cands: Vec<u32>, slots: usize) -> FakeRows {
             let parked = (0..slots).map(|i| if i == 0 { (0, Vec::new(), Vec::new()) } else { (0, vec![-1; n_ctx], vec![0.0; vocab]) }).collect();
-            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new(), trims: Vec::new(), dev_sampler_ok: true, armed: None, dev_draws: 0, rebooks: Vec::new() }
+            FakeRows { n_ctx, vocab, cands, state: 0, mla: vec![-1; n_ctx], logits: vec![0.0; vocab], fail_at: None, alloc_fail_at: None, rows_run: 0, heads_run: 0, parked, cur: 0, batches: Vec::new(), trims: Vec::new(), dev_sampler_ok: true, armed: None, dev_draws: 0, rebooks: Vec::new(), spec: None, mtp_draft: None }
+        }
+
+        /// #192: one sequence with the speculative decode's twin, `n` drafts per verify
+        /// (`CROW_GLM_MTP=n`; the device sampler is refused, as on the device)
+        pub fn with_mtp(n_ctx: usize, vocab: usize, cands: Vec<u32>, n: usize) -> FakeRows {
+            let mut f = FakeRows::new(n_ctx, vocab, cands);
+            f.spec = (n > 0).then(|| FakeSpec { n, ahead: None, blk: vec![u64::MAX; n_ctx], hp: u64::MAX, verifies: 0, restores: 0 });
+            f
+        }
+
+        /// #192: verifies run and KDA restores since construction (`(0, 0)` when off)
+        pub fn mtp_counts(&self) -> (usize, usize) {
+            self.spec.as_ref().map_or((0, 0), |s| (s.verifies, s.restores))
+        }
+
+        /// #192: the block's cache values `0 .. rows` and the pending head-norm value (empty and
+        /// `u64::MAX` when off)
+        pub fn mtp_block(&self, rows: usize) -> (Vec<u64>, u64) {
+            self.spec.as_ref().map_or((Vec::new(), u64::MAX), |s| (s.blk[..rows].to_vec(), s.hp))
+        }
+
+        /// #192: the head-norm value of the last row run (a function of the state after it)
+        fn hn(&self) -> u64 {
+            mix(self.state, 0x4E4F_524D)
+        }
+
+        /// #192: the twin of `Glm5Run::spec_settle`: with verified rows ahead, the state back to
+        /// after row `pos - 1` unless the trunk holds exactly `pos` rows, and the block over the
+        /// rows the caller took (their next ids: the fed drafts, then `tok`); with none ahead,
+        /// the block over row `pos - 1` from the pending value
+        fn spec_settle(&mut self, tok: i64, pos: usize) -> Result<(), String> {
+            let sp = self.spec.as_mut().expect("the twin's MTP is on");
+            match sp.ahead.take() {
+                Some(ah) => {
+                    let c = ah.taken;
+                    if pos != ah.p0 + c {
+                        return Err(format!("fake: a row at {pos}, the sequence holds {} rows (MTP)", ah.p0 + c));
+                    }
+                    if c < ah.fed.len() {
+                        self.state = ah.states[c - 1];
+                        sp.restores += 1;
+                    }
+                    for j in 0..c {
+                        let next = if j + 1 < c { ah.fed[j + 1] } else { tok };
+                        sp.blk[ah.p0 + j] = mix(ah.hn[j], next as u64);
+                    }
+                }
+                None if pos > 0 => sp.blk[pos - 1] = mix(sp.hp, tok as u64),
+                None => {}
+            }
+            Ok(())
+        }
+
+        /// The prompt rows `ids` at `pos0 ..` row by row, the head on the last; at `cut` the
+        /// state into `anchor` (`save_state`'s layout). #192 with the twin's MTP: settled first
+        /// (`Glm5Run::spec_prefill`), the block over every row whose next id is in `ids`, the
+        /// last row's value pending; the anchor holds the pending value at the cut
+        unsafe fn prompt(&mut self, ids: &[i64], pos0: usize, mut cut: Option<(usize, &mut [f32])>) -> Result<i64, String> {
+            if self.spec.is_some() && !ids.is_empty() {
+                self.spec_settle(ids[0], pos0)?;
+            }
+            let mut last = None;
+            for (i, &tok) in ids.iter().enumerate() {
+                last = self.row(tok, pos0 + i, i + 1 == ids.len())?;
+                let h = self.hn();
+                if let Some(sp) = self.spec.as_mut() {
+                    if i + 1 < ids.len() {
+                        sp.blk[pos0 + i] = mix(h, ids[i + 1] as u64);
+                    } else {
+                        sp.hp = h;
+                    }
+                }
+                if let Some((c, a)) = cut.as_mut() {
+                    if i + 1 == *c {
+                        a[0] = f32::from_bits(self.state as u32);
+                        a[1] = f32::from_bits((self.state >> 32) as u32);
+                        if self.spec.is_some() {
+                            a[2] = f32::from_bits(h as u32);
+                            a[3] = f32::from_bits((h >> 32) as u32);
+                        }
+                    }
+                }
+            }
+            last.ok_or_else(|| "glm5: an empty prefill chunk".to_string())
+        }
+
+        /// #192: the twin of `Glm5Run::spec_decode_in`: a verified row the caller reached is
+        /// handed out without a row; otherwise settle, then one verify of `1 + k` rows (the
+        /// drafts from `mtp_draft`), every row's state, logits row and head-norm value kept
+        unsafe fn spec_decode(&mut self, tok: i64, pos: usize) -> Result<i64, String> {
+            let sp = self.spec.as_mut().expect("the twin's MTP is on");
+            if let Some(ah) = sp.ahead.as_mut() {
+                let c = ah.taken;
+                if pos == ah.p0 + c && c < ah.fed.len() && tok == ah.fed[c] {
+                    ah.taken += 1;
+                    self.logits = ah.logits[c].clone();
+                    return Ok(ah.ids[c]);
+                }
+            }
+            let n = sp.n;
+            self.spec_settle(tok, pos)?;
+            let k = n.min(self.n_ctx.saturating_sub(pos + 1));
+            let mut ah = FakeAhead { p0: pos, fed: vec![tok], ids: Vec::new(), taken: 1, states: Vec::new(), logits: Vec::new(), hn: Vec::new() };
+            for j in 0..=k {
+                if j > 0 {
+                    let g = ah.ids[j - 1];
+                    let d = self.mtp_draft.as_mut().map_or(g, |f| f(pos + j, g));
+                    ah.fed.push(d);
+                }
+                let id = self.row(ah.fed[j], pos + j, true)?.ok_or_else(|| format!("fake: the head row at {} gave no id", pos + j))?;
+                ah.ids.push(id);
+                ah.states.push(self.state);
+                ah.logits.push(self.logits.clone());
+                ah.hn.push(self.hn());
+            }
+            self.logits = ah.logits[0].clone();
+            let first = ah.ids[0];
+            let sp = self.spec.as_mut().expect("checked above");
+            sp.verifies += 1;
+            sp.ahead = Some(ah);
+            Ok(first)
         }
 
         /// crow-nest #215: the armed twin's draw from the current row (booked, as `sample_k` books)
@@ -1976,7 +2429,32 @@ pub mod fake {
             45
         }
         fn state_floats(&self) -> usize {
-            2
+            // #192: + the pending head-norm value (two f32 bit patterns)
+            if self.spec.is_some() {
+                4
+            } else {
+                2
+            }
+        }
+        unsafe fn prefill_chunk(&mut self, ids: &[i64], pos0: usize) -> Result<i64, String> {
+            self.prompt(ids, pos0, None)
+        }
+        unsafe fn prefill_anchored(&mut self, ids: &[i64], pos0: usize, cut: usize, anchor: &mut [f32]) -> Result<(i64, Option<f64>), String> {
+            if cut == 0 || cut >= ids.len() {
+                return Err(format!("glm5: an anchor after {cut} of {} prompt rows", ids.len()));
+            }
+            let t = std::time::Instant::now();
+            let id = self.prompt(ids, pos0, Some((cut, anchor)))?;
+            Ok((id, Some(t.elapsed().as_secs_f64() * 1e3)))
+        }
+        unsafe fn decode(&mut self, tok: i64, pos: usize) -> Result<i64, String> {
+            if self.spec.is_some() {
+                return self.spec_decode(tok, pos);
+            }
+            self.row(tok, pos, true)?.ok_or_else(|| format!("glm5: the head row at {pos} gave no id"))
+        }
+        fn mtp_drafts(&self) -> usize {
+            self.spec.as_ref().map_or(0, |s| s.n)
         }
         unsafe fn row(&mut self, tok: i64, pos: usize, head: bool) -> Result<Option<i64>, String> {
             if self.fail_at == Some(pos) {
@@ -2017,12 +2495,25 @@ pub mod fake {
         unsafe fn save_state(&self, into: &mut [f32]) {
             into[0] = f32::from_bits(self.state as u32);
             into[1] = f32::from_bits((self.state >> 32) as u32);
+            // #192: the device's `spec_pending_row` asserts the same
+            if let Some(sp) = self.spec.as_ref() {
+                assert!(sp.ahead.is_none(), "fake: a prefix snapshot while MTP verified ids are ahead of the sequence");
+                into[2] = f32::from_bits(sp.hp as u32);
+                into[3] = f32::from_bits((sp.hp >> 32) as u32);
+            }
         }
         unsafe fn load_state(&mut self, from: &[f32]) {
             self.state = from[0].to_bits() as u64 | ((from[1].to_bits() as u64) << 32);
+            if let Some(sp) = self.spec.as_mut() {
+                sp.ahead = None;
+                sp.hp = from[2].to_bits() as u64 | ((from[3].to_bits() as u64) << 32);
+            }
         }
         unsafe fn zero_state(&mut self) {
             self.state = 0;
+            if let Some(sp) = self.spec.as_mut() {
+                sp.ahead = None;
+            }
         }
         fn counters(&self) -> ([u64; 3], u64) {
             ([self.rows_run as u64 * 8, 0, 0], 0)
@@ -2053,6 +2544,8 @@ pub mod fake {
         fn dev_sampler_refusal(&self) -> Option<String> {
             if !self.dev_sampler_ok {
                 Some("fake: no device sampler".to_string())
+            } else if self.spec.is_some() {
+                Some("fake: CROW_GLM_MTP > 0".to_string())
             } else if self.slots() > 1 {
                 Some("fake: CROW_GLM_MAX_BATCH > 1".to_string())
             } else {
@@ -2287,13 +2780,13 @@ mod tests_217 {
         e
     }
 
-    fn text(seed: i64, n: usize) -> Vec<i64> {
+    pub(super) fn text(seed: i64, n: usize) -> Vec<i64> {
         (0..n as i64).map(|i| 10 + (i * 7 + seed * 13 + (i * i) % 11) % 30).collect()
     }
 
     /// a Crow prompt: the tools + system head (`head` ids, the per-chat working-area line from
     /// `diverge` on when given), `<|user|>`, the user message
-    fn chat(head: usize, diverge: Option<(usize, i64)>, user: i64) -> Vec<i64> {
+    pub(super) fn chat(head: usize, diverge: Option<(usize, i64)>, user: i64) -> Vec<i64> {
         let mut p = text(1, head);
         if let Some((at, seed)) = diverge {
             p.splice(at.., text(seed, head - at));
@@ -2481,6 +2974,209 @@ mod tests_217 {
                 assert_eq!(e.anchor_pos(), Some(1100));
             }
             assert_eq!(turn(&mut e, &t2, &[]), (1100, 301, None), "the next chat from the anchor");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_192_reuse {
+    //! #192 with crow-nest #219 / #217 on the host twin: `CROW_GLM_MTP` leaves
+    //! `CROW_GLM_ANSWER_REUSE` and `CROW_GLM_PREFIX_ANCHOR` on. The twin's speculative decode
+    //! (`FakeRows::with_mtp`: verify rows ahead of the caller, KDA restores, the block lagging one
+    //! row with its pending value in the snapshot) gives, turn for turn, the decisions, ids and
+    //! logits rows of the twin without MTP; after a LIVE round and after a rollback to the
+    //! anchor, the state, the block's cache and its pending value are a cold prefill's.
+    use super::fake::{token_bytes, FakeRows};
+    use super::tests_217::{chat, text};
+    use super::*;
+    use std::sync::Arc;
+
+    /// a twin engine with both switches on: MTP off (`n` 0) or `n` drafts per verify
+    fn eng(n: usize) -> Glm5Engine<FakeRows> {
+        let rows = if n == 0 { FakeRows::new(4096, 64, (10..40).collect()) } else { FakeRows::with_mtp(4096, 64, (10..40).collect(), n) };
+        let mut e = Glm5Engine::new(rows, true);
+        e.set_answer_reuse(true, Some(Arc::new(token_bytes())));
+        e.set_prefix_anchor(true);
+        e
+    }
+
+    /// what one turn did: (cached_n, prefilled, the anchor taken, realigned), the greedy id and
+    /// logits row after the prompt, then per decode step the id fed, the id returned and the row
+    #[derive(Debug, PartialEq)]
+    struct Turn {
+        books: (usize, usize, Option<usize>, bool),
+        next: i64,
+        row: Vec<f32>,
+        steps: Vec<(i64, i64, Vec<f32>)>,
+    }
+
+    /// serve's prompt phase (`glm_prompt_phase` without the logs), `chk` on the engine right
+    /// after it, then `n` decode steps: the id fed is the returned one, except steps `forced`
+    /// (another id: a redraw / injected id)
+    unsafe fn turn(e: &mut Glm5Engine<FakeRows>, prompt: &[i64], n: usize, forced: &[usize], chk: &dyn Fn(&Glm5Engine<FakeRows>)) -> Turn {
+        let (r, plan) = e.plan(prompt);
+        let realigned = r.is_some();
+        let prompt = r.as_ref().map_or(prompt, |r| &r.ids);
+        let cached = match plan.reuse {
+            Some((REUSE_LIVE, p)) => {
+                e.continue_live().unwrap();
+                p
+            }
+            Some((_, p)) => {
+                e.rollback(p).unwrap();
+                p
+            }
+            None => {
+                e.reset_for(prompt);
+                0
+            }
+        };
+        let at = e.anchor_point(prompt, &plan);
+        let mut next = if cached == prompt.len() {
+            e.restore_logits()
+        } else {
+            match at {
+                Some(b) => e.prefill_anchored(&prompt[cached..], b).unwrap().0,
+                None => e.prefill(&prompt[cached..]).unwrap(),
+            }
+        };
+        e.snapshot(next);
+        chk(e);
+        let first = next;
+        let row = e.logits();
+        let mut steps = Vec::new();
+        for i in 0..n {
+            let fed = if forced.contains(&i) { 10 + (next - 10 + 7) % 30 } else { next };
+            next = e.decode_step(fed).unwrap();
+            steps.push((fed, next, e.logits()));
+        }
+        Turn { books: (cached, prompt.len() - cached, at, realigned), next: first, row, steps }
+    }
+
+    /// the state (with MTP: + the pending value), the block's cache below the held end and the
+    /// logits row of `e`, against a cold prefill of `e`'s held ids on a fresh twin
+    unsafe fn is_the_cold_prefill(e: &Glm5Engine<FakeRows>, n: usize, what: &str) {
+        let h = e.history().to_vec();
+        let mut c = eng(n);
+        c.prefill(&h).unwrap();
+        let (mut sw, mut sc) = (vec![0f32; e.rows().state_floats()], vec![0f32; c.rows().state_floats()]);
+        e.rows().save_state(&mut sw);
+        c.rows().save_state(&mut sc);
+        assert_eq!(sw.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), sc.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "{what}: the state (+ the pending value)");
+        assert_eq!(e.rows().mtp_block(h.len() - 1), c.rows().mtp_block(h.len() - 1), "{what}: the block's cache rows and pending value");
+        assert_eq!(e.logits(), c.logits(), "{what}: the logits row");
+    }
+
+    /// the switches are on with MTP, the anchor and the snapshot hold the pending value
+    #[test]
+    fn mtp_leaves_answer_reuse_and_the_anchor_on() {
+        for n in [0, 1, 3] {
+            let e = eng(n);
+            assert_eq!(e.rows().mtp_drafts(), n);
+            assert!(e.answer_reuse() && e.realigns() && e.prefix_anchor(), "MTP {n}: the switches");
+            let pending = if n > 0 { 2 } else { 0 };
+            assert_eq!((e.anchor_bytes(), e.snapshot_bytes()), ((2 + pending) * 4, (2 + pending + 64) * 4), "MTP {n}: the books");
+            let mut off = Glm5Engine::new(FakeRows::with_mtp(4096, 64, (10..40).collect(), n), false);
+            off.set_answer_reuse(true, None);
+            off.set_prefix_anchor(true);
+            assert!(!off.answer_reuse() && !off.prefix_anchor(), "MTP {n}: the prefix cache off turns both off");
+        }
+    }
+
+    /// the anchored prefill with MTP: the prefill's ids, rows and state; the anchor is the state
+    /// and the pending value a prefill of the rows below the cut leaves
+    #[test]
+    fn an_anchor_with_mtp_holds_the_pending_value_at_the_cut() {
+        let p = text(3, 1500);
+        unsafe {
+            let mut a = eng(3);
+            let (id, ms) = a.prefill_anchored(&p, 1100).unwrap();
+            assert!(ms.is_some());
+            let mut b = eng(3);
+            assert_eq!(id, b.prefill(&p).unwrap());
+            is_the_cold_prefill(&a, 3, "anchored prefill");
+            let mut c = eng(3);
+            c.prefill(&p[..1100]).unwrap();
+            let mut sc = vec![0f32; 4];
+            c.rows().save_state(&mut sc);
+            assert_eq!((a.anchor_pos(), a.anchor.state.clone()), (Some(1100), sc), "the anchor: the state and the pending value after 1,100 rows");
+            assert_eq!(a.rows().mtp_block(1099).0, c.rows().mtp_block(1099).0, "the block's rows below the cut are the 1,100-row prefill's");
+        }
+    }
+
+    /// Crow's session on the twin: t1 (anchored at its first `<|user|>`), three LIVE tool rounds
+    /// (one realigned: the held answer's ' fisher' + 'men' re-rendered as ' fishermen'), the next
+    /// chat t2 from the anchor, a LIVE round on it. Greedy steps with forced ids among them. With
+    /// MTP (1 and 3 drafts; the block agreeing with the trunk, a transcript block that misses
+    /// every fourth position, a block that always misses) every turn's books, ids and logits rows
+    /// are those without MTP; after the LIVE round and after the rollback to the anchor the state
+    /// and the block are a cold prefill's.
+    #[test]
+    fn live_rounds_and_a_new_chat_with_mtp_are_the_turns_without_it() {
+        let (t1, t2) = (chat(1100, None, 5), chat(1100, None, 6));
+        unsafe {
+            let script = |e: &mut Glm5Engine<FakeRows>, n: usize| -> Vec<Turn> {
+                // with MTP, right after every prompt phase: a cold prefill's state and block
+                let cold = |e: &Glm5Engine<FakeRows>| {
+                    if n > 0 {
+                        is_the_cold_prefill(e, n, &format!("MTP {n} at {}", e.pos()));
+                    }
+                };
+                let mut out = vec![turn(e, &t1, 30, &[3, 11, 12], &cold)];
+                for k in 0..3 {
+                    let mut p = e.history().to_vec();
+                    if k == 1 {
+                        // the held answer ends ' fisher' 'men' (fed below), the re-render ' fishermen'
+                        p.truncate(p.len() - 2);
+                        p.push(43);
+                    }
+                    p.push(54);
+                    p.extend(text(20 + k, 40));
+                    out.push(turn(e, &p, 25, &[0, 9], &cold));
+                    if k == 0 {
+                        // the answer of round 1 ends with the split the sampler drew
+                        e.decode_step(41).unwrap();
+                        e.decode_step(42).unwrap();
+                    }
+                }
+                out.push(turn(e, &t2, 0, &[], &cold));
+                out.push(turn(e, &t2, 20, &[5], &cold));
+                let mut p = e.history().to_vec();
+                p.push(54);
+                p.extend(text(40, 30));
+                out.push(turn(e, &p, 0, &[], &cold));
+                out
+            };
+            let want = script(&mut eng(0), 0);
+            let books: Vec<_> = want.iter().map(|t| t.books).collect();
+            assert_eq!(books[0], (0, 1401, Some(1100), false), "t1 cold, anchored");
+            assert!(books[1..4].iter().all(|b| b.0 > 1401 && b.2.is_none()), "the tool rounds continue LIVE: {books:?}");
+            assert!(books[2].3 && !books[1].3 && !books[3].3, "round 2 realigned: {books:?}");
+            assert_eq!(&books[4..6], &[(1100, 301, None, false), (1401, 0, None, false)], "t2 from the anchor, then its snapshot");
+            assert_eq!((books[6].1, books[6].2), (31, None), "t2's tool round LIVE");
+            for n in [1, 3] {
+                for blk in 0..3 {
+                    let mut e = eng(n);
+                    e.rows_mut().mtp_draft = match blk {
+                        0 => None,
+                        // a block that misses every fourth position
+                        1 => Some(Box::new(|pos, g| if pos % 4 == 1 { 10 + (g - 10 + 1) % 30 } else { g })),
+                        _ => Some(Box::new(|_, g| 10 + (g - 10 + 3) % 30)),
+                    };
+                    let got = script(&mut e, n);
+                    for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(g, w, "MTP {n} block {blk}: turn {k}");
+                    }
+                    let (verifies, restores) = e.rows().mtp_counts();
+                    let steps: usize = want.iter().map(|t| t.steps.len()).sum::<usize>() + 2;
+                    assert!(restores > 0, "MTP {n} block {blk}: forced ids roll back");
+                    if blk == 0 {
+                        assert!(verifies < steps, "MTP {n}: an agreeing block skips verifies ({verifies} of {steps} steps)");
+                    } else {
+                        assert!(verifies > 0);
+                    }
+                }
+            }
         }
     }
 }
