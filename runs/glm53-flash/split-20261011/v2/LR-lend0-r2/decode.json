@@ -2,21 +2,21 @@
   "tool": "glm5_run",
   "ticket": 187,
   "args": [
-    "C:\\Users\\robin\\dev\\crow-nest-wt-int\\engine\\target\\release\\glm5_run.exe",
+    "<home>\\dev\\crow-nest-wt-int\\engine\\target\\release\\glm5_run.exe",
     "--vram-slots",
     "37",
     "--reps",
     "3",
     "--prompt-ids",
-    "C:/Users/robin/dev/crow-nest/runs/glm53-flash/split-20261011/req2-glm5-model.ids",
+    "<home>/dev/crow-nest/runs/glm53-flash/split-20261011/req2-glm5-model.ids",
     "-n",
     "256",
     "--json",
-    "C:/Users/robin/dev/crow-nest/runs/glm53-flash/split-20261011/v2/LR-lend0-r2/decode.json"
+    "<home>/dev/crow-nest/runs/glm53-flash/split-20261011/v2/LR-lend0-r2/decode.json"
   ],
   "env": {
     "CROW_CHUNK": "8192",
-    "CROW_CNQ": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+    "CROW_CNQ": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
     "CROW_GLM_ARENA": "global",
     "CROW_GLM_ARENA_ELASTIC_GB": "10",
     "CROW_GLM_ARENA_FREQ": "1",
@@ -25,7 +25,7 @@
     "CROW_GLM_ARENA_REGROW": "1",
     "CROW_GLM_ARENA_STAGE_GB": "2.6",
     "CROW_GLM_ARENA_STAGE_LEND": "0",
-    "CROW_GLM_ARENA_WARM": "C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json",
+    "CROW_GLM_ARENA_WARM": "<home>/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json",
     "CROW_GLM_ATTN2": "1",
     "CROW_GLM_ATTN_FUSE": "1",
     "CROW_GLM_CPU_LANE": "split",
@@ -47,28 +47,28 @@
     "CROW_GLM_SIDE_NOJOIN": "1",
     "CROW_GLM_STAGER": "1",
     "CROW_GLM_STAGE_OVERLAP": "1",
-    "CROW_IMAGE_MODEL_DIR": "C:\\Users\\robin\\dev\\crow-lab\\models\\qwen-image-2.1",
-    "CROW_LLAMA_SERVER_FLASH_NEXT_Q2_K_XL": "C:\\Users\\robin\\dev\\crow-lab\\wt-27880\\build-27880\\bin\\Release\\llama-server.exe",
-    "CROW_MODELS": "C:\\Users\\robin\\dev\\crow-lab\\models",
+    "CROW_IMAGE_MODEL_DIR": "<home>\\dev\\crow-lab\\models\\qwen-image-2.1",
+    "CROW_LLAMA_SERVER_FLASH_NEXT_Q2_K_XL": "<home>\\dev\\crow-lab\\wt-27880\\build-27880\\bin\\Release\\llama-server.exe",
+    "CROW_MODELS": "<home>\\dev\\crow-lab\\models",
     "CROW_NVME_DEMAND_FIRST": "1",
     "CROW_PINNED_ALLOC": "host",
     "CROW_STAGE_PAR": "0",
-    "CROW_TOKENIZER": "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json"
+    "CROW_TOKENIZER": "<home>\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json"
   },
   "commit": "1463ad6ef442992fca3acfcc0569b04a5c875bf4",
   "binary": {
-    "path": "C:\\Users\\robin\\dev\\crow-nest-wt-int\\engine\\target\\release\\glm5_run.exe",
+    "path": "<home>\\dev\\crow-nest-wt-int\\engine\\target\\release\\glm5_run.exe",
     "mtime_unix_s": 1791666860
   },
   "container": {
-    "path": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+    "path": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
     "bytes": 124591634567,
     "record_bytes": 9474048,
     "experts": 288,
     "codec": "mul1"
   },
   "prompt": {
-    "source": "--prompt-ids C:/Users/robin/dev/crow-nest/runs/glm53-flash/split-20261011/req2-glm5-model.ids",
+    "source": "--prompt-ids <home>/dev/crow-nest/runs/glm53-flash/split-20261011/req2-glm5-model.ids",
     "base_ids": 3985,
     "ids": 3985,
     "prompt_tokens_flag": null
@@ -95,7 +95,7 @@
     "policy": "Lru",
     "pinned_use": "PinnedUse { stay: true, cpu_lane: true }",
     "arena": "Global",
-    "arena_config": "ArenaConfig { admit_max: 64, noadmit: false, warm: Some(\"C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json\"), vring: 24, elastic_bytes: 10737418240, stage_bytes: 2791728742, stage_min: 512, freq: true, regrow: true, lazy_refill: true, stage_lend: false, prompt_count: true }",
+    "arena_config": "ArenaConfig { admit_max: 64, noadmit: false, warm: Some(\"<home>/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json\"), vring: 24, elastic_bytes: 10737418240, stage_bytes: 2791728742, stage_min: 512, freq: true, regrow: true, lazy_refill: true, stage_lend: false, prompt_count: true }",
     "staging_slots": 8,
     "pinned_budget_bytes": 49392123904,
     "free_vram_at_plan_bytes": 32496418816,

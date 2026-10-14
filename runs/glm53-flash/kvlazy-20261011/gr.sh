@@ -3,10 +3,10 @@
 #   A = --kv-rows context, CROW_GLM_KV_LAZY unset   (serve's KV and plan, eager)
 #   B = --kv-rows context, CROW_GLM_KV_LAZY=4096    (serve's KV and plan, lazy)
 #   C = no --kv-rows, switch unset                  (cap = prompt + n, the 2,524-slot reference)
-# Alternated A B C x 3. The caller holds C:\Users\robin\dev\.gpu-lock. Usage: gr.sh [reps]
-R=/c/Users/robin/dev/crow-nest; D=$R/runs/glm53-flash/kvlazy-20261011; E=$R/engine; K=${1:-3}
-export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
-TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
+# Alternated A B C x 3. The caller holds <home>\dev\.gpu-lock. Usage: gr.sh [reps]
+R=<home>/dev/crow-nest; D=$R/runs/glm53-flash/kvlazy-20261011; E=$R/engine; K=${1:-3}
+export CROW_CNQ='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+TOK='<home>\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
 ARM3="$(cat $R/runs/glm53-flash/quick/arm3.env)"
 TXT="Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus write-through, and how false sharing hurts multithreaded code. Give concrete examples."
 cd $E || exit 1

@@ -8,7 +8,7 @@
 - L(t1, t2) = 6,043.
 
 **Third chat:**
-- t2's system message, with the working area replaced by `C:\Users\robin\Desktop\g5-run1\t3-accept`, and t1's user message.
+- t2's system message, with the working area replaced by `<home>\Desktop\g5-run1\t3-accept`, and t1's user message.
 - Crow's 31 tools and Crow's sampling fields (temperature 1, top_p 0.95, min_p 0.01, max_tokens as below), seed 1408639702.
 - Offline: 6,438 ids, and L against t2 request 1 is 6,043.
 

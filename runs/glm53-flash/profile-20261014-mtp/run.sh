@@ -4,16 +4,16 @@
 # existing profile-20261010l-decode (budget3.txt, same prompt and length); no new MTP-off run (robin, 2026-10-14).
 # The other arm names stay available by hand only.
 # Prompt and length = profile-20261010l-decode/run.sh (57-id question, -n 128, --cold --reps 1).
-# Waits for C:\Users\robin\dev\.gpu-lock, for no glm5_run/serve/decode/llama-server/sd-server process and for > 50.5 GiB
+# Waits for <home>\dev\.gpu-lock, for no glm5_run/serve/decode/llama-server/sd-server process and for > 50.5 GiB
 # free RAM (poll 60 s); holds the lock for the whole job; rebuilds glm5_run only if older than the engine sources.
 # nsys: CUDA + NVTX trace, no CPU sampling, no context switches; glm5_run exits by itself (no Stop-Process, CUPTI tail kept).
 # Usage: run.sh [arm ...]   (default: nsys-mtp)   DRY=1 run.sh  checks inputs, prints commands
-W=/c/Users/robin/dev; R=$W/crow-nest; D=$R/runs/glm53-flash/profile-20261014-mtp; E=$R/engine
+W=<home>/dev; R=$W/crow-nest; D=$R/runs/glm53-flash/profile-20261014-mtp; E=$R/engine
 LOCK=$W/.gpu-lock
 NSYS="/c/Program Files/NVIDIA Corporation/Nsight Systems 2026.5.1/target-windows-x64/nsys.exe"
-export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
-export CROW_GLM_MTP_OVERLAY='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MTP-overlay.cnq'
-TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
+export CROW_CNQ='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+export CROW_GLM_MTP_OVERLAY='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MTP-overlay.cnq'
+TOK='<home>\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
 ARM4="$(cat $R/runs/glm53-flash/quick/arm4.env)"
 P="Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus write-through, and how false sharing hurts multithreaded code. Give concrete examples."
 ARMS=("$@"); [ ${#ARMS[@]} -eq 0 ] && ARMS=(nsys-mtp)

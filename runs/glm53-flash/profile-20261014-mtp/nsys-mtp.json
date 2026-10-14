@@ -2,22 +2,22 @@
   "tool": "glm5_run",
   "ticket": 187,
   "args": [
-    "C:\\Users\\robin\\dev\\crow-nest\\engine\\target\\release\\glm5_run.EXE",
+    "<home>\\dev\\crow-nest\\engine\\target\\release\\glm5_run.EXE",
     "--cold",
     "--reps",
     "1",
     "--tokenizer",
-    "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json",
+    "<home>\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json",
     "--prompt",
     "Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus write-through, and how false sharing hurts multithreaded code. Give concrete examples.",
     "-n",
     "128",
     "--json",
-    "C:/Users/robin/dev/crow-nest/runs/glm53-flash/profile-20261014-mtp/nsys-mtp.json"
+    "<home>/dev/crow-nest/runs/glm53-flash/profile-20261014-mtp/nsys-mtp.json"
   ],
   "env": {
     "CROW_CHUNK": "8192",
-    "CROW_CNQ": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+    "CROW_CNQ": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
     "CROW_GLM_ARENA": "global",
     "CROW_GLM_ARENA_ELASTIC_GB": "10",
     "CROW_GLM_ARENA_FREQ": "1",
@@ -26,7 +26,7 @@
     "CROW_GLM_ARENA_REGROW": "1",
     "CROW_GLM_ARENA_STAGE_GB": "2.6",
     "CROW_GLM_ARENA_STAGE_LEND": "1",
-    "CROW_GLM_ARENA_WARM": "C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json",
+    "CROW_GLM_ARENA_WARM": "<home>/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json",
     "CROW_GLM_ATTN2": "1",
     "CROW_GLM_ATTN_FUSE": "1",
     "CROW_GLM_CPU_LANE": "split",
@@ -38,7 +38,7 @@
     "CROW_GLM_KV_LAZY": "4096",
     "CROW_GLM_MOE_TC": "2",
     "CROW_GLM_MTP": "1",
-    "CROW_GLM_MTP_OVERLAY": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MTP-overlay.cnq",
+    "CROW_GLM_MTP_OVERLAY": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MTP-overlay.cnq",
     "CROW_GLM_MUL1_FUSE": "1",
     "CROW_GLM_PINNED": "zerocopy",
     "CROW_GLM_PREFETCH": "1",
@@ -51,21 +51,21 @@
     "CROW_GLM_SIDE_NOJOIN": "1",
     "CROW_GLM_STAGER": "1",
     "CROW_GLM_STAGE_OVERLAP": "1",
-    "CROW_IMAGE_MODEL_DIR": "C:\\Users\\robin\\dev\\crow-lab\\models\\qwen-image-2.1",
-    "CROW_LLAMA_SERVER_FLASH_NEXT_Q2_K_XL": "C:\\Users\\robin\\dev\\crow-lab\\wt-27880\\build-27880\\bin\\Release\\llama-server.exe",
-    "CROW_MODELS": "C:\\Users\\robin\\dev\\crow-lab\\models",
+    "CROW_IMAGE_MODEL_DIR": "<home>\\dev\\crow-lab\\models\\qwen-image-2.1",
+    "CROW_LLAMA_SERVER_FLASH_NEXT_Q2_K_XL": "<home>\\dev\\crow-lab\\wt-27880\\build-27880\\bin\\Release\\llama-server.exe",
+    "CROW_MODELS": "<home>\\dev\\crow-lab\\models",
     "CROW_NVME_DEMAND_FIRST": "1",
     "CROW_PINNED_ALLOC": "host",
     "CROW_STAGE_PAR": "0",
-    "CROW_TOKENIZER": "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json"
+    "CROW_TOKENIZER": "<home>\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json"
   },
   "commit": "ae0b8a3848078e0a8ee8b47dbc24dec83bfee750",
   "binary": {
-    "path": "C:\\Users\\robin\\dev\\crow-nest\\engine\\target\\release\\glm5_run.EXE",
+    "path": "<home>\\dev\\crow-nest\\engine\\target\\release\\glm5_run.EXE",
     "mtime_unix_s": 1791966804
   },
   "container": {
-    "path": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+    "path": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
     "bytes": 124591634567,
     "record_bytes": 9474048,
     "experts": 288,
@@ -99,7 +99,7 @@
     "policy": "Lru",
     "pinned_use": "PinnedUse { stay: true, cpu_lane: true }",
     "arena": "Global",
-    "arena_config": "ArenaConfig { admit_max: 64, noadmit: false, warm: Some(\"C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json\"), vring: 24, elastic_bytes: 10737418240, stage_bytes: 2791728742, stage_min: 512, freq: true, regrow: true, lazy_refill: true, stage_lend: true, prompt_count: true, unified: false }",
+    "arena_config": "ArenaConfig { admit_max: 64, noadmit: false, warm: Some(\"<home>/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json\"), vring: 24, elastic_bytes: 10737418240, stage_bytes: 2791728742, stage_min: 512, freq: true, regrow: true, lazy_refill: true, stage_lend: true, prompt_count: true, unified: false }",
     "staging_slots": 16,
     "pinned_budget_bytes": 49392123904,
     "free_vram_at_plan_bytes": 32481738752,
@@ -120,7 +120,7 @@
   "mtp": {
     "drafts_per_step": 1,
     "planner_vram_reserved_bytes": 3207615578,
-    "overlay": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MTP-overlay.cnq"
+    "overlay": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MTP-overlay.cnq"
   },
   "machine_after_setup": {
     "vram_used_bytes": 32614600704,

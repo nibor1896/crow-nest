@@ -1,8 +1,8 @@
 #!/bin/bash
 # G3 (per layer + head, `decode glmgolden`, #161/#165 form) with the operating set arm3.env, twice, 2026-10-11.
 # Goldens: models/GLM-5.3-Flash-step06/ref-mul1-all (runner on the same 3-bit container, all 45 layers + head).
-R=/c/Users/robin/dev/crow-nest; D=$R/runs/glm53-flash/g3g4-20261011; E=$R/engine
-export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+R=<home>/dev/crow-nest; D=$R/runs/glm53-flash/g3g4-20261011; E=$R/engine
+export CROW_CNQ='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
 ARM="$(cat $R/runs/glm53-flash/quick/arm3.env)"
 cd $E
 echo "start $(date +%T) head $(git rev-parse --short HEAD) builds $(tasklist | grep -ciE 'cargo|rustc') decode.exe $(date -r target/release/decode.exe +%FT%T)" | tee $D/g3.log

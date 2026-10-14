@@ -1,6 +1,6 @@
-[log] file C:\Users\robin\AppData\Local\crow\logs\engine.log (rotate at 64.000 MiB, keep 8, gzip on rotation), stderr mirror on, filter info
-[glmgolden] golden C:/Users/robin/dev/crow-nest/models/GLM-5.3-Flash-step06/ref-mul1-all: 90 rows (T 86 + D 4), prompt in calls of 512 (5 calls), layers [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44], golden-fed (G3: cosine >= 0.9999 per layer, site and row group)
-[glmgolden] container C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq: 38 constants verified, routed experts 288 x 9474048 B (12096 records, codec mul1)
+[log] file <home>\AppData\Local\crow\logs\engine.log (rotate at 64.000 MiB, keep 8, gzip on rotation), stderr mirror on, filter info
+[glmgolden] golden <home>/dev/crow-nest/models/GLM-5.3-Flash-step06/ref-mul1-all: 90 rows (T 86 + D 4), prompt in calls of 512 (5 calls), layers [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44], golden-fed (G3: cosine >= 0.9999 per layer, site and row group)
+[glmgolden] container <home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq: 38 constants verified, routed experts 288 x 9474048 B (12096 records, codec mul1)
 [glmgolden] l0 kda+dense loaded in 0.1 s: 169280500 B to VRAM, 0 NVFP4 scale bytes 0x7F -> 0x7E (#177)
 [glmgolden] l0 computed in 0.02 s (taps synchronize: not a speed figure)
 glmgolden l0  attn pre        not compared (HF's hyper-connection does not return it)

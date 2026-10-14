@@ -24,7 +24,7 @@ import harness as h  # noqa: E402
 OUT = os.path.join(h.HERE, "215")
 os.makedirs(OUT, exist_ok=True)
 ROWS = os.path.join(OUT, "rows.jsonl")
-BEFORE_BIN = r"C:\Users\robin\dev\crow-nest-wt-accept-6944330\engine\target\release\serve.exe"
+BEFORE_BIN = r"<home>\dev\crow-nest-wt-accept-6944330\engine\target\release\serve.exe"
 SEED = 1408639702
 TXT = ("Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus "
        "write-through, and how false sharing hurts multithreaded code. Give concrete examples.")

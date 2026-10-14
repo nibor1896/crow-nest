@@ -2,7 +2,7 @@
 
 **Conditions:**
 - Hardware and model: RTX 5090, Windows 11. Container `converter/GLM-5.3-Flash-MUL1K3.cnq`, `runs/glm53-flash/quick/arm4.env`, `serve --port 8099`, `CROW_CONTEXT` unset (200,000), MTP off.
-- One engine at a time under `C:\Users\robin\dev\.gpu-lock`. Nothing else on the GPU, Crow closed.
+- One engine at a time under `<home>\dev\.gpu-lock`. Nothing else on the GPU, Crow closed.
 - Binaries:
   - **after** = local main `2a18fbc` (#215 + #218 + #219 + #217 + #216, new switches off).
   - **before** = `6944330` (the step-0 commit), built in a temporary worktree.

@@ -1,4 +1,4 @@
-## Step 1 measured (2026-10-11, RTX 5090, Windows 11, under `C:\Users\robin\dev\.gpu-lock`)
+## Step 1 measured (2026-10-11, RTX 5090, Windows 11, under `<home>\dev\.gpu-lock`)
 
 **Result: none of the three prompt-phase switches closes the long-prompt decode gap. The gap follows NVMe demand reads per decode token, about 2.5 ms per read. The 4,096-token synthetic prompt decodes as fast as the short one.**
 

@@ -2,7 +2,7 @@
   "tool": "glm5_run",
   "ticket": 187,
   "args": [
-    "C:\\Users\\robin\\dev\\crow-nest\\engine\\target\\release\\glm5_run.exe",
+    "<home>\\dev\\crow-nest\\engine\\target\\release\\glm5_run.exe",
     "-n",
     "64",
     "--reps",
@@ -15,14 +15,14 @@
     "CROW_GLM_GRAPH": "1",
     "CROW_GLM_PINNED": "zerocopy",
     "CROW_GLM_STAGER": "1",
-    "CROW_IMAGE_MODEL_DIR": "C:\\Users\\robin\\dev\\crow-lab\\models\\qwen-image-2.1",
-    "CROW_LLAMA_SERVER_FLASH_NEXT_Q2_K_XL": "C:\\Users\\robin\\dev\\crow-lab\\wt-27880\\build-27880\\bin\\Release\\llama-server.exe",
-    "CROW_MODELS": "C:\\Users\\robin\\dev\\crow-lab\\models",
+    "CROW_IMAGE_MODEL_DIR": "<home>\\dev\\crow-lab\\models\\qwen-image-2.1",
+    "CROW_LLAMA_SERVER_FLASH_NEXT_Q2_K_XL": "<home>\\dev\\crow-lab\\wt-27880\\build-27880\\bin\\Release\\llama-server.exe",
+    "CROW_MODELS": "<home>\\dev\\crow-lab\\models",
     "CROW_STAGE_PAR": "0"
   },
   "commit": "8e48fd6e98e9570645d3f501e58800a83e3b06c8",
   "binary": {
-    "path": "C:\\Users\\robin\\dev\\crow-nest\\engine\\target\\release\\glm5_run.exe",
+    "path": "<home>\\dev\\crow-nest\\engine\\target\\release\\glm5_run.exe",
     "mtime_unix_s": 1791577481
   },
   "container": {

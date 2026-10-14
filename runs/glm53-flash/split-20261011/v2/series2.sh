@@ -1,15 +1,15 @@
 #!/bin/bash
 # #213 step 1 (corrected): --vram-slots 37, -n 256 --reps 3 (rep 1 cold, reps 2-3 warm), arms alternated, n=2 processes per arm.
-# Takes C:\Users\robin\dev\.gpu-lock itself (waits for series 1 to release it), removes it on exit. DRY=1 prints only.
-W=/c/Users/robin/dev; WT=$W/crow-nest-wt-int; Q=$W/crow-nest/runs/glm53-flash/quick
+# Takes <home>\dev\.gpu-lock itself (waits for series 1 to release it), removes it on exit. DRY=1 prints only.
+W=<home>/dev; WT=$W/crow-nest-wt-int; Q=$W/crow-nest/runs/glm53-flash/quick
 OUT=$W/crow-nest/runs/glm53-flash/split-20261011/v2; mkdir -p $OUT
 E=$WT/engine; BIN=$E/target/release/glm5_run.exe
 if [ -z "$DRY" ]; then
   until mkdir $W/.gpu-lock 2>/dev/null; do sleep 5; done
   trap 'rmdir $W/.gpu-lock && echo "lock removed $(date +%T)" | tee -a $OUT/series.log' EXIT
 fi
-export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
-TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
+export CROW_CNQ='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+TOK='<home>\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
 ARM="$(cat $Q/arm2.env) CROW_GLM_RT2=1 $(cat $Q/arm3.env)"
 TXT="Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus write-through, and how false sharing hurts multithreaded code. Give concrete examples."
 REQ2=$W/crow-nest/runs/glm53-flash/split-20261011/req2-glm5-model.ids

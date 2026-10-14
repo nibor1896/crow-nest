@@ -8,7 +8,7 @@
  "served_model": "GLM-5.3-Flash-MUL1K3",
  "template": "glm",
  "server_props": {
-  "model_path": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+  "model_path": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
   "model": "GLM-5.3-Flash-MUL1K3",
   "n_ctx": 200000,
   "default_generation_settings": {

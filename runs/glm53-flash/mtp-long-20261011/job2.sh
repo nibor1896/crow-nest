@@ -1,13 +1,13 @@
 #!/bin/bash
-# run.sh's arms A B C without its own lock/rebuild (the caller holds C:\Users\robin\dev\.gpu-lock and built 045bfa0).
+# run.sh's arms A B C without its own lock/rebuild (the caller holds <home>\dev\.gpu-lock and built 045bfa0).
 # Usage: job2.sh N [extra env applied to all arms, e.g. CROW_GLM_KV_LAZY=4096]
-W=/c/Users/robin/dev; R=$W/crow-nest; D=$R/runs/glm53-flash/mtp-long-20261011; E=$R/engine; N=${1:-5500}; shift
+W=<home>/dev; R=$W/crow-nest; D=$R/runs/glm53-flash/mtp-long-20261011; E=$R/engine; N=${1:-5500}; shift
 ALL=("$@")
 cd $E || exit 1
 echo "job2 start $(date +%T) binary $(date -r target/release/glm5_run.exe '+%F %T') head $(git rev-parse --short HEAD) dirty $(git status --porcelain -- . | wc -l) N $N all-arms: ${ALL[*]}" | tee -a $D/run.log
-export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
-TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
-export CROW_GLM_MTP_OVERLAY='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MTP-overlay.cnq'
+export CROW_CNQ='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+TOK='<home>\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
+export CROW_GLM_MTP_OVERLAY='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MTP-overlay.cnq'
 ARM3="$(cat $R/runs/glm53-flash/quick/arm3.env)"
 NOLANE="$(echo "$ARM3" | tr ' ' '\n' | grep -v '^CROW_GLM_CPU_LANE=' | tr '\n' ' ')"
 run_arm() {  # label, env...

@@ -5,10 +5,10 @@
 #   A = arm3.env as is (CROW_GLM_CPU_LANE=split), MTP off   (the operating point)
 #   B = arm3.env without CROW_GLM_CPU_LANE, MTP off
 #   C = arm3.env without CROW_GLM_CPU_LANE, CROW_GLM_MTP=1  (MTP refuses the CPU lane: glm5_tiers.rs spec_check)
-# Waits for C:\Users\robin\dev\.gpu-lock and for no glm5_run/serve/decode process (poll 60 s), holds the lock for the
+# Waits for <home>\dev\.gpu-lock and for no glm5_run/serve/decode process (poll 60 s), holds the lock for the
 # whole job (bundle.sh convention), rebuilds glm5_run only if older than the engine sources.
 # Usage: run.sh [N]   (default N 5500)
-W=/c/Users/robin/dev; R=$W/crow-nest; D=$R/runs/glm53-flash/mtp-long-20261011; E=$R/engine; N=${1:-5500}
+W=<home>/dev; R=$W/crow-nest; D=$R/runs/glm53-flash/mtp-long-20261011; E=$R/engine; N=${1:-5500}
 LOCK=$W/.gpu-lock
 busy() { tasklist 2>/dev/null | grep -qiE "^(glm5_run|serve|decode)\.exe"; }
 echo "wait start $(date +%T)" | tee -a $D/run.log
@@ -26,9 +26,9 @@ if [ -n "$(find src Cargo.toml build.rs -newer target/release/glm5_run.exe -type
   cargo build --release --bin glm5_run > $D/build.log 2>&1 || { echo "build failed" | tee -a $D/run.log; exit 1; }
 fi
 echo "binary $(date -r target/release/glm5_run.exe '+%F %T') head $(git rev-parse --short HEAD) dirty $(git status --porcelain -- . | wc -l)" | tee -a $D/run.log
-export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
-TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
-export CROW_GLM_MTP_OVERLAY='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MTP-overlay.cnq'
+export CROW_CNQ='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+TOK='<home>\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
+export CROW_GLM_MTP_OVERLAY='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MTP-overlay.cnq'
 ARM3="$(cat $R/runs/glm53-flash/quick/arm3.env)"
 NOLANE="$(echo "$ARM3" | tr ' ' '\n' | grep -v '^CROW_GLM_CPU_LANE=' | tr '\n' ' ')"
 run_arm() {  # label, env...

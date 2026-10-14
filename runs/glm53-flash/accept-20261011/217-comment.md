@@ -7,7 +7,7 @@
 - Requests per replay:
   - t1 request 1 (seed 1408639702).
   - t2 request 1 (seed 1145815877).
-  - The third chat (t2's system message with the working area `C:\Users\robin\Desktop\g5-run1\t3-accept`, t1's user message, seed 1408639702, `logprobs` + `top_logprobs` 20).
+  - The third chat (t2's system message with the working area `<home>\Desktop\g5-run1\t3-accept`, t1's user message, seed 1408639702, `logprobs` + `top_logprobs` 20).
   - All with Crow's tools and sampling fields, `max_tokens` 64.
 - Raw: `runs/glm53-flash/accept-20261011/217/` (untracked: `rows.jsonl`, serve logs, `analysis.txt`). Scripts: `replays.py`, `bodies.py`.
 

@@ -1,13 +1,13 @@
 {
  "date": "2026-10-11",
  "commit": "298092b",
- "binary": "C:\\Users\\robin\\dev\\crow-nest\\engine\\target\\release\\serve.exe",
+ "binary": "<home>\\dev\\crow-nest\\engine\\target\\release\\serve.exe",
  "env": {
   "CROW_GLM_PINNED": "zerocopy",
   "CROW_GLM_FLAGS": "1",
   "CROW_GLM_STAGER": "1",
   "CROW_GLM_ARENA": "global",
-  "CROW_GLM_ARENA_WARM": "C:/Users/robin/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json",
+  "CROW_GLM_ARENA_WARM": "<home>/dev/crow-nest-wt-int/runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json",
   "CROW_GLM_ARENA_ELASTIC_GB": "10",
   "CROW_GLM_ARENA_STAGE_GB": "2.6",
   "CROW_GLM_CPU_LANE": "split",
@@ -36,10 +36,10 @@
   "CROW_GLM_ATTN_FUSE": "1",
   "CROW_GLM_RT2_GATHER_EARLY": "1",
   "CROW_GLM_ARENA_PROMPT_COUNT": "1",
-  "CROW_CNQ": "C:\\Users\\robin\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
-  "CROW_TOKENIZER": "C:\\Users\\robin\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json"
+  "CROW_CNQ": "<home>\\dev\\crow-nest\\converter\\GLM-5.3-Flash-MUL1K3.cnq",
+  "CROW_TOKENIZER": "<home>\\dev\\crow-nest\\models\\GLM-5.3-Flash-original\\tokenizer.json"
  },
- "prompt": "C:\\Users\\robin\\dev\\crow-lab\\runs\\2026-08-28-flash-next\\prompt-33k.txt",
+ "prompt": "<home>\\dev\\crow-lab\\runs\\2026-08-28-flash-next\\prompt-33k.txt",
  "prompt_sha256": "62141cb4f43e4151c41bfbc0446821c42ec59509ffae2da8c5c47a9bca1bfcde",
  "commit_limit_gib": 103.38,
  "rows": [

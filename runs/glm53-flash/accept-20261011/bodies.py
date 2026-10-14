@@ -13,7 +13,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CROW = r"C:\Users\robin\dev\Crow\cli"
+CROW = r"<home>\dev\Crow\cli"
 SESS = os.path.join(os.environ["LOCALAPPDATA"], "crow", "session")
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 MODEL_DIR = os.path.join(REPO, "models", "GLM-5.3-Flash-original")
@@ -60,7 +60,7 @@ def t2(i, **kw):
     return body(m[:n], kw.pop("seed", T2_SEED1 if i == 1 else 0), **kw)
 
 
-THIRD_AREA = r"C:\Users\robin\Desktop\g5-run1\t3-accept"
+THIRD_AREA = r"<home>\Desktop\g5-run1\t3-accept"
 
 
 def third(**kw):

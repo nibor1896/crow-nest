@@ -74,7 +74,7 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 | `arm2.env` + `CROW_GLM_RT2=1` | 999.47 tok/s | 8.20 s | 11.71 tok/s | 11.45 tok/s | 2026-10-10 | `quick/b1-base` |
 | `arm3.env` (crow-nest v0.11.0 operating set) | 1137.54 tok/s | 7.20 s | 16.84 tok/s | 16.27 tok/s | 2026-10-10 | `quick/b6-promptcount` |
 
-- Operating set since 2026-10-11: `runs/glm53-flash/quick/arm4.env` = `arm3.env` + `CROW_GLM_KV_LAZY=4096` (#214, robin 2026-10-11; the code default stays off). Measured in `serve`, not in the 3-minute check: the quick request (57 prompt ids, `temperature` 0, 128 tokens), 3 cold boots per arm alternated, build `732369c`, `CROW_CONTEXT` 200,000: decode 67.19 -> 60.29 ms/token median (-10.3 %), raw data `runs/glm53-flash/kvlazy-20261011/recheck/` (local), #214 comment of 2026-10-11.
+- Operating set since 2026-10-11: `runs/glm53-flash/quick/arm4.env` = `arm3.env` + `CROW_GLM_KV_LAZY=4096` (#214, robin 2026-10-11; the code default stays off). Measured in `serve`, not in the 3-minute check: the quick request (57 prompt ids, `temperature` 0, 128 tokens), 3 cold boots per arm alternated, build `732369c`, `CROW_CONTEXT` 200,000: decode 67.19 -> 60.29 ms/token median (-10.3 %), raw data `runs/glm53-flash/kvlazy-20261011/recheck/`, #214 comment of 2026-10-11.
 
 - Decode is bound by one NVMe: on the routing of the cold decode check Belady MIN still sources 18.77 experts per token from NVMe, the operating set's policy 25.04 (`tools/glm_tier_sim.py arena`, 7,436 slots, `runs/glm53-flash/cache-sim-20261010m/`, 2026-10-10).
 

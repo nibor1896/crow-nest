@@ -28,7 +28,7 @@ SERVE = os.path.join(ENGINE, "target", "release", "serve.exe")
 CNQ = os.path.join(REPO, "converter", "GLM-5.3-Flash-MUL1K3.cnq")
 TOK = os.path.join(REPO, "models", "GLM-5.3-Flash-original", "tokenizer.json")
 ARM3 = os.path.join(REPO, "runs", "glm53-flash", "quick", "arm3.env")
-PROMPT33K = r"C:\Users\robin\dev\crow-lab\runs\2026-08-28-flash-next\prompt-33k.txt"
+PROMPT33K = r"<home>\dev\crow-lab\runs\2026-08-28-flash-next\prompt-33k.txt"
 URL = "http://127.0.0.1:8099"
 GIB = 1024 ** 3
 

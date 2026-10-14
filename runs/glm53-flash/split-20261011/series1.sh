@@ -1,12 +1,12 @@
 #!/bin/bash
-# Decode-after-long-prompt split, 2026-10-11. Lock C:\Users\robin\dev\.gpu-lock is taken by the caller; removed on exit.
+# Decode-after-long-prompt split, 2026-10-11. Lock <home>\dev\.gpu-lock is taken by the caller; removed on exit.
 # DRY=1 prints the commands only.
-W=/c/Users/robin/dev; WT=$W/crow-nest-wt-int; Q=$W/crow-nest/runs/glm53-flash/quick
+W=<home>/dev; WT=$W/crow-nest-wt-int; Q=$W/crow-nest/runs/glm53-flash/quick
 OUT=$W/crow-nest/runs/glm53-flash/split-20261011; mkdir -p $OUT
 E=$WT/engine; BIN=$E/target/release/glm5_run.exe
 [ -z "$DRY" ] && trap 'rmdir $W/.gpu-lock && echo "lock removed $(date +%T)" | tee -a $OUT/series.log' EXIT
-export CROW_CNQ='C:\Users\robin\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
-TOK='C:\Users\robin\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
+export CROW_CNQ='<home>\dev\crow-nest\converter\GLM-5.3-Flash-MUL1K3.cnq'
+TOK='<home>\dev\crow-nest\models\GLM-5.3-Flash-original\tokenizer.json'; export CROW_TOKENIZER="$TOK"
 ARM="$(cat $Q/arm2.env) CROW_GLM_RT2=1 $(cat $Q/arm3.env)"   # as bundle.sh -> quick.sh applies arm3.env
 TXT="Explain in detail how a modern CPU cache hierarchy works: L1, L2, L3, coherence protocols, write-back versus write-through, and how false sharing hurts multithreaded code. Give concrete examples."
 LONG="--prompt-ids $Q/prefill8192.ids --prompt-tokens 4096"
