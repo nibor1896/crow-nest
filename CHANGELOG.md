@@ -6,6 +6,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The 241 files `86c8195` emptied are back** (#231, 2026-10-14): the `<home>` path pass wrote every file it touched back empty (1,272,228 lines), among them the GLM operating sets `runs/glm53-flash/quick/arm{2,3,4}.env`, `runs/glm53-flash/PREREG.md`, the lever blocks and `docs/ten-task-prompts-crowlab.json`. Each file is restored from `86c8195^` with the replacement #231 asked for (`C:\Users\robin` in every spelling and the `C--Users-robin` temp slug become `<home>`): 1,933 lines differ from `86c8195^`, nothing else; all 203 `.json` files and every `.jsonl` line parse.
+- **`tools/gate-linux.sh` runs `cargo test` with `TMPDIR` on the disk** (#230, 2026-10-14): `/tmp` is tmpfs on the Linux machine, and the `nvme_source` pool / lane ordering tests read their file with `O_DIRECT` in 4 KiB pieces, assuming a drive's latency. From RAM 1 to 3 of them failed per run (2 of 2 runs); with `TMPDIR=engine/target/test-tmp` 3 of 3 runs passed 810 / 0. Engine code unchanged.
+
+### Measured
+
+- **Linux gate, the first since 2026-10-02** (#230, 2026-10-14, `1aa06b9`, RTX 5090 / Arch Linux / driver 610.57.04 / NVRTC 13.3.33): parity8 `148cb72e8e44`, parity512 `6e9cb25fff43`, p8tf `8f5e5ce8dcec` and run32 GREEN on the unchanged values of record, so the GLM-5.3-Flash series (v0.11.0 to v0.13.1) left Flash-Next's Linux path byte-identical. Only the pins were RED: `cargo test` 810 passed / 0 failed against `TESTS=462`, clippy 1,679 against 1,494. Re-pinned to 810 / 1,679 (lib 645, serve 143, glm5_run 11, parity 6, decode 5).
+
 ## 2026-10-13 — v0.13.1
 
 **serve on glm5_next names the next-layer guesses of every request and logs which host wait a stalled decode row is in.** v0.13.1 carries the log-only changes merged since v0.13.0 (PR #234's #232 fix and docs, PR #235 `b77adc2` and `56c6573`, merge `2145f7b`) and the release commit:

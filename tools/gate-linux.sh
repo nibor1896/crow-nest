@@ -282,8 +282,16 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="462"
-CLIPPY="1494"
+TESTS="810"
+CLIPPY="1679"
+#   tests 462 -> 810 / clippy 1494 -> 1679   crow-nest #230, the first Linux gate since 2026-10-02 (2026-10-14,
+#                              1aa06b9 = main 86c8195 + the #231 restore, RTX 5090 / Arch / driver 610.57.04):
+#                              parity8, parity512, p8tf and run32 GREEN on the unchanged values of record; only
+#                              the two pins were RED. 810 = lib 645 + serve 143 + glm5_run 11 + parity 6 +
+#                              decode 5, the releases v0.9.1 to v0.13.1 (GLM-5.3-Flash series among them) that
+#                              shipped without this gate. Measured 3 of 3 runs 810 / 0 with TMPDIR on the disk
+#                              (the cargo test step below); on tmpfs 1 to 3 nvme_source ordering tests fail.
+#                              clippy +185 from the same releases, counted as below (`^warning: ` lines).
 #   tests 460 -> 462 / clippy 1494 (unchanged)   crow-nest #131, serve off the build machine (2026-10-01, 7726c37): +2
 #                              `the_default_lock_lives_in_the_per_user_state_dir_and_crow_lock_still_wins`,
 #                              `a_relative_default_falls_back_from_the_cwd_to_the_exe_root_and_the_exe_folder`.
@@ -609,7 +617,12 @@ else
 fi
 
 # 10) host-side checks - no GPU, no model
-( cd "$root/engine" && env LD_LIBRARY_PATH="$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" cargo test --release > "$out/cargo-test.log" 2>&1 )
+# TMPDIR on the disk, not /tmp: /tmp is tmpfs here, and the nvme_source pool/lane ordering tests
+# read their 16 MiB file with O_DIRECT in 4 KiB pieces, assuming a drive's latency (Windows' temp
+# dir is on the NVMe). From RAM the prefetch is done before the demand read starts and 1 to 3 of
+# them fail per run (2 of 2 runs red on tmpfs, 3 of 3 green on disk, 2026-10-14).
+ttmp="$root/engine/target/test-tmp"; rm -rf "$ttmp"; mkdir -p "$ttmp"
+( cd "$root/engine" && env TMPDIR="$ttmp" LD_LIBRARY_PATH="$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" cargo test --release > "$out/cargo-test.log" 2>&1 )
 tpass=$(grep -hoE '^test result: ok\. [0-9]+ passed' "$out/cargo-test.log" | awk '{s+=$4} END{print s+0}')
 tfail=$(grep -hoE '[0-9]+ failed' "$out/cargo-test.log" | awk '{s+=$1} END{print s+0}')
 if [ "$tpass" = "$TESTS" ] && [ "$tfail" = "0" ]; then green "cargo test" "$tpass passed, 0 failed"
