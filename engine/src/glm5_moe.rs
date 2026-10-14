@@ -588,6 +588,10 @@ struct Rt2Buf {
     /// #202 R: `glm5_moe_gather` when `CROW_GLM_RT2_GATHER_EARLY=1` (read when the buffer is
     /// made; tests set it), else null: [`GpuMoePlan::lane_x_early`] queues the gather with it
     gather_early: std::cell::Cell<usize>,
+    /// #192: `{t * K, H}` for a plan of `t > 1` rows (`glm5_moe_tables_in` copies `2 t K` words;
+    /// a gather with it puts one row of x into every slot of its grid); 0 at one row, where
+    /// `prm_kh2` is that
+    prm_c: CUdeviceptr,
 }
 
 /// #202 early reply: the late pass of [`GpuMoePlan::experts_late`]: `slots` record bases, the
@@ -676,24 +680,25 @@ impl GpuMoePlan {
         }
     }
 
-    /// #202 RT2 (one row): queue the MoE input row `x` `[H]` f32 into the CPU lane's host buffer
-    /// and its event now, ahead of the router's publish, so the host has x once it saw the flag;
-    /// the coming [`GpuMoePlan::experts`] call does not copy it again (and drops the mark).
+    /// #202 RT2: queue the MoE input rows `x` `[T][H]` f32 into the CPU lane's host buffer and
+    /// its event now, ahead of the router's publish, so the host has x once it saw the flag; the
+    /// coming [`GpuMoePlan::experts`] call does not copy it again (and drops the mark). #192: a
+    /// verify call's `T` rows too (the buffer of `experts_lane`'s layout).
     ///
     /// # Safety
-    /// `x` holds the MoE input written by work queued before; `tokens == 1`.
+    /// `x` holds the MoE input written by work queued before.
     pub unsafe fn lane_x_early(&self, x: CUdeviceptr) {
         use cudarc::driver::sys;
-        assert_eq!(self.tokens, 1, "glm5_moe: RT2's early x is a one-row call");
-        let (h, k) = (self.geo.hidden, self.geo.topk);
-        let buf = self.lane.get_or_init(|| LaneBuf::new(h, k, 1));
+        let (h, k, t) = (self.geo.hidden, self.geo.topk, self.tokens);
+        let buf = self.lane.get_or_init(|| LaneBuf::new(h, t * k, t));
         let s = cuda::cur_stream();
-        cuda::ck(sys::cuMemcpyDtoHAsync_v2(buf.host.host, x, h * 4, s));
+        cuda::ck(sys::cuMemcpyDtoHAsync_v2(buf.host.host, x, t * h * 4, s));
         cuda::event_record(buf.ev as sys::CUevent, s);
         self.x_early.set(true);
         // #202 R (`CROW_GLM_RT2_GATHER_EARLY`, from the plan's second RT2 call on): the RT2
-        // gather reads only the router's ids and x, so it goes ahead of the publish too
-        if let Some(tb) = self.rt2.get().filter(|tb| tb.gather_early.get() != 0) {
+        // gather reads only the router's ids and x, so it goes ahead of the publish too (one row
+        // only: `T` rows gather by their early / late slot runs, known after the expert hook)
+        if let Some(tb) = self.rt2.get().filter(|tb| tb.gather_early.get() != 0 && t == 1) {
             launch_v(tb.gather_early.get() as sys::CUfunction, h.div_ceil(256) as u32, k as u32, 1, 256, &[self.ids, tb.zero_table, x, self.ptrs, self.xg, self.prm_kh2]);
             self.gather_early.set(x);
         }
@@ -751,7 +756,7 @@ impl GpuMoePlan {
         let x_queued = self.x_early.replace(false);
         // #202 R: the gather queued ahead of the publish serves only an RT2 call on the same x
         // (every other path gathers through its table again, over it)
-        let gathered = self.gather_early.replace(0) == x && x != 0;
+        let gathered = self.gather_early.replace(0) == x && x != 0 && self.tokens == 1;
         if let Some(mut call) = lane::take(table, self.tokens, self.geo.topk) {
             if let Some(rt) = call.rt2.take() {
                 return self.experts_rt2(kn, mk, gk, w, x, y, call, rt, x_queued, gathered);
@@ -985,6 +990,15 @@ impl GpuMoePlan {
     ///
     /// The compute stream always waits for the stager's event before the combine, so as before
     /// every stager batch has run before the next router flag.
+    ///
+    /// #192: a call of `T` rows (an MTP verify call): `T x K` combos, combo c of
+    /// row c / K. Slots stay early then late, each group in combo order, so its slots form one run
+    /// per row; every run gets its row of x by one `glm5_moe_gather` with `{T K, H}` (c / (T K) =
+    /// 0 for every slot of the grid: the row at `x + r H`), at most 2 T launches, then the same
+    /// two passes. The CPU lane runs one pool run per row (as `experts_lane`), and
+    /// `glm5_moe_combine_rows` sums every row (grid y = T). Each slot's row is the one the plan's
+    /// `experts_merge` computes for that combo, so each row keeps its bits; one row: the launches
+    /// of record.
     #[allow(clippy::too_many_arguments)]
     unsafe fn experts_rt2(
         &self,
@@ -1001,25 +1015,32 @@ impl GpuMoePlan {
     ) {
         use cudarc::driver::sys;
         let g = &self.geo;
-        let (h, k, ie) = (g.hidden, g.topk, g.expert_inter);
-        assert!(self.tokens == 1 && call.combos.len() == k && rt.late.len() == k, "glm5_moe: RT2 is a one-row call of top-k combos");
+        let (h, k, ie, t) = (g.hidden, g.topk, g.expert_inter, self.tokens);
+        // #192: `t` rows of `k` combos (one row: the call of record)
+        let ca = t * k;
+        assert!(call.combos.len() == ca && rt.late.len() == ca, "glm5_moe: RT2 takes {t} rows x {k} combos, got {} combos and {} late marks", call.combos.len(), rt.late.len());
         lane::RT2_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if t > 1 {
+            lane::RT2_ROWS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let rb = g.record.bytes as usize;
-        let buf = self.lane.get_or_init(|| LaneBuf::new(h, k, 1));
+        let buf = self.lane.get_or_init(|| LaneBuf::new(h, ca, t));
         let tb = self.rt2.get_or_init(|| Rt2Buf {
-            host: cuda::Pinned::alloc(2 * k * 8),
-            dev: cuda::alloc_zeroed(2 * k * 8),
+            host: cuda::Pinned::alloc(2 * ca * 8),
+            dev: cuda::alloc_zeroed(2 * ca * 8),
             zero_table: cuda::alloc_zeroed(g.experts * 8),
             ev_early: cuda::event_create() as u64,
             sm: std::cell::Cell::new(lane::rt2_table_sm_on()),
             gather_early: std::cell::Cell::new(if lane::rt2_gather_early_on() { gk.gather as usize } else { 0 }),
+            prm_c: if t > 1 { i32_dev(&[ca, h]) } else { 0 },
         });
+        let prm_c = if tb.prm_c != 0 { tb.prm_c } else { self.prm_kh2 };
         let host = buf.host.host as *mut u8;
-        let (xh, yh) = (host as *const f32, host.add(h * 4 + k * 8) as *mut f32);
-        let yh_dev = buf.host.dev + (h * 4 + k * 8) as u64;
+        let (xh, yh) = (host as *const f32, host.add(t * h * 4 + ca * 8) as *mut f32);
+        let yh_dev = buf.host.dev + (t * h * 4 + ca * 8) as u64;
         let s = cuda::cur_stream();
         let ev = buf.ev as sys::CUevent;
-        let (mut early, mut late, mut cpu) = (Vec::with_capacity(k), Vec::with_capacity(k), Vec::with_capacity(k));
+        let (mut early, mut late, mut cpu) = (Vec::with_capacity(ca), Vec::with_capacity(ca), Vec::with_capacity(ca));
         for (c, combo) in call.combos.iter().enumerate() {
             match *combo {
                 lane::Combo::Gpu(base) if rt.late[c] => late.push((c, base)),
@@ -1031,7 +1052,7 @@ impl GpuMoePlan {
             }
         }
         if !x_queued && !cpu.is_empty() {
-            cuda::ck(sys::cuMemcpyDtoHAsync_v2(xh as *mut _, x, h * 4, s));
+            cuda::ck(sys::cuMemcpyDtoHAsync_v2(xh as *mut _, x, t * h * 4, s));
             cuda::event_record(ev, s);
         }
         let (ne, nl) = (early.len(), late.len());
@@ -1040,14 +1061,23 @@ impl GpuMoePlan {
         let hp = tb.host.host as *mut u64;
         for (j, &(c, base)) in early.iter().chain(&late).enumerate() {
             *hp.add(j) = base;
-            *hp.add(k + c) = self.ye + (j * h * 4) as u64;
+            *hp.add(ca + c) = self.ye + (j * h * 4) as u64;
         }
         for (i, &(c, _)) in cpu.iter().enumerate() {
-            *hp.add(k + c) = yh_dev + (i * h * 4) as u64;
+            *hp.add(ca + c) = yh_dev + (i * h * 4) as u64;
         }
-        // #202 R: queued before the publish when `gathered` (the same launch on the same ids and x)
-        if !gathered {
-            launch_v(gk.gather, h.div_ceil(256) as u32, k as u32, 1, 256, &[self.ids, tb.zero_table, x, self.ptrs, self.xg, self.prm_kh2]);
+        if t == 1 {
+            // #202 R: queued before the publish when `gathered` (the same launch on the same ids and x)
+            if !gathered {
+                launch_v(gk.gather, h.div_ceil(256) as u32, k as u32, 1, 256, &[self.ids, tb.zero_table, x, self.ptrs, self.xg, self.prm_kh2]);
+            }
+        } else {
+            // #192: one gather per run of slots of one row (its `ptrs` writes read the zeroed
+            // table and go unused: the passes read `tb.dev`)
+            let combo_of: Vec<usize> = early.iter().chain(&late).map(|x| x.0).collect();
+            for (j0, n, r) in slot_runs(&combo_of, ne, k) {
+                launch_v(gk.gather, h.div_ceil(256) as u32, n as u32, 1, 256, &[self.ids, tb.zero_table, x + (r * h * 4) as u64, self.ptrs, self.xg + (j0 * h * 4) as u64, prm_c]);
+            }
         }
         if tb.sm.get() {
             // #202 CROW_GLM_RT2_TABLE_SM: the SMs copy the words from the mapped buffer (one
@@ -1060,9 +1090,9 @@ impl GpuMoePlan {
             // after this kernel and after every launch below that reads `tb.dev` (late pass,
             // combine_rows); the next call's kernel overwrites `tb.dev` behind them in stream
             // order. Cacheable pinned memory, host stores before the launch: the kernel sees them.
-            launch_v(gk.tables_in, 1, 1, 1, 32, &[tb.host.dev, tb.dev, self.prm_kh2]);
+            launch_v(gk.tables_in, 1, 1, 1, 32, &[tb.host.dev, tb.dev, prm_c]);
         } else {
-            cuda::upload_from_pinned(tb.dev, hp as *const _, 2 * k * 8);
+            cuda::upload_from_pinned(tb.dev, hp as *const _, 2 * ca * 8);
         }
         let pass = |off: usize, n: usize| {
             let p = tb.dev + (off * 8) as u64;
@@ -1097,16 +1127,26 @@ impl GpuMoePlan {
             let start_in_gpu = ne > 0 && busy();
             let t0 = std::time::Instant::now();
             let limit = g.swiglu_limit;
-            let es: Vec<Mul1Expert> = cpu
-                .iter()
-                .map(|&(c, rec)| Mul1Expert::from_record(std::slice::from_raw_parts(rec, rb), h, ie, g.bitrate).unwrap_or_else(|e| panic!("glm5_moe RT2 lane: combo {c}: {e}")))
-                .collect();
-            let ys = std::slice::from_raw_parts_mut(yh, cpu.len() * h);
-            cpu_mul1::experts_ffn(&es, std::slice::from_raw_parts(xh, h), ys, &move |a, b| swiglu_clamp(a, b, limit), lane::threads(), Path::Auto);
+            // one pool run per row over the row's CPU combos (one row: every CPU combo, the run
+            // of record); `cpu` is in combo order, so the rows land at their row-table entries
+            let mut at = 0;
+            for r in 0..t {
+                let mine: Vec<(usize, *const u8)> = cpu.iter().copied().filter(|&(c, _)| c / k == r).collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                let es: Vec<Mul1Expert> = mine
+                    .iter()
+                    .map(|&(c, rec)| Mul1Expert::from_record(std::slice::from_raw_parts(rec, rb), h, ie, g.bitrate).unwrap_or_else(|e| panic!("glm5_moe RT2 lane: combo {c}: {e}")))
+                    .collect();
+                let ys = std::slice::from_raw_parts_mut(yh.add(at * h), mine.len() * h);
+                cpu_mul1::experts_ffn(&es, std::slice::from_raw_parts(xh.add(r * h), h), ys, &move |a, b| swiglu_clamp(a, b, limit), lane::threads(), Path::Auto);
+                at += mine.len();
+            }
             call.clock.add(t0.elapsed(), cpu.len());
             call.clock.add_rt2(start_in_gpu, ne > 0 && busy());
         }
-        launch_v(gk.combine_rows, h.div_ceil(256) as u32, 1, 1, 256, &[tb.dev + (k * 8) as u64, self.wts, self.ys, y, self.prm_kh2]);
+        launch_v(gk.combine_rows, h.div_ceil(256) as u32, t as u32, 1, 256, &[tb.dev + (ca * 8) as u64, self.wts, self.ys, y, self.prm_kh2]);
     }
 
     /// the routing of the last `run` (synchronizes)
@@ -1161,6 +1201,9 @@ impl GpuMoePlan {
             b.host.free();
             cuda::free_dev(&mut b.dev);
             cuda::free_dev(&mut b.zero_table);
+            if b.prm_c != 0 {
+                cuda::free_dev(&mut b.prm_c);
+            }
             cuda::event_destroy(b.ev_early as cudarc::driver::sys::CUevent);
         }
     }
@@ -2096,11 +2139,27 @@ impl LaneBuf {
     }
 }
 
+/// #192 RT2 of `t` rows: the slots' combos `combo_of` (the early group's `ne` first, then the
+/// late group, each in combo order) as runs of one row each: (first slot, slots, row = combo / k).
+/// A run never crosses the early / late border.
+fn slot_runs(combo_of: &[usize], ne: usize, k: usize) -> Vec<(usize, usize, usize)> {
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for (j, &c) in combo_of.iter().enumerate() {
+        let r = c / k;
+        match runs.last_mut() {
+            Some(last) if last.2 == r && j != ne && last.0 + last.1 == j => last.1 += 1,
+            _ => runs.push((j, 1, r)),
+        }
+    }
+    runs
+}
+
 /// #188 CPU lane hand-off. `glm5_tiers::ExpertTiers::table_for` (the expert hook) posts the
 /// combos of a decode call here; [`GpuMoePlan::experts`] of the same thread takes them when its
 /// `table` is the posted one, so the expert hook and its call site (`glm5_model.rs`
-/// `call_with_experts`) stay as they are. Anything else (no post, another table, `t > 1`, no CPU
-/// combo) runs the GPU path unchanged; a post is consumed by the next `experts` call either way.
+/// `call_with_experts`) stay as they are. Anything else (no post, another table, another shape,
+/// no CPU combo and no RT2 split) runs the GPU path unchanged (an RT2 post behind its stager's
+/// event, `take`); a post is consumed by the next `experts` call either way.
 /// Every CPU combo's table entry stays a valid pinned record base, so the GPU path is also
 /// correct for a post that is not taken.
 pub mod lane {
@@ -2167,6 +2226,9 @@ pub mod lane {
 
     /// #202 RT2: calls run by `GpuMoePlan::experts_rt2` since the process started (tests)
     pub static RT2_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// #192: of them the calls of more than one row (an MTP verify call; tests)
+    pub static RT2_ROWS_CALLS: AtomicU64 = AtomicU64::new(0);
 
     /// the CPU lane's wall time and expert count, summed (shared with the counters' owner)
     #[derive(Debug, Default)]
@@ -2243,10 +2305,23 @@ pub mod lane {
     /// the posted call, if it is for `table`, a decode call of `tokens` rows (one, or a batched
     /// step of `CROW_GLM_MAX_BATCH`) with `tokens x topk` combos, at least one on the CPU; the
     /// post is consumed either way
+    ///
+    /// #192: an RT2 post of `tokens` rows is taken too. One that is not taken (another table,
+    /// another shape) leaves the compute stream waiting for its stager event here: its tiers
+    /// queued no wait (the RT2 call waits inside `experts_rt2`), and the GPU path must not read a
+    /// record before it landed.
     pub(crate) fn take(table: CUdeviceptr, tokens: usize, topk: usize) -> Option<Call> {
         let c = POSTED.with(|p| p.borrow_mut().take())?;
-        let rt2 = c.rt2.as_ref().is_some_and(|r| tokens == 1 && r.late.len() == c.combos.len());
-        (c.table == table && c.combos.len() == tokens * topk && (rt2 || c.combos.iter().any(|x| matches!(x, Combo::Cpu(_))))).then_some(c)
+        let rt2 = c.rt2.as_ref().is_some_and(|r| r.late.len() == c.combos.len());
+        let ok = c.table == table && c.combos.len() == tokens * topk && (rt2 || c.combos.iter().any(|x| matches!(x, Combo::Cpu(_))));
+        if !ok {
+            if let Some(r) = c.rt2.as_ref() {
+                // SAFETY: a live event of the tiers' stager, recorded before the post
+                unsafe { crate::cuda::stream_wait_event(crate::cuda::cur_stream(), r.event as cudarc::driver::sys::CUevent) };
+            }
+            return None;
+        }
+        Some(c)
     }
 }
 
@@ -2288,6 +2363,31 @@ mod tests {
         assert_eq!(mul1_bitrate(4096, 2048, cpu_mul1::record_bytes(4096, 2048, Bitrate { bits: 2, half: true }) as u64).unwrap(), Bitrate { bits: 2, half: true });
         let big = Glm5Geo { experts: 513, ..Glm5Geo::GLM_5_3_FLASH };
         assert!(MoeGeo::new(&big, g.record).is_err());
+    }
+
+    /// #192 RT2 of `t` rows: the early / late slot groups split into runs of one row, each run
+    /// one gather of its row of x; a run never crosses the group border or a row change
+    #[test]
+    fn glm5_moe_rt2_slot_runs_are_rows_inside_their_group() {
+        // one row: every group is one run of row 0
+        assert_eq!(slot_runs(&[0, 2, 5, 1, 3, 4, 6, 7], 3, 8), vec![(0, 3, 0), (3, 5, 0)]);
+        assert_eq!(slot_runs(&[0, 1, 2, 3, 4, 5, 6, 7], 8, 8), vec![(0, 8, 0)]);
+        assert_eq!(slot_runs(&[0, 1, 2, 3, 4, 5, 6, 7], 0, 8), vec![(0, 8, 0)]);
+        // two rows of 8: early = combos 0, 3, 9, 15 (rows 0, 0, 1, 1), late = 1, 8, 10 (rows 0, 1, 1)
+        assert_eq!(slot_runs(&[0, 3, 9, 15, 1, 8, 10], 4, 8), vec![(0, 2, 0), (2, 2, 1), (4, 1, 0), (5, 2, 1)]);
+        // the same row on both sides of the border: two runs
+        assert_eq!(slot_runs(&[8, 9, 10, 11], 2, 8), vec![(0, 2, 1), (2, 2, 1)]);
+        // three rows, no early slot; every slot covered once, in order
+        let combos: Vec<usize> = (0..24).filter(|c| c % 3 != 0).collect();
+        let runs = slot_runs(&combos, 0, 8);
+        assert_eq!(runs.iter().map(|r| r.2).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let mut j = 0;
+        for &(j0, n, r) in &runs {
+            assert_eq!(j0, j);
+            assert!(combos[j0..j0 + n].iter().all(|c| c / 8 == r));
+            j += n;
+        }
+        assert_eq!(j, combos.len());
     }
 
     #[test]
@@ -3544,6 +3644,157 @@ mod tests {
             free_ffn(w.shared);
             let (mut wr, mut wb) = (w.router, w.bias);
             for d in [&mut tp, &mut xd, &mut yd, &mut y2, &mut wr, &mut wb] {
+                cuda::free_dev(d);
+            }
+            pinned.free();
+        }
+    }
+
+    /// #192 RT2 of a verify call (`GpuMoePlan::experts_rt2`, T 2; row 1 is x reversed, so the
+    /// rows route differently; every record in pinned RAM). Each row of the GPU-only two-row run
+    /// has the bits of a one-row plan's run on that row. For CPU / late masks over the 16 combos
+    /// (none, one row late, both rows mixed, all CPU), with the stager's event held: `run`
+    /// returns with the lane's per-row runs done and the layer not ended, the event behind the
+    /// early pass completes under the hold, and once the hold is released `y` (both rows) has the
+    /// bits of `experts_lane` for the same CPU set (no CPU combo: the GPU-only run's bits), with
+    /// the tables by H2D and by `glm5_moe_tables_in`, x copied by the call or queued ahead
+    /// (`lane_x_early`), MUL1_FUSE off and on. An RT2 post the plan does not take (another
+    /// table) still holds the layer behind the stager's event (`lane::take`).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_moe_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_moe_gpu_rt2_rows_of_a_verify_call_keep_their_bits() {
+        use cudarc::driver::sys;
+        use std::sync::Arc;
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let (_m, kn) = main_kernels();
+            let mk = mul1::Kernels::new();
+            let gk = kernels::glm5_moe::Kernels::new();
+            let (s, g) = (synth(), geo());
+            let (h, k, t) = (4096usize, g.topk, 2usize);
+            let rb = cpu_mul1::GLM_RECORD_BYTES_K3;
+            let recs: Vec<u8> = (0..4u32).flat_map(record).collect();
+            let mut pinned = cuda::Pinned::alloc(recs.len());
+            pinned.write_bytes(0, &recs);
+            let slot = |e: u32| (e % 4) as usize;
+            let table: Vec<u64> = (0..g.experts as u32).map(|e| pinned.dev + (rb * slot(e)) as u64).collect();
+            let mut tp = cuda::to_u64_dev(&table);
+            let w = GpuMoeWeights { router: cuda::upload_dev(&le_u16(&s.router_w)), bias: cuda::to_f32_dev(&s.bias), shared: gpu_ffn(&s.shared) };
+            let mut plan = GpuMoePlan::new(&g, t);
+            plan.set_mul1_fuse(false);
+            let mut one = GpuMoePlan::new(&g, 1);
+            one.set_mul1_fuse(false);
+            let x0 = &s.x_moe[..h];
+            let x1: Vec<f32> = x0.iter().rev().copied().collect();
+            let xs: Vec<f32> = x0.iter().chain(&x1).copied().collect();
+            let (mut xd, mut yd, mut y1) = (cuda::to_f32_dev(&xs), cuda::alloc_zeroed(t * h * 4), cuda::alloc_zeroed(h * 4));
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            lane::post(None);
+            plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+            cuda::sync();
+            let y_gpu = bits(&cuda::dtoh(yd, t * h));
+            let ids: Vec<u32> = cuda::dtoh_i32(plan.ids, t * k).into_iter().map(|v| v as u32).collect();
+            assert_ne!(ids[..k], ids[k..], "the two rows must route differently for the test to mean something");
+            for r in 0..t {
+                one.run(&kn, &mk, &gk, &w, tp, xd + (r * h * 4) as u64, y1);
+                cuda::sync();
+                assert_eq!(bits(&cuda::dtoh(y1, h)), y_gpu[r * h..(r + 1) * h], "row {r}: the two-row plan vs a one-row call");
+            }
+            let host = pinned.host as *const u8;
+            let combos = |mask: u32| -> Vec<lane::Combo> {
+                ids.iter()
+                    .enumerate()
+                    .map(|(c, &e)| if mask >> c & 1 == 1 { lane::Combo::Cpu(host.add(rb * slot(e))) } else { lane::Combo::Gpu(table[e as usize]) })
+                    .collect()
+            };
+            let clock = Arc::new(lane::Clock::default());
+            let mut word = cuda::Pinned::alloc(4096);
+            std::ptr::write_bytes(word.host as *mut u8, 0, word.bytes);
+            let side = cuda::stream_create_non_blocking();
+            let held = cuda::event_create();
+            let fin = cuda::event_create();
+            // one RT2 call with a free event makes the plan's tables, so the test sets the switch
+            cuda::event_record(held, side);
+            lane::post(Some(lane::Call { table: tp, combos: combos(0), clock: clock.clone(), ready: None, rt2: Some(lane::Rt2 { event: held as u64, late: vec![false; t * k] }) }));
+            plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+            cuda::sync();
+            assert_eq!(bits(&cuda::dtoh(yd, t * h)), y_gpu, "an RT2 call of two rows, nothing late");
+            let rows0 = lane::RT2_ROWS_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut v = 0u64;
+            let mut calls = 0u64;
+            let cases = [(0x0000u32, 0x0000u32), (0x0000, 0x8001), (0x0000, 0xFF00), (0x0003, 0x0300), (0x0F00, 0x00F0), (0x5050, 0x0A0A), (0xFFFF, 0x0000)];
+            for (i, (cpu, late)) in cases.into_iter().enumerate() {
+                plan.set_mul1_fuse(false);
+                lane::post((cpu != 0).then(|| lane::Call { table: tp, combos: combos(cpu), clock: clock.clone(), ready: None, rt2: None }));
+                plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+                cuda::sync();
+                let y_ref = bits(&cuda::dtoh(yd, t * h));
+                if cpu == 0 {
+                    assert_eq!(y_ref, y_gpu, "case {i}: the GPU path without a post");
+                }
+                let late_v: Vec<bool> = (0..t * k).map(|c| late >> c & 1 == 1 && cpu >> c & 1 == 0).collect();
+                for (sm, early_x, fuse) in [(false, false, false), (true, true, false), (true, false, true), (false, true, true)] {
+                    plan.set_mul1_fuse(fuse);
+                    plan.rt2.get().expect("the RT2 tables").sm.set(sm);
+                    cuda::to_f32_into(yd, &vec![f32::NAN; t * h]);
+                    if early_x {
+                        plan.lane_x_early(xd);
+                    }
+                    cuda::sync();
+                    v += 1;
+                    cuda::ck(sys::cuStreamWaitValue64_v2(side, word.dev, v, 0));
+                    cuda::event_record(held, side);
+                    cuda::stream_query(side);
+                    let runs0 = clock.read_rt2().0;
+                    lane::post(Some(lane::Call { table: tp, combos: combos(cpu), clock: clock.clone(), ready: None, rt2: Some(lane::Rt2 { event: held as u64, late: late_v.clone() }) }));
+                    plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+                    calls += 1;
+                    cuda::event_record(fin, cuda::cur_stream());
+                    cuda::stream_query(cuda::cur_stream());
+                    let what = format!("case {i} cpu {cpu:04x} late {late:04x} sm {sm} x early {early_x} F {fuse}");
+                    assert_eq!(clock.read_rt2().0, runs0 + (cpu != 0) as u64, "{what}: the lane's run");
+                    assert_eq!(sys::cuEventQuery(fin), sys::CUresult::CUDA_ERROR_NOT_READY, "{what}: the layer ended before the stager's event");
+                    let ev_early = plan.rt2.get().expect("the RT2 tables").ev_early as sys::CUevent;
+                    let t0 = std::time::Instant::now();
+                    while sys::cuEventQuery(ev_early) == sys::CUresult::CUDA_ERROR_NOT_READY {
+                        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "{what}: the early pass did not run under the hold");
+                        std::hint::spin_loop();
+                    }
+                    assert_eq!(sys::cuEventQuery(fin), sys::CUresult::CUDA_ERROR_NOT_READY, "{what}: the layer ended before the stager's event");
+                    std::ptr::write_volatile(word.host as *mut u64, v);
+                    cuda::sync();
+                    assert_eq!(bits(&cuda::dtoh(yd, t * h)), y_ref, "{what}: y differs from experts_lane's");
+                }
+                eprintln!("glm5_moe RT2 two rows case {i} cpu {cpu:04x} late {late:04x}: y = experts_lane's bits in 4 arms");
+            }
+            assert_eq!(lane::RT2_ROWS_CALLS.load(std::sync::atomic::Ordering::Relaxed) - rows0, calls, "every two-row call went through experts_rt2");
+            // an RT2 post for another table: the GPU path, still behind the stager's event
+            v += 1;
+            cuda::ck(sys::cuStreamWaitValue64_v2(side, word.dev, v, 0));
+            cuda::event_record(held, side);
+            cuda::stream_query(side);
+            cuda::to_f32_into(yd, &vec![f32::NAN; t * h]);
+            cuda::sync();
+            lane::post(Some(lane::Call { table: tp + 8, combos: combos(0), clock: clock.clone(), ready: None, rt2: Some(lane::Rt2 { event: held as u64, late: vec![true; t * k] }) }));
+            plan.run(&kn, &mk, &gk, &w, tp, xd, yd);
+            cuda::event_record(fin, cuda::cur_stream());
+            cuda::stream_query(cuda::cur_stream());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(sys::cuEventQuery(fin), sys::CUresult::CUDA_ERROR_NOT_READY, "a refused RT2 post: the layer ran before the stager's event");
+            std::ptr::write_volatile(word.host as *mut u64, v);
+            cuda::sync();
+            assert_eq!(bits(&cuda::dtoh(yd, t * h)), y_gpu, "a refused RT2 post: the GPU path's bits");
+            lane::post(None);
+            cuda::sync();
+            cuda::event_destroy(held);
+            cuda::event_destroy(fin);
+            cuda::stream_destroy(side);
+            word.free();
+            plan.free();
+            one.free();
+            free_ffn(w.shared);
+            let (mut wr, mut wb) = (w.router, w.bias);
+            for d in [&mut tp, &mut xd, &mut yd, &mut y1, &mut wr, &mut wb] {
                 cuda::free_dev(d);
             }
             pinned.free();

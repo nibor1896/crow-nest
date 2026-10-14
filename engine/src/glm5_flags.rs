@@ -47,8 +47,14 @@
 //!   read are those of the path without it, so ids, logits and row reports are the same.
 //! - **`CROW_GLM_PREFETCH_SIDE=1`** (needs `CROW_GLM_PREFETCH=1`; the reference's
 //!   `GLM53_NV_PFSIDE`, `nv2.py` `predict_early`): the guess runs on a side stream, launched before
-//!   layer l's own router so the two overlap; the compute stream joins it before the publish. One
-//!   row only; inside a `CROW_GLM_GRAPH` capture it stays on the compute stream.
+//!   layer l's own router so the two overlap; the compute stream joins it before the publish.
+//!   Inside a `CROW_GLM_GRAPH` capture it stays on the compute stream.
+//! - **#192 (`CROW_GLM_MTP`'s verify call of `t = 1 + N` rows)**: [`Routed::rows`] holds calls of
+//!   up to the decode rows of `load`; each call publishes its own id count (a device table of
+//!   count words, so the publish kernels are those of one row), the guess runs on all `t` rows
+//!   (`gemv_bf16_b` grid (E, t), the router grid t) and reaches the host rank-major
+//!   ([`rank_major`]: every row's rank 0 first), and [`ENV_GUESS_TRIM_K`] keeps K per row. One
+//!   row: the layout and the launches of record.
 //! - **`CROW_GLM_SIDE_NOJOIN=1`** (#202 S, with `CROW_GLM_PREFETCH_SIDE=1`; [`ENV_SIDE_NOJOIN`]):
 //!   the side guess publishes itself. Behind its router the side stream copies the guess and its
 //!   layer into its own area of the mapped block and raises its own sequence word
@@ -553,13 +559,18 @@ impl Kernels {
 /// #149 path B: the router ids of one MoE call published into mapped pinned memory behind a
 /// sequence flag (see the module doc)
 pub struct Routed {
-    /// `[0]` the flag (u64), `[8]` the guess's layer (i32, prefetch), `[64..]` the ids (i32),
-    /// then the guess's `topk` ids (prefetch); at [`side_at`] the side guess's own publish (#202
-    /// S): its sequence word (u64), its layer (i32), its ids (i32)
+    /// `[0]` the flag (u64), `[8]` the guess's layer (i32, prefetch), `[64..]` the ids (i32,
+    /// room for `n`), then the guess's ids (prefetch, room for [`guess_cap`]); at [`side_at`] the
+    /// side guess's own publish (#202 S): its sequence word (u64), its layer (i32), its ids (i32)
     host: Pinned,
-    /// device: `[0]` the publish counter (u64), `[8]` the id count (i32)
+    /// device: `[0]` the publish counter (u64), `[8..]` the id counts (i32) of calls of 1, 2, ..
+    /// rows (`r * per_row` at `8 + 4 * (r - 1)`: the publish kernels read the call's own word)
     dev: Dev,
+    /// the capacity in ids (`rows x per_row`); the mapped layout is laid out for it
     n: usize,
+    /// #192: the ids of one row (`topk`), and those of the last publish
+    per_row: usize,
+    last_n: usize,
     seq: u64,
     publish: CUfunction,
     publish_pred: CUfunction,
@@ -568,7 +579,8 @@ pub struct Routed {
     /// #202 S: side guesses that published themselves, and the one the next publish leaves to
     /// the host: (guessed layer, its sequence number)
     side_seq: u64,
-    side_pending: Option<(usize, u64)>,
+    /// (guessed layer, sequence number, rows of the guess)
+    side_pending: Option<(usize, u64, usize)>,
     /// calls since construction, and how many of them found the flag already up on the first look
     pub calls: u64,
     pub ready_first_look: u64,
@@ -583,9 +595,38 @@ pub struct Routed {
 const IDS_AT: usize = 64;
 const TAG_AT: usize = 8;
 
+/// #192: the guess ids a block of `n` ids has room for (one row: `MAXK`, the layout of record)
+fn guess_cap(n: usize) -> usize {
+    n.max(crate::kernels::glm5_moe::MAXK)
+}
+
 /// #202 S: where the side guess's own publish starts in a block of `n` ids
 fn side_at(n: usize) -> usize {
-    (IDS_AT + (n + crate::kernels::glm5_moe::MAXK) * 4).next_multiple_of(64)
+    (IDS_AT + (n + guess_cap(n)) * 4).next_multiple_of(64)
+}
+
+/// #192: the count word (index into the device table at `+8`) of a call of `n` ids on a
+/// publisher of `rows` rows of `per_row` ids: `n / per_row - 1`; `None` for a call it does not
+/// hold (not whole rows, none, or more rows)
+fn count_word(per_row: usize, rows: usize, n: usize) -> Option<usize> {
+    (per_row > 0 && n > 0 && n % per_row == 0 && n / per_row <= rows).then(|| n / per_row - 1)
+}
+
+/// #192: the ids a guess of `rows` rows keeps under the trim's `K` (`K` best ranks per row of a
+/// rank-major guess); `None` = no trim
+fn trim_cap(trim: Option<usize>, rows: usize) -> Option<usize> {
+    trim.map(|k| k.saturating_mul(rows.max(1)))
+}
+
+/// #192: a guess of `rows` rows (`[rows][k]`, each row in rank order) rank-major: every row's
+/// rank 0, then every row's rank 1, ..., so a cut to `K x rows` keeps each row's best `K` and the
+/// reads go out best rank first. One row: unchanged.
+pub fn rank_major(ids: &[i32], rows: usize) -> Vec<i32> {
+    if rows <= 1 || ids.len() % rows != 0 {
+        return ids.to_vec();
+    }
+    let k = ids.len() / rows;
+    (0..k).flat_map(|j| (0..rows).map(move |r| ids[r * k + j])).collect()
 }
 
 /// `CROW_GLM_PREFETCH`: the guesses compared with the layer's own routing when it came
@@ -617,6 +658,10 @@ pub struct Predict {
     w: Vec<Option<(Dev, Dev)>>,
     topk: usize,
     experts: usize,
+    /// #192: the rows the buffers hold (a verify call's `1 + N`), and those of the guess launched last
+    rows_cap: usize,
+    rows: usize,
+    /// `[rows_cap][E]` logits, `[rows_cap][K]` ids and weights
     logits: Dev,
     ids: Dev,
     wts: Dev,
@@ -641,7 +686,7 @@ pub struct Predict {
 impl Predict {
     /// # Safety
     /// A CUDA context is current; the layers' router weights outlive this guess.
-    unsafe fn new(layers: &[crate::glm5_model::LayerW], moe: &crate::glm5_moe::MoeGeo, side: bool) -> Predict {
+    unsafe fn new(layers: &[crate::glm5_model::LayerW], moe: &crate::glm5_moe::MoeGeo, side: bool, rows: usize) -> Predict {
         let mut w = Vec::new();
         for lw in layers {
             if w.len() <= lw.layer {
@@ -651,21 +696,26 @@ impl Predict {
                 w[lw.layer] = Some((mw.router, mw.bias));
             }
         }
-        Predict::with(w, moe.experts, moe.topk, moe.hidden, moe.routed_scaling, moe.swiglu_limit, side)
+        Predict::with(w, moe.experts, moe.topk, moe.hidden, moe.routed_scaling, moe.swiglu_limit, side, rows)
     }
 
-    /// the guess over `w` (per decoder layer: router BF16 `[e][h]`, bias f32 `[e]`), top-`k`
+    /// the guess over `w` (per decoder layer: router BF16 `[e][h]`, bias f32 `[e]`), top-`k`,
+    /// for calls of up to `rows` rows
     ///
     /// # Safety
     /// As [`Predict::new`].
-    unsafe fn with(w: Vec<Option<(Dev, Dev)>>, e: usize, k: usize, h: usize, scaling: f32, limit: f32, side: bool) -> Predict {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn with(w: Vec<Option<(Dev, Dev)>>, e: usize, k: usize, h: usize, scaling: f32, limit: f32, side: bool, rows: usize) -> Predict {
+        let rows = rows.max(1);
         Predict {
             w,
             topk: k,
             experts: e,
-            logits: cuda::alloc_zeroed(e * 4),
-            ids: cuda::alloc_zeroed(k * 4),
-            wts: cuda::alloc_zeroed(k * 4),
+            rows_cap: rows,
+            rows: 1,
+            logits: cuda::alloc_zeroed(rows * e * 4),
+            ids: cuda::alloc_zeroed(rows * k * 4),
+            wts: cuda::alloc_zeroed(rows * k * 4),
             tag: cuda::to_i32_dev(&[-1]),
             prm_kh: cuda::to_i32_dev(&[h as i32]),
             prm_route: cuda::to_i32_dev(&[e as i32, k as i32]),
@@ -694,16 +744,21 @@ impl Predict {
         self.w.get(layer + 1).copied().flatten()
     }
 
-    /// the three launches of the guess on the current stream
-    unsafe fn launch(&self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, tagk: CUfunction, layer: usize, x: Dev, w: (Dev, Dev)) {
-        self.launch_router(kn, gk, x, w);
+    /// the three launches of the guess of `t` rows of `x` on the current stream
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, tagk: CUfunction, layer: usize, x: Dev, w: (Dev, Dev), t: usize) {
+        self.launch_router(kn, gk, x, w, t);
         launch_v(tagk, 1, 1, 1, 32, &[self.tag, (layer + 1) as u64]);
     }
 
-    /// the guess's router (GEMV + selection) on the current stream
-    unsafe fn launch_router(&self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, x: Dev, (r, b): (Dev, Dev)) {
-        launch_v(kn.f("gemv_bf16_b"), self.experts as u32, 1, 1, 256, &[r, x, self.logits, self.prm_kh]);
-        launch_v(gk.router, 1, 1, 1, crate::kernels::glm5_moe::ROUTER_THREADS as u32, &[self.logits, b, self.ids, self.wts, self.prm_route, self.prm_f]);
+    /// the guess's router (GEMV + selection) over `t <= rows_cap` rows of `x` (`[t][H]`) on the
+    /// current stream (both kernels a row per grid y / x: `gemv_bf16_b` grid (E, t),
+    /// `glm5_router_sig_topk` grid t; one row: the launches of record)
+    unsafe fn launch_router(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, x: Dev, (r, b): (Dev, Dev), t: usize) {
+        debug_assert!((1..=self.rows_cap).contains(&t));
+        launch_v(kn.f("gemv_bf16_b"), self.experts as u32, t as u32, 1, 256, &[r, x, self.logits, self.prm_kh]);
+        launch_v(gk.router, t as u32, 1, 1, crate::kernels::glm5_moe::ROUTER_THREADS as u32, &[self.logits, b, self.ids, self.wts, self.prm_route, self.prm_f]);
+        self.rows = t;
     }
 
     unsafe fn free(&mut self) {
@@ -723,20 +778,35 @@ impl Predict {
 }
 
 impl Routed {
-    /// `n` ids per call (`t x topk` of the pass's calls)
+    /// `n` ids per call (`t x topk` of the pass's calls): [`Routed::rows`] of one row of `n`
     ///
     /// # Safety
     /// A CUDA context is current; `k` outlives this publisher.
     pub unsafe fn new(k: &Kernels, n: usize) -> Routed {
-        assert!(n > 0);
-        let host = Pinned::alloc((side_at(n) + 16 + crate::kernels::glm5_moe::MAXK * 4).next_multiple_of(4096));
+        Routed::rows(k, n, 1)
+    }
+
+    /// #192: a publisher of calls of 1 ..= `rows` rows of `per_row` ids each (a decode call and
+    /// a verify call of `1 + N` rows, `per_row = topk`): the mapped block is laid out for
+    /// `rows x per_row` ids ([`side_at`]); each call publishes its own count through its word in
+    /// the device's count table, so the publish kernels are those of one row. One row: the
+    /// layout and the launches of record.
+    ///
+    /// # Safety
+    /// As [`Routed::new`].
+    pub unsafe fn rows(k: &Kernels, per_row: usize, rows: usize) -> Routed {
+        assert!(per_row > 0 && rows > 0);
+        let n = per_row * rows;
+        let host = Pinned::alloc((side_at(n) + 16 + guess_cap(n) * 4).next_multiple_of(4096));
         std::ptr::write_bytes(host.host as *mut u8, 0, host.bytes);
-        let dev = cuda::alloc_named("glm5 routed-ids counter", 16);
-        cuda::to_i32_into(dev + 8, &[n as i32]);
+        let dev = cuda::alloc_named("glm5 routed-ids counter", (8 + 4 * rows).next_multiple_of(16));
+        cuda::to_i32_into(dev + 8, &(1..=rows).map(|r| (r * per_row) as i32).collect::<Vec<_>>());
         Routed {
             host,
             dev,
             n,
+            per_row,
+            last_n: per_row,
             seq: 0,
             publish: k.publish,
             publish_pred: k.publish_pred,
@@ -762,7 +832,8 @@ impl Routed {
         if let Some(mut p) = self.pred.take() {
             p.free();
         }
-        let mut p = Predict::new(layers, moe, side);
+        // #192: a guess of as many rows as a call this publisher holds
+        let mut p = Predict::new(layers, moe, side, (self.n / moe.topk.max(1)).max(1));
         // #202 S: read once here, with the side stream only
         if side_nojoin_on() {
             p.nojoin_on();
@@ -780,6 +851,18 @@ impl Routed {
         self.pred.is_some()
     }
 
+    /// #192: a call of `n` ids goes through this publisher (`n` whole rows, at most its capacity);
+    /// else the caller reads the ids after a stream sync
+    pub fn holds(&self, n: usize) -> bool {
+        count_word(self.per_row, self.n / self.per_row, n).is_some()
+    }
+
+    /// #192: the device word holding the count of a call of `n` ids ([`Routed::holds`])
+    fn count_at(&self, n: usize) -> Dev {
+        let w = count_word(self.per_row, self.n / self.per_row, n).expect("a call the publisher holds");
+        self.dev + 8 + 4 * w as u64
+    }
+
     /// `CROW_GLM_CONTROLLER`: the guess's device buffers `(ids, layer tag)` for the request ring
     pub fn guess_bufs(&self) -> Option<(Dev, Dev)> {
         self.pred.as_ref().map(|p| (p.ids, p.tag))
@@ -792,7 +875,7 @@ impl Routed {
     /// # Safety
     /// `x` holds the MoE input `[hidden]` f32, written by work queued before.
     pub unsafe fn predict_early(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev) {
-        self.predict_early_with(kn, gk, layer, x, false)
+        self.predict_early_with(kn, gk, layer, x, false, 1)
     }
 
     /// #202 S: [`Routed::predict_early`] whose side guess publishes itself when
@@ -805,15 +888,25 @@ impl Routed {
     /// # Safety
     /// As [`Routed::predict_early`].
     pub unsafe fn predict_early_unjoined(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev) {
-        let on = self.side_nojoin();
-        self.predict_early_with(kn, gk, layer, x, on)
+        self.predict_early_unjoined_rows(kn, gk, layer, x, 1)
     }
 
-    unsafe fn predict_early_with(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev, unjoined: bool) {
+    /// #192: [`Routed::predict_early_unjoined`] of a call of `t` rows (`x` `[t][hidden]`): the
+    /// guess of every row (a no-op above the rows the guess holds)
+    ///
+    /// # Safety
+    /// As [`Routed::predict_early`], `x` holding `t` rows.
+    pub unsafe fn predict_early_unjoined_rows(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev, t: usize) {
+        let on = self.side_nojoin();
+        self.predict_early_with(kn, gk, layer, x, on, t)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn predict_early_with(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev, unjoined: bool, t: usize) {
         let (tagk, gpub, host, sat) = (self.pred_tag, self.guess_publish, self.host.dev, side_at(self.n) as u64);
         let Some(p) = self.pred.as_mut() else { return };
         let (Some((s, e0, e1)), Some(w)) = (p.side, p.next(layer)) else { return };
-        if crate::glm5_graph::capturing() {
+        if crate::glm5_graph::capturing() || t > p.rows_cap {
             return;
         }
         let main = cuda::cur_stream();
@@ -826,10 +919,10 @@ impl Routed {
         cuda::stream_wait_event(s, e0);
         cuda::set_stream(s as u64);
         if unjoined {
-            p.launch_router(kn, gk, x, w);
-            launch_v(gpub, 1, 1, 1, 32, &[p.ids, p.topk as u64, host + sat + 16, host + sat + 8, (layer + 1) as u64, p.sctr, host + sat]);
+            p.launch_router(kn, gk, x, w, t);
+            launch_v(gpub, 1, 1, 1, 32, &[p.ids, (t * p.topk) as u64, host + sat + 16, host + sat + 8, (layer + 1) as u64, p.sctr, host + sat]);
         } else {
-            p.launch(kn, gk, tagk, layer, x, w);
+            p.launch(kn, gk, tagk, layer, x, w, t);
         }
         cuda::set_stream(main as u64);
         cuda::event_record(e1, s);
@@ -840,7 +933,7 @@ impl Routed {
             // (WDDM batches launches until a query or a sync)
             cuda::stream_query(s);
             self.side_seq += 1;
-            self.side_pending = Some((layer + 1, self.side_seq));
+            self.side_pending = Some((layer + 1, self.side_seq, t));
         }
         self.guess.launched += 1;
         self.guess.side += 1;
@@ -870,6 +963,16 @@ impl Routed {
     /// # Safety
     /// As [`Routed::predict_early`].
     pub unsafe fn predict(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev) {
+        self.predict_rows(kn, gk, layer, x, 1)
+    }
+
+    /// #192: [`Routed::predict`] of a call of `t` rows (`x` `[t][hidden]`): the join of the side
+    /// guess as there, else the guess of every row on the current stream (none above the rows the
+    /// guess holds)
+    ///
+    /// # Safety
+    /// As [`Routed::predict`], `x` holding `t` rows.
+    pub unsafe fn predict_rows(&mut self, kn: &crate::kernels::Kernels, gk: &crate::kernels::glm5_moe::Kernels, layer: usize, x: Dev, t: usize) {
         let tagk = self.pred_tag;
         let Some(p) = self.pred.as_mut() else { return };
         if !p.joined && p.unjoined {
@@ -886,7 +989,10 @@ impl Routed {
             return;
         }
         let Some(w) = p.next(layer) else { return };
-        p.launch(kn, gk, tagk, layer, x, w);
+        if t > p.rows_cap {
+            return;
+        }
+        p.launch(kn, gk, tagk, layer, x, w, t);
         self.guess.launched += 1;
     }
 
@@ -902,10 +1008,12 @@ impl Routed {
     /// # Safety
     /// A CUDA context is current; `ids` holds `n` i32 written by work queued before.
     pub unsafe fn publish(&mut self, ids: Dev, n: usize) {
-        assert_eq!(n, self.n, "glm5 flags: a call of {n} ids on a publisher of {}", self.n);
+        assert!(self.holds(n), "glm5 flags: a call of {n} ids on a publisher of {} ({} per row)", self.n, self.per_row);
+        let count = self.count_at(n);
+        self.last_n = n;
         // #202 S: the call's guess published itself on the side stream: the ids alone
         match self.pred.as_ref().filter(|_| self.side_pending.is_none()) {
-            None => launch_v(self.publish, 1, 1, 1, 32, &[ids, self.dev + 8, self.host.dev + IDS_AT as u64, self.dev, self.host.dev]),
+            None => launch_v(self.publish, 1, 1, 1, 32, &[ids, count, self.host.dev + IDS_AT as u64, self.dev, self.host.dev]),
             Some(p) => launch_v(
                 self.publish_pred,
                 1,
@@ -914,12 +1022,13 @@ impl Routed {
                 32,
                 &[
                     ids,
-                    self.dev + 8,
+                    count,
                     self.host.dev + IDS_AT as u64,
                     self.dev,
                     self.host.dev,
                     p.ids,
-                    p.topk as u64,
+                    // #192: the guess of the rows launched last (one row: `topk`)
+                    (p.rows * p.topk) as u64,
                     self.host.dev + (IDS_AT + self.n * 4) as u64,
                     p.tag,
                     self.host.dev + TAG_AT as u64,
@@ -952,8 +1061,9 @@ impl Routed {
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let p = unsafe { (self.host.host as *const u8).add(IDS_AT) as *const i32 };
-        // SAFETY: `n` i32 inside the block; the kernel wrote them before the flag (fence_system)
-        Ok((0..self.n).map(|i| unsafe { std::ptr::read_volatile(p.add(i)) }).collect())
+        // SAFETY: the last publish's `last_n <= n` i32 inside the block; the kernel wrote them
+        // before the flag (fence_system)
+        Ok((0..self.last_n).map(|i| unsafe { std::ptr::read_volatile(p.add(i)) }).collect())
     }
 
     /// [`Routed::wait`] for the call of decoder layer `layer`. With the guess on, the ids are
@@ -969,24 +1079,31 @@ impl Routed {
         // #202 S: a self-published guess is scored as the host read it ([`take_guess`])
         if let Some((gl, g)) = self.last_guess.take().or_else(take_side_read) {
             if gl == layer {
+                // #192: the distinct experts of the call's rows (one row's ids are distinct)
+                let mut d = ids.clone();
+                d.sort_unstable();
+                d.dedup();
                 self.guess.compared += 1;
-                self.guess.picks += ids.len() as u64;
-                self.guess.hits += ids.iter().filter(|e| g.contains(e)).count() as u64;
+                self.guess.picks += d.len() as u64;
+                self.guess.hits += d.iter().filter(|e| g.contains(e)).count() as u64;
             }
         }
-        if let Some((gl, seq)) = self.side_pending.take() {
+        if let Some((gl, seq, rows)) = self.side_pending.take() {
             // SAFETY: the side area of this live block (`side_at`)
             let base = unsafe { (self.host.host as *const u8).add(side_at(self.n)) };
-            post_side(SideHint { word: base as *const u64, tag: unsafe { base.add(8) } as *const i32, ids: unsafe { base.add(16) } as *const i32, k: p.topk, layer: gl, seq });
+            post_side(SideHint { word: base as *const u64, tag: unsafe { base.add(8) } as *const i32, ids: unsafe { base.add(16) } as *const i32, k: rows * p.topk, rows, layer: gl, seq });
             return Ok(ids);
         }
         // SAFETY: inside the block, written by the publish before the flag
         let tag = unsafe { std::ptr::read_volatile((self.host.host as *const u8).add(TAG_AT) as *const i32) };
         if tag >= 0 {
             let q = unsafe { (self.host.host as *const u8).add(IDS_AT + self.n * 4) as *const i32 };
-            let g: Vec<i32> = (0..p.topk).map(|i| unsafe { std::ptr::read_volatile(q.add(i)) }).collect();
+            // #192: the guess of the rows launched last, rank-major (one row: as published)
+            let rows = p.rows;
+            let g: Vec<i32> = (0..rows * p.topk).map(|i| unsafe { std::ptr::read_volatile(q.add(i)) }).collect();
+            let g = rank_major(&g, rows);
             self.last_guess = Some((tag as usize, g.clone()));
-            post_hint(Some(Hint { layer: tag as usize, ids: g }));
+            post_hint(Some(Hint { layer: tag as usize, ids: g, rows }));
         } else {
             post_hint(None);
         }
@@ -1011,6 +1128,10 @@ impl Routed {
 pub struct Hint {
     pub layer: usize,
     pub ids: Vec<i32>,
+    /// #192: the rows the guess covers. A decode or verify guess is rank-major
+    /// ([`rank_major`]) and the trim keeps `K x rows` of its ids; a prompt guess
+    /// ([`post_prompt_guess`], never trimmed) stays row-major
+    pub rows: usize,
 }
 
 /// #202 S: a guess the side stream publishes itself: its sequence word, layer and ids in the
@@ -1021,6 +1142,8 @@ pub struct SideHint {
     tag: *const i32,
     ids: *const i32,
     k: usize,
+    /// #192: the rows of the `k` ids (row-major as published)
+    rows: usize,
     layer: usize,
     seq: u64,
 }
@@ -1101,7 +1224,7 @@ fn read_side(s: SideHint, wait: std::time::Duration, how: &mut SideRead) -> Opti
         return None;
     }
     let ids: Vec<i32> = (0..s.k).map(|i| unsafe { std::ptr::read_volatile(s.ids.add(i)) }).collect();
-    Some(Hint { layer: s.layer, ids })
+    Some(Hint { layer: s.layer, ids: rank_major(&ids, s.rows), rows: s.rows.max(1) })
 }
 
 /// The guess for the expert hook's next reads: [`take_hint`], or #202 S the self-published side
@@ -1123,7 +1246,8 @@ pub fn take_guess(pf: &mut Prefetch) -> Option<Hint> {
             h
         }
     };
-    if let Some(k) = pf.trim {
+    // #192: `K` best ranks per row of a rank-major guess of several rows
+    if let Some(k) = trim_cap(pf.trim, h.rows) {
         if h.ids.len() > k {
             pf.stats.capped += (h.ids.len() - k) as u64;
             h.ids.truncate(k);
@@ -1898,7 +2022,7 @@ impl RingReader {
             let layer = rd(8);
             let tag = rd(12);
             let ids = (0..self.k).map(|i| rd(16 + 4 * i)).collect();
-            let guess = (tag >= 0).then(|| Hint { layer: tag as usize, ids: (0..self.k).map(|i| rd(80 + 4 * i)).collect() });
+            let guess = (tag >= 0).then(|| Hint { layer: tag as usize, ids: (0..self.k).map(|i| rd(80 + 4 * i)).collect(), rows: 1 });
             let wts = (0..self.k).map(|i| std::ptr::read_volatile(e.add(144 + 4 * i) as *const f32)).collect();
             Ok(Request { seq: s, layer: layer as usize, ids, guess, wts })
         }
@@ -2672,6 +2796,36 @@ pub(crate) mod tests {
 
     /// #202 N2: the trim is off unless `1`, its cap defaults to no cut, a cap that is no whole
     /// number from 1 is refused by name
+    /// #192: the publisher of several rows: one row keeps the layout of record (ids at 64, the
+    /// guess's 16 ids, the side area at 192); more rows move the guess and the side area past
+    /// their room; a call's count word is its row count's; the guess goes rank-major and the
+    /// trim keeps `K` per row
+    #[test]
+    fn glm5_flags_rows_layout_count_words_and_rank_major() {
+        assert_eq!((guess_cap(8), side_at(8)), (16, 192));
+        for rows in 1..=5usize {
+            let n = 8 * rows;
+            let sa = side_at(n);
+            assert!(sa >= IDS_AT + (n + guess_cap(n)) * 4 && sa % 64 == 0, "rows {rows}: side area at {sa}");
+            assert!(guess_cap(n) >= n, "rows {rows}: the guess of every row fits");
+            assert!(sa + 16 + guess_cap(n) * 4 <= 4096, "rows {rows}: one page");
+            for r in 1..=rows {
+                assert_eq!(count_word(8, rows, 8 * r), Some(r - 1), "rows {rows}: a call of {r}");
+            }
+            for bad in [0, 7, 12, 8 * rows + 8] {
+                assert_eq!(count_word(8, rows, bad), None, "rows {rows}: a call of {bad} ids");
+            }
+        }
+        assert_eq!(rank_major(&[1, 2, 3], 1), vec![1, 2, 3]);
+        assert_eq!(rank_major(&[10, 11, 12, 20, 21, 22], 2), vec![10, 20, 11, 21, 12, 22]);
+        assert_eq!(rank_major(&[1, 2, 3, 4, 5, 6], 3), vec![1, 3, 5, 2, 4, 6]);
+        // a cut to K x rows of a rank-major guess keeps each row's best K
+        let rm = rank_major(&[10, 11, 12, 20, 21, 22], 2);
+        let k = trim_cap(Some(2), 2).unwrap();
+        assert_eq!(&rm[..k], &[10, 20, 11, 21]);
+        assert_eq!((trim_cap(None, 3), trim_cap(Some(3), 1), trim_cap(Some(usize::MAX), 2)), (None, Some(3), Some(usize::MAX)));
+    }
+
     #[test]
     fn n2_the_guess_trim_is_off_unless_asked() {
         for off in [None, Some(""), Some("0"), Some("yes")] {
@@ -2702,9 +2856,9 @@ pub(crate) mod tests {
                 std::ptr::write((base.add(16) as *mut i32).add(i), v);
             }
         }
-        let hint = |layer: usize, seq: u64| SideHint { word: base as *const u64, tag: unsafe { base.add(8) } as *const i32, ids: unsafe { base.add(16) } as *const i32, k: 3, layer, seq };
+        let hint = |layer: usize, seq: u64| SideHint { word: base as *const u64, tag: unsafe { base.add(8) } as *const i32, ids: unsafe { base.add(16) } as *const i32, k: 3, rows: 1, layer, seq };
         let mut how = SideRead::default();
-        assert_eq!(read_side(hint(7, 4), SIDE_WAIT, &mut how), Some(Hint { layer: 7, ids: ids.to_vec() }));
+        assert_eq!(read_side(hint(7, 4), SIDE_WAIT, &mut how), Some(Hint { layer: 7, ids: ids.to_vec(), rows: 1 }));
         assert_eq!(how, SideRead { ready: 1, waited: 0, late: 0 });
         assert_eq!(read_side(hint(7, 5), std::time::Duration::from_micros(50), &mut how), None);
         assert_eq!(how.late, 1);
@@ -3306,10 +3460,10 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
 
     #[test]
     fn a_hint_is_taken_once() {
-        post_hint(Some(Hint { layer: 4, ids: vec![1, 2] }));
-        assert_eq!(take_hint(), Some(Hint { layer: 4, ids: vec![1, 2] }));
+        post_hint(Some(Hint { layer: 4, ids: vec![1, 2], rows: 1 }));
+        assert_eq!(take_hint(), Some(Hint { layer: 4, ids: vec![1, 2], rows: 1 }));
         assert_eq!(take_hint(), None);
-        post_hint(Some(Hint { layer: 5, ids: vec![3] }));
+        post_hint(Some(Hint { layer: 5, ids: vec![3], rows: 1 }));
         post_hint(None);
         assert_eq!(take_hint(), None);
     }
@@ -3361,7 +3515,7 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
             let mut ids = cuda::to_i32_dev(&[7, 1, 2, 3, 4, 5, 6, 0]);
             for side in [false, true] {
                 let mut r = Routed::new(&k5, k);
-                r.pred = Some(Predict::with(vec![None, Some((wr, wb))], e, k, h, 2.5, 7.0, side));
+                r.pred = Some(Predict::with(vec![None, Some((wr, wb))], e, k, h, 2.5, 7.0, side, 1));
                 assert!(r.predicting());
                 for call in 0..3 {
                     cuda::to_i32_into(ids, &[7, 1, 2, 3, 4, 5, 6, 0]);
@@ -3374,7 +3528,7 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
                     let dmax = logits.iter().zip(&host_logits).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                     assert!(dmax < 1e-4, "side {side}: the guess's logits are off the host GEMV by {dmax}");
                     let want = host_select(&logits, &bias, k);
-                    assert_eq!(take_hint(), Some(Hint { layer: 1, ids: want.clone() }), "side {side} call {call}: the hint");
+                    assert_eq!(take_hint(), Some(Hint { layer: 1, ids: want.clone(), rows: 1 }), "side {side} call {call}: the hint");
                     assert_eq!(take_hint(), None, "a hint is handed over once");
                     // layer 1's own call (its ids: the guess, 6 of them in another order, 2 others):
                     // no guess (layer 2 is no MoE layer here), scored against the guess
@@ -3428,7 +3582,7 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
             let mut pf = Prefetch::new(k, 4096);
             for nojoin in [true, false] {
                 let mut r = Routed::new(&k5, k);
-                let mut p = Predict::with(vec![None, Some((wr, wb))], e, k, h, 2.5, 7.0, true);
+                let mut p = Predict::with(vec![None, Some((wr, wb))], e, k, h, 2.5, 7.0, true, 1);
                 if nojoin {
                     p.nojoin_on();
                 }
@@ -3453,7 +3607,7 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
                     }
                     pf.trim = None;
                     let hint = take_guess(&mut pf);
-                    assert_eq!(hint, Some(Hint { layer: 1, ids: want.clone() }), "nojoin {nojoin} call {call}: the guess");
+                    assert_eq!(hint, Some(Hint { layer: 1, ids: want.clone(), rows: 1 }), "nojoin {nojoin} call {call}: the guess");
                     assert_eq!(take_guess(&mut pf), None, "a guess is handed over once");
                     r.join_late();
                     assert!(!r.pred.as_ref().unwrap().late, "the late join is still owed");
@@ -3486,6 +3640,105 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
                 eprintln!("glm5 guess S nojoin {nojoin}: {gs:?}, side reads {d:?}");
                 r.free();
             }
+            pf.buf.free();
+            pf.flags.free();
+            for d in [&mut wr, &mut wb, &mut xd, &mut ids] {
+                cuda::free_dev(d);
+            }
+            km.unload();
+            k5.free();
+        }
+    }
+
+    /// #192: one publisher of 1 ..= 3 rows of top-8 ids (`Routed::rows`) with a guess of up to 3
+    /// rows. Calls of 8, 16, 24, 8 and 16 ids arrive with their own counts; the guess of a call of
+    /// `t` rows on x `[t][H]` (x, x reversed, x negated) arrives on the compute stream, on the
+    /// joined side stream, and published by the side stream itself (`CROW_GLM_SIDE_NOJOIN`),
+    /// rank-major, every row's ids the host selection of that row's device logits (which are the
+    /// host GEMV's); the trim of K = 3 keeps 3 per row. A publisher of 4 rows with a guess of 3:
+    /// a call of 4 rows publishes its 32 ids and launches no guess.
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_flags_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_flags_gpu_rows_publish_their_counts_and_guess_every_row() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let (e, k, h) = (g.experts, g.topk, g.hidden);
+        let mut rng = Rng(0x0192_F1A6);
+        let w_bf: Vec<u16> = (0..e * h).map(|_| gm::f32_to_bf16_rne(rng.sym() / (h as f32).sqrt())).collect();
+        let w_f: Vec<f32> = w_bf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+        let bias: Vec<f32> = (0..e).map(|_| 0.05 * rng.sym()).collect();
+        let x0: Vec<f32> = (0..h).map(|_| rng.sym()).collect();
+        let xs: Vec<f32> = x0.iter().copied().chain(x0.iter().rev().copied()).chain(x0.iter().map(|v| -v)).chain(x0.iter().map(|v| 0.5 * v)).collect();
+        let host_logits = |r: usize| -> Vec<f32> { (0..e).map(|o| (0..h).map(|c| w_f[o * h + c] as f64 * xs[r * h + c] as f64).sum::<f64>() as f32).collect() };
+        let hl: Vec<Vec<f32>> = (0..3).map(host_logits).collect();
+        let own: Vec<i32> = (0..4 * k as i32).map(|i| (i * 7 + 3) % e as i32).collect();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut km = cuda::compile(&crate::kernels::KernelGeo::flash_next().source());
+            let kn = crate::kernels::Kernels::new(&km, false);
+            let gk = crate::kernels::glm5_moe::Kernels::new();
+            let mut k5 = Kernels::new(&g);
+            let mut wr = cuda::upload_dev(&w_bf.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+            let mut wb = cuda::to_f32_dev(&bias);
+            let mut xd = cuda::to_f32_dev(&xs);
+            let mut ids = cuda::to_i32_dev(&own);
+            let mut pf = Prefetch::new(k, 4096);
+            for (side, nojoin) in [(false, false), (true, false), (true, true)] {
+                let mut r = Routed::rows(&k5, k, 3);
+                let mut p = Predict::with(vec![None, Some((wr, wb))], e, k, h, 2.5, 7.0, side, 3);
+                if nojoin {
+                    p.nojoin_on();
+                }
+                r.pred = Some(p);
+                assert_eq!(r.side_nojoin(), nojoin);
+                let what = |t: usize| format!("side {side} nojoin {nojoin} rows {t}");
+                for (call, t) in [1usize, 2, 3, 1, 2].into_iter().enumerate() {
+                    let n = t * k;
+                    assert!(r.holds(n) && !r.holds(n + 1) && !r.holds(4 * k), "{}", what(t));
+                    r.predict_early_unjoined_rows(&kn, &gk, 0, xd, t);
+                    r.predict_rows(&kn, &gk, 0, xd, t);
+                    r.publish(ids, n);
+                    let got = r.wait_layer(0).unwrap();
+                    assert_eq!(got, own[..n].to_vec(), "{} call {call}: the call's own ids", what(t));
+                    let want = {
+                        let pr = r.pred.as_ref().unwrap();
+                        if let Some((_, _, e1)) = pr.side {
+                            cuda::ck(sys::cuEventSynchronize(e1));
+                        }
+                        let lg = cuda::dtoh(pr.logits, t * e);
+                        for row in 0..t {
+                            let dmax = lg[row * e..(row + 1) * e].iter().zip(&hl[row]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                            assert!(dmax < 1e-4, "{} row {row}: the guess's logits are off the host GEMV by {dmax}", what(t));
+                        }
+                        let rows: Vec<i32> = (0..t).flat_map(|row| host_select(&lg[row * e..(row + 1) * e], &bias, k)).collect();
+                        rank_major(&rows, t)
+                    };
+                    pf.trim = None;
+                    assert_eq!(take_guess(&mut pf), Some(Hint { layer: 1, ids: want.clone(), rows: t }), "{} call {call}: the guess", what(t));
+                    assert_eq!(take_guess(&mut pf), None, "a guess is handed over once");
+                    r.join_late();
+                }
+                assert_eq!(r.guess.launched, 5, "side {side} nojoin {nojoin}: {:?}", r.guess);
+                // the trim: K = 3 per row
+                r.predict_early_unjoined_rows(&kn, &gk, 0, xd, 2);
+                r.predict_rows(&kn, &gk, 0, xd, 2);
+                r.publish(ids, 2 * k);
+                r.wait_layer(0).unwrap();
+                pf.trim = Some(3);
+                let c0 = pf.stats.capped;
+                let hint = take_guess(&mut pf).expect("the guess");
+                assert_eq!((hint.ids.len(), hint.rows, pf.stats.capped - c0), (6, 2, 2 * k as u64 - 6), "side {side} nojoin {nojoin}: the cap");
+                r.join_late();
+                r.free();
+            }
+            // more rows than the guess holds: the ids, no guess
+            let mut r = Routed::rows(&k5, k, 4);
+            r.pred = Some(Predict::with(vec![None, Some((wr, wb))], e, k, h, 2.5, 7.0, false, 3));
+            r.predict_rows(&kn, &gk, 0, xd, 4);
+            r.publish(ids, 4 * k);
+            assert_eq!(r.wait_layer(0).unwrap(), own, "4 rows: the ids");
+            pf.trim = None;
+            assert_eq!((take_guess(&mut pf), r.guess.launched), (None, 0), "4 rows: no guess above the guess's 3");
+            r.free();
             pf.buf.free();
             pf.flags.free();
             for d in [&mut wr, &mut wb, &mut xd, &mut ids] {
@@ -3670,13 +3923,13 @@ extern "C" __global__ void slow_ids(int* ids, const int* base, const long long* 
     #[test]
     fn the_controller_scores_a_guess_against_the_layer_it_named() {
         let mut s = GuessScore::default();
-        s.see(3, &[1, 2, 3, 4], Some(&Hint { layer: 4, ids: vec![2, 3, 9, 8] }));
+        s.see(3, &[1, 2, 3, 4], Some(&Hint { layer: 4, ids: vec![2, 3, 9, 8], rows: 1 }));
         assert_eq!(s.stats.compared, 0, "no guess for layer 3");
         s.see(4, &[3, 2, 7, 6], None);
         assert_eq!((s.stats.compared, s.stats.picks, s.stats.hits), (1, 4, 2));
         s.see(5, &[1, 2, 3, 4], None);
         assert_eq!(s.stats.compared, 1, "layer 4's call made no guess");
-        s.see(6, &[1, 2, 3, 4], Some(&Hint { layer: 7, ids: vec![1, 2, 3, 4] }));
+        s.see(6, &[1, 2, 3, 4], Some(&Hint { layer: 7, ids: vec![1, 2, 3, 4], rows: 1 }));
         s.see(8, &[1, 2, 3, 4], None);
         assert_eq!(s.stats.compared, 1, "a guess for layer 7 does not score layer 8");
     }

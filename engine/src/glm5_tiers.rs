@@ -1083,6 +1083,12 @@ pub enum ArenaKind {
     Global,
 }
 
+/// #192: a decode call of `n` picks takes RT2: one row (`topk`), or `t` whole rows whose picks
+/// fit the staging slots (an MTP verify call of `1 + N` rows, [`ExpertTiers::set_rt2_rows`])
+pub fn rt2_rows(n: usize, topk: usize, stage_cap: usize) -> bool {
+    n == topk || (topk > 0 && n > 0 && n % topk == 0 && n <= stage_cap)
+}
+
 /// Parse `CROW_GLM_ARENA`: unset, empty or `layer` = [`ArenaKind::Layer`]; `global` =
 /// [`ArenaKind::Global`]; anything else refused by name.
 pub fn arena_kind(v: Option<&str>) -> Result<ArenaKind, String> {
@@ -4757,8 +4763,12 @@ impl ExpertTiers {
         }
         // CROW_GLM_CONTROLLER with the CPU lane: the lane's worker waits per expert, not this thread
         let ctl_lane = reply.is_some() && self.dev_lane.is_some();
-        // #202 RT2: a one-row call off the controller through the stager splits early / late
-        let rt2 = !prompt && self.rt2 && reply.is_none() && self.stager.is_some() && sel.len() == self.topk;
+        // #202 RT2: a one-row call off the controller through the stager splits early / late;
+        // #192: so does an MTP verify call of `t` rows ([`ExpertTiers::set_rt2_rows`];
+        // `glm5_moe::lane::take` and `GpuMoePlan::experts_rt2` take its `t x topk` post: the
+        // three go together, a refused RT2 post would leave the experts without the stager's event)
+        let rows_ok = if self.rt2_rows { rt2_rows(sel.len(), self.topk, self.stage_cap) } else { sel.len() == self.topk };
+        let rt2 = !prompt && self.rt2 && reply.is_none() && self.stager.is_some() && rows_ok;
         // #216: the prompt guess of the call (guesses taken, guessed experts resident, reads issued)
         let mut pguess = (0u64, 0u64, 0u64);
         let mut written: Vec<Dev> = Vec::new();
@@ -5601,6 +5611,22 @@ mod arena_tests {
 
     fn keys(a: &GlobalArena, p: impl Fn(Place) -> bool) -> Vec<(usize, u32)> {
         (0..a.layers).flat_map(|l| (0..a.experts as u32).map(move |e| (l, e))).filter(|&(l, e)| p(a.place(l, e))).collect()
+    }
+
+    /// #192: RT2 takes a decode call of one row and (with `set_rt2_rows`) an MTP verify call of
+    /// whole rows that fit the staging slots
+    #[test]
+    fn rt2_rows_takes_one_row_and_whole_rows_within_the_staging_slots() {
+        assert!(rt2_rows(8, 8, 8));
+        assert!(rt2_rows(8, 8, 32));
+        for n in [16, 24, 32] {
+            assert!(rt2_rows(n, 8, 32), "{n} picks, 32 slots");
+        }
+        assert!(!rt2_rows(40, 8, 32), "more picks than staging slots");
+        assert!(!rt2_rows(16, 8, 8), "two rows on one row's slots");
+        assert!(!rt2_rows(12, 8, 32), "not whole rows");
+        assert!(!rt2_rows(0, 8, 32), "no pick");
+        assert!(!rt2_rows(4, 8, 32), "less than a row");
     }
 
     #[test]
@@ -8561,6 +8587,8 @@ pub struct ExpertTiers {
     lanes2: bool,
     /// #202 RT2 (`CROW_GLM_RT2=1`, [`ExpertTiers::set_rt2`])
     rt2: bool,
+    /// #192: RT2 also for calls of whole rows ([`ExpertTiers::set_rt2_rows`])
+    rt2_rows: bool,
     /// #216 `CROW_GLM_SMALL_PROMPT` as read at construction: the rows a prompt call stays below
     /// for the small-prompt route (`None` = off; [`ExpertTiers::small_prompt_below`])
     small_prompt: Option<usize>,
@@ -9077,6 +9105,7 @@ impl ExpertTiers {
             prefetch: None,
             lanes2: false,
             rt2: false,
+            rt2_rows: false,
             small_prompt: small_prompt_rows(std::env::var(SMALL_PROMPT_ENV).ok().as_deref(), std::env::var(SMALL_PROMPT_ROWS_ENV).ok().as_deref())?,
             small_stats: SmallPromptStats::default(),
         };
@@ -10240,7 +10269,8 @@ impl ExpertTiers {
     /// records, so it never waits for a landing or a write-back and starts right after the
     /// router flag (`glm5_moe::GpuMoePlan::experts_rt2`); the decode call also queues x to the
     /// lane ahead of the router's publish (`glm5_moe::lane::X_EARLY`). Off: the former path.
-    /// Not under the controller (its calls keep their own path).
+    /// Not under the controller (its calls keep their own path). #192: also an MTP verify call
+    /// of whole rows within the staging slots ([`ExpertTiers::set_rt2_rows`]).
     pub fn set_rt2(&mut self, on: bool) {
         self.rt2 = on;
         crate::glm5_moe::lane::X_EARLY.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -10249,6 +10279,14 @@ impl ExpertTiers {
     /// #202 RT2: on
     pub fn rt2(&self) -> bool {
         self.rt2
+    }
+
+    /// #192: with RT2 on, a decode call of `t` whole rows within the staging slots
+    /// ([`rt2_rows`]) splits early / late too: the MTP verify call (`Glm5Run::spec_verify` turns
+    /// it on). Off (the default): one row only, the path of record (a `CROW_GLM_MAX_BATCH` step,
+    /// never with MTP, keeps it).
+    pub fn set_rt2_rows(&mut self, on: bool) {
+        self.rt2_rows = on;
     }
 
     /// #149 path B: the stager is on
@@ -10718,6 +10756,9 @@ pub struct Glm5Run {
     /// `prompt_t` rows of scratch from the elastic part and gives it back after the prompt
     /// ([`Glm5Run::prefill_with`]); `None` = the scratch of `max_t` rows stays allocated
     borrow: Option<(usize, usize)>,
+    /// #192: the rows of a verify call at `load` (`1 + CROW_GLM_MTP` drafts; 1 without MTP): the
+    /// router publisher holds that many rows ([`Glm5Run::set_switches`])
+    verify_t: usize,
     pub load: LoadReport,
     pass: Glm5Pass,
     layers: Vec<LayerW>,
@@ -10987,6 +11028,7 @@ impl Glm5Run {
             cap,
             prompt_chunk: chunk,
             borrow,
+            verify_t: (1 + crate::glm5_mtp::draft_rows_from_env().unwrap_or(0)).min(cap.max(1)).min(max_t),
             load,
             pass: Glm5Pass::new(g, *moe, max_t, cap),
             layers,
@@ -11111,9 +11153,10 @@ impl Glm5Run {
         }
         let k = glm5_flags::Kernels::new(&self.g);
         if sw.flags {
-            // the decode calls' ids (one row); #186 prompt calls and #192 verify calls of more rows
+            // the decode calls' ids, and #192 a verify call's of up to `verify_t` rows (MTP off:
+            // the one-row publisher of record); #186 prompt calls and `CROW_GLM_MAX_BATCH` steps
             // read theirs after a stream sync
-            let mut r = Routed::new(&k, self.moe.topk);
+            let mut r = Routed::rows(&k, self.moe.topk, self.verify_t.max(1));
             if sw.prefetch {
                 r.predict_on(&self.layers, &self.moe, sw.pf_side);
             }
@@ -14241,6 +14284,8 @@ impl Glm5Run {
         let t = 1 + k;
         let toks: Vec<i64> = std::iter::once(last).chain(drafts.iter().copied()).collect();
         cuda::to_f32_into(sp.x, &gm::trunk_input(&gm::embed_rows(cnq, &g, &toks), h, g.hc_streams));
+        // #192: RT2 for the verify's rows (the one-row decode's early / late split)
+        tiers.set_rt2_rows(true);
         for l in 0..g.layers {
             if let Some(s) = self.kda[l].as_mut() {
                 self.pass.swap_kda_state(s);
@@ -14778,6 +14823,151 @@ mod spec_tests {
                 }
             }
             run.set_mtp(0, None).unwrap();
+            run.free();
+        }
+        drop(cnq);
+    }
+
+    /// the process environment set for a scope, put back on drop (the tests run one at a time)
+    struct EnvScope(Vec<(String, Option<String>)>);
+
+    impl EnvScope {
+        fn set(kv: &[(&str, Option<&str>)]) -> EnvScope {
+            let old = kv.iter().map(|(k, _)| (k.to_string(), std::env::var(k).ok())).collect();
+            for (k, v) in kv {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            EnvScope(old)
+        }
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// #192: the verify call with the one-row decode's MoE levers, on the synthetic model: a
+    /// 5-id prompt and 40 greedy ids, V 3 + P 4 on the global arena with the stager, zero-copy
+    /// pinned reads, `CROW_GLM_FLAGS`, `CROW_GLM_PREFETCH` (on the compute stream, on the joined
+    /// side stream, self-published with `CROW_GLM_SIDE_NOJOIN`, with `CROW_GLM_GUESS_TRIM`),
+    /// `CROW_GLM_SHARED_OVERLAP`, `CROW_GLM_RT2` + `CROW_GLM_RT2_TABLE_SM`, `CROW_GLM_MUL1_FUSE`,
+    /// `CROW_NVME_DEMAND_FIRST`. MTP off with the same levers gives the levers-off run's ids and
+    /// logits bit for bit; every MTP arm (N = 1 / 2 / 3, drafts forced right or wrong, the
+    /// block's own drafts) gives MTP off's ids, every logit's bits and the final KDA states and
+    /// MLA cache rows; its verify calls took every MoE layer's ids through the router's flag (no
+    /// stream sync), launched next-layer guesses and ran RT2 calls of more than one row.
+    #[test]
+    #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_spec_gpu_levers_keep_the_bits() {
+        use crate::glm5_model::verify_counts;
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = geo();
+        let s = synth_model(&g, REC);
+        let (spec, _) = crate::nvme_source::glm5_record_of_container(&s.path).unwrap();
+        let moe = MoeGeo::new(&g, spec).unwrap();
+        let mut cnq = Cnq::open_checked(&s.path).unwrap();
+        let prompt = [3i64, 17, 101, 999, 5];
+        let (pn, n) = (prompt.len(), 40usize);
+        let cap = pn + n;
+        let last = pn + n - 2;
+        let sizes = TierSizes { vram: 3, pinned: 4 };
+        // read when a plan is made / on a plan's first RT2 call: set for the whole test
+        let _keep = EnvScope::set(&[(crate::glm5_moe::MUL1_FUSE_ENV, Some("1")), (crate::glm5_moe::lane::ENV_RT2_TABLE_SM, Some("1")), (crate::glm5_moe::lane::ENV_RT2_GATHER_EARLY, Some("1"))]);
+        let sw_on = |side: bool| Switches { flags: true, prefetch: true, pf_side: side, overlap: true, ..Switches::default() };
+        type Pat = fn(usize) -> bool;
+        // (name, drafts, pattern, side stream, nojoin, trim K)
+        let arms: Vec<(&str, usize, Option<Pat>, bool, bool, Option<&str>)> = vec![
+            ("N 1, right unless i % 3 == 2, guess on the compute stream", 1, Some(|i| i % 3 != 2), false, false, None),
+            ("N 2, right unless i % 4 == 1, side stream joined", 2, Some(|i| i % 4 != 1), true, false, None),
+            ("N 3, right unless i % 5 == 3, side nojoin + trim 2", 3, Some(|i| i % 5 != 3), true, true, Some("2")),
+            ("N 2, every draft wrong, side nojoin", 2, Some(|_| false), true, true, None),
+            ("N 2, the block's own drafts, side nojoin + trim", 2, None, true, true, Some("")),
+        ];
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut run = {
+                let _e = EnvScope::set(&[(mtp::MTP_ENV, Some("3"))]);
+                Glm5Run::load(&mut cnq, &g, &moe, cap, &mut |s| eprintln!("{s}"))
+            };
+            // the levers' tiers: the global arena (and DEMAND_FIRST) are read at construction
+            let tiers_with = |cnq: &Cnq, nd: usize, on: bool, trim: Option<&str>| -> ExpertTiers {
+                let _e = EnvScope::set(&[
+                    (ARENA_ENV, on.then_some("global")),
+                    (crate::nvme_source::DEMAND_FIRST_ENV, on.then_some("1")),
+                    (glm5_flags::ENV_GUESS_TRIM, trim.map(|_| "1")),
+                    (glm5_flags::ENV_GUESS_TRIM_K, trim.filter(|k| !k.is_empty())),
+                ]);
+                let mut t = ExpertTiers::new(cnq, &s.path, &g, &moe, sizes, 1, (1 + nd) * g.topk).unwrap();
+                if on {
+                    t.set_pinned_use(PinnedUse { stay: true, cpu_lane: false }).unwrap();
+                    t.set_stager(true).unwrap();
+                    t.set_rt2(true);
+                    t.set_prefetch(true);
+                }
+                t
+            };
+            let gen = |run: &mut Glm5Run, cnq: &mut Cnq, tiers: &mut ExpertTiers| -> Generated { run.generate(cnq, tiers, &prompt, n, true, &mut |_| {}).unwrap() };
+            // levers off, MTP off: the reference
+            let mut tiers = tiers_with(&cnq, 0, false, None);
+            let off = gen(&mut run, &mut cnq, &mut tiers);
+            tiers.free();
+            let finite = off.logits.iter().flatten().filter(|v| v.is_finite()).count();
+            assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
+            let bits = |a: &Generated, b: &Generated| -> Vec<usize> { a.logits.iter().zip(&b.logits).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect() };
+            let gold = off.ids.clone();
+            let vocab = g.vocab as i64;
+            for (seed, (name, nd, pat, side, nojoin, trim)) in arms.into_iter().enumerate() {
+                let _e = EnvScope::set(&[(glm5_flags::ENV_SIDE_NOJOIN, nojoin.then_some("1"))]);
+                run.set_switches(&mut cnq, sw_on(side));
+                assert_eq!(run.pass.routed.as_ref().map(|r| r.side_nojoin()), Some(nojoin), "{name}: the side guess's switch");
+                // MTP off with the same levers
+                run.kda_states().for_each(|k| k.reset());
+                let mut tiers = tiers_with(&cnq, nd, true, trim);
+                let base = gen(&mut run, &mut cnq, &mut tiers);
+                tiers.free();
+                assert_eq!(base.ids, gold, "{name}: MTP off with the levers: ids");
+                let d = bits(&base, &off);
+                assert!(d.iter().all(|&x| x == 0), "{name}: MTP off with the levers: logits differ in bits {d:?}");
+                let (kda0, mla0) = states(&run, &g, last);
+                // MTP on with the same levers
+                run.set_mtp(nd, Some(mtp::synthetic_block(&g, &moe, 0x0192_7000 + seed as u64))).unwrap();
+                if let Some(p) = pat {
+                    let gold = gold.clone();
+                    run.set_mtp_hook(Some(Box::new(move |i, _| if p(i) { gold[i] } else { (gold[i] + 1) % vocab })));
+                }
+                let mut tiers = tiers_with(&cnq, nd, true, trim);
+                let (c0, r0) = (verify_counts::read(), crate::glm5_moe::lane::RT2_ROWS_CALLS.load(Relaxed));
+                let out = gen(&mut run, &mut cnq, &mut tiers);
+                let (c1, r1) = (verify_counts::read(), crate::glm5_moe::lane::RT2_ROWS_CALLS.load(Relaxed));
+                let (ps, gs) = (tiers.prefetch_stats(), run.guess_stats());
+                tiers.free();
+                let st = run.mtp_stats().unwrap().clone();
+                let (flagged, syncs, guesses) = (c1.0 - c0.0, c1.1 - c0.1, c1.2 - c0.2);
+                eprintln!("glm5_mtp levers {name}: {st:?}; verify MoE layers flagged {flagged}, synced {syncs}, guesses {guesses}; RT2 calls of rows {}; prefetch {ps:?}; guess {gs:?}", r1 - r0);
+                assert_eq!(out.ids, gold, "{name}: ids");
+                let d = bits(&out, &base);
+                assert!(out.logits.len() == n && d.iter().all(|&x| x == 0), "{name}: logits differ in bits per generated id {d:?}");
+                let (kda1, mla1) = states(&run, &g, last);
+                assert!(kda1 == kda0, "{name}: the KDA states at the end differ from MTP off");
+                assert!(mla1 == mla0, "{name}: the MLA cache rows 0..={last} differ from MTP off");
+                assert!(st.drafts > 0, "{name}: the arm must draft: {st:?}");
+                // 5 MoE layers per verify call
+                assert_eq!((flagged, syncs), (5 * st.steps, 0), "{name}: every verify MoE layer through the router's flag, no stream sync");
+                assert_eq!(guesses, 4 * st.steps, "{name}: one guess per verify MoE layer with a next MoE layer");
+                assert!(r1 - r0 > 0, "{name}: RT2 calls of more than one row");
+                assert!(ps.is_some_and(|p| p.hints > 0), "{name}: guesses reached the prefetch: {ps:?}");
+                run.set_mtp(0, None).unwrap();
+            }
+            run.set_switches(&mut cnq, Switches::default());
             run.free();
         }
         drop(cnq);
@@ -15835,7 +16025,7 @@ mod nvme_par_tests {
             let mut t = slow_tiers(&cnq, &s.path, &g, &moe, 1, 4);
             let first = t.first_moe;
             let sel: Vec<i32> = (0..8).collect();
-            post_hint(Some(Hint { layer: first + 1, ids: (8..16).collect() }));
+            post_hint(Some(Hint { layer: first + 1, ids: (8..16).collect(), rows: 1 }));
             t.table_for(first, &sel).unwrap();
             let st = t.stager_stats().unwrap();
             eprintln!("glm5 nvme par: records in flight at the answer {} (answers {}), io {:?}", st.inflight_at_answer, st.answers, t.nvme_io());
@@ -15888,7 +16078,7 @@ mod nvme_par_tests {
                 t.set_prefetch(true);
                 t.prefetch.as_mut().unwrap().trim = trim.then_some(8);
                 let first = t.first_moe;
-                post_hint(Some(Hint { layer: first + 1, ids: (8..16).collect() }));
+                post_hint(Some(Hint { layer: first + 1, ids: (8..16).collect(), rows: 1 }));
                 t.table_for(first, &(0..8).collect::<Vec<i32>>()).unwrap();
                 let sel: Vec<i32> = vec![0, 1, 2, 3, 8, 9, 10, 11];
                 let (table, served) = t.table_for(first + 1, &sel).unwrap();
@@ -15942,7 +16132,7 @@ mod nvme_par_tests {
             let mut t = slow_tiers(&cnq, &s.path, &g, &moe, 1, 4);
             let first = t.first_moe;
             let guess: Vec<i32> = (8..16).collect();
-            post_hint(Some(Hint { layer: first + 1, ids: guess.clone() }));
+            post_hint(Some(Hint { layer: first + 1, ids: guess.clone(), rows: 1 }));
             t.table_for(first, &(0..8).collect::<Vec<i32>>()).unwrap();
             let (sub0, _) = t.nvme_io();
             let r0 = t.nvme_reads;
