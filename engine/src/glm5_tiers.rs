@@ -14582,6 +14582,36 @@ mod spec_tests {
         (kda, mla)
     }
 
+    /// #192: `CROW_GLM_ATTN_FUSE` and `CROW_GLM_HCFUSE` both `1` (`on`) or both unset while it
+    /// lives; the previous values back on drop (a failed assert included)
+    struct FuseEnv(Vec<(&'static str, Option<String>)>);
+
+    impl FuseEnv {
+        fn set(on: bool) -> FuseEnv {
+            let keys = [crate::glm5_mhc::ATTN_FUSE_ENV, crate::glm5_mhc::HCFUSE_ENV];
+            let old = keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+            for k in keys {
+                if on {
+                    std::env::set_var(k, "1");
+                } else {
+                    std::env::remove_var(k);
+                }
+            }
+            FuseEnv(old)
+        }
+    }
+
+    impl Drop for FuseEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// The counters a draft pattern must give: `ok(i)` = the draft that guesses generated id `i`
     /// is right. `(stats, last valid row of every rollback)`
     fn simulate(n_draft: usize, pn: usize, n: usize, cap: usize, ok: &dyn Fn(usize) -> bool) -> (SpecStats, Vec<usize>) {
@@ -14614,11 +14644,14 @@ mod spec_tests {
     /// ids, V 3 + P 4 tiers (every kind of move), a fresh store and a fresh block per arm. Arms:
     /// N = 1 / 2 / 3 with drafts forced right or wrong by a pattern (the draft hook), N = 2 with
     /// every draft wrong, N = 1 with every draft right under `CROW_GLM_FLAGS` + `CROW_GLM_GRAPH`,
-    /// and N = 2 with the synthetic block's own drafts. Every arm gives the ids and every logit's
-    /// bits of the run without MTP; after every rollback the KDA states (S, conv) equal, bit for
-    /// bit, the states the one-row path has after the same row (`Glm5Run::row`, hashed per row);
-    /// at the end every KDA state and every MLA cache row `0 ..= last` equal the run without
-    /// MTP; the counters equal the host simulation of the pattern.
+    /// and N = 2 with the synthetic block's own drafts; every arm with the switches off and again
+    /// with `CROW_GLM_ATTN_FUSE` + `CROW_GLM_HCFUSE` on (the run without MTP and the one-row door
+    /// under the same switches, which itself gives the bits of the switches off). Every arm gives
+    /// the ids and every logit's bits of the run without MTP; after every rollback the KDA states
+    /// (S, conv) equal, bit for bit, the states the one-row path has after the same row
+    /// (`Glm5Run::row`, hashed per row); at the end every KDA state and every MLA cache row
+    /// `0 ..= last` equal the run without MTP; the counters equal the host simulation of the
+    /// pattern.
     #[test]
     #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1"]
     fn glm5_mtp_spec_gpu_is_lossless() {
@@ -14642,90 +14675,106 @@ mod spec_tests {
                 Some(o) => std::env::set_var(mtp::MTP_ENV, o),
                 None => std::env::remove_var(mtp::MTP_ENV),
             }
-            // the run without MTP, and the one-row door's KDA states after every row
-            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
-            let base = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
-            let (kda0, mla0) = states(&run, &g, last);
-            tiers.free();
-            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
-            run.kda_states().for_each(|k| k.reset());
-            let mut row_hash: HashMap<usize, u64> = HashMap::new();
-            let mut door = Vec::new();
-            let mut tok = 0i64;
-            for pos in 0..=last {
-                let input = if pos < pn { prompt[pos] } else { tok };
-                if let Some(id) = run.row(&mut cnq, &mut tiers, input, pos, pos + 1 >= pn).unwrap() {
-                    tok = id;
-                    door.push(id);
-                }
-                row_hash.insert(pos, hash(&states(&run, &g, 0).0));
-            }
-            tiers.free();
-            assert_eq!(door, base.ids, "the one-row door gives generate's ids");
-            let finite = base.logits.iter().flatten().filter(|v| v.is_finite()).count();
-            assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
-            let gold = base.ids.clone();
-            let vocab = g.vocab as i64;
-            type Pat = fn(usize) -> bool;
-            let arms: Vec<(&str, usize, Option<Pat>, bool)> = vec![
-                ("N 1, right unless i % 3 == 2", 1, Some(|i| i % 3 != 2), false),
-                ("N 2, right unless i % 4 == 1", 2, Some(|i| i % 4 != 1), false),
-                ("N 3, right unless i % 5 == 3", 3, Some(|i| i % 5 != 3), false),
-                ("N 2, every draft wrong", 2, Some(|_| false), false),
-                ("N 1, every draft right, flags + graph", 1, Some(|_| true), true),
-                ("N 2, the block's own drafts", 2, None, false),
-            ];
-            for (seed, (name, nd, pat, sw)) in arms.into_iter().enumerate() {
-                let block = mtp::synthetic_block(&g, &moe, 0x0192_0000 + seed as u64);
-                run.set_mtp(nd, Some(block)).unwrap();
-                if let Some(p) = pat {
-                    let gold = gold.clone();
-                    run.set_mtp_hook(Some(Box::new(move |i, _| if p(i) { gold[i] } else { (gold[i] + 1) % vocab })));
-                }
-                let seen: Arc<Mutex<Vec<(usize, bool)>>> = Arc::default();
-                let rh = row_hash.clone();
-                let seen2 = seen.clone();
-                run.set_mtp_probe(Some(Box::new(move |row, b| seen2.lock().unwrap().push((row, rh.get(&row) == Some(&hash(b)))))));
-                if sw {
-                    run.set_graph(true);
-                    run.set_switches(&mut cnq, Switches { flags: true, lookahead: false, ..Switches::default() });
-                }
-                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, (1 + nd) * g.topk).unwrap();
-                let mut reps: Vec<TokenReport> = Vec::new();
-                let out = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |r| reps.push(r.clone())).unwrap();
+            // #192: every arm twice, the switches off and with CROW_GLM_ATTN_FUSE + CROW_GLM_HCFUSE
+            // (the fused KDA rows, the fused mHC sites and the folded expand, in the verify and in
+            // the run without MTP alike); test builds read both at every call
+            let mut off_bits: Option<Vec<Vec<u32>>> = None;
+            for fused in [false, true] {
+                let _env = FuseEnv::set(fused);
+                run.set_mtp(0, None).unwrap();
+                let tag = if fused { " (ATTN_FUSE + HCFUSE)" } else { "" };
+                // the run without MTP, and the one-row door's KDA states after every row
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                let base = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
+                let (kda0, mla0) = states(&run, &g, last);
                 tiers.free();
-                if sw {
-                    run.set_graph(false);
-                    run.set_switches(&mut cnq, Switches::default());
+                // the fusions are bit-identical: the run without MTP has the same logits either way
+                let lb: Vec<Vec<u32>> = base.logits.iter().map(|r| r.iter().map(|v| v.to_bits()).collect()).collect();
+                match &off_bits {
+                    Some(o) => assert!(*o == lb, "the run without MTP{tag}: logits differ in bits from the switches off"),
+                    None => off_bits = Some(lb),
                 }
-                let st = run.mtp_stats().unwrap().clone();
-                eprintln!("glm5_mtp spec {name}: {st:?}");
-                assert_eq!(out.ids, base.ids, "{name}: ids");
-                let diff: Vec<usize> = out.logits.iter().zip(&base.logits).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect();
-                assert!(out.logits.len() == n && diff.iter().all(|&d| d == 0), "{name}: logits differ in bits per generated id {diff:?}");
-                let (kda1, mla1) = states(&run, &g, last);
-                assert!(kda1 == kda0, "{name}: the KDA states at the end differ from the run without MTP");
-                assert!(mla1 == mla0, "{name}: the MLA cache rows 0..={last} differ from the run without MTP");
-                // one report per row and id; the decode reports carry the emitted ids in order
-                assert_eq!(reps.iter().map(|r| r.pos).collect::<Vec<_>>(), (0..=last).collect::<Vec<_>>(), "{name}: report positions");
-                assert_eq!(reps.iter().filter_map(|r| r.next).collect::<Vec<_>>(), base.ids, "{name}: report ids");
-                let seen = seen.lock().unwrap().clone();
-                assert!(seen.iter().all(|x| x.1), "{name}: KDA states after a rollback differ from the one-row path at rows {:?}", seen.iter().filter(|x| !x.1).map(|x| x.0).collect::<Vec<_>>());
-                assert_eq!(seen.len() as u64, st.kda_restore_steps, "{name}: probe calls = rollback steps");
-                assert_eq!((st.tokens, st.verify_rows, st.hist.iter().sum::<u64>()), ((n - 1) as u64, st.steps + st.drafts, st.steps), "{name}: counter identities");
-                assert_eq!(st.kda_snapshots, st.drafts * 6, "{name}: one snapshot per KDA layer (6) per draft row");
-                match pat {
-                    Some(p) => {
-                        let (want, restores) = simulate(nd, pn, n, cap, &|i| p(i));
-                        assert_eq!(
-                            (st.steps, st.tokens, st.drafts, st.accepted, st.verify_rows, st.hist.clone(), st.kda_restore_steps),
-                            (want.steps, want.tokens, want.drafts, want.accepted, want.verify_rows, want.hist.clone(), want.kda_restore_steps),
-                            "{name}: counters vs the simulation"
-                        );
-                        assert_eq!(seen.iter().map(|x| x.0).collect::<Vec<_>>(), restores, "{name}: rollback rows");
-                        assert!(want.drafts > 0, "{name}: the arm must draft");
+                let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, g.topk).unwrap();
+                run.kda_states().for_each(|k| k.reset());
+                let mut row_hash: HashMap<usize, u64> = HashMap::new();
+                let mut door = Vec::new();
+                let mut tok = 0i64;
+                for pos in 0..=last {
+                    let input = if pos < pn { prompt[pos] } else { tok };
+                    if let Some(id) = run.row(&mut cnq, &mut tiers, input, pos, pos + 1 >= pn).unwrap() {
+                        tok = id;
+                        door.push(id);
                     }
-                    None => assert!(st.drafts > 0 && st.accepted <= st.drafts, "{name}: {st:?}"),
+                    row_hash.insert(pos, hash(&states(&run, &g, 0).0));
+                }
+                tiers.free();
+                assert_eq!(door, base.ids, "the one-row door gives generate's ids{tag}");
+                let finite = base.logits.iter().flatten().filter(|v| v.is_finite()).count();
+                assert_eq!(finite, n * g.vocab, "the synthetic model must stay finite for the comparison to mean something");
+                let gold = base.ids.clone();
+                let vocab = g.vocab as i64;
+                type Pat = fn(usize) -> bool;
+                let arms: Vec<(&str, usize, Option<Pat>, bool)> = vec![
+                    ("N 1, right unless i % 3 == 2", 1, Some(|i| i % 3 != 2), false),
+                    ("N 2, right unless i % 4 == 1", 2, Some(|i| i % 4 != 1), false),
+                    ("N 3, right unless i % 5 == 3", 3, Some(|i| i % 5 != 3), false),
+                    ("N 2, every draft wrong", 2, Some(|_| false), false),
+                    ("N 1, every draft right, flags + graph", 1, Some(|_| true), true),
+                    ("N 2, the block's own drafts", 2, None, false),
+                ];
+                for (seed, (name, nd, pat, sw)) in arms.into_iter().enumerate() {
+                    let name = format!("{name}{tag}");
+                    let block = mtp::synthetic_block(&g, &moe, 0x0192_0000 + seed as u64);
+                    run.set_mtp(nd, Some(block)).unwrap();
+                    if let Some(p) = pat {
+                        let gold = gold.clone();
+                        run.set_mtp_hook(Some(Box::new(move |i, _| if p(i) { gold[i] } else { (gold[i] + 1) % vocab })));
+                    }
+                    let seen: Arc<Mutex<Vec<(usize, bool)>>> = Arc::default();
+                    let rh = row_hash.clone();
+                    let seen2 = seen.clone();
+                    run.set_mtp_probe(Some(Box::new(move |row, b| seen2.lock().unwrap().push((row, rh.get(&row) == Some(&hash(b)))))));
+                    if sw {
+                        run.set_graph(true);
+                        run.set_switches(&mut cnq, Switches { flags: true, lookahead: false, ..Switches::default() });
+                    }
+                    let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, (1 + nd) * g.topk).unwrap();
+                    let mut reps: Vec<TokenReport> = Vec::new();
+                    let out = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |r| reps.push(r.clone())).unwrap();
+                    tiers.free();
+                    if sw {
+                        run.set_graph(false);
+                        run.set_switches(&mut cnq, Switches::default());
+                    }
+                    let st = run.mtp_stats().unwrap().clone();
+                    eprintln!("glm5_mtp spec {name}: {st:?}");
+                    assert_eq!(out.ids, base.ids, "{name}: ids");
+                    let diff: Vec<usize> = out.logits.iter().zip(&base.logits).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).collect();
+                    assert!(out.logits.len() == n && diff.iter().all(|&d| d == 0), "{name}: logits differ in bits per generated id {diff:?}");
+                    let (kda1, mla1) = states(&run, &g, last);
+                    assert!(kda1 == kda0, "{name}: the KDA states at the end differ from the run without MTP");
+                    assert!(mla1 == mla0, "{name}: the MLA cache rows 0..={last} differ from the run without MTP");
+                    // one report per row and id; the decode reports carry the emitted ids in order
+                    assert_eq!(reps.iter().map(|r| r.pos).collect::<Vec<_>>(), (0..=last).collect::<Vec<_>>(), "{name}: report positions");
+                    assert_eq!(reps.iter().filter_map(|r| r.next).collect::<Vec<_>>(), base.ids, "{name}: report ids");
+                    let seen = seen.lock().unwrap().clone();
+                    assert!(seen.iter().all(|x| x.1), "{name}: KDA states after a rollback differ from the one-row path at rows {:?}", seen.iter().filter(|x| !x.1).map(|x| x.0).collect::<Vec<_>>());
+                    assert_eq!(seen.len() as u64, st.kda_restore_steps, "{name}: probe calls = rollback steps");
+                    assert_eq!((st.tokens, st.verify_rows, st.hist.iter().sum::<u64>()), ((n - 1) as u64, st.steps + st.drafts, st.steps), "{name}: counter identities");
+                    assert_eq!(st.kda_snapshots, st.drafts * 6, "{name}: one snapshot per KDA layer (6) per draft row");
+                    match pat {
+                        Some(p) => {
+                            let (want, restores) = simulate(nd, pn, n, cap, &|i| p(i));
+                            assert_eq!(
+                                (st.steps, st.tokens, st.drafts, st.accepted, st.verify_rows, st.hist.clone(), st.kda_restore_steps),
+                                (want.steps, want.tokens, want.drafts, want.accepted, want.verify_rows, want.hist.clone(), want.kda_restore_steps),
+                                "{name}: counters vs the simulation"
+                            );
+                            assert_eq!(seen.iter().map(|x| x.0).collect::<Vec<_>>(), restores, "{name}: rollback rows");
+                            assert!(want.drafts > 0, "{name}: the arm must draft");
+                        }
+                        None => assert!(st.drafts > 0 && st.accepted <= st.drafts, "{name}: {st:?}"),
+                    }
                 }
             }
             run.set_mtp(0, None).unwrap();

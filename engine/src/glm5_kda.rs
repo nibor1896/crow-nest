@@ -566,20 +566,8 @@ pub unsafe fn prompt_rows_cut_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaStat
 /// # Safety
 /// As [`step`]; `proj` as in [`prompt_with`].
 pub unsafe fn step_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
-    let d = &kk.d;
-    let (cc, wb, hd, heads) = (d.conv_ch(), (d.width() * 4) as u64, d.head_dim as u32, d.heads as u32);
     proj(KdaProj::Qkv, x, sc.qkv, 1);
-    launch_v(kk.conv_step, cc.div_ceil(256) as u32, 1, 1, 256, &[sc.qkv, w.conv, st.conv, sc.conv_t]);
-    launch_v(kk.l2norm, heads, 1, 1, hd, &[sc.conv_t, sc.conv_t + wb, sc.qn, sc.kn]);
-    gemv(kk, sc, w.f_a, x, sc.fa, P_HIDDEN, d.head_dim, P_HD);
-    gemv(kk, sc, w.f_b, sc.fa, sc.f, P_HD, d.width(), P_WIDTH);
-    gemv(kk, sc, w.b, x, sc.b, P_HIDDEN, d.heads, P_HEADS);
-    launch_v(kk.kda.gate, d.width().div_ceil(256) as u32, 1, 1, 256, &[
-        sc.f, w.dt_bias, w.a_log, sc.b, sc.g, sc.beta, sc.p(P_ONE), sc.p(P_HEADS), sc.lb]);
-    launch_v(kk.kda.step, heads, 1, 1, hd, &[st.s, sc.qn, sc.kn, sc.conv_t + 2 * wb, sc.g, sc.beta, sc.o]);
-    gemv(kk, sc, w.g_a, x, sc.ga, P_HIDDEN, d.head_dim, P_HD);
-    gemv(kk, sc, w.g_b, sc.ga, sc.gate, P_HD, d.width(), P_WIDTH);
-    launch_v(kk.gated_norm, heads, 1, 1, hd, &[sc.o, sc.gate, w.o_norm, sc.normed]);
+    step_mid(kk, w, st, sc, x, sc.qkv, sc.normed, false);
     proj(KdaProj::O, sc.normed, out, 1);
 }
 
@@ -594,15 +582,70 @@ pub unsafe fn step_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &Kda
 /// # Safety
 /// As [`step_with`].
 pub unsafe fn step_fused_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, out: Dev, proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
-    let d = &kk.d;
-    let (wb, heads, hd) = ((d.width() * 4) as u64, d.heads as u32, d.head_dim as u32);
     proj(KdaProj::Qkv, x, sc.qkv, 1);
-    launch_v(kk.kda.conv_l2, heads, 1, 1, hd, &[sc.qkv, w.conv, st.conv, sc.conv_t, sc.qn, sc.kn, sc.fprm]);
-    launch_v(kk.kda.proj_a3, d.head_dim.max(d.heads).div_ceil(8) as u32, 3, 1, 256, &[w.f_a, w.b, w.g_a, x, sc.fa, sc.b, sc.ga, sc.fprm]);
-    launch_v(kk.kda.proj_b2_gate, d.width().div_ceil(8) as u32, 2, 1, 256, &[w.f_b, w.g_b, sc.fa, sc.ga, sc.b, w.dt_bias, w.a_log, sc.f, sc.g, sc.beta, sc.gate, sc.fprm]);
-    launch_v(kk.kda.step_norm, heads, 1, 1, hd, &[st.s, sc.qn, sc.kn, sc.conv_t + 2 * wb, sc.g, sc.beta, sc.o, sc.gate, w.o_norm, sc.normed, sc.fprm]);
+    step_mid(kk, w, st, sc, x, sc.qkv, sc.normed, true);
     proj(KdaProj::O, sc.normed, out, 1);
 }
+
+/// The launches of a decode row between its two projections ([`step_with`]'s 10; `fused`:
+/// [`step_fused_with`]'s 4) on the row's input `x` `[hidden]`, its q|k|v projection `qkv`
+/// `[conv_ch]` and its gated-normed output `normed` `[width]`; every other scratch value at the
+/// scratch's first row. One body for the decode row and the verify rows ([`steps_with`]), so
+/// the two cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+unsafe fn step_mid(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, qkv: Dev, normed: Dev, fused: bool) {
+    let d = &kk.d;
+    let (cc, wb, hd, heads) = (d.conv_ch(), (d.width() * 4) as u64, d.head_dim as u32, d.heads as u32);
+    if fused {
+        launch_v(kk.kda.conv_l2, heads, 1, 1, hd, &[qkv, w.conv, st.conv, sc.conv_t, sc.qn, sc.kn, sc.fprm]);
+        launch_v(kk.kda.proj_a3, d.head_dim.max(d.heads).div_ceil(8) as u32, 3, 1, 256, &[w.f_a, w.b, w.g_a, x, sc.fa, sc.b, sc.ga, sc.fprm]);
+        launch_v(kk.kda.proj_b2_gate, d.width().div_ceil(8) as u32, 2, 1, 256, &[w.f_b, w.g_b, sc.fa, sc.ga, sc.b, w.dt_bias, w.a_log, sc.f, sc.g, sc.beta, sc.gate, sc.fprm]);
+        launch_v(kk.kda.step_norm, heads, 1, 1, hd, &[st.s, sc.qn, sc.kn, sc.conv_t + 2 * wb, sc.g, sc.beta, sc.o, sc.gate, w.o_norm, normed, sc.fprm]);
+        return;
+    }
+    launch_v(kk.conv_step, cc.div_ceil(256) as u32, 1, 1, 256, &[qkv, w.conv, st.conv, sc.conv_t]);
+    launch_v(kk.l2norm, heads, 1, 1, hd, &[sc.conv_t, sc.conv_t + wb, sc.qn, sc.kn]);
+    gemv(kk, sc, w.f_a, x, sc.fa, P_HIDDEN, d.head_dim, P_HD);
+    gemv(kk, sc, w.f_b, sc.fa, sc.f, P_HD, d.width(), P_WIDTH);
+    gemv(kk, sc, w.b, x, sc.b, P_HIDDEN, d.heads, P_HEADS);
+    launch_v(kk.kda.gate, d.width().div_ceil(256) as u32, 1, 1, 256, &[
+        sc.f, w.dt_bias, w.a_log, sc.b, sc.g, sc.beta, sc.p(P_ONE), sc.p(P_HEADS), sc.lb]);
+    launch_v(kk.kda.step, heads, 1, 1, hd, &[st.s, sc.qn, sc.kn, sc.conv_t + 2 * wb, sc.g, sc.beta, sc.o]);
+    gemv(kk, sc, w.g_a, x, sc.ga, P_HIDDEN, d.head_dim, P_HD);
+    gemv(kk, sc, w.g_b, sc.ga, sc.gate, P_HD, d.width(), P_WIDTH);
+    launch_v(kk.gated_norm, heads, 1, 1, hd, &[sc.o, sc.gate, w.o_norm, normed]);
+}
+
+/// #192 (`CROW_GLM_MTP`, the verify call): `t` decode steps, rows `x` `[t][hidden]` into `out`
+/// `[t][hidden]`, continuing `st` row after row. Each row is bit for bit its own [`step_with`]
+/// (`fused`: [`step_fused_with`]) when `proj` computes every row of a call on its own and as a
+/// one-row call (the glm5 NVFP4 GEMV: grid y = row): q|k|v of the `t` rows is ONE
+/// `proj(Qkv, x, sc.qkv, t)` and o ONE `proj(O, sc.normed, out, t)`; between them the step's
+/// launches run row by row on the row's slices of `x`, `sc.qkv` and `sc.normed` (every other
+/// scratch value is written and read by the row's own launches before the next row's, stream
+/// order). After row `r < t - 1` the state (S and conv window) is copied into `snaps[r]`
+/// (queued, D2D): the state after that row, for the caller's rollback.
+///
+/// # Safety
+/// As [`step_with`]; `x` / `out` hold `t` rows, `t <= sc.max_t`, `snaps` holds `t - 1` states of
+/// these dims; `proj` queues on the current stream and writes `y` dense, `[t][out]`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn steps_with(kk: &KdaKernels, w: &KdaWeights, st: &KdaState, sc: &KdaScratch, x: Dev, t: usize, out: Dev, fused: bool, snaps: &[KdaState], proj: &mut dyn FnMut(KdaProj, Dev, Dev, usize)) {
+    let d = &kk.d;
+    assert!((1..=sc.max_t).contains(&t), "#192: {t} KDA decode rows (scratch holds {})", sc.max_t);
+    assert!(snaps.len() + 1 >= t, "#192: {t} KDA decode rows, {} snapshot slots", snaps.len());
+    let (xb, qb, nb) = ((d.hidden * 4) as u64, (d.conv_ch() * 4) as u64, (d.width() * 4) as u64);
+    proj(KdaProj::Qkv, x, sc.qkv, t);
+    for r in 0..t {
+        let ro = r as u64;
+        step_mid(kk, w, st, sc, x + ro * xb, sc.qkv + ro * qb, sc.normed + ro * nb, fused);
+        if r + 1 < t {
+            snaps[r].copy_from(st);
+        }
+    }
+    proj(KdaProj::O, sc.normed, out, t);
+}
+
 
 /// The synthetic KDA layer of the #162 goldens: the counter-based generator of
 /// `oracle/export_glm5_kda_golden.py`, bit for bit. Every value is `q * 2^-p` (or the `Dt` /
@@ -1104,6 +1147,19 @@ extern "C" __global__ void hold(long long ns)
         }
     }
 
+    /// [`gemv_proj`] over the `tt` rows of a call, row by row (each row a one-row GEMV)
+    fn rows_proj<'a>(kk: &'a KdaKernels, w: &'a KdaWeights, sc: &'a KdaScratch) -> impl FnMut(KdaProj, Dev, Dev, usize) + 'a {
+        let (h, cc, wd) = (kk.d.hidden as u64, kk.d.conv_ch() as u64, kk.d.width() as u64);
+        move |p, xi, yo, tt| unsafe {
+            for r in 0..tt as u64 {
+                match p {
+                    KdaProj::Qkv => gemv(kk, sc, w.qkv, xi + r * h * 4, yo + r * cc * 4, P_HIDDEN, kk.d.conv_ch(), P_CONV),
+                    KdaProj::O => gemv(kk, sc, w.o_proj, xi + r * wd * 4, yo + r * h * 4, P_WIDTH, kk.d.hidden, P_HIDDEN),
+                }
+            }
+        }
+    }
+
     /// `prompt`'s two projections (the BF16 GEMMs) as a `proj` of [`prompt_with`]
     fn gemm_proj<'a>(kk: &'a KdaKernels, w: &'a KdaWeights, sc: &'a KdaScratch) -> impl FnMut(KdaProj, Dev, Dev, usize) + 'a {
         move |p, xi, yo, t| unsafe {
@@ -1220,6 +1276,79 @@ extern "C" __global__ void hold(long long ns)
             st2.free();
             sc1.free();
             sc2.free();
+            l.w.free();
+            l.st.free();
+            l.sc.free();
+        }
+    }
+
+    /// #192 (`CROW_GLM_MTP` verify): `steps_with` over 4 rows, unfused and fused, is bit for bit
+    /// 4 one-row steps (`step_with` / `step_fused_with`) on the synthetic real-shape layer from a
+    /// non-zero state (a 24-row prompt): every output row, the final S and conv window, and each
+    /// snapshot equal to the state after its row. The projections are `step`'s BF16 GEMVs run
+    /// row by row (each row as a one-row call, as the verify's NVFP4 GEMV computes it).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_kda::tests_gpu -- --ignored --nocapture --test-threads 1"]
+    fn kda_gpu_steps_are_one_row_steps() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut l = layer(24);
+            let d = l.kk.d;
+            let (h, t) = (d.hidden, 4usize);
+            let x = synth::input(24 + t, h);
+            let mut xd = cuda::to_f32_dev(&x);
+            let mut od = cuda::alloc_zeroed((24 + t) * h * 4);
+            prompt(&l.kk, &l.w, &l.st, &l.sc, xd, 24, od);
+            let (kk, w) = (&l.kk, &l.w);
+            let bits = |v: Vec<f32>| v.into_iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            let state = |s: &KdaState| (bits(cuda::dtoh(s.s, d.state_floats())), bits(cuda::dtoh(s.conv, d.conv_floats())));
+            let x0 = xd + (24 * h * 4) as u64;
+            for fused in [false, true] {
+                // one-row steps on a copy of the prompt state, the state read back after each row
+                let mut sa = KdaState::alloc(&d);
+                sa.copy_from(&l.st);
+                let mut sc1 = KdaScratch::alloc(&d, 1);
+                let mut o1 = cuda::alloc_zeroed(t * h * 4);
+                let mut after = Vec::new();
+                for r in 0..t {
+                    let (xr, or) = (x0 + (r * h * 4) as u64, o1 + (r * h * 4) as u64);
+                    if fused {
+                        step_fused_with(kk, w, &sa, &sc1, xr, or, &mut rows_proj(kk, w, &sc1));
+                    } else {
+                        step_with(kk, w, &sa, &sc1, xr, or, &mut rows_proj(kk, w, &sc1));
+                    }
+                    cuda::sync();
+                    after.push(state(&sa));
+                }
+                // the verify's rows on another copy
+                let mut sb = KdaState::alloc(&d);
+                sb.copy_from(&l.st);
+                let mut sc4 = KdaScratch::alloc(&d, t);
+                let mut o4 = cuda::alloc_zeroed(t * h * 4);
+                let mut snaps: Vec<KdaState> = (0..t - 1).map(|_| KdaState::alloc(&d)).collect();
+                steps_with(kk, w, &sb, &sc4, x0, t, o4, fused, &snaps, &mut rows_proj(kk, w, &sc4));
+                cuda::sync();
+                for r in 0..t {
+                    let at = |o: Dev| bits(cuda::dtoh(o + (r * h * 4) as u64, h));
+                    assert_eq!(at(o4), at(o1), "fused {fused}: output row {r}");
+                }
+                assert!(state(&sb) == after[t - 1], "fused {fused}: the state after the last row");
+                for (r, s) in snaps.iter().enumerate() {
+                    assert!(state(s) == after[r], "fused {fused}: snapshot {r} is not the state after row {r}");
+                }
+                eprintln!("#192 KDA: steps_with (fused {fused}) == {t} one-row steps bit for bit (out, S, window, {} snapshots)", snaps.len());
+                for s in snaps.iter_mut().chain([&mut sa, &mut sb]) {
+                    s.free();
+                }
+                for p in [&mut o1, &mut o4] {
+                    cuda::free_dev(p);
+                }
+                sc1.free();
+                sc4.free();
+            }
+            for p in [&mut xd, &mut od] {
+                cuda::free_dev(p);
+            }
             l.w.free();
             l.st.free();
             l.sc.free();

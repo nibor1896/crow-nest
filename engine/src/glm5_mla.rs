@@ -491,10 +491,15 @@ pub struct MlaScratch {
 pub const ST_RING: usize = 64;
 
 impl MlaScratch {
+    /// (row, split) slots of the attention partials at `max_t` rows: `t * attn_splits(t) <= max(t, 16)`
+    fn part_slots(max_t: usize) -> usize {
+        max_t.max(16)
+    }
+
     /// f32 values of the activations in the region at `max_t` rows over caches of `cap` tokens,
     /// in field order: qa, q, kva, ip, iq, scores, ncb, pos, qt, part_o, part_ml, u, o
     fn widths(d: &MlaDims, max_t: usize, cap: usize) -> [usize; 13] {
-        let slots = max_t.max(16); // t * attn_splits(t) <= max(t, 16)
+        let slots = MlaScratch::part_slots(max_t);
         [
             max_t * d.q_lora,
             max_t * d.heads * d.nope,
@@ -702,6 +707,15 @@ impl MlaScratch {
         if ns == 1 && attn2_on() && attn2_fits(d) {
             // #186: one split on tensor cores writes u directly
             launch_v(kn.attn2, t, (d.heads / 64) as u32, 1, 256, &[self.qt, c.latent, sel, sel_n, self.u, self.st]);
+        } else if self.t * ns as usize > MlaScratch::part_slots(self.max_t) {
+            // #192 (`forward_steps_with`): more partials than the slots hold: row by row, each
+            // pair the row's one-row launches but for the row offsets (gm_attn and gm_attn_merge
+            // compute a row from its own q~, selection and partials, and read no `st`)
+            let (qb, lb) = ((d.heads * d.kv_lora * 4) as u64, (self.sel_max * 4) as u64);
+            for r in 0..self.t as u64 {
+                launch_v(kn.attn, d.heads.div_ceil(8) as u32, 1, ns as u32, 256, &[self.qt + r * qb, c.latent, sel + r * lb, sel_n + r * 4, self.part_o, self.part_ml, ns, self.st]);
+                launch_v(kn.merge, d.heads as u32, 1, 1, 256, &[self.part_o, self.part_ml, self.u + r * qb, ns, self.st]);
+            }
         } else {
             launch_v(kn.attn, d.heads.div_ceil(8) as u32, t, ns as u32, 256, &[self.qt, c.latent, sel, sel_n, self.part_o, self.part_ml, ns, self.st]);
             launch_v(kn.merge, d.heads as u32, t, 1, 256, &[self.part_o, self.part_ml, self.u, ns, self.st]);
@@ -797,9 +811,60 @@ impl MlaScratch {
         split_t: usize,
         proj: &mut dyn FnMut(&MlaScratch, MlaProj, CUdeviceptr, CUdeviceptr),
     ) {
+        assert!(split_t >= t, "glm5_mla: sub-call of {t} rows (split rows {split_t})");
+        self.forward_split_with(kn, w, c, x, y, pos0, t, row_off, split_t, proj);
+    }
+
+    /// #192 (`CROW_GLM_MTP`, the verify call): [`MlaScratch::forward_with`] for `t` rows at
+    /// `pos0 ..` whose attention takes the split count of a ONE-row call ([`attn_splits`]`(1)`)
+    /// on every row, so each row is bit for bit its own one-row call (`forward_with(pos0 + r, 1)`)
+    /// when `proj` computes every row of a call on its own and as a one-row call (the glm5 NVFP4
+    /// GEMV, grid y = row). Every other launch already computes a row from that row alone: the
+    /// rmsnorm, both stores and `gm_attn_merge` a block per row, `gm_gemv` / `gm_absorb1` /
+    /// `gm_out_v1` one summation chain per (row, output) whatever the call's rows (and the tiled
+    /// kernels above `DECODE_T` rows the same chains), `gm_idx_scores` the same pooled key per
+    /// pool and scores only the pools complete at the row's own position, `gm_sel_prep` and the
+    /// selection a row's own position, `gm_attn` a (row, split) from the row's q~ and selection.
+    /// The call stores every row's latent and indexer rows before any row selects; a row never
+    /// selects a later position. Partials beyond the scratch's slots run row by row
+    /// ([`MlaScratch::attend`]).
+    ///
+    /// # Safety
+    /// As [`MlaScratch::forward_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_steps_with(
+        &mut self,
+        kn: &MlaKernels,
+        w: &MlaWeights,
+        c: &MlaCache,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        pos0: usize,
+        t: usize,
+        proj: &mut dyn FnMut(&MlaScratch, MlaProj, CUdeviceptr, CUdeviceptr),
+    ) {
+        self.forward_split_with(kn, w, c, x, y, pos0, t, 0, 1, proj);
+    }
+
+    /// [`MlaScratch::forward_rows_with`] with any split rows (`split_t < t`: more partials than
+    /// one launch's slots, [`MlaScratch::attend`] runs them row by row)
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn forward_split_with(
+        &mut self,
+        kn: &MlaKernels,
+        w: &MlaWeights,
+        c: &MlaCache,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        pos0: usize,
+        t: usize,
+        row_off: usize,
+        split_t: usize,
+        proj: &mut dyn FnMut(&MlaScratch, MlaProj, CUdeviceptr, CUdeviceptr),
+    ) {
         let d = kn.dims;
         self.begin(pos0, t);
-        assert!(row_off + t <= self.sel_rows && split_t >= t, "glm5_mla: sub-call rows {row_off}..{} of {} (split rows {split_t})", row_off + t, self.sel_rows);
+        assert!(row_off + t <= self.sel_rows && split_t >= 1, "glm5_mla: sub-call rows {row_off}..{} of {} (split rows {split_t})", row_off + t, self.sel_rows);
         (self.row_off, self.split_t) = (row_off, split_t);
         proj(self, MlaProj::QA, x, self.qa);
         launch_v(kn.rmsnorm, self.t as u32, 1, 1, 256, &[self.qa, w.q_a_norm, d.q_lora as u64, self.st]);
@@ -1371,6 +1436,88 @@ mod tests_gpu {
             }
             assert!(sel[45].len() == TINY.topk + 2 && sel[18].len() == 19, "{} {}", sel[45].len(), sel[18].len());
             println!("small shapes: {n} rows, every selection identical, worst cosine {worst_cos:.9}");
+            free_weights(&mut w);
+        }
+    }
+
+    /// #192 (`CROW_GLM_MTP` verify): `forward_steps_with` over `t` rows is, bit for bit, `t`
+    /// one-row `forward_with` calls in position order: every output row, every row's selection
+    /// and every latent and indexer cache row. Small shapes after a 40-row prompt (sparse from
+    /// row 19), blocks of 1, 2, 3, 4 and 5 rows (5 > `DECODE_T`: the tiled kernels) that start
+    /// inside the previous block (a rollback rewrites rejected rows), on a scratch of 5 rows (the
+    /// partials row by row) and one of 64 (one launch, `t * 16 <= 64` slots).
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib glm5_mla::tests_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mla_gpu_steps_are_one_row_calls() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let (_m, select) = main_select();
+            let d = TINY;
+            let kn = MlaKernels::new(d, select);
+            let hw = synth::weights(&d, 23);
+            let mut w = upload(&hw);
+            let h = d.hidden;
+            // (start, rows) of the verify blocks; each starts at or before the previous block's end
+            let blocks: [(usize, usize); 7] = [(40, 2), (41, 3), (44, 1), (44, 5), (46, 4), (50, 2), (51, 5)];
+            let n = 56;
+            let x = synth::x(23, 40 + 8 * blocks.len(), h);
+            let mut xd = cuda::alloc_zeroed(n * h * 4);
+            let mut yd = cuda::alloc_zeroed(n * h * 4);
+            let proj = |s: &MlaScratch, p: MlaProj, xi: CUdeviceptr, yo: CUdeviceptr| match p {
+                MlaProj::QA => s.linear(&kn, w.q_a, d.hidden, d.q_lora, xi, d.hidden, yo, d.q_lora),
+                MlaProj::QB => s.linear(&kn, w.q_b, d.q_lora, d.heads * d.nope, xi, d.q_lora, yo, d.heads * d.nope),
+                MlaProj::KVA => s.linear(&kn, w.kv_a, d.hidden, d.kv_lora, xi, d.hidden, yo, d.kv_lora),
+                MlaProj::O => s.linear(&kn, w.o_proj, d.heads * d.v, d.hidden, xi, d.heads * d.v, yo, d.hidden),
+            };
+            let sels = |s: &MlaScratch, t: usize| -> Vec<Vec<i32>> {
+                let (sn, sl) = (cuda::dtoh_i32(s.sel_n, t), cuda::dtoh_i32(s.sel, t * d.sel_max()));
+                (0..t).map(|r| sl[r * d.sel_max()..r * d.sel_max() + sn[r] as usize].to_vec()).collect()
+            };
+            let bits = |v: Vec<f32>| v.into_iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            let mut checked = 0;
+            for max_t in [5usize, 64] {
+                let (mut ca, mut cb) = (MlaCache::new(&d, n), MlaCache::new(&d, n));
+                let (mut sa, mut sb) = (MlaScratch::new(&d, max_t, n), MlaScratch::new(&d, max_t, n));
+                let mut s40 = MlaScratch::new(&d, 40, n);
+                cuda::to_f32_into(xd, &x[..40 * h]);
+                for c in [&ca, &cb] {
+                    s40.forward(&kn, &w, c, xd, yd, 0, 40);
+                }
+                for (bi, &(p0, t)) in blocks.iter().enumerate() {
+                    // the block's rows: fresh inputs per block (a rewritten row sees new values)
+                    let xo = 40 + bi * 8;
+                    cuda::to_f32_into(xd, &x[xo * h..(xo + t) * h]);
+                    let mut one_y = Vec::new();
+                    let mut one_sel = Vec::new();
+                    for r in 0..t {
+                        sa.forward_with(&kn, &w, &ca, xd + (r * h * 4) as u64, yd + (r * h * 4) as u64, p0 + r, 1, &mut |s, p, a, b| proj(s, p, a, b));
+                        cuda::sync();
+                        one_y.push(bits(cuda::dtoh(yd + (r * h * 4) as u64, h)));
+                        one_sel.extend(sels(&sa, 1));
+                    }
+                    cuda::memset_zero_sync(yd, t * h * 4);
+                    sb.forward_steps_with(&kn, &w, &cb, xd, yd, p0, t, &mut |s, p, a, b| proj(s, p, a, b));
+                    cuda::sync();
+                    for (r, want) in one_y.iter().enumerate() {
+                        assert_eq!(&bits(cuda::dtoh(yd + (r * h * 4) as u64, h)), want, "scratch {max_t}, block {p0}+{t}: output row {r}");
+                    }
+                    assert_eq!(sels(&sb, t), one_sel, "scratch {max_t}, block {p0}+{t}: selections");
+                    let rows = p0 + t;
+                    for (what, a, b, per) in [("latent", ca.latent, cb.latent, d.latent_bytes_per_token()), ("indexer", ca.index, cb.index, d.indexer_bytes_per_token())] {
+                        assert_eq!(cuda::dtoh_t::<u8>(b, rows * per as usize), cuda::dtoh_t::<u8>(a, rows * per as usize), "scratch {max_t}, block {p0}+{t}: {what} cache rows");
+                    }
+                    assert!(one_sel.iter().any(|v| v.len() < p0 + 1), "block {p0}+{t}: the rows must select sparsely");
+                    checked += t;
+                }
+                for s in [&mut sa, &mut sb, &mut s40] {
+                    s.free();
+                }
+                ca.free();
+                cb.free();
+            }
+            println!("#192 MLA: forward_steps_with == one-row calls bit for bit ({checked} rows over {} blocks x 2 scratches)", blocks.len());
+            cuda::free_dev(&mut xd);
+            cuda::free_dev(&mut yd);
             free_weights(&mut w);
         }
     }
