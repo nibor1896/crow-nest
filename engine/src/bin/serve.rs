@@ -6665,13 +6665,13 @@ fn glm_answer_reuse_line<R: Rows>(eng: &Glm5Engine<R>) -> String {
     let k = glm5_engine::ANSWER_REUSE_ENV;
     if eng.answer_reuse() {
         format!(
-            "{k}=1 (#219): a prompt that extends the whole held conversation continues from the live state (LIVE, 0 B host RAM, no rollback); {}",
-            if eng.realigns() { "a re-render that splits the held answer's bytes into other ids is realigned to the held ids (realigned:)" } else { "no realign (no tokenizer)" }
+            "{k}=1 (#219): a prompt that extends the whole held conversation continues from the live state (LIVE, 0 B host RAM, no rollback); {}{}",
+            if eng.realigns() { "a re-render that splits the held answer's bytes into other ids is realigned to the held ids (realigned:)" } else { "no realign (no tokenizer)" },
+            // #192: the live prefill settles the verify rows past the held end first
+            if eng.rows().mtp_drafts() > 0 { "; with CROW_GLM_MTP the prefill first drops the verify rows past the held end (KDA from the verify's snapshot slot) and runs the MTP block over the held rows" } else { "" }
         )
     } else if !eng.cache_enabled() {
         format!("{k}: off (the prefix cache is off)")
-    } else if eng.rows().mtp_drafts() > 0 {
-        format!("{k}: off while CROW_GLM_MTP > 0 (the spec head-norm row is not proven consistent after a speculative decode, #219)")
     } else {
         format!("{k}: off (default; every request rolls back to the prompt snapshot and prefills the previous answer again)")
     }
@@ -6682,14 +6682,14 @@ fn glm_prefix_anchor_line<R: Rows>(eng: &Glm5Engine<R>) -> String {
     let k = glm5_engine::PREFIX_ANCHOR_ENV;
     if eng.prefix_anchor() {
         format!(
-            "{k}=1 (#217): + 1 anchor snapshot per sequence slot, {} B in HOST RAM (KDA states, no logits row), at the first <|user|> or at L of a cold prompt with L >= {}, captured inside the prefill by cutting the KDA scan (device copy from the prompt's elastic hand-back, freed after the prompt)",
+            "{k}=1 (#217): + 1 anchor snapshot per sequence slot, {} B in HOST RAM (KDA states{}, no logits row), at the first <|user|> or at L of a cold prompt with L >= {}, captured inside the prefill by cutting the KDA scan (device copy from the prompt's elastic hand-back, freed after the prompt)",
             eng.anchor_bytes(),
+            // #192: the MTP block's pending head-norm row at the cut
+            if eng.rows().mtp_drafts() > 0 { " + the MTP block's pending head-norm row at the cut" } else { "" },
             glm5_engine::ANCHOR_MIN
         )
     } else if !eng.cache_enabled() {
         format!("{k}: off (the prefix cache is off)")
-    } else if eng.rows().mtp_drafts() > 0 {
-        format!("{k}: off while CROW_GLM_MTP > 0 (the spec head-norm row exists only at the prompt's end, #217)")
     } else {
         format!("{k}: off (default; a new chat with the same tools and system prompt starts cold)")
     }
@@ -12619,6 +12619,58 @@ Red is #FF0000."), "{off}");
             let mut rows = g5_replay(&mut off);
             rows.push((glm_prompt_phase(&mut off, &g5_t3()).unwrap().prefilled, 0, false));
             assert_eq!(rows[9].0, 6450, "off: t3 is cold");
+        }
+    }
+
+    /// #192 on the G5 session's shape (host twin): with `CROW_GLM_MTP` (the twin's speculative
+    /// decode, 1 and 3 drafts, a block that guesses the session's answer ids but misses every
+    /// seventh position) `CROW_GLM_ANSWER_REUSE` (A + B) and `CROW_GLM_PREFIX_ANCHOR` stay on:
+    /// every request prefills the rows it does without MTP (t2's second request 65, t3 from the
+    /// anchor 407), its prompt phase gives the same greedy id and logits row, and every decode
+    /// step the same id. The boot lines say on.
+    #[test]
+    fn glm_g5_session_with_mtp_keeps_answer_reuse_and_the_anchor() {
+        type Req = (usize, usize, bool, usize, Vec<f32>, Vec<i64>);
+        let run = |mtp: usize| -> (Vec<Req>, (usize, usize)) {
+            let rows = if mtp == 0 { FakeRows::new(20_000, 64, (10..40).collect()) } else { FakeRows::with_mtp(20_000, 64, (10..40).collect(), mtp) };
+            let mut e = Glm5Engine::new(rows, true);
+            e.set_prefix_anchor(true);
+            e.set_answer_reuse(true, Some(std::sync::Arc::new(crow_nest_engine::glm5_engine::fake::token_bytes())));
+            if mtp > 0 {
+                assert!(glm_answer_reuse_line(&e).starts_with("CROW_GLM_ANSWER_REUSE=1") && glm_answer_reuse_line(&e).contains("CROW_GLM_MTP"), "{}", glm_answer_reuse_line(&e));
+                assert!(glm_prefix_anchor_line(&e).starts_with("CROW_GLM_PREFIX_ANCHOR=1") && glm_prefix_anchor_line(&e).contains("MTP"), "{}", glm_prefix_anchor_line(&e));
+            }
+            let mut reqs = g5_session();
+            reqs.push(G5Req { prompt: g5_t3(), answer: Vec::new() });
+            let mut out = Vec::new();
+            unsafe {
+                for r in reqs {
+                    let b = glm_prompt_phase(&mut e, &r.prompt).unwrap();
+                    let row = e.logits();
+                    // the block's draft for the id at `pos`: the answer's id there, but every seventh
+                    let (base, answer) = (e.pos(), r.answer.clone());
+                    e.rows_mut().mtp_draft = Some(Box::new(move |pos, g| match answer.get(pos - base) {
+                        Some(&t) if pos % 7 != 3 => t,
+                        _ => g,
+                    }));
+                    let ids: Vec<i64> = r.answer.iter().map(|&id| e.decode_step(id).unwrap()).collect();
+                    out.push((b.prefilled, b.cached_n, b.realigned.is_some(), b.next, row, ids));
+                }
+            }
+            (out, e.rows().mtp_counts())
+        };
+        let (want, none) = run(0);
+        assert_eq!(none, (0, 0));
+        let f: Vec<usize> = want.iter().map(|r| r.0).collect();
+        assert_eq!(f, [6438, 157, 70, 6456, 65, 158, 206, 491, 38, 407], "off: #219 (A) + (B) and #217");
+        for mtp in [1, 3] {
+            let (got, (verifies, restores)) = run(mtp);
+            for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g, w, "MTP {mtp}: request {}", k + 1);
+            }
+            let steps: usize = want.iter().map(|r| r.5.len()).sum();
+            eprintln!("glm g5 MTP {mtp}: {steps} decode steps, {verifies} verifies, {restores} KDA restores");
+            assert!(verifies < steps && restores > 0, "MTP {mtp}: drafts accepted and rejected ({verifies} verifies, {restores} restores, {steps} steps)");
         }
     }
 

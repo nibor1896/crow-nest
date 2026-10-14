@@ -10764,12 +10764,16 @@ pub struct Glm5Run {
 
 /// crow-nest #217: the prefix anchor of one prompt phase: the position whose KDA states are
 /// copied (the state after rows `0 .. pos`), the device copy of every KDA layer's state there
-/// (`dev`, the layout of the host copy; 0 = none: row by row or no VRAM), and the host copy
+/// (`dev`, the layout of the host copy; 0 = none: row by row or no VRAM), and the host copy.
+/// #192: with MTP also the block's pending head-norm row there (row `pos - 1`'s, `hp`; empty
+/// when off), taken from the prompt call that holds that row
 struct AnchorCut {
     pos: usize,
     dev: Dev,
     host: Vec<f32>,
     done: bool,
+    hp: Vec<f32>,
+    hp_done: bool,
 }
 
 /// #214 `CROW_GLM_KV_LAZY`: what the run mapped and released, cumulative since load
@@ -12974,31 +12978,35 @@ impl Glm5Run {
     /// into a device buffer taken from the elastic arena with the prompt's scratch, one DtoH after
     /// the prompt (prompt chunk 1: a DtoH after the row). `Some(ms)` = captured, the wall of the
     /// whole anchored prefill; `None` = no VRAM for the device copy, the rows are prefilled all
-    /// the same. Not with MTP (the spec head-norm row exists only at the prompt's end).
+    /// the same. #192: with MTP the rows run through [`Glm5Run::spec_prefill`] (verify rows ahead
+    /// of a live sequence are settled first) and the anchor also holds the block's pending
+    /// head-norm row at the cut (row `cut - 1`'s, after the KDA states: the layout of
+    /// `Glm5Device::save_state`); the block's cache rows below the cut are the prompt's own and
+    /// stay in place, so a rollback to the anchor finds the block as a prefill of `cut` rows
+    /// leaves it.
     ///
     /// # Safety
-    /// As [`Glm5Run::prefill`]; `anchor` holds at least the KDA states' floats.
+    /// As [`Glm5Run::prefill`]; `anchor` holds at least the KDA states' floats (+ H with MTP).
     pub unsafe fn prefill_anchored(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, ids: &[i64], pos0: usize, cut: usize, anchor: &mut [f32]) -> Result<(i64, Option<f64>), String> {
         if cut == 0 || cut >= ids.len() {
             return Err(format!("glm5_run: an anchor after {cut} of {} prompt rows", ids.len()));
         }
-        if self.mtp_drafts() > 0 {
-            return Err("glm5_run: no prefix anchor with CROW_GLM_MTP (#217)".to_string());
-        }
         let need = (self.kda_state_bytes() / 4) as usize;
-        if anchor.len() < need {
-            return Err(format!("glm5_run: an anchor of {} floats, the KDA states take {need}", anchor.len()));
+        let hn = self.spec_state_floats();
+        if anchor.len() < need + hn {
+            return Err(format!("glm5_run: an anchor of {} floats, the KDA states (+ the MTP pending row) take {}", anchor.len(), need + hn));
         }
-        self.anchor = Some(AnchorCut { pos: pos0 + cut, dev: 0, host: vec![0.0; need], done: false });
+        self.anchor = Some(AnchorCut { pos: pos0 + cut, dev: 0, host: vec![0.0; need], done: false, hp: vec![0.0; hn], hp_done: false });
         let t = std::time::Instant::now();
-        let r = self.prefill(cnq, tiers, ids, pos0, &mut |_| {});
+        let r = if hn > 0 { self.spec_prefill(cnq, tiers, ids, pos0) } else { self.prefill(cnq, tiers, ids, pos0, &mut |_| {}) };
         let a = self.anchor.take().expect("set above");
         let ms = t.elapsed().as_secs_f64() * 1e3;
         let id = r?;
-        if !a.done {
+        if !a.done || !(hn == 0 || a.hp_done) {
             return Ok((id, None));
         }
         anchor[..need].copy_from_slice(&a.host);
+        anchor[need..need + hn].copy_from_slice(&a.hp);
         Ok((id, Some(ms)))
     }
 
@@ -14325,6 +14333,15 @@ impl Glm5Run {
     /// head-norm row waits in `Spec::hp`. Returns the greedy id of the last row (its logits in
     /// [`Glm5Run::logits_dev`]).
     ///
+    /// crow-nest #219 (a LIVE continuation after a speculative decode): the settle drops the
+    /// verify rows past the last fed id (the KDA states from the snapshot slot of that row when a
+    /// verify ran past it) and runs the block over the verified rows the caller took, with the
+    /// prompt's first id as the last one's next id; the trunk's and the block's MLA / indexer
+    /// rows from `pos0` on (draft rows, chained drafts) are written by this prompt before any
+    /// call reads them; `Spec::hp` and the logits row are this prompt's last row's. So the state
+    /// afterwards is the one a decode without MTP plus this prefill leaves (rows the verify wrote
+    /// stand in for the one-row decode's: accuracy, not bits).
+    ///
     /// # Safety
     /// A CUDA context is current; `tiers` belongs to this model; the speculative decode is on.
     pub unsafe fn spec_prefill(&mut self, cnq: &mut Cnq, tiers: &mut ExpertTiers, ids: &[i64], pos0: usize) -> Result<i64, String> {
@@ -14346,6 +14363,8 @@ impl Glm5Run {
         let mut w = BlockWindow { start: pos0, k: 0 };
         let id = {
             let mut rows = |run: &mut Glm5Run, cnq: &mut Cnq, r0: usize, t: usize| -> Result<(), String> {
+                // crow-nest #217: the anchor's pending row, when this call holds the cut
+                run.spec_anchor_row(sp, pos0, r0, t);
                 run.spec_window_rows(sp, cnq, ids, r0, t, &mut w, true);
                 Ok(())
             };
@@ -14356,6 +14375,28 @@ impl Glm5Run {
         }
         cuda::sync();
         Ok(id)
+    }
+
+    /// crow-nest #217 with MTP: when the prompt call of rows `r0 .. r0 + t` (indices into the
+    /// prompt at `pos0`, the first `t` rows of `x`) holds the anchor's last row (`cut - 1`),
+    /// that row's head-norm row (the kernel and input of [`Glm5Run::spec_window_rows`], one
+    /// block per row) into the anchor's host copy: the block's pending row at the cut.
+    /// Synchronizes, once per anchored prompt. `Spec::normed` is the scratch: the settle before
+    /// the prompt consumed the verify's rows, and the next verify writes them again.
+    ///
+    /// # Safety
+    /// A CUDA context is current; `x` holds the call's rows.
+    unsafe fn spec_anchor_row(&mut self, sp: &crate::glm5_mtp::Spec, pos0: usize, r0: usize, t: usize) {
+        let Some(cut) = self.anchor.as_ref().filter(|a| !a.hp.is_empty() && !a.hp_done).map(|a| a.pos) else { return };
+        if cut <= pos0 + r0 || cut > pos0 + r0 + t {
+            return;
+        }
+        let (h, row) = (self.g.hidden, self.g.hc_streams * self.g.hidden);
+        self.head.stream_mean_rms(self.x + ((cut - 1 - pos0 - r0) * row * 4) as u64, self.hw.norm, sp.normed, 1);
+        cuda::sync();
+        let a = self.anchor.as_mut().expect("checked above");
+        cuda::ck(cudarc::driver::sys::cuMemcpyDtoH_v2(a.hp.as_mut_ptr() as *mut std::ffi::c_void, sp.normed, h * 4));
+        a.hp_done = true;
     }
 
     /// serve: one decode step, `tok` at `pos` (the caller's sequence holds `pos` rows): the
