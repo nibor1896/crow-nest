@@ -1564,15 +1564,27 @@ impl Glm5Pass {
     ///   `gemv_bf16_b` grid y = row, MUL1 slots that never interact);
     /// - the router ids of all rows reach `experts` in ONE hook call (`[t][topk]`), so the tiers
     ///   stage the union of the rows' experts once;
-    /// - KDA runs the decode step row after row (`glm5_kda::step_with`; the prompt path is another
-    ///   operation order), and after row `r < t - 1` the state (S and conv window) is copied into
-    ///   `kda_snaps[r]` (queued, D2D): the caller restores the state of the last accepted row;
-    /// - MLA runs one one-row call per row (`attn_splits(t)` would change the split-K partition);
-    ///   rows of rejected positions stay in the cache and are rewritten before any later row
-    ///   reads them (absolute positions, store before select).
+    /// - KDA (`glm5_kda::steps_with`): q|k|v of the `t` rows in ONE `glm5_gemv_fp4_x3` launch and
+    ///   o in ONE `glm5_gemv_fp4` launch (grid y = row, the kernel of a one-row call), the decode
+    ///   step's launches between them row after row (the prompt path is another operation order);
+    ///   after row `r < t - 1` the state (S and conv window) is copied into `kda_snaps[r]`
+    ///   (queued, D2D): the caller restores the state of the last accepted row;
+    /// - MLA (`MlaScratch::forward_steps_with`): ONE call over the `t` rows, every row's
+    ///   attention at the split count of a one-row call (`attn_splits(1)`, not `attn_splits(t)`,
+    ///   which would change the split-K partition); rows of rejected positions stay in the cache
+    ///   and are rewritten before any later row reads them (absolute positions, store before
+    ///   select).
     ///
     /// Any change to the launches of `call_inner` must be mirrored here (the GPU test
-    /// `glm5_tiers::spec_tests::glm5_mtp_spec_gpu_is_lossless` compares the bits).
+    /// `glm5_tiers::spec_tests::glm5_mtp_spec_gpu_is_lossless` compares the bits, its arms with
+    /// `CROW_GLM_ATTN_FUSE` + `CROW_GLM_HCFUSE` on and off). Mirrored: `CROW_GLM_HCFUSE` (both
+    /// sites' `coeffs_norm`); `CROW_GLM_ATTN_FUSE` (the fused KDA row of `step_fused_with`, and
+    /// with `CROW_GLM_HCFUSE` the attention site's expand folded into the FFN site's
+    /// `expand_coeffs_norm`, `glm5_mhc_expand_mix_norm` keeps a done counter per row); the
+    /// q|k|v projection as one `glm5_gemv_fp4_x3`; the projections' kernel picked as a one-row
+    /// call's (`CROW_GLM_DENSE_GEMM` never applies: `call_t` 1). Not mirrored (one-row only):
+    /// `CROW_GLM_FLAGS` / `CROW_GLM_PREFETCH` / `CROW_GLM_SHARED_OVERLAP` / `CROW_GLM_RT2` around
+    /// the router, the controller, the graph seams.
     ///
     /// # Safety
     /// As [`Glm5Pass::call_with_experts`]; `t <= max_t`; a KDA layer needs `t - 1` snapshot
@@ -1580,7 +1592,6 @@ impl Glm5Pass {
     pub unsafe fn call_verify_with_experts(&mut self, lw: &LayerW, x: Dev, pos0: usize, t: usize, kda_snaps: &[KdaState], experts: &mut ExpertHook) -> Result<(), String> {
         assert!((1..=self.max_t).contains(&t) && pos0 + t <= self.cap, "glm5_model: verify rows {pos0}..{} (max_t {}, cap {})", pos0 + t, self.max_t, self.cap);
         let h = self.g.hidden;
-        let row = |b: Dev, r: usize| b + (r * h * 4) as u64;
         let fuse = glm5_mhc::hcfuse();
         if fuse { self.mhc.coeffs_norm(&self.kn.mhc, &lw.attn_hc, x, lw.input_norm, self.collapsed, t) } else { self.mhc.coeffs(&self.kn.mhc, &lw.attn_hc, x, self.collapsed, t) }
         if !fuse { self.kn.mla.rmsnorm_rows(self.collapsed, lw.input_norm, h, t, self.st2) }
@@ -1588,22 +1599,14 @@ impl Glm5Pass {
             AttnW::Kda(a) => {
                 assert!(kda_snaps.len() + 1 >= t, "glm5_model: {t} verify rows, {} KDA snapshot slots", kda_snaps.len());
                 let (kn, ints) = (&self.kn, &self.ints);
-                let w = kn.kda.d.width();
-                let cc = kn.kda.d.conv_ch();
+                // every row as a one-row call: call_t 1 keeps the GEMV (grid y = row) at any t
                 let mut proj = |p: KdaProj, xi: Dev, yo: Dev, tt: usize| match p {
-                    KdaProj::Qkv => {
-                        fp4_gemv(kn, ints, &a.q, xi, yo, tt, Some(cc));
-                        fp4_gemv(kn, ints, &a.k, xi, yo + (w * 4) as u64, tt, Some(cc));
-                        fp4_gemv(kn, ints, &a.v, xi, yo + (2 * w * 4) as u64, tt, Some(cc));
-                    }
-                    KdaProj::O => fp4_gemv(kn, ints, &a.o, xi, yo, tt, None),
+                    KdaProj::Qkv => fp4_gemv_x3_of(kn, ints, [&a.q, &a.k, &a.v], xi, yo, tt, kn.kda.d.conv_ch(), 1),
+                    KdaProj::O => fp4_gemv_of(kn, ints, &a.o, xi, yo, tt, None, 1),
                 };
-                for r in 0..t {
-                    glm5_kda::step_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, row(self.collapsed, r), row(self.sub, r), &mut proj);
-                    if r + 1 < t {
-                        kda_snaps[r].copy_from(&self.kda_st);
-                    }
-                }
+                // #202 A (CROW_GLM_ATTN_FUSE): the fused row, as `attention`'s decode row
+                let fused = glm5_mhc::attn_fuse();
+                glm5_kda::steps_with(&kn.kda, &a.w, &self.kda_st, &self.kda_sc, self.collapsed, t, self.sub, fused, kda_snaps, &mut proj);
             }
             AttnW::Mla(a) => {
                 let (kn, ints) = (&self.kn, &self.ints);
@@ -1614,15 +1617,21 @@ impl Glm5Pass {
                         MlaProj::KVA => &a.kv_a,
                         MlaProj::O => &a.o,
                     };
-                    fp4_gemv(kn, ints, m, xi, yo, s.t(), None);
+                    fp4_gemv_of(kn, ints, m, xi, yo, s.t(), None, 1);
                 };
-                for r in 0..t {
-                    self.mla_sc.forward_with(&kn.mla, &a.w, &self.mla_c, row(self.collapsed, r), row(self.sub, r), pos0 + r, 1, &mut proj);
-                }
+                self.mla_sc.forward_steps_with(&kn.mla, &a.w, &self.mla_c, self.collapsed, self.sub, pos0, t, &mut proj);
+                self.last_mla_t = t;
             }
         }
-        self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
-        if fuse { self.mhc.coeffs_norm(&self.kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t) } else { self.mhc.coeffs(&self.kn.mhc, &lw.ffn_hc, x, self.collapsed, t) }
+        // #202 A (CROW_GLM_ATTN_FUSE, with the fused site): this expand runs inside the FFN site's
+        // coeffs_norm launch below, as in `call_inner`
+        let fold = fuse && glm5_mhc::attn_fuse() && self.mhc.expand_fits();
+        if fold {
+            self.mhc.expand_coeffs_norm(&self.kn.mhc, &lw.ffn_hc, x, self.sub, lw.post_norm, self.collapsed, t);
+        } else {
+            self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
+            if fuse { self.mhc.coeffs_norm(&self.kn.mhc, &lw.ffn_hc, x, lw.post_norm, self.collapsed, t) } else { self.mhc.coeffs(&self.kn.mhc, &lw.ffn_hc, x, self.collapsed, t) }
+        }
         if !fuse { self.kn.mla.rmsnorm_rows(self.collapsed, lw.post_norm, h, t, self.st2) }
         match &lw.ffn {
             FfnW::Dense(w) => {
@@ -1658,7 +1667,9 @@ impl Glm5Pass {
     /// sequences, row `r` at position `pos[r]` of its own sequence, `x` `[t][4][hidden]` updated
     /// in place, each row's result bit for bit the one-row decode call's of its sequence
     /// ([`Glm5Pass::call_with_experts`] with `t = 1`, `decode`). The launches are those of
-    /// [`Glm5Pass::call_verify_with_experts`]; only the recurrent state and the cache differ:
+    /// [`Glm5Pass::call_verify_with_experts`] before #192 batched its attention (one unfused
+    /// one-row step / call per row, no `CROW_GLM_HCFUSE` / `CROW_GLM_ATTN_FUSE`); only the
+    /// recurrent state and the cache differ:
     ///
     /// - mHC, both norms, the dense FFN, the router, the routed and the shared experts and the
     ///   combine run over all `t` rows (every row on its own, as in the verify call);

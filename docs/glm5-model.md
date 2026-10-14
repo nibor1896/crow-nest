@@ -583,8 +583,13 @@ second #192 change, 2026-10-09): see **serve** below and
 - **Lossless by construction.** Every verify row's logits are the one-row decode call's bits: mHC,
   norms, dense FFN, router, MUL1 experts, shared expert, combine and head run over all rows with
   kernels that compute each row on its own (block or grid y per row, MUL1 slots that never
-  interact); KDA runs the decode step row after row (the prompt path is another operation order);
-  MLA runs one one-row call per row (`attn_splits(t)` changes the split-K partition). A draft is
+  interact); KDA runs q|k|v and o as one GEMV launch each over all rows (grid y per row, the
+  one-row kernel) and the decode step's launches between them row after row
+  (`glm5_kda::steps_with`; the prompt path is another operation order); MLA runs one call over all
+  rows with every row's attention at a one-row call's split count
+  (`MlaScratch::forward_steps_with`; `attn_splits(t)` would change the split-K partition).
+  `CROW_GLM_HCFUSE` and `CROW_GLM_ATTN_FUSE` apply as in the decode row (the fused KDA row, the
+  fused sites, the folded expand). A draft is
   accepted while it equals the trunk's greedy id of the row before; the step emits the accepted
   drafts plus the trunk's own next id. The router ids of all rows go to the tiers in one
   `table_for` (the union is staged once; `glm5_run` gives the tiers `(1 + N) x top-k` staging slots).
