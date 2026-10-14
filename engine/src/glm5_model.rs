@@ -1462,7 +1462,7 @@ impl Glm5Pass {
         crate::glm5_flags::post_prompt_guess(None);
         if let (Some(g), Some((gl, _, _))) = (guess, self.prompt_guess) {
             let v = cuda::dtoh_i32(g, t * self.moe.topk);
-            crate::glm5_flags::post_prompt_guess(Some(crate::glm5_flags::Hint { layer: gl, ids: v }));
+            crate::glm5_flags::post_prompt_guess(Some(crate::glm5_flags::Hint { layer: gl, ids: v, rows: t }));
         }
         let s = ExpertMajor::new(&ids, self.moe.topk, self.moe.experts, GROUP_ROWS).map_err(|e| format!("layer {}: {e}", lw.layer))?;
         gp.upload(&s);
@@ -1637,17 +1637,84 @@ impl Glm5Pass {
                     self.moe_plans.push(GpuMoePlan::new(&self.moe, t));
                 }
                 let p = self.moe_plans.iter().find(|p| p.tokens == t).unwrap();
-                p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
-                // `CROW_GLM_FLAGS` publishes one row's ids; more rows read theirs by a sync
-                let routed = if t == 1 { self.routed.as_mut() } else { None };
-                let ids = router_ids(routed, p.ids, t * self.moe.topk, lw.layer)?;
-                let tb = experts(lw.layer, &ids)?;
+                // #192: `call_inner`'s MoE levers for the `t` rows, in its order: the next
+                // layer's guess around the router (every row, rank-major to the prefetch), x to
+                // the CPU lane, the ids through the router's flag (`CROW_GLM_FLAGS`, a publisher
+                // of `t` rows) with the shared expert queued behind the publish, the expert hook,
+                // the experts, the late join of the side guess. Hints, copies and the same
+                // launches on the same rows: every row keeps its bits. A publisher that does not
+                // hold `t` rows: the stream sync, no guess.
+                let n = t * self.moe.topk;
+                let capturing = crate::glm5_graph::capturing();
+                let fl = !capturing && self.routed.as_ref().is_some_and(|r| r.holds(n));
+                let g0 = self.routed.as_ref().map_or(0, |r| r.guess.launched);
+                match self.routed.as_mut().filter(|_| fl) {
+                    Some(r) => {
+                        r.predict_early_unjoined_rows(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed, t);
+                        p.route(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                        r.predict_rows(&self.kn.k, &self.kn.moe, lw.layer, self.collapsed, t);
+                    }
+                    None => p.route(&self.kn.k, &self.kn.moe, w, self.collapsed),
+                }
+                let overlap = fl && self.overlap;
+                // #202 RT2: x to the CPU lane's host buffer ahead of the publish
+                if crate::glm5_moe::lane::X_EARLY.load(std::sync::atomic::Ordering::Relaxed) && !capturing {
+                    p.lane_x_early(self.collapsed);
+                }
+                let ids = match self.routed.as_mut().filter(|_| overlap) {
+                    Some(r) => {
+                        r.publish(p.ids, n);
+                        p.shared_early(&self.kn.k, &self.kn.moe, w, self.collapsed);
+                        cuda::stream_query(cuda::cur_stream());
+                        r.wait_layer(lw.layer).map_err(|e| {
+                            p.shared_forget();
+                            format!("layer {}: {e}", lw.layer)
+                        })?
+                    }
+                    None => {
+                        if !fl {
+                            verify_counts::SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // no guess of this call: none left over for the hook either
+                            crate::glm5_flags::post_hint(None);
+                        }
+                        router_ids(self.routed.as_mut().filter(|_| fl), p.ids, n, lw.layer)?
+                    }
+                };
+                if fl {
+                    verify_counts::FLAGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let g1 = self.routed.as_ref().map_or(0, |r| r.guess.launched);
+                    verify_counts::GUESSES.fetch_add(g1 - g0, std::sync::atomic::Ordering::Relaxed);
+                }
+                let tb = experts(lw.layer, &ids).inspect_err(|_| p.shared_forget())?;
                 p.experts(&self.kn.k, &self.kn.mul1, &self.kn.moe, w, tb, self.collapsed, self.sub);
+                // #202 S: the side guess read `collapsed`; joined before the next layer overwrites it
+                if let Some(r) = self.routed.as_mut() {
+                    r.join_late();
+                }
             }
         }
         self.last_ffn_t = t;
         self.mhc.expand(&self.kn.mhc, x, self.sub, x, t);
         Ok(())
+    }
+}
+
+/// #192: how the verify calls' MoE layers reached their ids since the process started (tests,
+/// reports): through the router's flag, by a stream sync, and the next-layer guesses they launched
+pub mod verify_counts {
+    use std::sync::atomic::AtomicU64;
+
+    /// MoE layers whose ids came through `CROW_GLM_FLAGS` (a publisher holding the call's rows)
+    pub static FLAGGED: AtomicU64 = AtomicU64::new(0);
+    /// MoE layers whose ids came after a stream sync (no publisher, or one of fewer rows)
+    pub static SYNCS: AtomicU64 = AtomicU64::new(0);
+    /// next-layer guesses (`CROW_GLM_PREFETCH`) the flagged layers launched
+    pub static GUESSES: AtomicU64 = AtomicU64::new(0);
+
+    /// (flagged, syncs, guesses)
+    pub fn read() -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (FLAGGED.load(Relaxed), SYNCS.load(Relaxed), GUESSES.load(Relaxed))
     }
 }
 
