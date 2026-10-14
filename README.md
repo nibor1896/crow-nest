@@ -48,7 +48,7 @@ engine/target/release/serve.exe --port 8099
 **Windows engine without building** (`serve.exe` from the release, NVRTC from NVIDIA's own wheel)
 
 ```powershell
-irm https://github.com/nibor1896/crow-nest/releases/download/v0.13.1/crow-nest-engine-0.13.1-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
+irm https://github.com/nibor1896/crow-nest/releases/download/v0.13.2/crow-nest-engine-0.13.2-win-x64.zip -OutFile engine.zip; Expand-Archive engine.zip crow-nest-engine
 powershell -ExecutionPolicy Bypass -File crow-nest-engine\fetch-nvrtc.ps1 -Target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the zip holds no NVIDIA file
 $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe --port 8099
 ```
@@ -63,7 +63,7 @@ hf download zai-org/GLM-5.3-Flash tokenizer.json tokenizer_config.json chat_temp
 cd engine && cargo build --release --bin serve --bin glm5_run && cd ..
 # one prompt, from the repository root
 env $(cat runs/glm53-flash/quick/arm4.env) CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json   engine/target/release/glm5_run --cnq converter/GLM-5.3-Flash-MUL1K3.cnq --cold --reps 1 --tokenizer models/GLM-5.3-Flash-original/tokenizer.json --prompt "Explain how a CPU cache works." -n 128
-# serve (Linux unmeasured)
+# serve
 env $(cat runs/glm53-flash/quick/arm4.env) CROW_GLM_ARENA_WARM=runs/glm53-flash/arena-warm/glm53-cal4-decode-counts.json CROW_CNQ=converter/GLM-5.3-Flash-MUL1K3.cnq tools/serve-linux.sh --port 8099
 ```
 

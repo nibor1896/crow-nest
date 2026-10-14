@@ -162,7 +162,7 @@ tools/gate-linux.sh
 - At v0.7.0 (2026-09-27) the pins are `TESTS=458` and `CLIPPY=1494` (the dense 27B, MTP, #122, #123), and all items are
   GREEN on the release head (`decode_out/gate-2026-09-27`); the four numeric values of record are unchanged.
 - At v0.7.1 (2026-09-27) `TESTS=460` (+2 `tokenizer::tests`, #121) and `CLIPPY=1494`; gate `decode_out/gate-2026-09-27-v071`.
-- The script still pins `TESTS="462"` (`tools/gate-linux.sh:285`, raised in `135143e` on 2026-10-02 for #131's two tests) and its cargo-test item compares the summed `N passed` against it (`:613-616`). The last Linux gate run recorded is 2026-09-28 at `97b4e05` (CHANGELOG v0.7.2); every release from v0.8.0 to v0.13.0 says it was not run (CHANGELOG v0.13.0, v0.12.0, v0.11.0, v0.10.0, v0.9.1). The engine now carries 963 `#[test]` and 155 `#[ignore]` attributes (`engine/src`, `engine/tests`, grep 2026-10-12), so the pin is stale for the GLM releases until the next Linux gate run measures it.
+- At v0.13.2 (2026-10-14, #230) `TESTS=812` and `CLIPPY=1679`, the first Linux gate since 2026-10-02 (releases v0.8.0 to v0.13.1 shipped without it); all items GREEN at `83d16c2` (`decode_out/gate-2026-10-14-83d16c2`), the four numeric values of record unchanged. The `nvme_source` tests run apart with `--test-threads=1` (their ordering tests race under the parallel suite).
 - Engine runs are sequential on purpose: before every engine start the gate asks the engine's own
   `ramcheck --need` (`free_for_pin`, issue #103, `tools/pin-room.sh`) whether the pinned tier fits.
 
@@ -225,7 +225,7 @@ GLM-5.3-Flash (engine family glm5_next) is Crow's third operating point (robin's
 | GPU | one RTX 5090; glm5_next keeps 2 GiB VRAM free under a 31.9 GiB cap | `docs/glm-stability.md` |
 | host RAM | the pinned cap is engine-wide, `HOST_PINNED_CAP` 46 GiB, and the derived budget is at most free RAM minus `CROW_RAM_MARGIN_GB`; every GLM number was measured on robin's Windows machine, 63.38 GiB RAM, where G4 bounds commit at RAM + page file 103.38 GiB | `engine/src/geo.rs:42`, `engine/src/bin/glm5_run.rs:30-32`, CHANGELOG v0.9.1, `runs/glm53-flash/PREREG.md:89` |
 | disk | the container is the NVMe tier: decode reads its missing experts from that one drive, 1 reader, B = 6.994 GB/s (PREREG amendment 5), so decode is bound by one NVMe. Building it needs the FP8 download and the staged conversion's disk (the converter refuses below the bytes to write + 16 GiB) | `runs/glm53-flash/PREREG.md:181-185`, `docs/measurements.md`, `docs/glm-mul1-conversion.md` "Disk" |
-| OS | measured on Windows 11 only; Linux is not measured for GLM (every GLM release: "Windows only; `tools/gate-linux.sh` was not run") | CHANGELOG v0.13.0, v0.12.0, v0.11.0 |
+| OS | Windows 11 and, since v0.13.2, Arch Linux (2026-10-14, #230: the 16 smoke ids equal Windows', arm4 decode 16.09 tok/s, Crow's `glm53-flash` point boots); Linux needs v0.13.2 or later (the pinned-tier fix) | CHANGELOG v0.13.2, `docs/measurements.md` |
 
 ### Get the container
 
