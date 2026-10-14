@@ -73,6 +73,9 @@ The measured figures and the targets, moved out of the README on 2026-09-23.
 | `arm2.env` (start of the day) | 994.55 tok/s | 8.24 s | 11.07 tok/s | 10.62 tok/s | 2026-10-10 | `quick/q6-arm2` |
 | `arm2.env` + `CROW_GLM_RT2=1` | 999.47 tok/s | 8.20 s | 11.71 tok/s | 11.45 tok/s | 2026-10-10 | `quick/b1-base` |
 | `arm3.env` (crow-nest v0.11.0 operating set) | 1137.54 tok/s | 7.20 s | 16.84 tok/s | 16.27 tok/s | 2026-10-10 | `quick/b6-promptcount` |
+| `arm4.env`, **Arch Linux**, driver 610.57.04 (`quick-linux.sh`, #230) | 1108.69 tok/s | 7.39 s | 16.09 tok/s | 15.61 tok/s | 2026-10-14 | `quick/linux-arm4-20261014` |
+
+- Linux, 2026-10-14 (#230, N=1 each): `glm5_run -n 16` (default switches, the #169 smoke) gives the 16 ids of the Windows smoke (`runs/glm53-flash/linux-20261014/`). Crow 3.4.2's `glm53-flash` point booted through `crow_boot --start` with the v0.13.2 `serve` in 36 s; one API request decoded 400 tokens at 17.33 tok/s; robin's Crow-window check: a 1-round turn 14.11 tok/s decode (cold 6,318-token prefill at 807.68 tok/s), a 10-round tool task 11.90 tok/s decode, 10,682 of 10,938 prompt tokens from the prefix cache.
 
 - Operating set since 2026-10-11: `runs/glm53-flash/quick/arm4.env` = `arm3.env` + `CROW_GLM_KV_LAZY=4096` (#214, robin 2026-10-11; the code default stays off). Measured in `serve`, not in the 3-minute check: the quick request (57 prompt ids, `temperature` 0, 128 tokens), 3 cold boots per arm alternated, build `732369c`, `CROW_CONTEXT` 200,000: decode 67.19 -> 60.29 ms/token median (-10.3 %), raw data `runs/glm53-flash/kvlazy-20261011/recheck/`, #214 comment of 2026-10-11.
 

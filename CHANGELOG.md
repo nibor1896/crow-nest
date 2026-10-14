@@ -6,6 +6,21 @@
 
 ## Unreleased
 
+## 2026-10-14 — v0.13.2
+
+**GLM-5.3-Flash runs on Linux.** v0.13.2 fixes the one Linux-only fault in the glm5_next path (the pinned expert arena crossed a `cuMemHostRegister` seam and the first copy into slot 113 failed), restores the 241 files `86c8195` emptied (the GLM operating sets among them), and runs the Linux gate for the first time since 2026-10-02, re-pinned to 812 tests:
+
+- glm5_next on Linux: the pinned arena is registered in whole records (#230);
+- the 241 emptied files are back, `arm2/3/4.env` and `PREREG.md` among them (#231);
+- `tools/gate-linux.sh` ALL GREEN at `83d16c2`, `TESTS` 462 -> 812, clippy 1494 -> 1679 (#230);
+- `runs/glm53-flash/quick/quick-linux.sh`, the Linux twin of the 3-minute check (#230).
+
+Flash-Next and the 27B keep their path; their Linux parity values of record are unchanged. Windows behaviour unchanged (the glm5_next arena stays one `cuMemHostAlloc` block there).
+
+### Added
+
+- **`runs/glm53-flash/quick/quick-linux.sh`** (#230, 2026-10-14): the Linux twin of `quick.sh`: the same cold 8,192-token prefill and 128-token decode, with the checkout's own paths and each `glm5_run` inside the bounded `systemd-run --user --scope` of `tools/serve-linux.sh`. `quick.sh` stays the Windows / Git-Bash script.
+
 ### Fixed
 
 - **The 241 files `86c8195` emptied are back** (#231, 2026-10-14): the `<home>` path pass wrote every file it touched back empty (1,272,228 lines), among them the GLM operating sets `runs/glm53-flash/quick/arm{2,3,4}.env`, `runs/glm53-flash/PREREG.md`, the lever blocks and `docs/ten-task-prompts-crowlab.json`. Each file is restored from `86c8195^` with the replacement #231 asked for (`C:\Users\robin` in every spelling and the `C--Users-robin` temp slug become `<home>`): 1,933 lines differ from `86c8195^`, nothing else; all 203 `.json` files and every `.jsonl` line parse.
@@ -16,6 +31,12 @@
 
 - **Linux gate, the first since 2026-10-02** (#230, 2026-10-14, `1aa06b9`, RTX 5090 / Arch Linux / driver 610.57.04 / NVRTC 13.3.33): parity8 `148cb72e8e44`, parity512 `6e9cb25fff43`, p8tf `8f5e5ce8dcec` and run32 GREEN on the unchanged values of record, so the GLM-5.3-Flash series (v0.11.0 to v0.13.1) left Flash-Next's Linux path byte-identical. Only the pins were RED: `cargo test` 810 passed / 0 failed against `TESTS=462`, clippy 1,679 against 1,494. Re-pinned to 810 / 1,679 (lib 645, serve 143, glm5_run 11, parity 6, decode 5), then to 812 with the two `cuda::reg_pieces` tests.
 - **GLM-5.3-Flash runs on Linux** (#230, 2026-10-14, RTX 5090 / Arch Linux / driver 610.57.04): the container copied from the Windows partition, sha256 `9ce11456c68f…` (= the conversion's, `docs/glm-mul1-conversion.md`), MTP overlay `191d5e182f91…`. `glm5_run -n 16` (default switches, `CROW_STAGE_PAR=0`, the #169 smoke) gives the 16 ids of the Windows smoke `[785, 1196, 374, 10156, ...]` with the pinned-tier fix and with `CROW_PINNED_ALLOC=host`; before the fix it panicked at row 34. Raw data `runs/glm53-flash/linux-20261014/`.
+
+### Known limitations
+
+- **No engine package for Linux in this release.** `tools/pack-engine.sh` writes `crow-nest-engine-<v>-linux-x64.tar.gz`, while Crow's engine updater asks for `crow-nest-engine-<v>-linux-x64.zip` (Crow `cli/crow_core.py` `_engine_asset_name`); until one side follows the other, Linux builds from source (README).
+- **The Windows asset `crow-nest-engine-0.13.2-win-x64.zip` is built on the Windows machine** with `tools/pack-engine.ps1`, as for v0.13.1; Windows behaviour is the same as v0.13.1's.
+- The arm4 Linux figures are N=1, cold (`docs/measurements.md`); the 2-hour soak (#227) has not run on either OS.
 
 ## 2026-10-13 — v0.13.1
 
