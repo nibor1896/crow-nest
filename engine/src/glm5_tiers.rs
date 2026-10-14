@@ -967,18 +967,16 @@ pub fn kv_lazy_from_env() -> Result<Option<usize>, String> {
     kv_lazy_from(std::env::var(KV_LAZY_ENV).ok().as_deref())
 }
 
-/// #214: the decode paths that grow the caches through [`Glm5Run::row`] and
-/// [`Glm5Run::prefill_with`] only: with [`KV_LAZY_ENV`] on, serve refuses MTP drafts
-/// (`CROW_GLM_MTP`), the lookahead decode (`CROW_GLM_LA`) and sequence slots
-/// (`CROW_GLM_MAX_BATCH` above 1) by name; their rows would reach unmapped memory
-pub fn kv_lazy_refusal(lazy: Option<usize>, mtp_drafts: usize, la: bool, batch: usize) -> Result<(), String> {
+/// #214: the decode paths that grow the caches through [`Glm5Run::row`],
+/// [`Glm5Run::prefill_with`] and [`Glm5Run::spec_decode`] (#192: the verify's rows `pos ..= pos +
+/// N` mapped before it runs) only: with [`KV_LAZY_ENV`] on, serve refuses the lookahead decode
+/// (`CROW_GLM_LA`) and sequence slots (`CROW_GLM_MAX_BATCH` above 1) by name; their rows would
+/// reach unmapped memory
+pub fn kv_lazy_refusal(lazy: Option<usize>, la: bool, batch: usize) -> Result<(), String> {
     if lazy.is_none() {
         return Ok(());
     }
     let mut no = Vec::new();
-    if mtp_drafts > 0 {
-        no.push(format!("{}={mtp_drafts}", crate::glm5_mtp::MTP_ENV));
-    }
     if la {
         no.push("CROW_GLM_LA".to_string());
     }
@@ -1044,7 +1042,11 @@ pub fn plan_for_rows(g: &Glm5Geo, context: usize, rows: usize, vram_total: u64, 
     // #149 path B: the stager's pinned blocks come off the pinned budget (as #186's prefill landing)
     let env = |k: &str| std::env::var(k).ok();
     let stager = stager_on(env(STAGER_ENV).as_deref(), env(glm5_flags::ENV_FLAGS).as_deref(), env(CPU_LANE_ENV).as_deref())?;
-    let pinned_budget = if stager { pinned_budget.saturating_sub(stager_pinned_bytes(g.moe_layers(), g.experts, g.topk, record_bytes)) } else { pinned_budget };
+    // #192: the landing holds the staging slots ExpertTiers is built with, (1 + N) x top-k with MTP
+    let drafts = crate::glm5_mtp::draft_rows_from_env()?;
+    let pinned_budget = if stager { pinned_budget.saturating_sub(stager_pinned_bytes(g.moe_layers(), g.experts, (1 + drafts) * g.topk, record_bytes)) } else { pinned_budget };
+    // #192 CROW_GLM_MTP_EXPERTS=pinned: the MTP block's records in mapped pinned memory
+    let pinned_budget = pinned_budget.saturating_sub(crate::glm5_mtp::mtp_pinned_bytes(g, record_bytes, drafts, crate::glm5_mtp::mtp_experts_from_env()?));
     // CROW_GLM_PREFETCH's store and CROW_GLM_LA's host-mapped embedding table, the same way
     let pinned_budget = pinned_budget.saturating_sub(decode_switch_pinned_bytes(g, &Switches::from_env(), record_bytes));
     // #196: the prefill stage engine's pinned ring (CROW_GLM_ARENA=global with staging)
@@ -11443,8 +11445,6 @@ impl Glm5Run {
     pub fn dev_sampler_refusal(&self) -> Option<&'static str> {
         if self.dsamp.is_none() {
             Some("no device sampler buffers (glm5_run allocates none; serve does at boot)")
-        } else if self.mtp_drafts() > 0 {
-            Some("CROW_GLM_MTP > 0 (the verify rows draw on the host; device per-row draws are a follow-up)")
         } else if self.slots() > 1 {
             Some("CROW_GLM_MAX_BATCH > 1 (the batched step reads every row back; a follow-up)")
         } else if self.sw.la {
@@ -13760,11 +13760,11 @@ mod tests_214 {
 
     #[test]
     fn kv_lazy_refuses_the_paths_that_do_not_map_their_rows() {
-        assert_eq!(kv_lazy_refusal(None, 2, true, 4), Ok(()), "off: nothing refused");
-        assert_eq!(kv_lazy_refusal(Some(4096), 0, false, 1), Ok(()));
-        let e = kv_lazy_refusal(Some(4096), 2, true, 4).unwrap_err();
-        assert!(e.contains(KV_LAZY_ENV) && e.contains("CROW_GLM_MTP=2") && e.contains("CROW_GLM_LA") && e.contains("CROW_GLM_MAX_BATCH=4"), "{e}");
-        assert!(kv_lazy_refusal(Some(1), 0, false, 2).is_err());
+        assert_eq!(kv_lazy_refusal(None, true, 4), Ok(()), "off: nothing refused");
+        assert_eq!(kv_lazy_refusal(Some(4096), false, 1), Ok(()), "MTP maps its verify rows (spec_decode): not refused");
+        let e = kv_lazy_refusal(Some(4096), true, 4).unwrap_err();
+        assert!(e.contains(KV_LAZY_ENV) && !e.contains("CROW_GLM_MTP") && e.contains("CROW_GLM_LA") && e.contains("CROW_GLM_MAX_BATCH=4"), "{e}");
+        assert!(kv_lazy_refusal(Some(1), false, 2).is_err());
     }
 }
 
@@ -14022,7 +14022,10 @@ mod tests_186 {
 /// [`crate::glm5_mtp::MTP_CHUNK`] rows (their time is in the prompt rows' reports). The verify
 /// and the block's calls run uncaptured. `CROW_GLM_LOOKAHEAD` and `CROW_CHUNK` (#186) do not apply;
 /// the verify is not the #186 prompt call (KDA prompt path, MLA multi-row: other bits). The CPU lane
-/// (`CROW_GLM_CPU_LANE=1`) is refused (its experts have other bits than the verify's GPU path).
+/// (`CROW_GLM_CPU_LANE=1` / `split`) serves the verify's rows as a batched step's (`lane_plan`, up
+/// to `MAX_BATCH` rows, one pool run per row); its CPU experts have other bits than the GPU's, so
+/// with the lane a verify row is held to accuracy (G3) against the run without MTP and the same
+/// lane, not to bits.
 /// #192: the block's window over prompt rows: `k` rows of `Spec::h` / `Spec::e` filled, for
 /// the block's cache positions `start ..`
 struct BlockWindow {
@@ -14072,18 +14075,24 @@ impl Glm5Run {
         let t0 = std::time::Instant::now();
         cuda::sync();
         let free0 = cuda::free_vram_bytes();
+        let at = mtp::mtp_experts_from_env()?;
         let mut ov = Cnq::open_checked(&path).map_err(|e| format!("{} {path}: {e}", mtp::OVERLAY_ENV))?;
-        let block = mtp::load_mtp(cnq, &mut ov, &self.g, &self.moe)?;
+        let block = mtp::load_mtp(cnq, &mut ov, &self.g, &self.moe, at)?;
         let (bytes, sanitized, inexact) = (block.bytes, block.sanitized, block.kv_b_inexact);
+        let host = block.w.records_host.as_ref().map_or(0, |p| p.bytes);
         self.set_mtp(n, Some(block))?;
         cuda::sync();
         let used = free0.saturating_sub(cuda::free_vram_bytes());
         let snap = self.spec.as_ref().map_or(0, |s| s.snapshot_bytes());
+        let experts = match at {
+            mtp::MtpExperts::Vram => format!("{}=vram: the {} routed experts in VRAM", mtp::EXPERTS_ENV, self.g.experts),
+            mtp::MtpExperts::Pinned => format!("{}=pinned: the {} routed experts in mapped pinned memory ({host} B, read zero-copy)", mtp::EXPERTS_ENV, self.g.experts),
+        };
         log(&format!(
-            "[glm5_run] {}={n}: MTP block loaded in {:.1} s from the container + {path}: {bytes} B to VRAM, {sanitized} NVFP4 scale bytes 0x7F -> 0x7E, kv_b {inexact} values inexact; KDA snapshot slots {n} x {snap} B; VRAM used by MTP {used} B (derived beforehand {} B)",
+            "[glm5_run] {}={n}: MTP block loaded in {:.1} s from the container + {path}: {bytes} B to VRAM, {sanitized} NVFP4 scale bytes 0x7F -> 0x7E, kv_b {inexact} values inexact; {experts}; KDA snapshot slots {n} x {snap} B; VRAM used by MTP {used} B (derived beforehand {} B)",
             mtp::MTP_ENV,
             t0.elapsed().as_secs_f64(),
-            mtp::spec_vram_bytes(&self.g, &self.moe, self.cap, n)
+            mtp::spec_vram_bytes(&self.g, &self.moe, self.cap, n, at)
         ));
         Ok(n)
     }
@@ -14130,13 +14139,11 @@ impl Glm5Run {
         r
     }
 
-    /// the refusals of the speculative decode, by name: the CPU lane (its experts have other bits
-    /// than the verify's GPU kernels) and too few staging slots for a verify of `1 + N` rows
+    /// the refusal of the speculative decode, by name: too few staging slots for a verify of
+    /// `1 + N` rows. The CPU lane is not refused: a verify of `1 + N <= MAX_BATCH` rows takes the
+    /// lane of a batched step (`lane_plan`, one pool run per row), held to accuracy (G3)
     pub(crate) fn spec_check(nd: usize, tiers: &ExpertTiers, topk: usize) -> Result<(), String> {
         use crate::glm5_mtp::MTP_ENV;
-        if tiers.pinned_use.cpu_lane {
-            return Err(format!("{MTP_ENV}={nd} and {CPU_LANE_ENV}=1: the CPU lane's experts have other bits than the verify's GPU kernels, so the ids could differ from the run without MTP; turn one of them off"));
-        }
         if tiers.stage_cap < (1 + nd) * topk {
             return Err(format!("{MTP_ENV}={nd}: the tiers hold {} staging slots, a verify of {} rows may stage {}; build ExpertTiers with stage_cap (1 + {nd}) x top-k", tiers.stage_cap, 1 + nd, (1 + nd) * topk));
         }
@@ -14286,6 +14293,8 @@ impl Glm5Run {
         cuda::to_f32_into(sp.x, &gm::trunk_input(&gm::embed_rows(cnq, &g, &toks), h, g.hc_streams));
         // #192: RT2 for the verify's rows (the one-row decode's early / late split)
         tiers.set_rt2_rows(true);
+        let nvme0 = tiers.nvme_reads;
+        let (mut moe_layers, mut experts) = (0u64, 0u64);
         for l in 0..g.layers {
             if let Some(s) = self.kda[l].as_mut() {
                 self.pass.swap_kda_state(s);
@@ -14293,7 +14302,14 @@ impl Glm5Run {
             if let Some(c) = self.mla[l].as_mut() {
                 self.pass.swap_mla_cache(c);
             }
-            let mut hook = |layer: usize, sel: &[i32]| -> Result<Dev, String> { tiers.table_for(layer, sel).map(|(tb, _)| tb) };
+            let mut hook = |layer: usize, sel: &[i32]| -> Result<Dev, String> {
+                // the distinct experts of the rows (host counters, no launch)
+                let mut d = sel.to_vec();
+                d.sort_unstable();
+                d.dedup();
+                (moe_layers, experts) = (moe_layers + 1, experts + d.len() as u64);
+                tiers.table_for(layer, sel).map(|(tb, _)| tb)
+            };
             let r = self.pass.call_verify_with_experts(&self.layers[l], sp.x, pos, t, &sp.snaps[l], &mut hook);
             // the layer's own state goes back even when the call failed
             if let Some(s) = self.kda[l].as_mut() {
@@ -14322,6 +14338,9 @@ impl Glm5Run {
         st.verify_rows += t as u64;
         st.kda_snapshots += k as u64 * n_kda;
         st.kda_snapshot_bytes += k as u64 * slot;
+        st.verify_moe_layers += moe_layers;
+        st.verify_experts += experts;
+        st.verify_nvme_reads += tiers.nvme_reads - nvme0;
         if !greedy {
             // serve: the first id now, the others when the caller reaches them
             st.tokens += 1;
@@ -14404,8 +14423,8 @@ impl Glm5Run {
     }
 
     /// serve: one decode step, `tok` at `pos` (the caller's sequence holds `pos` rows): the
-    /// greedy id after it, its logits row in [`Glm5Run::logits_dev`] (the verify's row, the bits
-    /// of the one-row decode). While the last verify's rows lie ahead (`Spec::ahead`) and `tok`
+    /// greedy id after it (#215: the device sampler's draw when armed), its logits row in
+    /// [`Glm5Run::logits_dev`] (the verify's row). While the last verify's rows lie ahead (`Spec::ahead`) and `tok`
     /// is the draft the verify fed at `pos`, that row's id and logits row are handed out without
     /// a launch: a greedy caller keeps the drafts that equal the argmax, a sampling caller the
     /// drafts its draws hit (speculative sampling with a point-mass draft: kept with probability
@@ -14439,12 +14458,14 @@ impl Glm5Run {
                 ah.taken += 1;
                 sp.stats.tokens += 1;
                 sp.stats.accepted += 1;
-                cuda::d2d_async(self.logits, sp.logits + (c * v * 4) as u64, v * 4);
-                cuda::sync();
-                return Ok(ah.ids[c]);
+                let greedy = ah.ids[c];
+                return Ok(self.spec_hand_out(sp, c, greedy));
             }
         }
         Self::spec_check(sp.n, tiers, self.g.topk)?;
+        // #214 CROW_GLM_KV_LAZY: the verify's trunk cache rows `pos ..= pos + N` mapped first, as
+        // `row` maps its one (a no-op when off or mapped; nothing is pending here)
+        self.kv_ensure(tiers, (pos + 1 + sp.n).min(self.cap))?;
         let row = self.spec_settle(sp, cnq, tok, pos)?;
         let k = if row.is_some() { sp.n.min(self.cap.saturating_sub(pos + 1)) } else { 0 };
         let drafts = match row {
@@ -14455,9 +14476,26 @@ impl Glm5Run {
         let fed = std::iter::once(tok).chain(drafts.iter().copied()).collect();
         let first = ids[0];
         sp.ahead = Some(crate::glm5_mtp::Ahead { p0: pos, fed, ids, taken: 1 });
-        cuda::d2d_async(self.logits, sp.logits, v * 4);
+        Ok(self.spec_hand_out(sp, 0, first))
+    }
+
+    /// serve: hand out verify row `c` as the last head's: its logits row into
+    /// [`Glm5Run::logits_dev`]; with the device sampler armed (#215) its draw from that row,
+    /// else `greedy` (the verify's argmax of the row). Drawn only when the caller reaches the
+    /// row, so the sampler books the emitted ids alone.
+    ///
+    /// # Safety
+    /// A CUDA context is current; the verify that wrote `Spec::logits` row `c` is queued.
+    unsafe fn spec_hand_out(&self, sp: &crate::glm5_mtp::Spec, c: usize, greedy: i64) -> i64 {
+        let v = self.g.vocab;
+        cuda::d2d_async(self.logits, sp.logits + (c * v * 4) as u64, v * 4);
+        self.sample_into_next();
         cuda::sync();
-        Ok(first)
+        if self.dsamp_on && self.dsamp.is_some() {
+            cuda::dtoh_i32(self.next, 1)[0] as i64
+        } else {
+            greedy
+        }
     }
 
     /// Bring the sequence level at `pos` with `tok` as the id at `pos`: with verify rows ahead,
@@ -14807,6 +14845,9 @@ mod spec_tests {
                     assert_eq!(seen.len() as u64, st.kda_restore_steps, "{name}: probe calls = rollback steps");
                     assert_eq!((st.tokens, st.verify_rows, st.hist.iter().sum::<u64>()), ((n - 1) as u64, st.steps + st.drafts, st.steps), "{name}: counter identities");
                     assert_eq!(st.kda_snapshots, st.drafts * 6, "{name}: one snapshot per KDA layer (6) per draft row");
+                    // the verify's MoE counters: 5 MoE layers per step, top-8 .. all 16 experts each
+                    assert_eq!(st.verify_moe_layers, st.steps * 5, "{name}: MoE layers per verify");
+                    assert!((8 * st.verify_moe_layers..=16 * st.verify_moe_layers).contains(&st.verify_experts), "{name}: distinct experts {st:?}");
                     match pat {
                         Some(p) => {
                             let (want, restores) = simulate(nd, pn, n, cap, &|i| p(i));
@@ -15122,8 +15163,13 @@ mod spec_tests {
         drop(cnq);
     }
 
-    /// The CPU lane and too few staging slots are refused by name before any row runs; a model
-    /// loaded for one row refuses `set_mtp(2, ..)`.
+    /// Too few staging slots are refused by name before any row runs; a model loaded for one row
+    /// refuses `set_mtp(2, ..)`. The CPU lane is accepted: V 0 + P 16 (every expert pinned) with
+    /// `CROW_GLM_CPU_LANE=split` (`CROW_PINNED_ALLOC=host`), N = 1 with drafts forced right unless
+    /// `i % 3 == 2`: the lane computes experts in the verify calls (its clock moves after the
+    /// prompt), rollbacks run, and the ids and every generated row are those of the run without
+    /// MTP and the same lane within G3 (cosine >= 0.9999, top-1; KL reported): the lane's CPU
+    /// experts and its split over the verify's rows are not the bits of the one-row path.
     #[test]
     #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1"]
     fn glm5_mtp_spec_gpu_refusals() {
@@ -15150,11 +15196,48 @@ mod spec_tests {
             let e = run.generate(&mut cnq, &mut tiers, &[3, 4], 4, false, &mut |_| {}).unwrap_err();
             assert!(e.starts_with("CROW_GLM_MTP=1: the tiers hold 8 staging slots, a verify of 2 rows may stage 16"), "{e}");
             tiers.free();
-            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, sizes, 1, 2 * g.topk).unwrap();
-            tiers.set_pinned_use(PinnedUse { stay: true, cpu_lane: true }).unwrap();
-            let e = run.generate(&mut cnq, &mut tiers, &[3, 4], 4, false, &mut |_| {}).unwrap_err();
-            assert!(e.starts_with("CROW_GLM_MTP=1 and CROW_GLM_CPU_LANE=1"), "{e}");
+            // the CPU lane: the run without MTP and the same lane first (the reference)
+            let old_lane = std::env::var(CPU_LANE_ENV).ok();
+            std::env::set_var(CPU_LANE_ENV, "split");
+            let lane_sizes = TierSizes { vram: 0, pinned: 16 };
+            let prompt = [3i64, 17, 101, 999, 5];
+            let n = 12;
+            run.set_mtp(0, None).unwrap();
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, lane_sizes, 1, 2 * g.topk).unwrap();
+            assert!(tiers.pinned_use.cpu_lane, "the lane is on");
+            let base = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |_| {}).unwrap();
+            let lane_base = tiers.cpu_lane_clock().read().1;
             tiers.free();
+            run.set_mtp(1, Some(mtp::synthetic_block(&g, &moe, 3))).unwrap();
+            let (gold, vocab) = (base.ids.clone(), g.vocab as i64);
+            run.set_mtp_hook(Some(Box::new(move |i, _| if i % 3 != 2 { gold[i] } else { (gold[i] + 1) % vocab })));
+            let mut tiers = ExpertTiers::new(&cnq, &s.path, &g, &moe, lane_sizes, 1, 2 * g.topk).unwrap();
+            let clk = tiers.cpu_lane_clock();
+            let mut at_prompt = 0;
+            let out = run.generate(&mut cnq, &mut tiers, &prompt, n, true, &mut |r| {
+                if r.prompt {
+                    at_prompt = clk.read().1;
+                }
+            });
+            let lane_mtp = clk.read().1;
+            tiers.free();
+            match old_lane {
+                Some(o) => std::env::set_var(CPU_LANE_ENV, o),
+                None => std::env::remove_var(CPU_LANE_ENV),
+            }
+            let out = out.unwrap_or_else(|e| panic!("CROW_GLM_MTP=1 with the CPU lane: {e}"));
+            let st = run.mtp_stats().unwrap().clone();
+            eprintln!("glm5_mtp spec lane split: CPU experts {lane_base} without MTP, {at_prompt} after the prompt and {lane_mtp} at the end with MTP; {st:?}");
+            assert!(lane_base > 0, "the lane computed nothing without MTP");
+            assert!(lane_mtp > at_prompt, "the lane computed nothing in the verify calls");
+            assert!(st.steps > 0 && st.accepted > 0 && st.kda_restore_steps > 0, "{st:?}");
+            assert_eq!(out.ids, base.ids, "lane split: ids");
+            assert_eq!(out.logits.len(), n);
+            for (j, (p, q)) in out.logits.iter().zip(&base.logits).enumerate() {
+                let (cos, kl, top1) = crate::glm5_int_tests::g3(q, p);
+                eprintln!("glm5_mtp spec lane split G3 row {j}: cosine {cos:.7}, KL {kl:.3e}, top-1 {top1}");
+                assert!(cos >= 0.9999 && top1, "lane split: generated row {j}: cosine {cos}, top-1 {top1} (G3: 0.9999)");
+            }
             run.set_mtp(0, None).unwrap();
             assert_eq!(run.mtp_drafts(), 0);
             run.free();

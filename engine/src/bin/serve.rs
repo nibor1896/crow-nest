@@ -7228,12 +7228,13 @@ fn glm_chat_on(
 /// - sampling: greedy takes the head's argmax (the id `glm5_run` takes); crow-nest #215: a
 ///   sampled request draws on the device sampler (#20's kernel pair behind the head, armed per
 ///   request, the first id from the prompt's row) unless `draws_on_host` or the sequence's
-///   `dev_sampler_refusal` (MTP, CROW_GLM_MAX_BATCH > 1, LA) sends it to the HOST (`draw_row` on
+///   `dev_sampler_refusal` (CROW_GLM_MAX_BATCH > 1, LA) sends it to the HOST (`draw_row` on
 ///   the logits row read back); a greedy or device-drawn id refused inside a tool call is redrawn
 ///   under the grammar (`redraw_from_row`) and the device booking moved (`rebook_sampler`)
 /// - #192 MTP (`CROW_GLM_MTP`): inside `decode_step`; a verify step's ids come back one per
-///   step, every id with its own logits row (the one-row decode's bits), so greedy, sampled and
-///   forced ids are those without MTP; `timings` count the emitted ids; one `[chat] MTP` line
+///   step, every id drawn from its own verify row (G3-close to the one-row decode's): greedy, on
+///   the device sampler (#215, drawn when the step reaches the row) or on the host as without
+///   MTP; `timings` count the emitted ids; one `[chat] MTP` line
 /// - not on this path: the trickle, vision, the park of #118
 /// - `Err` is an engine failure (a row that failed: an NVMe read, the staging); the engine has
 ///   reset itself, the next request is cold
@@ -7289,7 +7290,7 @@ fn glm_generate_on(
     // crow-nest #215: a sampled request draws on the device (#20's `sample_topk_part` /
     // `sample_k` behind the head, the id comes back in the 4-byte readback) unless it needs the
     // host as on Qwen (`draws_on_host`: logit_bias, top_k 0 or > 64, DRY / #92 knobs) or this
-    // sequence has no device sampler (MTP, CROW_GLM_MAX_BATCH > 1, LA: `dev_sampler_refusal`)
+    // sequence has no device sampler (CROW_GLM_MAX_BATCH > 1, LA: `dev_sampler_refusal`)
     let knobs_host = draws_on_host(req, sampler.as_ref());
     let dev_refusal = if sampler.is_some() && !knobs_host { seq.dev_sampler_refusal() } else { None };
     let host = knobs_host || dev_refusal.is_some();
@@ -12813,9 +12814,9 @@ Red is #FF0000."), "{off}");
         let body = glm_sampled_body(serde_json::json!({ "top_k": 100, "logit_bias": { bias_id: 0.0 } }));
         let (req, _) = glm_request(&tk, GLM_VOCAB, Markup::Glm, 4096, body.to_string().as_bytes()).unwrap();
         let s = sampler_from(&req).unwrap();
-        let line = glm_host_route_line(&req, &s, Some("CROW_GLM_MTP > 0"));
+        let line = glm_host_route_line(&req, &s, Some("CROW_GLM_LA (a row run ahead would book a draw the host may drop)"));
         assert!(line.starts_with("[chat] glm5_next draws on the HOST sampler (#215): "), "{line}");
-        for w in ["logit_bias, 1 entries (#86)", "top_k 100 outside the device sampler's 1..=64 (#111)", "CROW_GLM_MTP > 0"] {
+        for w in ["logit_bias, 1 entries (#86)", "top_k 100 outside the device sampler's 1..=64 (#111)", "CROW_GLM_LA (a row run ahead"] {
             assert!(line.contains(w), "{w}: {line}");
         }
     }

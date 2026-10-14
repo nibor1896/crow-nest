@@ -44,8 +44,9 @@
 //! (`Glm5Run::spec_decode`): one verify step emits up to `1 + N` ids, handed out one per
 //! [`Glm5Engine::decode_step`] while the fed id is the verified one (they stream at once); a fed id
 //! that differs (a sampled draw, a forced id, a grammar redraw) rolls the KDA states back to that
-//! row (the verify's snapshot slot). Every emitted id's logits row is the verify's row, the bits of
-//! the one-row decode, so the host sampler draws as without MTP. The block's MLA cache truncates
+//! row (the verify's snapshot slot). Every emitted id's logits row is the verify's own row (G3-close
+//! to the one-row decode's), so a sampled id is drawn from it as without MTP: on the device sampler
+//! (#215) when armed, drawn only for the rows the caller reaches, else on the host. The block's MLA cache truncates
 //! like the trunk's; its one pending row (the last trunk row's head-norm row, whose next id is not
 //! known yet) is part of the snapshot (`state_floats` + H).
 
@@ -279,7 +280,7 @@ impl Glm5Device {
         // #192: CROW_GLM_MTP=N; the block, its cache of `context` rows and the KDA snapshot slots
         // come off the plan's free VRAM, as in glm5_run
         let drafts = crate::glm5_mtp::draft_rows_from_env()?;
-        let mtp_reserved = if drafts > 0 { crate::glm5_mtp::spec_vram_bytes(&o.g, &o.moe, context, drafts) } else { 0 };
+        let mtp_reserved = if drafts > 0 { crate::glm5_mtp::spec_vram_bytes(&o.g, &o.moe, context, drafts, crate::glm5_mtp::mtp_experts_from_env()?) } else { 0 };
         if drafts > 0 {
             log(&format!("[budget] {}={drafts}: the #159 plan runs at free VRAM minus {mtp_reserved} B (the MTP block, its cache, {drafts} KDA snapshot slots; derived)", crate::glm5_mtp::MTP_ENV));
         }
@@ -319,18 +320,19 @@ impl Glm5Device {
             run.free();
             return Err(e);
         }
-        if let Err(e) = gt::kv_lazy_refusal(kv_lazy, mtp_n, run.switches().la, batch) {
+        if let Err(e) = gt::kv_lazy_refusal(kv_lazy, run.switches().la, batch) {
             run.free();
             return Err(e);
         }
         // crow-nest #215: the #20 device sampler's buffers, before the tiers spend the plan's
-        // launch slack; not where it cannot draw (MTP, sequence slots, LA: those stay on the host)
-        if mtp_n == 0 && batch <= 1 && !run.switches().la {
+        // launch slack; not where it cannot draw (sequence slots, LA: those stay on the host).
+        // #192 MTP: each emitted verify row is drawn on it when the caller reaches the row
+        if batch <= 1 && !run.switches().la {
             let b = run.alloc_dev_sampler();
             log(&format!("[budget] device sampler (#215): {b} B (mask, window counts, ring, candidates, profile) held from boot"));
         }
-        // #192: a verify call stages the experts of 1 + N rows at once; the CPU lane is refused
-        // (CROW_GLM_MAX_BATCH: a batched step those of N rows)
+        // #192: a verify call stages the experts of 1 + N rows at once; the CPU lane serves its
+        // rows as a batched step's (CROW_GLM_MAX_BATCH: a batched step those of N rows)
         let mut tiers = ExpertTiers::new(&o.cnq, &o.path, &o.g, &o.moe, sizes, readers, (1 + mtp_n).max(batch) * o.g.topk)?;
         if mtp_n > 0 {
             if let Err(e) = Glm5Run::spec_check(mtp_n, &tiers, o.g.topk) {
@@ -1604,7 +1606,7 @@ mod tests_192_serve {
 
     /// a device of the synthetic model at `cap` rows: `nd` drafts per step (0 = off) with the
     /// synthetic block of `seed`
-    unsafe fn device(path: &str, g: &Glm5Geo, nd: usize, cap: usize, seed: u64) -> Glm5Device {
+    pub(super) unsafe fn device(path: &str, g: &Glm5Geo, nd: usize, cap: usize, seed: u64) -> Glm5Device {
         let (spec, _) = crate::nvme_source::glm5_record_of_container(path).unwrap();
         let moe = MoeGeo::new(g, spec).unwrap();
         let mut cnq = Cnq::open_checked(path).unwrap();
@@ -2980,6 +2982,69 @@ mod tests_215_gpu {
                 next = e.decode_step(next).unwrap();
             }
             drop(e);
+        }
+    }
+
+    /// #192 + #215: with MTP (N = 2) the device sampler draws each emitted verify row once, when
+    /// the request reaches it (`Glm5Run::spec_hand_out`): the ids are the host chain's on the rows
+    /// handed out (`Sampler::sample` + `observe`, so the window and presence booking hold the
+    /// emitted ids only), the same seed twice gives the same ids, and the drafts (MTP off's
+    /// transcript, wrong where the position % 4 == 1) are handed out without a launch. Against MTP
+    /// off on the same seed: the same ids and every row within G3 (cosine >= 0.9999, top-1).
+    #[test]
+    #[ignore = "needs the GPU (about 3 GB VRAM, a 2.3 GB synthetic container in the temp dir): cargo test --release --lib glm5_devsampler_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_devsampler_gpu_mtp_draws_each_emitted_row_once() {
+        let g = super::tests_batch_gpu::geo();
+        let syn = synth_model(&g, REC);
+        let prompt: Vec<i64> = (0..9i64).map(|i| (i * 37 + 5) % 2048).collect();
+        let (pn, n) = (prompt.len(), 24usize);
+        let cap = pn + n + 2;
+        let s = {
+            let mut s = profile(1408639702, (1.0, 0.95, 20, 0.01, 0.0, 1.0, 64));
+            s.observe_prompt(&prompt.iter().map(|&v| v as u32).collect::<Vec<u32>>());
+            s
+        };
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let mut d0 = super::tests_192_serve::device(&syn.path, &g, 0, cap, 0);
+            d0.run.alloc_dev_sampler();
+            let mut e0 = Glm5Engine::new(d0, true);
+            let (ids0, rows0) = answer(&mut e0, &prompt, &s, n);
+            drop(e0);
+            let mut d1 = super::tests_192_serve::device(&syn.path, &g, 2, cap, 0x0215);
+            d1.run.alloc_dev_sampler();
+            assert_eq!(d1.dev_sampler_refusal(), None, "MTP draws on the device sampler");
+            let (gold, vocab) = (ids0.clone(), g.vocab as i64);
+            d1.run.set_mtp_hook(Some(Box::new(move |q, d| match q.checked_sub(pn).and_then(|i| gold.get(i)) {
+                Some(&x) if q % 4 == 1 => (x + 1) % vocab,
+                Some(&x) => x,
+                None => d,
+            })));
+            let mut e1 = Glm5Engine::new(d1, true);
+            let _ = e1.rows_mut().mtp_report();
+            let (ids1, rows1) = answer(&mut e1, &prompt, &s, n);
+            let st = e1.rows_mut().run.mtp_take_stats().unwrap();
+            let (again, _) = answer(&mut e1, &prompt, &s, n);
+            drop(e1);
+            let mut h = s.clone();
+            let want: Vec<i64> = rows1
+                .iter()
+                .map(|r| {
+                    let t = h.sample(r);
+                    h.observe(t);
+                    t as i64
+                })
+                .collect();
+            eprintln!("glm5_devsampler MTP 2: ids {ids1:?}; {}", st.summary());
+            assert_eq!(ids1, want, "MTP: device draws vs the host chain on the rows handed out");
+            assert_eq!(ids1, again, "MTP: the same seed twice");
+            assert_eq!(st.tokens, (n - 1) as u64, "one id per decode step");
+            assert!(st.accepted > 0 && st.steps < st.tokens, "drafts handed out without a launch: {st:?}");
+            assert_eq!(ids1, ids0, "MTP vs MTP off: ids on the same seed");
+            for (j, (p, q)) in rows1.iter().zip(&rows0).enumerate() {
+                let (cos, kl, top1) = crate::glm5_int_tests::g3(q, p);
+                assert!(cos >= 0.9999 && top1, "row {j}: cosine {cos}, KL {kl:e}, top-1 {top1} (G3: 0.9999)");
+            }
         }
     }
 }
