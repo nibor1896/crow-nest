@@ -291,7 +291,9 @@ impl MtpKernels {
 
 /// Device weights of the block. Vectors f32, `eh_proj` BF16 `[H][2H]`; `attn` as `glm5_mla` reads it
 /// (projections 0 when a codec hook runs them, as `glm5_model::MlaLayer`); `records` the 288 MUL1
-/// records back to back behind the `[E]` u64 `table` (`GpuMoePlan::run`).
+/// records back to back behind the `[E]` u64 `table` (`GpuMoePlan::run`); with
+/// `CROW_GLM_MTP_EXPERTS=pinned` they lie in `records_host` (mapped pinned memory, `records` 0)
+/// and the table holds their UVA addresses.
 pub struct MtpWeights {
     pub enorm: Dev,
     pub hnorm: Dev,
@@ -302,6 +304,7 @@ pub struct MtpWeights {
     pub attn: MlaWeights,
     pub moe: GpuMoeWeights,
     pub records: Dev,
+    pub records_host: Option<cuda::Pinned>,
     pub table: Dev,
 }
 
@@ -325,28 +328,89 @@ impl MtpWeights {
             cuda::free_dev(&mut m.w);
             cuda::free_dev(&mut m.gs);
         }
+        if let Some(p) = self.records_host.as_mut() {
+            p.free();
+        }
+        self.records_host = None;
+    }
+}
+
+/// `CROW_GLM_MTP_EXPERTS`: where the MTP block's 288 routed-expert records live
+pub const EXPERTS_ENV: &str = "CROW_GLM_MTP_EXPERTS";
+
+/// [`EXPERTS_ENV`]: `vram` (default) = one VRAM buffer; `pinned` = mapped pinned host memory
+/// (the trunk's pinned tier allocator, `cuda::Pinned::alloc_cold`), read zero-copy by the
+/// block's MoE (`GpuMoePlan::run` takes UVA bases), its bytes off the pinned budget
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpExperts {
+    #[default]
+    Vram,
+    Pinned,
+}
+
+impl MtpExperts {
+    /// the word of the boot lines
+    pub fn name(self) -> &'static str {
+        match self {
+            MtpExperts::Vram => "vram",
+            MtpExperts::Pinned => "pinned",
+        }
+    }
+}
+
+/// Parse [`EXPERTS_ENV`]: unset, empty or `vram` = VRAM; `pinned`; anything else refused by name
+pub fn mtp_experts(v: Option<&str>) -> Result<MtpExperts, String> {
+    match v.map(str::trim) {
+        None | Some("") | Some("vram") => Ok(MtpExperts::Vram),
+        Some("pinned") => Ok(MtpExperts::Pinned),
+        Some(s) => Err(format!("{EXPERTS_ENV}={s:?}: accepted vram (default), pinned")),
+    }
+}
+
+/// [`mtp_experts`] of the environment
+pub fn mtp_experts_from_env() -> Result<MtpExperts, String> {
+    mtp_experts(std::env::var(EXPERTS_ENV).ok().as_deref())
+}
+
+/// the pinned bytes the block's records take at `n` drafts (`at` = [`EXPERTS_ENV`]): the 288
+/// records with `pinned` and `n > 0`, else 0; `glm5_tiers::plan_for_rows` takes them off the
+/// pinned budget
+pub fn mtp_pinned_bytes(g: &Glm5Geo, record_bytes: u64, n: usize, at: MtpExperts) -> u64 {
+    if n > 0 && at == MtpExperts::Pinned {
+        g.experts as u64 * record_bytes
+    } else {
+        0
     }
 }
 
 /// The block's 288 routed-expert records from the container's `mtp` section into one VRAM buffer
-/// and the `[E]` table of their bases - the half of the block the 3-bit container holds.
+/// (`at` vram) or one mapped pinned block (`at` pinned) and the `[E]` table of their bases (device
+/// addresses, UVA for pinned) - the half of the block the 3-bit container holds. Returns
+/// `(VRAM buffer or 0, the pinned block, table)`.
 ///
 /// # Safety
 /// A CUDA context is current.
-pub unsafe fn load_mtp_records(cnq: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo) -> (Dev, Dev) {
+pub unsafe fn load_mtp_records(cnq: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo, at: MtpExperts) -> (Dev, Option<cuda::Pinned>, Dev) {
     let (l, rb) = (mtp_layer(g), moe.record.bytes);
-    let records = cuda::alloc_named("glm5 MTP expert records", (g.experts as u64 * rb) as usize);
+    let bytes = (g.experts as u64 * rb) as usize;
+    let (records, mut host) = match at {
+        MtpExperts::Vram => (cuda::alloc_named("glm5 MTP expert records", bytes), None),
+        MtpExperts::Pinned => (0, Some(cuda::Pinned::alloc_cold(bytes))),
+    };
+    let first = host.as_ref().map_or(records, |p| p.dev);
     let mut bases = Vec::with_capacity(g.experts);
     for e in 0..g.experts {
         let [gate, _, _] = expert_names(l, e);
         let t = cnq.find(&gate, MTP_SECTION).clone();
         assert_eq!(t.dtype, "mul1", "glm5_mtp: {gate} is {}, the record table takes MUL1 records (#181)", t.dtype);
         let rec = cnq.read_range(&t, 0, rb as usize);
-        let base = records + e as u64 * rb;
-        cuda::into_dev(base, rec.as_slice());
-        bases.push(base);
+        match host.as_mut() {
+            Some(p) => p.write_bytes(e * rb as usize, rec.as_slice()),
+            None => cuda::into_dev(records + e as u64 * rb, rec.as_slice()),
+        }
+        bases.push(first + e as u64 * rb);
     }
-    (records, cuda::to_u64_dev(&bases))
+    (records, host, cuda::to_u64_dev(&bases))
 }
 
 // ---------------------------------------------------------------- the MTP overlay
@@ -492,10 +556,11 @@ impl OvLoader<'_> {
 /// [`mtp_overlay_check`]. Takes as the trunk's DSA + MoE loader does (`glm5_model::load_layer`):
 /// norms widened to f32, BF16 matrices as stored, `kv_b` NVFP4 decoded once to BF16, the indexer's
 /// `wk | index_kpool_compress_gate | weights_proj` stacked, NVFP4 scale bytes 0x7F -> 0x7E (#177).
+/// The routed experts where `at` says ([`load_mtp_records`]); `MtpBlock::bytes` counts VRAM only.
 ///
 /// # Safety
 /// A CUDA context is current.
-pub unsafe fn load_mtp(base: &mut Cnq, overlay: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo) -> Result<MtpBlock, String> {
+pub unsafe fn load_mtp(base: &mut Cnq, overlay: &mut Cnq, g: &Glm5Geo, moe: &MoeGeo, at: MtpExperts) -> Result<MtpBlock, String> {
     mtp_overlay_check(g, &base.tensors, base.model(), &overlay.tensors, overlay.model())?;
     let mut ld = OvLoader { cnq: overlay, prefix: mtp_prefix(g), bytes: 0, sanitized: 0 };
     let mut idx_x = ld.raw("self_attn.indexer.wk.weight").1;
@@ -532,17 +597,18 @@ pub unsafe fn load_mtp(base: &mut Cnq, overlay: &mut Cnq, g: &Glm5Geo, moe: &Moe
     let (enorm, hnorm, eh_proj) = (ld.f32("enorm.weight"), ld.f32("hnorm.weight"), ld.bf16("eh_proj.weight"));
     let (input_norm, post_norm, head_norm) = (ld.f32("input_layernorm.weight"), ld.f32("post_attention_layernorm.weight"), ld.f32("shared_head.norm.weight"));
     let (bytes, sanitized) = (ld.bytes, ld.sanitized);
-    let (records, table) = load_mtp_records(base, g, moe);
+    let (records, records_host, table) = load_mtp_records(base, g, moe, at);
     let i = |v: usize| i32::try_from(v).expect("glm5_mtp: GEMV k beyond i32");
     let cols = cuda::to_i32_dev(&[i(q_a.cols), i(q_b.cols), i(kv_a.cols), i(o.cols), i(q_a.rows), i(q_b.rows), i(kv_a.rows), i(o.rows)]);
+    let in_vram = if records_host.is_some() { 0 } else { g.experts as u64 * moe.record.bytes };
     Ok(MtpBlock {
-        w: MtpWeights { enorm, hnorm, eh_proj, input_norm, post_norm, head_norm, attn, moe: moe_w, records, table },
+        w: MtpWeights { enorm, hnorm, eh_proj, input_norm, post_norm, head_norm, attn, moe: moe_w, records, records_host, table },
         q_a,
         q_b,
         kv_a,
         o,
         cols,
-        bytes: bytes + g.experts as u64 * moe.record.bytes,
+        bytes: bytes + in_vram,
         sanitized,
         kv_b_inexact,
     })
@@ -814,6 +880,14 @@ pub struct SpecStats {
     pub kda_restore_steps: u64,
     pub kda_restores: u64,
     pub kda_restore_bytes: u64,
+    /// the verify calls' MoE layers (one `table_for` each) and the distinct experts their rows
+    /// picked there, summed: distinct experts per MoE layer per verify = `verify_experts /
+    /// verify_moe_layers` (top-k for one row, up to `(1 + N) x` top-k)
+    pub verify_moe_layers: u64,
+    pub verify_experts: u64,
+    /// NVMe record reads the store counted during the verify calls (`ExpertTiers::nvme_reads`:
+    /// the demand reads; guess reads are counted apart)
+    pub verify_nvme_reads: u64,
 }
 
 impl SpecStats {
@@ -822,10 +896,15 @@ impl SpecStats {
         (self.drafts > 0).then(|| self.accepted as f64 / self.drafts as f64)
     }
 
+    /// distinct experts per MoE layer per verify (None before the first verify)
+    pub fn experts_per_moe_layer(&self) -> Option<f64> {
+        (self.verify_moe_layers > 0).then(|| self.verify_experts as f64 / self.verify_moe_layers as f64)
+    }
+
     /// one line of the counters (serve's per-request `[chat] MTP` line)
     pub fn summary(&self) -> String {
         format!(
-            "N {}, verify steps {}, ids {} ({:.3} per step), drafts {} accepted {} (acceptance {}), accepted per step {:?}, block rows {}, KDA restores {} steps",
+            "N {}, verify steps {}, ids {} ({:.3} per step), drafts {} accepted {} (acceptance {}), accepted per step {:?}, block rows {}, KDA restores {} steps, verify: distinct experts per MoE layer {}, NVMe demand reads {:.2} per step",
             self.n,
             self.steps,
             self.tokens,
@@ -835,7 +914,9 @@ impl SpecStats {
             self.acceptance().map_or("-".to_string(), |a| format!("{:.1} %", 100.0 * a)),
             self.hist,
             self.mtp_rows,
-            self.kda_restore_steps
+            self.kda_restore_steps,
+            self.experts_per_moe_layer().map_or("-".to_string(), |x| format!("{x:.2}")),
+            self.verify_nvme_reads as f64 / self.steps.max(1) as f64
         )
     }
 }
@@ -951,14 +1032,15 @@ impl Spec {
 }
 
 /// The VRAM the speculative decode adds at `n` drafts and `cap` rows, derived (not measured; the
-/// planner of `glm5_run` takes it off the free VRAM): the block's 288 records, its 25 overlay
-/// tensors as loaded (norms f32, `kv_b` BF16, the rest as stored), the KDA snapshot slots, the
-/// block's MLA cache and scratch, the verify buffers, the MoE plans of the block's calls.
-pub fn spec_vram_bytes(g: &Glm5Geo, moe: &MoeGeo, cap: usize, n: usize) -> u64 {
+/// planner of `glm5_run` takes it off the free VRAM): the block's 288 records (`at` vram; with
+/// pinned they are [`mtp_pinned_bytes`]), its 25 overlay tensors as loaded (norms f32, `kv_b`
+/// BF16, the rest as stored), the KDA snapshot slots, the block's MLA cache and scratch, the
+/// verify buffers, the MoE plans of the block's calls.
+pub fn spec_vram_bytes(g: &Glm5Geo, moe: &MoeGeo, cap: usize, n: usize, at: MtpExperts) -> u64 {
     let md = MlaDims::of(g);
     let kd = crate::glm5_kda::KdaDims::of(g);
     let (h, v, t) = (g.hidden as u64, g.vocab as u64, 1 + n as u64);
-    let records = g.experts as u64 * moe.record.bytes;
+    let records = if at == MtpExperts::Vram { g.experts as u64 * moe.record.bytes } else { 0 };
     let tensors: u64 = mtp_tensors(g)
         .iter()
         .filter(|x| x.store != Store::Mul1)
@@ -1082,6 +1164,7 @@ pub(crate) unsafe fn synthetic_block(g: &Glm5Geo, moe: &MoeGeo, seed: u64) -> Mt
             attn,
             moe: moe_w,
             records,
+            records_host: None,
             table: cuda::to_u64_dev(&bases),
         },
         q_a,
@@ -1164,6 +1247,61 @@ mod spec_gpu_tests {
             blk.free();
         }
     }
+
+    /// `CROW_GLM_MTP_EXPERTS=pinned`: the block's MoE reads its records zero-copy from mapped
+    /// pinned memory (`cuda::Pinned::alloc_cold`, the `[E]` table at their UVA addresses) and
+    /// gives the bits of the same calls on the VRAM records (same kernels, same bytes); real
+    /// shapes, a synthetic block, 3 rows then 1 row, the VRAM records freed before the pinned run.
+    #[test]
+    #[ignore = "needs the GPU (about 4 GB VRAM, 2.7 GB pinned host memory): cargo test --release --lib glm5_mtp_spec_gpu -- --ignored --nocapture --test-threads 1"]
+    fn glm5_mtp_spec_gpu_pinned_records_are_the_vram_records() {
+        let g = Glm5Geo::GLM_5_3_FLASH;
+        let moe = MoeGeo::new(&g, crate::geo::ExpertRecordSpec::new(crate::geo::ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kn = Glm5Kernels::new(&g);
+            let mk = MtpKernels::new();
+            let mut blk = synthetic_block(&g, &moe, 0x0192);
+            let h = g.hidden;
+            let mut x = 0x5eedu64;
+            let mut rnd = |n: usize, a: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        a * ((x >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                    })
+                    .collect()
+            };
+            let (e, hv) = (cuda::to_f32_dev(&rnd(4 * h, 0.035)), cuda::to_f32_dev(&rnd(4 * h, 1.7)));
+            let calls = |blk: &MtpBlock| -> Vec<u32> {
+                let mut pass = MtpPass::new(&g, moe, 3, 16);
+                let mut got = Vec::new();
+                for (p0, t) in [(0usize, 3usize), (3, 1)] {
+                    blk.call(&mut pass, &kn, &mk, e + (p0 * h * 4) as u64, hv + (p0 * h * 4) as u64, p0, t, false, None);
+                    cuda::sync();
+                    got.extend(cuda::dtoh(pass.normed, t * h).into_iter().map(f32::to_bits));
+                }
+                pass.free();
+                got
+            };
+            let vram = calls(&blk);
+            let rb = moe.record.bytes as usize;
+            let mut host = cuda::Pinned::alloc_cold(g.experts * rb);
+            host.write_bytes(0, &cuda::dtoh_t::<u8>(blk.w.records, g.experts * rb));
+            let mut old = blk.w.table;
+            blk.w.table = cuda::to_u64_dev(&(0..g.experts).map(|x| host.dev + (x * rb) as u64).collect::<Vec<u64>>());
+            cuda::free_dev(&mut old);
+            cuda::free_dev(&mut blk.w.records);
+            blk.w.records_host = Some(host);
+            let pinned = calls(&blk);
+            let differ = vram.iter().zip(&pinned).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "{differ} of {} head-norm values differ between the pinned and the VRAM records", vram.len());
+            assert!(vram.iter().all(|&b| f32::from_bits(b).is_finite()));
+            blk.free();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1184,17 +1322,34 @@ mod spec_host_tests {
     }
 
     #[test]
+    fn crow_glm_mtp_experts_parses_and_refuses_by_name() {
+        for (v, want) in [(None, MtpExperts::Vram), (Some(""), MtpExperts::Vram), (Some("vram"), MtpExperts::Vram), (Some(" pinned "), MtpExperts::Pinned)] {
+            assert_eq!(mtp_experts(v), Ok(want), "{v:?}");
+        }
+        for bad in ["1", "host", "VRAM", "zerocopy"] {
+            let e = mtp_experts(Some(bad)).unwrap_err();
+            assert!(e.starts_with(&format!("{EXPERTS_ENV}=\"{bad}\": accepted vram (default), pinned")), "{e}");
+        }
+        assert_eq!((MtpExperts::Vram.name(), MtpExperts::Pinned.name()), ("vram", "pinned"));
+    }
+
+    #[test]
     fn spec_stats_acceptance_and_vram_estimate() {
         let s = SpecStats { drafts: 10, accepted: 4, ..SpecStats::default() };
         assert_eq!(s.acceptance(), Some(0.4));
         assert_eq!(SpecStats::default().acceptance(), None);
         let g = Glm5Geo::GLM_5_3_FLASH;
         let moe = MoeGeo::new(&g, crate::geo::ExpertRecordSpec::new(crate::geo::ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
-        let (b1, b2) = (spec_vram_bytes(&g, &moe, 4096, 1), spec_vram_bytes(&g, &moe, 4096, 2));
+        let (b1, b2) = (spec_vram_bytes(&g, &moe, 4096, 1, MtpExperts::Vram), spec_vram_bytes(&g, &moe, 4096, 2, MtpExperts::Vram));
         // one more draft row adds at least one KDA snapshot slot: 34 x (4 MiB + 288 KiB)
         assert!(b2 - b1 >= 34 * 4_489_216, "{b1} {b2}");
         // the 288 records alone are 2,728,525,824 B
         assert!(b1 > 288 * 9_474_048, "{b1}");
+        // CROW_GLM_MTP_EXPERTS=pinned: the records leave VRAM for the pinned budget
+        let rb = moe.record.bytes;
+        assert_eq!(b1 - spec_vram_bytes(&g, &moe, 4096, 1, MtpExperts::Pinned), 288 * rb);
+        let pinned = |n: usize, at: MtpExperts| mtp_pinned_bytes(&g, rb, n, at);
+        assert_eq!((pinned(1, MtpExperts::Pinned), pinned(0, MtpExperts::Pinned), pinned(1, MtpExperts::Vram)), (288 * rb, 0, 0));
     }
 }
 
@@ -1593,6 +1748,7 @@ mod tests_gpu {
                     shared: GpuFfnWeights { gate: fp4(&sh[0], si, hd), up: fp4(&sh[1], si, hd), down: fp4(&sh[2], hd, si) },
                 },
                 records,
+                records_host: None,
                 table: cuda::to_u64_dev(&bases),
             };
             let mut pass = MtpPass::new(&G, moe, T_PROMPT, 64);
@@ -1683,7 +1839,7 @@ mod tests_gpu {
             let mut base = Cnq::open(&env("GLM5_CNQ"));
             let mut ov = Cnq::open(&env("GLM5_MTP_OVERLAY"));
             let moe = MoeGeo::new(&G, ExpertRecordSpec::new(ExpertCodec::Mul1, crate::cpu_mul1::GLM_RECORD_BYTES_K3 as u64).unwrap()).unwrap();
-            let mut blk = load_mtp(&mut base, &mut ov, &G, &moe).unwrap_or_else(|e| panic!("{e}"));
+            let mut blk = load_mtp(&mut base, &mut ov, &G, &moe, MtpExperts::Vram).unwrap_or_else(|e| panic!("{e}"));
             let mut rep = crate::glm5_model::LoadReport::default();
             let mut head_w = crate::glm5_model::load_head(&mut base, &G, &mut rep);
             eprintln!(

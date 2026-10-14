@@ -45,8 +45,10 @@
 //! - #192 `CROW_GLM_MTP=N` (1..=4): speculative decode with the MTP block (the container's
 //!   section `mtp` + `CROW_GLM_MTP_OVERLAY`, default `converter/GLM-5.3-Flash-MTP-overlay.cnq`);
 //!   the plan runs at free VRAM minus the block's derived bytes, the tiers get `(1 + N) x top-k`
-//!   staging slots, every rep prints and records the MTP counters per decode token. With
-//!   `CROW_CHUNK` the prompt runs in prompt calls and the block follows each call. A step's
+//!   staging slots, every rep prints and records the MTP counters per decode token (with the
+//!   verify's distinct experts per MoE layer and NVMe demand reads per step). The block's experts
+//!   in VRAM or mapped pinned memory (`CROW_GLM_MTP_EXPERTS`). The CPU lane and
+//!   `CROW_GLM_KV_LAZY` apply. With `CROW_CHUNK` the prompt runs in prompt calls and the block follows each call. A step's
 //!   clock is shared by the ids it emits (`secs` = step / ids), its tier counters sit on its
 //!   first id.
 //!
@@ -344,6 +346,8 @@ fn mtp_json(s: &SpecStats) -> Value {
         "accepted_hist": s.hist, "mtp_rows": s.mtp_rows, "mtp_rows_per_token": s.mtp_rows as f64 / t,
         "kda_snapshots": s.kda_snapshots, "kda_snapshot_gb_per_token": s.kda_snapshot_bytes as f64 / 1e9 / t,
         "kda_restore_steps": s.kda_restore_steps, "kda_restores": s.kda_restores, "kda_restore_gb_per_token": s.kda_restore_bytes as f64 / 1e9 / t,
+        "verify_moe_layers": s.verify_moe_layers, "verify_experts": s.verify_experts, "verify_experts_per_moe_layer": s.experts_per_moe_layer(),
+        "verify_nvme_reads": s.verify_nvme_reads, "verify_nvme_reads_per_step": s.verify_nvme_reads as f64 / steps, "verify_nvme_reads_per_token": s.verify_nvme_reads as f64 / t,
     })
 }
 
@@ -351,7 +355,7 @@ fn mtp_line(s: &SpecStats) -> String {
     let c = mtp_json(s);
     let f = |k: &str| c[k].as_f64().unwrap_or(0.0);
     format!(
-        "N {}, steps {}, tokens/step {:.3}, drafts {} accepted {} (acceptance {}), per token: drafts {:.3} accepted {:.3} verify rows {:.3} MTP rows {:.3}, accepted per step {:?}, KDA snapshots {:.4} GB/token, restores {} steps ({:.4} GB/token)",
+        "N {}, steps {}, tokens/step {:.3}, drafts {} accepted {} (acceptance {}), per token: drafts {:.3} accepted {:.3} verify rows {:.3} MTP rows {:.3}, accepted per step {:?}, KDA snapshots {:.4} GB/token, restores {} steps ({:.4} GB/token); verify: distinct experts per MoE layer {}, NVMe demand reads {:.2} per step ({:.2} per token)",
         s.n,
         s.steps,
         f("tokens_per_step"),
@@ -365,7 +369,10 @@ fn mtp_line(s: &SpecStats) -> String {
         s.hist,
         f("kda_snapshot_gb_per_token"),
         s.kda_restore_steps,
-        f("kda_restore_gb_per_token")
+        f("kda_restore_gb_per_token"),
+        s.experts_per_moe_layer().map_or("-".to_string(), |x| format!("{x:.2}")),
+        f("verify_nvme_reads_per_step"),
+        f("verify_nvme_reads_per_token")
     )
 }
 
@@ -735,7 +742,7 @@ fn run(args: &[String]) -> Result<(), String> {
     unsafe {
         let _ctx = cuda::Ctx::init();
         let free = cuda::free_vram_bytes();
-        let mtp_reserved = if drafts > 0 { mtp::spec_vram_bytes(&o.g, &o.moe, cap, drafts) } else { 0 };
+        let mtp_reserved = if drafts > 0 { mtp::spec_vram_bytes(&o.g, &o.moe, cap, drafts, mtp::mtp_experts_from_env()?) } else { 0 };
         if drafts > 0 {
             println!("[glm5_run] {}={drafts}: the #159 plan runs at free VRAM minus {mtp_reserved} B (the MTP block, its caches, {drafts} KDA snapshot slots; derived)", mtp::MTP_ENV);
         }
@@ -1277,16 +1284,22 @@ mod tests {
             kda_restore_steps: 4,
             kda_restores: 4 * 34,
             kda_restore_bytes: 4 * 1_000_000_000,
+            verify_moe_layers: 6 * 42,
+            verify_experts: 6 * 42 * 14,
+            verify_nvme_reads: 150,
         };
         let j = mtp_json(&s);
         assert_eq!(j["acceptance_rate"].as_f64(), Some(4.0 / 12.0));
+        assert_eq!((j["verify_experts_per_moe_layer"].as_f64(), j["verify_nvme_reads_per_step"].as_f64(), j["verify_nvme_reads_per_token"].as_f64()), (Some(14.0), Some(25.0), Some(15.0)));
         assert_eq!(j["tokens_per_step"].as_f64(), Some(10.0 / 6.0));
         assert_eq!((j["drafts_per_token"].as_f64(), j["verify_rows_per_token"].as_f64()), (Some(1.2), Some(1.8)));
         assert_eq!((j["kda_snapshot_gb_per_token"].as_f64(), j["kda_restore_gb_per_token"].as_f64()), (Some(1.2), Some(0.4)));
         assert_eq!(j["accepted_hist"], json!([3, 1, 1]));
         let l = mtp_line(&s);
         assert!(l.starts_with("N 2, steps 6, tokens/step 1.667, drafts 12 accepted 4 (acceptance 33.3 %), per token: drafts 1.200 accepted 0.400 verify rows 1.800"), "{l}");
+        assert!(l.ends_with("; verify: distinct experts per MoE layer 14.00, NVMe demand reads 25.00 per step (15.00 per token)"), "{l}");
         assert!(mtp_line(&SpecStats::default()).contains("(acceptance -)"));
+        assert!(mtp_line(&SpecStats::default()).contains("distinct experts per MoE layer -,"));
     }
 
     #[test]

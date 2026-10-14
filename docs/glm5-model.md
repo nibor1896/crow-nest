@@ -618,18 +618,22 @@ second #192 change, 2026-10-09): see **serve** below and
 - **Switches.** `CROW_GLM_GRAPH`: the prompt rows keep their graphs; the verify and the block run
   uncaptured (another shape). `CROW_GLM_FLAGS`: one-row calls publish their ids; a verify of more
   rows reads its ids by a sync. `CROW_CHUNK` (#186) applies to the prompt (above). `CROW_GLM_LOOKAHEAD`
-  does not apply under MTP. `CROW_GLM_CPU_LANE=1`
-  is refused by name (its experts have other bits than the verify's GPU kernels, so the ids could
-  differ from the run without MTP).
+  does not apply under MTP. `CROW_GLM_CPU_LANE=1` / `split` (2026-10-14): the verify's 1 + N rows
+  take the lane of a batched step (`lane_plan`, one pool run per row); its CPU experts have other
+  bits than the GPU's, so a verify with the lane is held to G3 against MTP off with the same lane.
+  `CROW_GLM_KV_LAZY` (2026-10-14): `generate` maps every row up front, serve's `spec_decode` maps
+  the verify's rows `pos ..= pos + N` before it runs. `CROW_GLM_MTP_EXPERTS=pinned`: the block's
+  288 records in mapped pinned memory, read zero-copy (same bits).
 - **Counters** (`Glm5Run::mtp_stats`, `glm5_run` line `decode MTP:` and JSON `decode.mtp` per rep):
   steps, ids, drafts, accepted, acceptance rate, ids per step, verify rows, block rows, accepted
-  drafts per step (histogram), KDA snapshot and restore copies and GB per token. A step's clock is
+  drafts per step (histogram), KDA snapshot and restore copies and GB per token, the verify's
+  distinct experts per MoE layer and its NVMe demand reads per step and per token. A step's clock is
   shared by its ids (`secs` = step / ids); its tier counters sit on its first id. `glm5_run` plans
   the tiers at free VRAM minus `glm5_mtp::spec_vram_bytes` (derived) and prints the measured VRAM
   the block took next to it.
 - **serve** (`glm5_engine::Glm5Device`: `Rows::decode` -> `Glm5Run::spec_decode`, `Rows::prefill_chunk`
   -> `Glm5Run::spec_prefill`; the boot plans at free VRAM minus `spec_vram_bytes` over the context,
-  `(1 + N) x top-k` staging slots, the CPU lane refused by name). `serve` feeds one id per
+  `(1 + N) x top-k` staging slots, the device sampler of #215 allocated as without MTP). `serve` feeds one id per
   `decode_step`. A verify at `p` feeds the caller's id and k drafts and keeps all 1 + k rows
   (`glm5_mtp::Ahead`: fed ids, greedy ids, logits and head-norm rows, KDA slots; no eager
   rollback). While the caller's next id equals the draft fed at that row, `decode_step` hands out
@@ -637,8 +641,10 @@ second #192 change, 2026-10-09): see **serve** below and
   differs, `Glm5Run::spec_settle` copies the KDA states back from the slot of the caller's last row,
   runs the block over the rows the caller reached (their next ids: the drafts reached, then the
   caller's id), chains new drafts and verifies again. A greedy caller keeps the drafts that equal
-  the argmax. A sampling caller (temperature > 0, host sampler, logit bias, grammar redraw, forced
-  ids) keeps the drafts its draws hit. Every id is drawn from its own row, the one-row decode's
+  the argmax. A sampling caller (temperature > 0, device or host sampler, logit bias, grammar
+  redraw, forced ids) keeps the drafts its draws hit; on the device sampler (#215) a row is drawn
+  only when the caller reaches it (`Glm5Run::spec_hand_out`), so the sampler books the emitted ids
+  alone. Every id is drawn from its own row, the one-row decode's
   bits, with the same draws as without MTP. That is speculative sampling (Leviathan et al.,
   arXiv:2211.17192, Algorithm 1; Chen et al., arXiv:2302.01318, Algorithm 2) with a point-mass draft
   q = one-hot(d): accept with probability p(d), else draw from p without d. Drawing x ~ p and keeping
@@ -658,7 +664,10 @@ equal the one-row path's after the same row (hashed per row); at the end every K
 cache row 0..=73 bit for bit; counters equal to a host simulation of the pattern (e.g. N = 3:
 28 steps, 79 drafts, 41 accepted, histogram [14, 0, 1, 13]). Red with the restore removed: ids
 diverge from generated id 6 (`[.., 189, 1016, 999, ..]` instead of `[.., 189, 894, 508, ..]`).
-`glm5_mtp_spec_gpu_refusals`: a model loaded for one row, too few staging slots, the CPU lane.
+`glm5_mtp_spec_gpu_refusals`: a model loaded for one row, too few staging slots; since
+2026-10-14 the CPU lane is an acceptance arm instead (V 0 + P 16, `split`: the lane computes in
+the verify calls, ids equal and every generated row within G3 of MTP off with the same lane; not
+yet run on the GPU).
 `glm5_mtp_spec_gpu_chunked_prompt_is_lossless` (37-id prompt, 24 ids, pass of 16 rows): N = 3 with
 patterned drafts at prompt chunk 1 and 16, N = 2 with the block's own drafts at chunk 12 (calls
 crossing the block's windows). Each gives the ids of the row path and every logit's bits of MTP off at

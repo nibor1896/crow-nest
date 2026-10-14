@@ -309,8 +309,8 @@ Since 2026-10-09 a glm5_next container boots and serves (`engine/src/glm5_engine
    The boot holds the buffers (`[budget] device sampler (#215)`, 501,556 B at V 154,880). The host
    draw (`draw_row`, the logits row read back, 619,520 B per token) stays for the requests Qwen
    sends there too (`logit_bias`, `top_k` 0 or > 64, DRY and the #92 knobs) and for
-   `CROW_GLM_MTP` > 0, `CROW_GLM_MAX_BATCH` > 1 and `CROW_GLM_LA`, which allocate no device
-   sampler; `[chat] glm5_next draws on the HOST sampler (#215)` names the reason. Inside a tool
+   `CROW_GLM_MAX_BATCH` > 1 and `CROW_GLM_LA`, which allocate no device sampler (with
+   `CROW_GLM_MTP` > 0 the device sampler draws each verify row the request reaches, 2026-10-14); `[chat] glm5_next draws on the HOST sampler (#215)` names the reason. Inside a tool
    call the device's id is checked by the grammar; a refused id is redrawn on the host from the
    same row and the device's presence / window booking moves to the kept id (`rebook_sampler`).
    **MTP** (#192, `CROW_GLM_MTP=N`, default off): `decode_step` runs the speculative decode
@@ -321,7 +321,8 @@ Since 2026-10-09 a glm5_next container boots and serves (`engine/src/glm5_engine
    without MTP. A sampled request keeps the drafts its draws hit (speculative sampling with a
    point-mass draft, [glm5-model.md](glm5-model.md) section 6.4). `timings` count the emitted ids
    (`decode_step` runs once per id). The boot plans the tiers at free VRAM minus the block's derived
-   bytes, gives `(1 + N) x top-k` staging slots and refuses `CROW_GLM_CPU_LANE=1` by name; the
+   bytes and gives `(1 + N) x top-k` staging slots (the CPU lane and `CROW_GLM_KV_LAZY` apply since
+   2026-10-14); the
    `[serve]` boot line names N, and one `[chat] MTP (#192)` line per request carries the
    counters.
 4. **Prefix cache.** One snapshot after each prompt, as for the other families (#31 A9, #36 M2b,
