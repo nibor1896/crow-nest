@@ -1076,6 +1076,9 @@ pub struct Pinned {
     /// this many bytes at `host` (`alloc_registered`), unregistered + unmapped
     /// by `free`
     map_len: usize,
+    /// the size of each `cuMemHostRegister` piece of a registered mapping (0 for a
+    /// `cuMemHostAlloc` block): `REG_CHUNK`, or whole records ([`Pinned::alloc_cold_records`])
+    reg_piece: usize,
 }
 
 /// How the pinned cold tier is allocated (`CROW_PINNED_ALLOC`, issue #103).
@@ -1115,6 +1118,17 @@ const REG_CHUNK: usize = 1 << 30;
 #[cfg(unix)]
 const HUGE: usize = 2 << 20;
 
+/// the `cuMemHostRegister` piece of an arena of `rb`-byte records: as many whole records as fit
+/// in `REG_CHUNK` (at least one), so a record never crosses a piece; `REG_CHUNK` when `rb` is
+/// not page-aligned (a piece must start on a page) or larger than `REG_CHUNK`
+#[cfg(unix)]
+fn reg_piece_for(rb: usize) -> usize {
+    if rb == 0 || !rb.is_multiple_of(4096) || rb > REG_CHUNK {
+        return REG_CHUNK;
+    }
+    REG_CHUNK / rb * rb
+}
+
 impl Pinned {
     /// the one `cuMemHostAlloc`; `alloc` and `alloc_wc` differ only by the flag word
     unsafe fn alloc_flags(bytes: usize, flags: u32) -> Pinned {
@@ -1122,7 +1136,7 @@ impl Pinned {
         ck(sys::cuMemHostAlloc(&mut host, bytes, flags));
         let mut dev: CUdeviceptr = 0;
         ck(sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0));
-        Pinned { host, dev, bytes, map_len: 0 }
+        Pinned { host, dev, bytes, map_len: 0, reg_piece: 0 }
     }
 
     /// mapped pinned allocation; the returned `dev` pointer is what kernels read
@@ -1142,6 +1156,23 @@ impl Pinned {
         }
     }
 
+    /// `alloc_cold` for an arena of `records` slots of `rb` bytes that is copied one slot at a
+    /// time (the glm5_next pinned tier, crow-nest #230). A registered mapping is cut into pieces
+    /// of whole records ([`reg_piece_for`]), so no slot straddles two `cuMemHostRegister`
+    /// ranges: a `cuMemcpy*Async` over such a seam fails with CUDA_ERROR_INVALID_VALUE (the
+    /// 124-slot GLM arena, 9,474,048 B per slot, had slot 113 across the 1 GiB seam;
+    /// 2026-10-14). The other two modes are one `cuMemHostAlloc` block, as `alloc_cold`.
+    ///
+    /// # Safety
+    /// A CUDA context is current; the block is freed with [`Pinned::free`].
+    pub unsafe fn alloc_cold_records(records: usize, rb: usize) -> Pinned {
+        match pin_alloc_mode() {
+            #[cfg(unix)]
+            PinAlloc::Register => Pinned::alloc_registered_pieces(records * rb, reg_piece_for(rb)),
+            _ => Pinned::alloc_cold(records * rb),
+        }
+    }
+
     /// #103: page-locked memory the KERNEL owns. An anonymous private
     /// mapping (2 MiB aligned, MADV_HUGEPAGE, MADV_DONTFORK so a child process
     /// never copy-on-writes 46 GiB of pinned pages) registered with
@@ -1156,6 +1187,14 @@ impl Pinned {
     /// register, WC and cacheable alike, `pin_return_probe bw` / `scatter`).
     #[cfg(unix)]
     pub unsafe fn alloc_registered(bytes: usize) -> Pinned {
+        Pinned::alloc_registered_pieces(bytes, REG_CHUNK)
+    }
+
+    /// `alloc_registered` with `cuMemHostRegister` pieces of `piece` bytes (page-aligned,
+    /// at most `REG_CHUNK`)
+    #[cfg(unix)]
+    unsafe fn alloc_registered_pieces(bytes: usize, piece: usize) -> Pinned {
+        assert!(piece > 0 && piece <= REG_CHUNK && piece.is_multiple_of(4096), "pinned tier: register piece {piece} B is not page-aligned in (0, {REG_CHUNK}]");
         let len = bytes.max(1).div_ceil(HUGE) * HUGE;
         let raw = libc::mmap(
             std::ptr::null_mut(),
@@ -1185,7 +1224,7 @@ impl Pinned {
         let mut done = 0usize;
         let mut dev0: CUdeviceptr = 0;
         while done < len {
-            let n = REG_CHUNK.min(len - done);
+            let n = piece.min(len - done);
             let p = (base + done) as *mut std::ffi::c_void;
             let r = sys::cuMemHostRegister_v2(p, n, flags);
             if r != sys::CUresult::CUDA_SUCCESS {
@@ -1193,7 +1232,7 @@ impl Pinned {
                 let mut o = 0;
                 while o < done {
                     let _ = sys::cuMemHostUnregister((base + o) as *mut std::ffi::c_void);
-                    o += REG_CHUNK;
+                    o += piece;
                 }
                 libc::munmap(host, len);
                 panic!("pinned tier: cuMemHostRegister of {n} B at offset {done} failed: {r:?}");
@@ -1208,7 +1247,7 @@ impl Pinned {
             }
             done += n;
         }
-        Pinned { host, dev: dev0, bytes, map_len: len }
+        Pinned { host, dev: dev0, bytes, map_len: len, reg_piece: piece }
     }
 
     pub unsafe fn write_bytes(&mut self, offset: usize, v: &[u8]) {
@@ -1232,7 +1271,7 @@ impl Pinned {
                 let mut o = 0;
                 while o < self.map_len {
                     ck_call("cuMemHostUnregister", sys::cuMemHostUnregister((self.host as usize + o) as *mut std::ffi::c_void));
-                    o += REG_CHUNK;
+                    o += self.reg_piece;
                 }
                 libc::munmap(self.host, self.map_len);
             }
@@ -1351,6 +1390,34 @@ mod tests {
         for r in [mine, uvm, gfx] {
             let _ = std::fs::remove_dir_all(r);
         }
+    }
+}
+
+/// #230: the register pieces of a record arena never cut a record (the glm5_next pinned tier
+/// failed with CUDA_ERROR_INVALID_VALUE on Linux when slot 113 of 124 crossed the 1 GiB piece)
+#[cfg(all(test, unix))]
+mod reg_pieces {
+    use super::*;
+
+    #[test]
+    fn a_record_arena_is_registered_in_whole_records() {
+        let rb = 9_474_048; // one MUL1K3 expert record
+        let piece = reg_piece_for(rb);
+        assert_eq!(piece, 113 * rb);
+        assert!(piece <= REG_CHUNK && piece.is_multiple_of(4096));
+        // the old 1 GiB pieces cut slot 113 of the 124-slot arena; whole-record pieces cut none
+        let cut = |piece: usize| (0..124usize).filter(|q| q * rb / piece != ((q + 1) * rb - 1) / piece).collect::<Vec<_>>();
+        assert_eq!(cut(REG_CHUNK), vec![113]);
+        assert!(cut(piece).is_empty());
+    }
+
+    #[test]
+    fn records_a_piece_cannot_hold_whole_keep_the_1_gib_piece() {
+        assert_eq!(reg_piece_for(0), REG_CHUNK);
+        assert_eq!(reg_piece_for(4097), REG_CHUNK);
+        assert_eq!(reg_piece_for(REG_CHUNK + 4096), REG_CHUNK);
+        assert_eq!(reg_piece_for(REG_CHUNK), REG_CHUNK);
+        assert_eq!(reg_piece_for(4096), REG_CHUNK);
     }
 }
 

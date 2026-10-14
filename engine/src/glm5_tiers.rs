@@ -9033,7 +9033,7 @@ impl ExpertTiers {
         for _ in 0..nl {
             vram.push(if sizes.vram > 0 { cuda::alloc_named("glm5 VRAM expert slots", sizes.vram * rb as usize) } else { 0 });
             if sizes.pinned > 0 {
-                pinned.push(Pinned::alloc_cold(sizes.pinned * rb as usize));
+                pinned.push(Pinned::alloc_cold_records(sizes.pinned, rb as usize));
             }
             tables.push(cuda::alloc_named("glm5 expert record table", g.experts * 8));
         }
