@@ -76,6 +76,7 @@ Switches and figures: the GLM rows of [env.md](env.md) (sections GLM-5.3-Flash, 
 ## Tooling and process
 
 - [regression-gate.md](regression-gate.md): regression gate R, Flash-Next and the 27B unchanged by an engine change (#174).
+- [prequal.md](prequal.md): `tools/prequal.py`, size, placement and decode ceiling of a new model from its shard headers, no download, no GPU (#240).
 - [improve-loop.md](improve-loop.md): the improve loop, canonical definition (German, 2026-09-03).
 - [sota-research-2026-09-03.md](sota-research-2026-09-03.md): SOTA research on FP4 inference on sm_120a / WDDM (German, 2026-09-03).
 - [acceptance/](acceptance/): acceptance protocols per issue (#83 to #96).
