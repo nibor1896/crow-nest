@@ -45,6 +45,15 @@ refuses an answer for another revision, a shard without `lfs.sha256`, or a shard
   62/62 shards, 76,108 tensors, 10,684,096 B of headers (incl. the 8-byte length fields) +
   328,326,771,576 B of tensors = 328,337,455,672 B = the shard total; 62 range requests, 0 retries.
 
+**Any other repo (#240):** the header read (256 KiB probe, a second range only for a longer header,
+tile check) lives in `tools/hf_headers.py`, which `--headers` calls. Without the GLM checks it reads
+any safetensors repo: `python -I tools/hf_headers.py --repo ORG/NAME --revision SHA --out DIR` writes
+`hf-revision.json`, `config.json`, `generation_config.json`, the index and `headers/<shard>.json` in
+the same format, reuses verified files on a rerun (0 B), sends `HF_TOKEN` only through curl's config
+on stdin, and exits 2 with `hf_headers: <reason>` on a refusal (gated repo, unknown revision, no
+safetensors index). Tests: `python -I tools/test_hf_headers.py`. Measured 2026-10-17 on GLM-5.3-Flash:
+62/62 headers byte-identical to this tool's, 24,812,140 B in 66 requests; a rerun 0 B.
+
 ## Retry, stall and disk rules
 
 Hugging Face drops long transfers (TLS resets, WinError 10054, curl exit 35). Whole files have

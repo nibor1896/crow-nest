@@ -35,6 +35,10 @@ is killed and parked when the free space drops below 20 GB while it transfers. A
 `<shard>.deleted` marker (converted and deleted by `tools/glm-stage.py`) is skipped, never
 fetched again.
 
+The header read itself (probe, second read for a longer header, tile check) lives in the
+shared helper `tools/hf_headers.py` (#240), which reads the headers of any repo; this tool keeps
+GLM's revision, its checks, its lock and log, and reads a verified local shard without network.
+
 Everything is logged with a timestamp to `models/GLM-5.3-Flash-original/fetch.log`.
 Standard library only; downloaded files are only read as data (run with `python -I`).
 Unit tests for the pure parts: `tools/test_fetch_glm.py` (no network). Docs: docs/glm-download.md.
@@ -42,10 +46,10 @@ Unit tests for the pure parts: `tools/test_fetch_glm.py` (no network). Docs: doc
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
 import time
@@ -53,6 +57,11 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# #240: the header read is shared with any repo; loaded by path (`python -I` puts no script dir on sys.path)
+_HH_SPEC = importlib.util.spec_from_file_location("hf_headers", Path(__file__).resolve().parent / "hf_headers.py")
+hh = importlib.util.module_from_spec(_HH_SPEC)
+_HH_SPEC.loader.exec_module(hh)
 
 REPO = "zai-org/GLM-5.3-Flash"
 REVISION = "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
@@ -81,16 +90,16 @@ N_SHARDS = 62
 
 GB = 1000 ** 3
 MIN_FREE_AFTER = 20 * GB          # owner rule: never leave less than 20 GB free
-HEADER_PROBE = 256 * 1024         # first range request of a shard header
-MAX_HEADER = 100 * 1000 * 1000    # safetensors caps the header at 100 MB
+HEADER_PROBE = hh.HEADER_PROBE    # first range request of a shard header (256 KiB)
+MAX_HEADER = hh.MAX_HEADER        # safetensors caps the header at 100 MB
 
-CURL_RETRY = ["--retry", "20", "--retry-all-errors", "--retry-delay", "10"]   # small range requests only
+CURL_RETRY = hh.CURL_RETRY        # small range requests only: --retry 20 --retry-all-errors --retry-delay 10
 # whole files: curl must never retry by itself - its retry rewinds to the start of the run
 # (curl docs/TODO.md, "--retry should resume"); the outer `-C -` loop is the only retry
 CURL_FILE_RETRY = ["--retry", "0"]
 SPEED_LIMIT = 256 * 1024          # B/s; below this for SPEED_TIME s curl aborts (and retries)
 SPEED_TIME = 120
-CONNECT_TIMEOUT = 30
+CONNECT_TIMEOUT = hh.CONNECT_TIMEOUT
 STALL_SEC = 600                   # watchdog: no growth for this long while curl lives -> kill
 POLL_SEC = 10
 PROGRESS_SEC = 300                # one progress line per file per 5 minutes
@@ -102,7 +111,7 @@ SPACE_POLL_SEC = 30               # --wait-for-space: free-space poll while park
 SPACE_LOG_SEC = 600               # --wait-for-space: one WAIT line per 10 minutes while parked
 LOW_SPACE_RC = -28                # run_curl: killed because the free space fell below the floor
 PERMANENT_HTTP = {401, 403, 404, 410}
-WRITE_OUT = "%{http_code} %{num_retries} %{size_download} %{exitcode}"
+WRITE_OUT = hh.WRITE_OUT
 
 LANG_LAYERS = "model.language_model.layers."
 FINAL_NORMS = ("model.language_model.norm.", "model.norm.")
@@ -251,41 +260,12 @@ def select_shards(weight_map, layers, with_embed_head):
     return sorted(reasons), counts, {s: sorted(r) for s, r in reasons.items()}
 
 
-def parse_safetensors_header(blob):
-    """(header dict, data_start) from a prefix of a safetensors file.
-
-    Raises NeedMore(total) when the prefix is shorter than 8 + header length.
-    """
-    if len(blob) < 8:
-        raise NeedMore(8)
-    header_len = struct.unpack("<Q", blob[:8])[0]
-    if header_len > MAX_HEADER:
-        raise ValueError(f"header length {header_len} B exceeds the safetensors cap of {MAX_HEADER} B")
-    if len(blob) < 8 + header_len:
-        raise NeedMore(8 + header_len)
-    header = json.loads(blob[8:8 + header_len])
-    if not isinstance(header, dict):
-        raise ValueError("safetensors header is not a JSON object")
-    return header, 8 + header_len
-
-
-class NeedMore(Exception):
-    def __init__(self, total):
-        super().__init__(f"need {total} bytes")
-        self.total = total
-
-
-def header_summary(header, data_start, file_size):
-    """(tensor count, tensor bytes) of one shard; refuses a header that does not tile the file."""
-    spans = sorted(tuple(v["data_offsets"]) for k, v in header.items() if k != "__metadata__")
-    cursor = 0
-    for b, e in spans:
-        if b != cursor or e < b:
-            raise ValueError(f"tensor bytes are not contiguous at offset {b} (expected {cursor})")
-        cursor = e
-    if data_start + cursor != file_size:
-        raise ValueError(f"header {data_start} B + tensors {cursor} B != file size {file_size} B")
-    return len(spans), cursor
+# moved to tools/hf_headers.py (#240), re-exported for the importers of this module
+parse_safetensors_header = hh.parse_safetensors_header
+NeedMore = hh.NeedMore
+header_summary = hh.header_summary
+parse_write_out = hh.parse_write_out
+curl_range_argv = hh.curl_range_argv
 
 
 def decide(have, expected):
@@ -311,18 +291,6 @@ def lock_is_stale(lock_mtime, now, ttl=LOCK_TTL):
     return now - lock_mtime > ttl
 
 
-def parse_write_out(text):
-    """curl -w WRITE_OUT -> {"http", "retries", "bytes", "exit"} (ints; missing -> 0)."""
-    parts = (text or "").strip().split()
-    vals = []
-    for i in range(4):
-        try:
-            vals.append(int(parts[i]))
-        except (IndexError, ValueError):
-            vals.append(0)
-    return dict(zip(("http", "retries", "bytes", "exit"), vals))
-
-
 def curl_file_argv(curl, url, out):
     """One whole-file curl run: resume from the bytes on disk, no curl-internal retry (it would
     rewind the file to where this run started), abort on a stall."""
@@ -330,14 +298,6 @@ def curl_file_argv(curl, url, out):
             "--connect-timeout", str(CONNECT_TIMEOUT),
             "--speed-limit", str(SPEED_LIMIT), "--speed-time", str(SPEED_TIME),
             "-w", WRITE_OUT, "-o", str(out), url]
-
-
-def curl_range_argv(curl, url, out, begin, end):
-    """Bytes [begin, end) into `out`. `--max-filesize` stops a server that ignores the range
-    from sending the whole 5 GB shard."""
-    return [curl, "-L", "-f", "-sS", *CURL_RETRY, "--connect-timeout", str(CONNECT_TIMEOUT),
-            "--max-time", "300", "--max-filesize", str(end - begin),
-            "-r", f"{begin}-{end - 1}", "-w", WRITE_OUT, "-o", str(out), url]
 
 
 def fmt_bytes(n):
@@ -711,9 +671,14 @@ def mode_small(dest, table, ctx):
     return 0 if ok else 3
 
 
-def read_local_prefix(path, n):
+def read_local_range(path, begin, end):
     with open(path, "rb") as f:
-        return f.read(n)
+        f.seek(begin)
+        return f.read(end - begin)
+
+
+def read_local_prefix(path, n):
+    return read_local_range(path, 0, n)
 
 
 def mode_headers(dest, table, shards, ctx):
@@ -726,25 +691,20 @@ def mode_headers(dest, table, shards, ctx):
         cache = hdir / (shard + ".json")
         if cache.exists():
             rec = json.loads(cache.read_text(encoding="utf-8"))
-            header, data_start = rec["header"], rec["data_start"]
+            data_start = rec["data_start"]
+            n, tb = header_summary(rec["header"], data_start, size)
         else:
+            # probe, second read for a longer header and tile check: tools/hf_headers.py (#240);
+            # a verified shard on disk is read locally, never over the network
             local = dest / shard
             if is_verified(local, table[shard]):
-                blob = read_local_prefix(local, HEADER_PROBE)
+                def read(b, e, local=local):
+                    return read_local_range(local, b, e)
             else:
-                blob = fetch_range(shard, 0, min(HEADER_PROBE, size), hdir / (shard + ".tmp"), ctx)
-            try:
-                header, data_start = parse_safetensors_header(blob)
-            except NeedMore as more:
-                if is_verified(local, table[shard]):
-                    blob = read_local_prefix(local, more.total)
-                else:
-                    blob += fetch_range(shard, len(blob), more.total, hdir / (shard + ".tmp"), ctx)
-                header, data_start = parse_safetensors_header(blob)
-        n, tb = header_summary(header, data_start, size)
-        if not cache.exists():
-            cache.write_text(json.dumps({"shard": shard, "size": size, "data_start": data_start,
-                                         "header": header}), encoding="utf-8")
+                def read(b, e, shard=shard):
+                    return fetch_range(shard, b, e, hdir / (shard + ".tmp"), ctx)
+            header, data_start, n, tb = hh.read_header(read, size)
+            cache.write_text(hh.header_record(shard, size, data_start, header), encoding="utf-8")
             log(f"header {shard}: {data_start} B header, {n} tensors, {fmt_bytes(tb)} B tensors (tiles the file)")
         count += 1
         header_bytes += data_start
