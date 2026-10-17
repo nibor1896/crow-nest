@@ -999,44 +999,36 @@ def dyn_min(routes, cap, arena="layer", n_experts=SHAPE[1]):
     return _min_miss(keys.tolist(), cap).reshape(n, L * K).sum(1).astype(np.int64)
 
 
+def _stage_ceiling():
+    """tools/stage_ceiling.py (#240), loaded by path: `python -I` puts no script dir on sys.path."""
+    mod = sys.modules.get("stage_ceiling")
+    if mod is None:
+        spec = importlib.util.spec_from_file_location("stage_ceiling", Path(__file__).with_name("stage_ceiling.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["stage_ceiling"] = mod
+    return mod
+
+
 def rates_from_file(path):
     """R_PCIe and R_DRAM (GB/s) from a JSON file {"R_pcie_gbps": x, "R_dram_gbps": y, "source": "..."}; either may be
-    missing (that stage is then not given), a present value must be a positive number."""
-    if not path:
-        return {}, "no rates file given"
-    d = jload(path)
-    out = {}
-    for key in ("R_pcie_gbps", "R_dram_gbps"):
-        if key in d:
-            x = d[key]
-            if isinstance(x, bool) or not isinstance(x, (int, float)) or not x > 0:
-                raise SimError("%s: %s = %r is not a positive number" % (path, key, x))
-            out[key] = float(x)
-    if not out:
+    missing (that stage is then not given), a present value must be a positive number. The reading is
+    stage_ceiling.read_rates (#240); other keys of the file (B_nvme_gbps, R_vram_gbps: tools/prequal.py) are ignored."""
+    out, why = _stage_ceiling().read_rates(path, ("R_pcie_gbps", "R_dram_gbps"), SimError)
+    if path and not out:
         raise SimError("%s: neither R_pcie_gbps nor R_dram_gbps" % path)
-    return out, "%s (%s)" % (os.path.basename(path), d.get("source", "no source named"))
+    return out, why
 
 
 def dyn_cost(row, expert_bytes, b, rates, visits=SHAPE[0] * SHAPE[2]):
     """Per-stage bytes per token and tok/s ceilings: NVMe = m (prefetch reads included) at B, PCIe = zero-copy +
     admissions + write-backs at R_PCIe, DRAM = NVMe data landed + every PCIe transfer at R_DRAM. The binding ceiling
     is the lowest given one (perfect overlap); the serial bound adds the stage times (no overlap), only when all
-    three rates are given."""
+    three rates are given. The arithmetic is stage_ceiling.ceilings (#240)."""
     per = visits * expert_bytes
-    out, ceil, serial = {}, [], 0.0
-    for name, share, rate in (("nvme", row["m"]["mean"], b), ("pcie", row["pcie"], rates.get("R_pcie_gbps")),
-                              ("dram", row["dram"], rates.get("R_dram_gbps"))):
-        by = share * per
-        c = None if rate is None else (math.inf if by == 0 else rate * 1e9 / by)
-        out[name] = {"bytes_per_token": by, "rate_gbps": rate, "ceiling_tok_s": c}
-        if c is not None:
-            ceil.append((c, name))
-        if serial is not None:
-            serial = None if rate is None else serial + by / (rate * 1e9)
-    out["binding"] = min(ceil)[1] if ceil else None
-    out["ceiling_tok_s"] = min(ceil)[0] if ceil else None
-    out["serial_tok_s"] = (math.inf if serial == 0 else 1.0 / serial) if serial is not None else None
-    return out
+    return _stage_ceiling().ceilings([("nvme", row["m"]["mean"] * per, b),
+                                      ("pcie", row["pcie"] * per, rates.get("R_pcie_gbps")),
+                                      ("dram", row["dram"] * per, rates.get("R_dram_gbps"))])
 
 
 def dyn_summary(res, gen, visits=SHAPE[0] * SHAPE[2]):

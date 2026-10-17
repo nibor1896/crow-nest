@@ -271,7 +271,8 @@ pinned slots prints no prefetch rows.
 
 B comes from the step-3 JSON exactly as in `sim` (`--step3`, `--readers`). R_PCIe and R_DRAM come from
 `--rates`, a JSON file `{"R_pcie_gbps": x, "R_dram_gbps": y, "source": "..."}`. A missing rate prints "-",
-never a default.
+never a default. Other keys of the file (`B_nvme_gbps`, `R_vram_gbps`, read by `tools/prequal.py`) are ignored here;
+the reading and the stage arithmetic live in `tools/stage_ceiling.py` (#240).
 
 **Tests** (in `tools/test_glm_tier_sim.py`, known answers, red without the change, 2026-10-08):
 
