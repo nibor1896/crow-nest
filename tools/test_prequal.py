@@ -445,6 +445,40 @@ class TestGeneric(_Dirs):
         self.assertFalse(mul["commit"]["ok"])
         self.assertIn("commit over the limit", mul["fits"])
 
+    def test_prefill_note_only_where_a_chunk_bound_exists(self):
+        # a small MoE whose experts all stay resident: no NVMe tier, so no chunk bound and no GLM calibration note
+        L, E, H, I = 2, 4, 128, 128
+        cfg = {"text_config": {"model_type": "tiny_moe_text", "num_hidden_layers": L, "hidden_size": H,
+                               "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 64,
+                               "n_routed_experts": E, "num_experts_per_tok": 2, "moe_intermediate_size": I}}
+        rows = [("model.embed_tokens.weight", "BF16", [256, H], "1", 256 * H * 2),
+                ("lm_head.weight", "BF16", [256, H], "1", 256 * H * 2)]
+        for l in range(L):
+            p = "model.layers.%d." % l
+            rows += [(p + "input_layernorm.weight", "BF16", [H], "1", H * 2),
+                     (p + "self_attn.q_proj.weight", "BF16", [H, H], "1", H * H * 2),
+                     (p + "mlp.gate.weight", "BF16", [E, H], "1", E * H * 2)]
+            for e in range(E):
+                for proj, shp in (("gate_proj", [I, H]), ("up_proj", [I, H]), ("down_proj", [H, I])):
+                    rows.append((p + "mlp.experts.%d.%s.weight" % (e, proj), "BF16", shp, "1", H * I * 2))
+        info = {"1": ("model-00001-of-00001.safetensors", 1000, 1000 + sum(r[4] for r in rows))}
+        d = write_dir(os.path.join(self.tmp, "tiny-moe"), Q27_CFG, rows, info, cfg)
+        j, md = self.json_of(["--model-dir", d, "--context", "4096", "--rates", self.rates])
+        self.assertTrue(j["moe"])
+        self.assertEqual([c["placement"]["nvme"]["value"] for c in j["candidates"]], [0, 0])
+        self.assertIn("**Prefill:** compute-bound, not modelled here.", md)
+        self.assertNotIn("uncalibrated", md)
+        self.assertNotIn("chunk bound", md)
+        for c in j["candidates"]:
+            self.assertIsNone(c["prefill_tok_s"]["value"])
+            self.assertNotIn("uncalibrated", c["prefill_tok_s"]["source"])
+        # a tiered model keeps the bound and its note, in the block and in --json
+        j, md = self.json_of(["--model-dir", self.glm, "--context", "200000", "--generic", "--rates", self.rates])
+        self.assertIn("uncalibrated: the GLM bound did not hold", md)
+        for c in j["candidates"]:
+            self.assertIsNotNone(c["prefill_tok_s"]["value"])
+            self.assertIn("uncalibrated", c["prefill_tok_s"]["source"])
+
 
 # ------------------------------------------------------------------ refusals
 

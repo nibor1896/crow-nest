@@ -1028,6 +1028,14 @@ def run(a):
             nb = pl["nvme"] * moe_layers * c["record"]
             c["prefill"] = consts["CHUNK_CAP"]["value"] / (nb / (rates["B_nvme_gbps"] * 1e9))
             c["prefill_bytes"] = nb
+            c["prefill_why"] = "chunk bound: CHUNK_CAP (%s) tokens per NVMe pass at B; %s" % (
+                consts["CHUNK_CAP"]["source"], PREFILL_NOTE)
+        elif not moe:
+            c["prefill_why"] = "compute-bound, not modelled here"
+        elif pl["fits"] and pl["nvme"] == 0:
+            c["prefill_why"] = "no NVMe tier, compute-bound, not modelled here"
+        else:
+            c["prefill_why"] = "not computed (%s)" % ("does not fit" if not pl["fits"] else "no B_nvme_gbps")
     if m_values and not moe:
         notes.append("--m ignored: a dense model has no expert tier")
 
@@ -1126,20 +1134,23 @@ def render(r):
     if not any(c["decode"] for c in r["candidates"]):
         out.append("**Decode ceiling:** not derived (%s)." % ("; ".join(r["notes"]) or "does not fit"))
     out.append("")
-    if r["moe"]:
+    # the chunk-bound lead and the GLM calibration note go only with a candidate that has a chunk bound
+    bound = [c for c in r["candidates"] if c["prefill"] is not None]
+    if not bound and all(c["prefill_why"].endswith("compute-bound, not modelled here") for c in r["candidates"]):
+        out.append("**Prefill:** compute-bound, not modelled here.")
+    else:
         parts = []
         for c in r["candidates"]:
             if c["prefill"] is not None:
                 parts.append("%s %s / (%d NVMe experts × %d MoE layers × %s B / %s GB/s) = %s tok/s" % (
                     c["name"], format(r["constants"]["CHUNK_CAP"]["value"], ","), c["placement"]["nvme"], r["moe_layers"],
                     format(c["record"], ","), "%g" % r["rates"]["B_nvme_gbps"], ft(c["prefill"])))
-            elif c["placement"]["fits"] and c["placement"].get("nvme") == 0:
-                parts.append("%s: no NVMe tier, compute-bound, not modelled here" % c["name"])
             else:
-                parts.append("%s: not computed (%s)" % (c["name"], "no B_nvme_gbps" if not r["rates"].get("B_nvme_gbps") else "does not fit"))
-        out.append("**Prefill:** chunk bound (CHUNK_CAP tokens per NVMe pass), %s; %s." % ("; ".join(parts), PREFILL_NOTE))
-    else:
-        out.append("**Prefill:** compute-bound, not modelled here.")
+                parts.append("%s: %s" % (c["name"], c["prefill_why"]))
+        if bound:
+            out.append("**Prefill:** chunk bound (CHUNK_CAP tokens per NVMe pass), %s; %s." % ("; ".join(parts), PREFILL_NOTE))
+        else:
+            out.append("**Prefill:** %s." % "; ".join(parts))
     out.append("")
     out.append("**Not computed here:** %s." % NOT_COMPUTED)
     if r["notes"]:
@@ -1227,7 +1238,7 @@ def to_json(r):
                                                                        "vram_used", "pinned_used", "slots") if kk in pl},
               "fits": c["fits"], "commit": c["commit"],
               "decode": [{"label": row["label"], "m": row["m"], "stages": row["ceil"]} for row in c["decode"]],
-              "prefill_tok_s": _num(c["prefill"], "CHUNK_CAP %s / NVMe pass at B; %s" % (k["CHUNK_CAP"]["source"], PREFILL_NOTE))}
+              "prefill_tok_s": _num(c["prefill"], c["prefill_why"])}
         if r["band"] and c["decode"]:
             cj["band_tok_s"] = [[row["ceil"]["ceiling_tok_s"] * r["band"][0] if row["ceil"]["ceiling_tok_s"] is not None else None,
                                  row["ceil"]["ceiling_tok_s"] * r["band"][1] if row["ceil"]["ceiling_tok_s"] is not None else None]
