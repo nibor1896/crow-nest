@@ -6,6 +6,21 @@
 
 ## Unreleased
 
+### Added
+
+- **`tools/prequal.py`: size, placement and decode ceiling of a new model before any download** (#240, 2026-10-17): from the shard headers and `config.json` alone, without a GPU, it prints the pre-qualification block of the model runbook (markdown; `--json` beside it), every number with its source. A family the converter knows goes through `converter plan --headers` and, for glm5_next, `states --plan`, both taken unchanged. Any other family takes a generic path, printed as `estimate: no recipe`: tensors classified by name and shape after the converter's keep rules, CNQ4.5 at 36 B per 64 values and MUL1 K=3 expert records, the KV cache from `config.json` (GQA / MHA, MLA, sliding window, linear states), a VRAM / pinned / NVMe split, and per-stage decode ceilings. The engine constants it plans with are parsed from `engine/src/*.rs` at run time. The calibration band comes in as `--band LO,HI`; the repo holds no copy of it. Measured 2026-10-17 at `8f9752f` on this machine's rates (B 6.994 GB/s measured, `docs/nvme-read-rate.md:16`; PCIe 47.78 GB/s measured; DRAM 89.6 and VRAM 1,792 GB/s nominal): GLM-5.3-Flash @ `eb9eb208` over the network, 24,812,140 B transferred in 66 requests for the 62 headers; CNQ4.5 178,478,618,624 B, equal to `converter plan`; MUL1 placement 50 / 124 / 114 experts per MoE layer, equal to `states --plan`; NVMe ceiling 19.97 / 17.58 tok/s at m 0.11 / 0.125 (the hand forecast of record said 18–20). The generic path forced on the same headers: size −0.19 %, split 54 / 124 / 110 (+8.0 / 0 / −3.5 %). Qwen3.8-27B @ `1d4bf0f2`: decode ceiling 122.6 tok/s at 190 tokens, all in VRAM (the forecast of record said ≈ 120, Crow #300). Tests: `tools/test_prequal.py`. Docs: `docs/prequal.md`.
+- **`tools/hf_headers.py`: the shard headers of any Hugging Face repo by HTTP range** (#240, 2026-10-17): `--repo ORG/NAME --revision SHA --out DIR` writes the API record, `config.json`, `generation_config.json`, the index and `headers/<shard>.json` in the converter's `--headers` format. It verifies the small files against the API record and reuses verified files on a rerun (0 B). It sends `HF_TOKEN` only through curl's config on stdin, never on argv or in a log. A gated repo, an unknown revision or a repo without a safetensors index exits 2 with the reason. `tools/fetch-glm.py --headers` now reads through it: its 62 header files are byte-identical to before (2026-10-17). Tests: `tools/test_hf_headers.py`. Docs: `docs/glm-download.md`.
+
+### Changed
+
+- **`tools/glm_tier_sim.py dyn` takes its stage ceilings and rates file from `tools/stage_ceiling.py`** (#240, 2026-10-17): the arithmetic `prequal.py` shares, with the same results; `tools/test_glm_tier_sim.py` 63 / 63 green before and after. Rates-file keys other than `R_pcie_gbps` / `R_dram_gbps` (`B_nvme_gbps`, `R_vram_gbps`, read by `prequal.py`) are ignored there. A rates file that is not a JSON object is now refused by name instead of failing with an `AttributeError`.
+
+### Known limitations
+
+- **`prequal.py` assumes uniform routing.** Hot sets and cache dynamics need a model run (`tools/glm_tier_sim.py`, `tools/hotset-eval.py`); `--m` takes a simulated or measured miss share instead.
+- **The generic split over-counts VRAM experts on GLM-5.3-Flash by 8.0 % (MUL1) and 9.4 % (CNQ4.5).** It leaves out the two terms only the glm5_next planner books: the BF16 decode of `kv_b` and the DSA indexer cache. Known families are not affected, because they use the engine's own planner.
+- **Prefill is modelled only as the NVMe chunk bound, and that bound is uncalibrated.** On GLM-5.3-Flash 1,137.5 tok/s was measured above it (`runs/glm53-flash/quick/README.md:38`). Prefill with resident weights is not modelled.
+
 ## 2026-10-14 — v0.13.2
 
 **GLM-5.3-Flash runs on Linux.** v0.13.2 fixes the one Linux-only fault in the glm5_next path (the pinned expert arena crossed a `cuMemHostRegister` seam and the first copy into slot 113 failed), restores the 241 files `86c8195` emptied (the GLM operating sets among them), and runs the Linux gate for the first time since 2026-10-02, re-pinned to 812 tests:
