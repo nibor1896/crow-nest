@@ -96,11 +96,11 @@ for i, line in enumerate((
 
 # ---------------------------------------------------------------- stats
 y = 452
-STATS = [("40", "tok/s decode in Crow, 8k"), ("780", "tok/s prefill, 100k–175k"), ("104.7 GB", "Flash-Next container file"),
+STATS = [("42", "tok/s decode in Crow, 8k–75k"), ("780", "tok/s prefill, 100k–175k"), ("104.7 GB", "Flash-Next container file"),
          ("4.5 bpw", "NVFP4, CNQ4.5-M"), ("200k", "context, one slot"), ("1.7 GiB", "VRAM lent to Crow while idle"),
          ("120", "tok/s decode, 27B with MTP"), ("17.8 GB", "27B container file"), ("8.48 GiB", "free beside the 27B, 64k context"),
          ("14.17", "tok/s decode, GLM-5.3-Flash in Crow"), ("124.6 GB", "GLM-5.3-Flash container file"), ("3.05 bpw", "GLM experts, EXL3 MUL1")]
-STATS_NOTE = ("Flash-Next, one RTX 5090, Windows 2026-10-06, after the PLE fix: decode in a live Crow session; prefill cold, 100k–175k; VRAM loan #117.",
+STATS_NOTE = ("Flash-Next, one RTX 5090, Windows: decode weighted over a 72-request Crow session, 2026-10-18 (#241); prefill cold, 100k–175k, 2026-10-06; VRAM loan #117.",
               "27B: one RTX 5090, Linux, CROW_MMA=1 CROW_GRAPH=1, BF16 KV, 2026-09-27 (#95, #122).",
               "GLM-5.3-Flash: one RTX 5090, Windows, live Crow task of 3 tool rounds, 2026-10-11. Conditions: docs/measurements.md, CHANGELOG.md")
 for i, (v, l) in enumerate(STATS):
