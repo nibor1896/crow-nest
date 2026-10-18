@@ -771,7 +771,8 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - The decode operating point that crossed the llama.cpp line: #62e, 2026-09-13 (the resumed #62d lever, 62a lever 2, the 32-rows-per-block GDN slab geometry, joins the default set with no new env; the no-env N mean 22.1761 ms per token = 45.1 tok/s is the first engine default under the 22.27 llama.cpp row). Measured before the 2026-09-23 PLE fix (`85a48e7`); not re-measured since.
 - The prefill operating point that opened the compute levers: #10c, 2026-09-14 (the dense GEMM variant B, F50's named next dense form, lands as OPT-IN `CROW_PF_GEMM_B`, no default flip; the clean pairs measured -2.27 and -2.33 s = -11 percent on t1-read 16k, and the llama 922.5 tok/s prefill row stays open: 18.44 s = 871 tok/s is 1.03 s short of it and 0.51 s above the 17.93 s no-copy floor band of F50).
 - The Linux prefill of record crosses that row, on the same prompt and a different machine: the 16,064-id t1-read form (`decode run … 128`, `CROW_CHUNK` unset so the policy picks 2048, context fill 16,192, crow-nest CNQ4.5-M NVFP4 4.5 bpw) reads **16.60 s = 968 tok/s and 16.66 s = 964 tok/s** on 2026-09-17, RTX 5090 / Arch Linux, commit `1032bc5`, against **598 / 601 tok/s** on the same two runs of the preceding build — an interleaved A/B in one session, two runs per arm, identical id traces (`CHANGELOG.md` 2026-09-17, the PLE prefill floor). It is NOT a row of the table above and does not close the 922.5 row: the llama.cpp arm of record (17.41 s = 922.5 tok/s, 2026-09-11) is a WINDOWS measurement with GGUF Q2_K_XL at 2.4 bpw, and no llama.cpp arm has been run adjacent to it on this machine. Measured before the 2026-09-23 PLE fix (`85a48e7`). Section 8.7 holds the Linux values of record.
-- **The fused rows below are history since 2026-09-23.** The activation-floor fix (`488a840`, 4.2 item 2) made `CROW_QFUSE` opt-in (exact `1`): the engine default is now the pre-scaled separate-launch cascade with the UNFUSED 8-launch hc chain and 6-launch shared chain. The fusions' cost of record is 19f -0.98 and 19h -0.23 ms per token, so the unfused default is expected to be roughly 1.2 ms per token slower than the 22.43 ms all-fused row; that is an estimate, NOT a measurement — no decode time of the 2026-09-23 default has been taken yet.
+- **The fused rows below are history since 2026-09-23.** The activation-floor fix (`488a840`, 4.2 item 2) made `CROW_QFUSE` opt-in (exact `1`): the engine default is now the pre-scaled separate-launch cascade with the UNFUSED 8-launch hc chain and 7-launch shared chain (6 launches plus its `quant_x_fp4`). The fusions' cost of record is 19f -0.98 and 19h -0.23 ms per token, so the unfused default is expected to be roughly 1.2 ms per token slower than the 22.43 ms all-fused row; that is an estimate, NOT a measurement — no decode time of the 2026-09-23 default has been taken yet.
+- **#241 (2026-10-18) splits the switch, the default is unchanged.** The two chain fusions went off on 2026-09-23 only because they read `CROW_QFUSE`; they now have opt-in switches of their own that keep the pre-scaled cascade: `CROW_HC_FUSE=1` (stage A1, the 19f chain, no FP4 write involved) and `CROW_SH_FUSE=1` (stage A2, the 19h chain plus the pre-scaled re-quantization of `sh2`, 4 launches per layer). `CROW_QP_FUSE=1` (stage B) moves the pre-scaled cascade into the decode producers (4.2 item 2). `CROW_QFUSE=1` keeps meaning all fused. All three are bit-identical to the default by construction and on synthetic data (`gen::tests_241_gpu`, `kernels::tests_241_qp_gpu`); none has a model run or a decode time yet. Stage A's estimate, transferred from the 2026-09-13 `decode run` pairs and NOT measured on today's path: about -1.21 ms per token. The acceptance thresholds (gate R N0 to N4, R3, R4; one Crow-window session, S1 median >= 41.5 tok/s at 7 to 9k context, S2, S3 for stage B) are fixed in issue #241; a default flips only after they pass.
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38, 0.5 rule 2). For a `serve` rate that rule is about the operating point since 2026-09-18 and not about the drift: `serve` (N 149, chunk 2048, trickle ticking) and `decode run` (N 142, chunk 4096, no tick) are different arms, so the adjacent `decode run` is what anchors the serve number.
@@ -844,11 +845,13 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      `rmsnorm_gated_q`, `gate_mul_q`, `silu_mul640_q`, `silu_mul_combo_q`, `sh_gate_up_q`)
      never see a whole row, store the factor 1.0 and keep the old floor, which is why
      `CROW_QFUSE` became OPT-IN (exact `1`) with this change and the two chain fusions below
-     went off by default with it. Every parity sha256 of record (8.7) moves on purpose; no
-     new values of record and no decode time for the unfused default are measured yet
-     (2026-09-23).
-   - hyper-connection decode chain — OPT-IN since 2026-09-23 (`CROW_QFUSE=1`, exact; the
-     default is the unfused 8-launch chain). History: DEFAULT fused from #19g (2026-09-13;
+     went off by default with it (they read the same switch until #241). Every parity sha256
+     of record (8.7) moves on purpose; no new values of record and no decode time for the
+     unfused default are measured yet (2026-09-23). Since #241 the pre-scaled cascade can
+     also come out of row-owning producers (`CROW_QP_FUSE=1`, the last bullet of this item).
+   - hyper-connection decode chain — OPT-IN since 2026-09-23; since #241 (2026-10-18) on a
+     switch of its own, `CROW_HC_FUSE=1` (exact; `CROW_QFUSE=1` turns it on too; the default
+     is the unfused 8-launch chain). History: DEFAULT fused from #19g (2026-09-13;
      the 19f fusion of 2026-09-13 behind the flip) until 2026-09-23. Fused form: the eight launches
      of one hc block (`rms_group`, down `gemv_bf16_w`,
      `silu_div4`, up `gemv_bf16_w`, `sigmoid_el`, `mix_streams_q`, `gemv_fp4_b1k`,
@@ -856,13 +859,18 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      4-row inject GEMV + `sig2_div4` in one launch — the `gemv_fp4_b1k` 1024-slot reduce
      emulated bit for bit on 256 threads, 44 blocks x T), `gemv_bf16_ws` (up GEMV storing
      the `sigmoid_el` epilogue) and `mix_streams_q`; `head_run` fuses the same epilogues
-     (no inject rows). Launch sites `gen.rs:2331` (`hc_run`) / `gen.rs:3572` (`head_run`)
-     behind `hc_fuse_on()` (`gen.rs:1817`), decode `t < 8` only — prefill keeps the
-     `gemm_bf16_dense` path verbatim; one `[hc]` boot line names the form (`gen.rs:1163`).
+     (no inject rows). Launch sites `gen.rs:3245` (`hc_run`) / `gen.rs:4730` (`head_run`)
+     behind `hc_fuse_on()` (`gen.rs:2593`), decode `t < 8` only — prefill keeps the
+     `gemm_bf16_dense` path verbatim; one `[hc]` boot line names the form (`gen.rs:1725`).
      Until 2026-09-23 `CROW_QFUSE=0` selected the unfused 8-launch fallback (and took the
      NVFP4 cascade to its separate-launch path — the documented overload of `docs/env.md`);
      since then unset or any value but exact `1` is that unfused path, now with the
-     pre-scaled cascade above.
+     pre-scaled cascade above. #241 stage A1: `hc_down_inj` and `gemv_bf16_ws` write f32
+     only (`sil`, `injw`, `mixw`) and no FP4 activation, so the activation floor never
+     applied to this fusion; under `CROW_HC_FUSE=1` with `CROW_QFUSE` unset the fused chain
+     ends in `mix_streams` and the consumers' pre-scaled `quant_x_fp4`, exactly as the
+     unfused chain does. No kernel changed; this combination (hc fused, cascade separate)
+     never ran before #241.
    - bit identity: by construction (every epilogue is elementwise on the finished
      accumulator, the merged grid keeps each row's dot product unchanged) and measured:
      the 19f switch-ON P8FUSE (504 teacher-forced rows) and PXFUSE (16,056 rows) forms
@@ -872,8 +880,9 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      plus the 16,056-row PXBOTH form byte-identical with the 61b sha256 values of
      record, the double-fallback 8 rows identical, ten tasks 10 of 10 equal BOTH
      splits-8 records (`decode_out/srv-19g.log`).
-   - shared-expert decode chain — OPT-IN since 2026-09-23 with the same exact `1`
-     (default: the unfused 6-launch chain). History: fused by DEFAULT from #19i
+   - shared-expert decode chain — OPT-IN since 2026-09-23; since #241 (2026-10-18) on a
+     switch of its own, `CROW_SH_FUSE=1` (exact; `CROW_QFUSE=1` turns it on too; default:
+     the unfused chain, 6 launches plus its `quant_x_fp4`). History: fused by DEFAULT from #19i
      (2026-09-13; the #19h fusion behind the SAME `CROW_QFUSE`: then unset or any value
      but `0` = hc chain FUSED + shared chain FUSED + cascade, `0` all off) until
      2026-09-23. Fused form: the SIX launches
@@ -885,10 +894,21 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      the hoisted `gemv_b` (`sgv`, reads `mixed_m` only, data-safe) and
      `gemv_fp4_mma_dg` (down GEMV + the `gate_shared` epilogue at the store:
      `moe_out = sigmoid(sgv) * down` ASSIGN, still the FIRST writer of `moe_out`,
-     `kernels.rs:3749`). Launch site `gen.rs:3130` behind `sh_fuse_on()`
-     (`gen.rs:1870`), decode `t < 8` and the mma/dense path only: prefill
-     (`gemm_fp4_dense`) and the `gemv_fp4_bs` fallback keep the separate launches
-     verbatim; the `[hc]` boot line names the shared state too (`gen.rs:1163`).
+     `kernels.rs:3765`). Launch site `gen.rs:4284` (`sh_gate_up_fused`, `gen.rs:2701`)
+     behind `sh_fuse_on()` (`gen.rs:2673`), decode `t < 8` and the mma/dense path only:
+     prefill (`gemm_fp4_dense`) and the `gemv_fp4_bs` fallback keep the separate launches
+     verbatim; the `[hc]` boot line names the shared state too (`gen.rs:1725`).
+     #241 stage A2 (`CROW_SH_FUSE=1`, cascade separate): `sh_gate_up_q` still writes its
+     unscaled `xq_s` (factor 1.0, it sees 64 values of the 640-wide row), and
+     `sh_gate_up_fused` (`ShCascade::Requant`) overwrites it with the pre-scaled
+     `quant_x_fp4` over `sh2`, the launch the unfused chain makes after `silu_mul640`:
+     4 launches per layer (`sh_gate_up_q`, `quant_x_fp4`, `gemv_b`, `gemv_fp4_mma_dg`)
+     against 7. By construction the default's bytes: `sh2` is the 19h-proven value, the
+     quantizer and the row are the same, and `_dg` stores `sig * ((s0 * gs) * rs)` with
+     `gemv_fp4_mma_d` + `gate_shared`'s expression order. `gen::tests_241_gpu` (GPU,
+     synthetic weights and rows from 0.004 to 40, t = 1 and 4) requires `sh2`, `xq_s` and
+     `moe_out` bit for bit against the 7-launch chain, and shows the unscaled form differs
+     on every value.
      Bit identity: epilogue folding only (every op elementwise, or warp-wide with
      the standalone 16-consecutive-j quant layout, on a finished accumulator;
      each k walk in the separate-launch order; the merged grid keeps every row's
@@ -903,6 +923,58 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      W + 3N form, no adjacent B arm post-flip) ids `5098f885ab3a` 4 of 4, the
      all-fused default 22.4266 ms per token = 44.6 tok/s, hard gate < 22.6999
      met (`decode_out/srv-19i.log`).
+   - pre-scaled fused producers — #241 stage B, OPT-IN `CROW_QP_FUSE=1` (exact; default
+     off; a switch of its own, never a further meaning of `CROW_QFUSE`, which wins when
+     both are set). In force (`qp_in_force`, `gen.rs:2611`) for Flash-Next's family with
+     `CROW_MMA=1` and the dense MMA path on. Why: the fused producers above split each row
+     over blocks (`mix_streams_q` 10 blocks per 2,560-wide row, `rmsnorm_gated_q` one per
+     value head, `gate_mul_q` and `silu_mul_combo_q` flat, `sh_gate_up_q` 10 blocks), so
+     none sees the row amax that `quant_row_prescaled` needs before its first nibble; with
+     them off, decode runs a separate 128-thread `quant_x_fp4` before every FP4
+     projection, 240 launches per token with both chains unfused. Design: twins that OWN
+     their rows, in `engine/src/kernels_qp.cu`, an NVRTC module of its own (the `MUL1_SRC`
+     precedent: one more `.entry` in `KERNEL_SRC` would move the PTX of record of 8.2;
+     `tests_300_c4` stays green unchanged). `kernels::qp::source` compiles the C4 prelude,
+     three spans cut out of `KERNEL_SRC` verbatim (`e2m1` / `ue4m3`; `q_e2m1`,
+     `enc_ue4m3_up`, `XQ_ROW`, `xq_rs`, `xq_set_rs`, `row_prescale_k`, `quant_level`,
+     `quant_row_prescaled`; `mma_fp4_16n8k64`) and then `QP_SRC`, so no quant helper is
+     copied. `Engine::load` compiles it and arms the five entries into the kernel table
+     (`Kernels::arm_qp`) only while in force (`gen.rs:1905`); every other boot compiles
+     and resolves what it did before.
+     - `mix_streams_qp` (grid T, 1,024 threads; `hc_run`, `gen.rs:3268`, writes `xq_m` /
+       `xq_gu`), `rmsnorm_gated_qp` (grid T, 1,024 threads = 8 groups of 128, 8 value
+       heads per round, each head with `rmsnorm_gated`'s own shared tree; `gdn_step`,
+       `gen.rs:3527`, `xq_v`), `gate_mul_qp` (grid T, 1,024; `attn_step`, `gen.rs:3855`,
+       `xq_v`), `silu_mul_combo_qp` (grid T x TOPK, 256; `moe_run`, `gen.rs:4499`,
+       `xq_dn`): the producer's f32 values in its own expression order, written to global
+       memory and to a shared row, then `quant_row_prescaled` over the shared row.
+       `quant_row_prescaled` reads `blockDim` only as a stride and its amax is a max, so
+       the bytes do not depend on the block size (the 27B precedent of 8.12).
+     - `sh_gate_up_qp` (grid 10 x T, `mma_bx()`; `ShCascade::Producer`, `gen.rs:4280`,
+       `xq_s`): the `sh_gate_up_q` body up to the `sh2` store, then the last-block-done
+       step of the CUDA Programming Guide (C++ Language Extensions, Memory Fence
+       Functions): every thread fences its stores (`__threadfence`), thread 0 counts the
+       block with `atomicInc(&cnt[tok], gridDim.x)`, the block that sees `gridDim.x - 1`
+       fences again, reads the 640-wide row back through L2 (`__ldcg`), quantizes it and
+       resets `cnt[tok]` to 0, so the next launch (the next replay of the decode graph)
+       starts from zero. The 8 counters (`qp::CNT_ROWS`, t < 8) are one allocation of
+       32 bytes, zeroed at load, freed in `Drop`. 4 -> 3 launches per layer.
+     - The consumers skip their separate launch through `quant_x_unless_produced`
+       (`gen.rs:3216`), which asks the same `qp_emits(t)` (`qp && t < 8`) as the
+       producer, so a skipped quant always has its producer. Not covered (they keep the
+       separate launch): prefill (t >= 8), the prompt paths' own producers
+       (`gdn_prompt`, `attn_prompt` re-quantize `mixed` from `hc_run` with the same
+       bytes), the unfused shared chain's `silu_mul640`, the dense family.
+     - Bit identity: by construction (the same f32 values, the same deterministic
+       quantizer) and on synthetic data: `kernels::tests_241_qp_gpu` holds every `_qp`
+       kernel to its producer + `quant_x_fp4` at t = 1, 3 and 7 (rows from 0.0007 to 40
+       and zero rows) and `sh_gate_up_qp` to `sh_gate_up_q` + `quant_x_fp4` over five
+       consecutive launches at KS 4 and KS 1 with the counters 0 after each;
+       `gen::tests_241_gpu` runs `ShCascade::Producer` twice against the 7-launch default
+       chain. Three deliberate mutations went red (no counter reset, a swapped multiply
+       in `rmsnorm_gated_qp`, the factor 1.0 stored by `mix_streams_qp`). No model run,
+       no timing: the gain is not estimated (the fused cascade's saving was never
+       measured alone); the acceptance is S3 of issue #241 on top of stage A's.
 3. **Router**: BF16 GEMM 2560 × 512 (kept BF16 per section 1).
 4. **Attention** (12 layers): 24 heads × head_dim 256, GQA 2 KV heads, partial rotary
    0.25, mrope interleaved [11,11,10] — compute stays BF16/FP8 (flash-attention style);
@@ -4933,7 +5005,10 @@ run_attn_subblock` hands `mixed` to the production `attn_prompt` from the host, 
 `mixed` AND the NVFP4 activation cascade `xq_m` that the v projection and the QSA indexer read
 under `CROW_MMA=1` (`attn_prompt` quantizes `mixed` itself only when `CROW_QFUSE=0`, precisely
 because the fused producer is the default). (That was the state of 2026-09-18. Since 2026-09-23, `488a840`, the fused producer is opt-in: `attn_prompt` quantizes `mixed` itself, pre-scaled, unless `CROW_QFUSE=1`, and `hc_run` no longer
-ends in `mix_streams_q` by default.) So `xq_m` stayed at its allocation zeros — measured
+ends in `mix_streams_q` by default. Since #241, 2026-10-18, `hc_run` ends in `mix_streams_qp` when
+`CROW_QP_FUSE=1` is in force and t < 8, which writes the same pre-scaled `xq_m`; `attn_prompt`
+still quantizes `mixed` itself, so `run_attn_subblock`'s own `quant_x_fp4` stays right under every
+switch.) So `xq_m` stayed at its allocation zeros — measured
 0 of 34,560 bytes non-zero — `q` was fine at `max_abs` 5.08 while `v` and the indexer `qk` were
 0.0, attention had nothing to weight, and gate, `xq_v` and `o_proj` were zero in turn. The fix is
 the missing launch: `run_attn_subblock` emits `quant_x_fp4` into `xq_m` after the upload, which

@@ -5216,6 +5216,21 @@ impl Kernels {
         }
     }
 
+    /// #241 stage B: the pre-scaled fused producers resolve from their own module (the #88 /
+    /// #96 pattern, one map entry each, `qp::NAMES`). Called once at load, only while
+    /// `CROW_QP_FUSE=1` is in force (`gen::qp_in_force`); never otherwise, so the map of every
+    /// other boot is the one of before #241.
+    ///
+    /// # Safety
+    ///
+    /// `module` was compiled from `qp::source`, its CUDA context is current, and it outlives
+    /// every launch through this map.
+    pub unsafe fn arm_qp(&mut self, module: &crate::cuda::Module) {
+        for &n in qp::NAMES {
+            self.map.insert(n, module.get(n));
+        }
+    }
+
     pub fn f(&self, name: &str) -> CUfunction {
         if KPROF_ON.load(std::sync::atomic::Ordering::Relaxed) {
             LAST_NAME.with(|c| *c.borrow_mut() = name.to_string());
@@ -6183,6 +6198,280 @@ mod tests_300_c4_gpu {
                 println!("mode {mode}: store_kv {stored} values exact; attn_sel max abs err {e6:.3e} at GQA 6 (the Flash-Next head / 12 mapping would be off by {e12:.3e})");
                 assert!(e6 < 1e-4, "mode {mode}: attn_sel at GQA 6 off by {e6:.3e}");
                 assert!(e12 > 1e-2, "mode {mode}: the reference cannot tell GQA 6 from 12 ({e12:.3e})");
+            }
+        }
+    }
+}
+
+// ---------------- #241 stage B: the pre-scaled fused producers ----------------
+
+/// #241 stage B: the decode producers that own whole rows and write the pre-scaled NVFP4
+/// cascade themselves (`kernels_qp.cu`). Its own NVRTC module, the `MUL1_SRC` precedent: one
+/// more `.entry` in `KERNEL_SRC` would break the PTX of record (`tests_300_c4`). It is never
+/// compiled alone: `qp::source` puts the C4 prelude and the quant helpers, cut out of
+/// `KERNEL_SRC` verbatim, in front of it.
+pub const QP_SRC: &str = include_str!("kernels_qp.cu");
+
+/// #241 stage B: the host side of `QP_SRC`. `gen` compiles the module and arms its entries
+/// into the engine's kernel table (`Kernels::arm_qp`) only while `CROW_QP_FUSE=1` is in force,
+/// so every other boot compiles and resolves exactly what it did before.
+pub mod qp {
+    use super::{KernelGeo, KERNEL_SRC};
+
+    /// every `.entry` of `QP_SRC`, in source order
+    pub const NAMES: &[&str] = &["mix_streams_qp", "rmsnorm_gated_qp", "gate_mul_qp", "silu_mul_combo_qp", "sh_gate_up_qp"];
+    /// the block of `mix_streams_qp` and `gate_mul_qp` (grid: one block per token row)
+    pub const BX_ROW: u32 = 1024;
+    /// the block of `rmsnorm_gated_qp`: 8 groups of `CN_GDV` = 128 threads, 8 value heads at a time
+    pub const BX_NORM: u32 = 1024;
+    /// the block of `silu_mul_combo_qp` (grid: one block per 640-wide combo row)
+    pub const BX_COMBO: u32 = 256;
+    /// `sh_gate_up_qp`'s last-block counters: one u32 per token row of a decode launch (t < 8)
+    pub const CNT_ROWS: usize = 8;
+
+    /// the spans of `KERNEL_SRC` the module shares, each from its first line to the line that
+    /// follows it there: `e2m1` / `ue4m3`; the activation-cascade helpers (`q_e2m1`,
+    /// `enc_ue4m3_up`, `XQ_ROW`, `xq_rs`, `xq_set_rs`, `row_prescale_k`, `quant_level`,
+    /// `quant_row_prescaled`); `mma_fp4_16n8k64`
+    pub const SPANS: [(&str, &str); 3] = [
+        ("__device__ __forceinline__ float e2m1(unsigned int nib) {", "// FP8 E4M3 (RNE, saturating)"),
+        ("// e2m1 RNE quantization with ties-to-even", "extern \"C\" __global__ void quant_x_fp4("),
+        ("// p2-proven instruction, wrapped for reuse (D accumulates in-place)", "// Tensor-core batched FP4 GEMV over the routed expert pointer table"),
+    ];
+
+    /// one span of `KERNEL_SRC`, verbatim; panics by name when a marker is gone
+    pub fn span(from: &str, to: &str) -> &'static str {
+        let src: &'static str = KERNEL_SRC;
+        let a = src.find(from).unwrap_or_else(|| panic!("#241: KERNEL_SRC has no {from:?}"));
+        let b = a + src[a..].find(to).unwrap_or_else(|| panic!("#241: KERNEL_SRC has no {to:?} after {from:?}"));
+        &src[a..b]
+    }
+
+    /// the text NVRTC compiles: the C4 prelude of `kg`, the shared spans, then `QP_SRC`
+    pub fn source(kg: &KernelGeo) -> String {
+        let mut s = kg.prelude();
+        s.push_str("// #241: the KERNEL_SRC spans of kernels::qp::SPANS, verbatim\n");
+        for (from, to) in SPANS {
+            s.push_str(span(from, to));
+        }
+        s.push_str(super::QP_SRC);
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests_241_qp_src {
+    //! #241 stage B, host only (NVRTC is a host compiler, no GPU): the module compiles with
+    //! exactly its entries, shares the quant helpers instead of copying them, and every
+    //! producer quantizes pre-scaled.
+    use super::{qp, tests_300_c4, KernelGeo, KERNEL_SRC, QP_SRC};
+
+    fn body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(&format!("void {name}(")).unwrap_or_else(|| panic!("no kernel {name}"));
+        let end = src[start..].find("\n}").map(|e| start + e).unwrap();
+        &src[start..end]
+    }
+
+    #[test]
+    fn the_qp_module_compiles_with_its_entries_and_the_helpers_of_kernel_src() {
+        let ptx = tests_300_c4::ptx(&qp::source(&KernelGeo::flash_next()));
+        let names: Vec<String> = tests_300_c4::entries(&ptx).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, qp::NAMES, "the qp module's entries");
+        // the helpers come from KERNEL_SRC: each span carries what the producers call, and
+        // QP_SRC defines none of them a second time
+        let spans: String = qp::SPANS.iter().map(|(a, b)| qp::span(a, b)).collect();
+        for f in ["float e2m1(", "float ue4m3(", "unsigned int q_e2m1(", "unsigned char enc_ue4m3_up(", "#define XQ_ROW(bpr)",
+                  "float xq_rs(", "void xq_set_rs(", "int row_prescale_k(", "void quant_level(", "void quant_row_prescaled(",
+                  "void mma_fp4_16n8k64("] {
+            assert_eq!(spans.matches(f).count(), 1, "{f} in the shared spans");
+            assert!(!QP_SRC.contains(f), "QP_SRC defines {f} itself");
+            assert!(KERNEL_SRC.contains(f));
+        }
+        assert!(!spans.contains("__global__"), "a span carries a kernel entry");
+        // the swish geometry (the dense family's gated norm) compiles too
+        let swish = KernelGeo { gate_act: crate::geo::GateAct::Silu, ..KernelGeo::flash_next() };
+        assert_eq!(tests_300_c4::entries(&tests_300_c4::ptx(&qp::source(&swish))).len(), qp::NAMES.len());
+    }
+
+    #[test]
+    fn every_qp_producer_quantizes_its_whole_row_pre_scaled() {
+        for k in qp::NAMES {
+            let b = body(QP_SRC, k);
+            assert!(b.contains("quant_row_prescaled(row, "), "{k} must quantize its shared row pre-scaled");
+            assert!(!b.contains("qf_store(") && !b.contains("xq_set_rs("), "{k} must not write the unscaled cascade");
+        }
+        let b = body(QP_SRC, "sh_gate_up_qp");
+        assert!(b.contains("xq_rs(xq, bpr,") && b.contains("* gs) * rs"), "sh_gate_up_qp folds the input row factor");
+        assert!(b.contains("__threadfence();\n    __syncthreads();") || b.contains("__threadfence();\r\n    __syncthreads();"), "the fence precedes the count");
+        assert!(b.contains("atomicInc(&cnt[tok], gridDim.x)") && b.contains("cnt[tok] = 0;"), "the last block counts and resets");
+        assert!(b.contains("__ldcg(h2 + "), "the last block reads the other blocks' values from L2");
+    }
+}
+
+#[cfg(test)]
+mod tests_241_qp_gpu {
+    //! #241 stage B on synthetic data (no model, no container): every `_qp` producer against
+    //! the stage-A sequence it replaces (the plain producer of `KERNEL_SRC`, then a separate
+    //! pre-scaled `quant_x_fp4`), bit for bit in the f32 output and byte for byte in the
+    //! cascade; `sh_gate_up_qp` against `sh_gate_up_q` + `quant_x_fp4` over several consecutive
+    //! launches, its counters 0 after each. Rows from 0.004 to 40 (and a zero row) make the
+    //! row factor visible. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib tests_241_qp_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::{launch_sync, qp, KernelGeo};
+    use crate::cuda;
+    use crate::kernels::act_cascade::xq_row_bytes;
+    use crate::sample::Rng;
+
+    /// `rows` rows of `n` values, row r at `scales[r % len]` (0.0 gives a zero row)
+    fn rows(n: usize, nrows: usize, scales: &[f32], seed: u64) -> Vec<f32> {
+        let mut r = Rng::new(seed);
+        (0..nrows).flat_map(|i| {
+            let sc = scales[i % scales.len()];
+            (0..n).map(|_| ((r.next_f64() * 2.0 - 1.0) as f32) * sc).collect::<Vec<_>>()
+        }).collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// the row factors 2^-k of `n` quantized rows of `bpr` 64-blocks
+    fn factors(xq: &[u8], bpr: usize, n: usize) -> Vec<f32> {
+        (0..n).map(|r| {
+            let o = r * xq_row_bytes(bpr) + bpr * 108;
+            f32::from_le_bytes(xq[o..o + 4].try_into().unwrap())
+        }).collect()
+    }
+
+    struct Mods {
+        main: cuda::Module,
+        qp: cuda::Module,
+        one: u64,
+    }
+
+    impl Mods {
+        unsafe fn new() -> Mods {
+            let kg = KernelGeo::flash_next();
+            Mods { main: cuda::compile(&kg.source()), qp: cuda::compile(&qp::source(&kg)), one: cuda::to_i32_dev(&[1]) }
+        }
+        /// the separate pre-scaled quantizer of stage A: `gx` rows of `n` values at stride `n`
+        unsafe fn quant(&self, gx: usize, src: u64, dst: u64, n: usize) {
+            let n_p = cuda::to_i32_dev(&[n as i32]);
+            launch_sync(self.main.get("quant_x_fp4"), gx as u32, 1, 1, 128, &[src, dst, n_p, self.one, n_p]);
+        }
+    }
+
+    /// one producer pair: stage A writes `out_a` + `xq_a` (producer, then `quant`), stage B
+    /// `out_b` + `xq_b`; both must agree bit for bit, and the row factors must not all be 1.0
+    unsafe fn same(name: &str, t: usize, n_out: usize, xq_rows: usize, bpr: usize, a: (u64, u64), b: (u64, u64)) {
+        cuda::sync();
+        let (oa, ob) = (cuda::dtoh(a.0, n_out), cuda::dtoh(b.0, n_out));
+        let bytes = xq_rows * xq_row_bytes(bpr);
+        let (qa, qb): (Vec<u8>, Vec<u8>) = (cuda::dtoh_t(a.1, bytes), cuda::dtoh_t(b.1, bytes));
+        assert!(oa.iter().all(|v| v.is_finite()), "{name} t {t}: the stage-A output is not finite");
+        assert_eq!(bits(&ob), bits(&oa), "{name} t {t}: the f32 output differs");
+        let f = factors(&qa, bpr, xq_rows);
+        assert!(f.iter().any(|&x| x != 1.0), "{name} t {t}: every row factor is 1.0, the test cannot see the pre-scale: {f:?}");
+        assert!(qb == qa, "{name} t {t}: the cascade differs (factors A {f:?}, B {:?})", factors(&qb, bpr, xq_rows));
+        println!("{name} t {t}: {n_out} f32 and {bytes} cascade bytes bit-identical, row factors {f:?}");
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib tests_241_qp_gpu -- --ignored --nocapture --test-threads 1"]
+    fn each_qp_producer_is_its_producer_then_quant_x_fp4_bit_for_bit() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let m = Mods::new();
+            let d = KernelGeo::flash_next().d;
+            let (h, hct, vh, gdv, val, core, inter, topk) = (d.h, d.hct, d.gdn_vheads, d.gdv, d.gdn_val, d.core, d.inter, d.topk);
+            let scales = [1.0f32, 0.004, 40.0, 0.0, 0.03, 3.0, 0.0007];
+            for t in [1usize, 3, 7] {
+                let seed = 0x241C0 + t as u64 * 16;
+                // mix_streams: mixw (sigmoid-like, positive) x normed, [t][HCN x H]
+                let mixw = cuda::to_f32_dev(&rows(hct, t, &[1.0], seed).iter().map(|v| v.abs() * 2.0).collect::<Vec<_>>());
+                let normed = cuda::to_f32_dev(&rows(hct, t, &scales, seed + 1));
+                let (oa, qa, ob, qb) = (cuda::alloc_zeroed(t * h * 4), cuda::alloc_zeroed(t * xq_row_bytes(h / 64)), cuda::alloc_zeroed(t * h * 4), cuda::alloc_zeroed(t * xq_row_bytes(h / 64)));
+                launch_sync(m.main.get("mix_streams"), (h / 256) as u32, t as u32, 1, 256, &[mixw, normed, oa]);
+                m.quant(t, oa, qa, h);
+                launch_sync(m.qp.get("mix_streams_qp"), t as u32, 1, 1, qp::BX_ROW, &[mixw, normed, ob, qb]);
+                same("mix_streams_qp", t, t * h, t, h / 64, (oa, qa), (ob, qb));
+
+                // rmsnorm_gated: x, z [t][VHEADS][GDV], w [GDV]
+                let x = cuda::to_f32_dev(&rows(val, t, &scales, seed + 2));
+                let z = cuda::to_f32_dev(&rows(val, t, &[6.0], seed + 3));
+                let w = cuda::to_f32_dev(&rows(gdv, 1, &[1.5], seed + 4));
+                let (oa, qa, ob, qb) = (cuda::alloc_zeroed(t * val * 4), cuda::alloc_zeroed(t * xq_row_bytes(val / 64)), cuda::alloc_zeroed(t * val * 4), cuda::alloc_zeroed(t * xq_row_bytes(val / 64)));
+                launch_sync(m.main.get("rmsnorm_gated"), vh as u32, t as u32, 1, gdv as u32, &[x, z, w, oa]);
+                m.quant(t, oa, qa, val);
+                launch_sync(m.qp.get("rmsnorm_gated_qp"), t as u32, 1, 1, qp::BX_NORM, &[x, z, w, ob, qb]);
+                same("rmsnorm_gated_qp", t, t * val, t, val / 64, (oa, qa), (ob, qb));
+
+                // gate_mul: core, gate [t][CORE]
+                let c = cuda::to_f32_dev(&rows(core, t, &scales, seed + 5));
+                let g = cuda::to_f32_dev(&rows(core, t, &[6.0], seed + 6));
+                let (oa, qa, ob, qb) = (cuda::alloc_zeroed(t * core * 4), cuda::alloc_zeroed(t * xq_row_bytes(core / 64)), cuda::alloc_zeroed(t * core * 4), cuda::alloc_zeroed(t * xq_row_bytes(core / 64)));
+                launch_sync(m.main.get("gate_mul"), (t * core).div_ceil(256) as u32, 1, 1, 256, &[c, g, oa]);
+                m.quant(t, oa, qa, core);
+                launch_sync(m.qp.get("gate_mul_qp"), t as u32, 1, 1, qp::BX_ROW, &[c, g, ob, qb]);
+                same("gate_mul_qp", t, t * core, t, core / 64, (oa, qa), (ob, qb));
+
+                // silu_mul_combo: h1 [t * TOPK][2 * INTER] -> h2 [t * TOPK][INTER]
+                let nc = t * topk;
+                let h1 = cuda::to_f32_dev(&rows(2 * inter, nc, &scales, seed + 7));
+                let n_flat = cuda::to_i32_dev(&[(nc * inter) as i32]);
+                let (oa, qa, ob, qb) = (cuda::alloc_zeroed(nc * inter * 4), cuda::alloc_zeroed(nc * xq_row_bytes(inter / 64)), cuda::alloc_zeroed(nc * inter * 4), cuda::alloc_zeroed(nc * xq_row_bytes(inter / 64)));
+                launch_sync(m.main.get("silu_mul_combo"), (nc * inter).div_ceil(256) as u32, 1, 1, 256, &[h1, oa, n_flat]);
+                m.quant(nc, oa, qa, inter);
+                launch_sync(m.qp.get("silu_mul_combo_qp"), nc as u32, 1, 1, qp::BX_COMBO, &[h1, ob, qb]);
+                same("silu_mul_combo_qp", t, nc * inter, nc, inter / 64, (oa, qa), (ob, qb));
+            }
+        }
+    }
+
+    /// an NVFP4 weight slab, `rows` x `k` values in 36-byte 64-blocks: four ue4m3 sub-block
+    /// scales in [0.25, 1.875] (never the NaN byte), then 32 bytes of random e2m1 nibbles
+    fn fp4_slab(nrows: usize, k: usize, seed: u64) -> Vec<u8> {
+        let mut r = Rng::new(seed);
+        let mut v = Vec::with_capacity(nrows * (k / 64) * 36);
+        for _ in 0..nrows * (k / 64) {
+            for _ in 0..4 {
+                v.push(0x28 + (r.next_u64() % 0x18) as u8);
+            }
+            for _ in 0..32 {
+                v.push((r.next_u64() & 0xFF) as u8);
+            }
+        }
+        v
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib tests_241_qp_gpu -- --ignored --nocapture --test-threads 1"]
+    fn sh_gate_up_qp_is_sh_gate_up_q_then_quant_x_fp4_and_leaves_its_counters_at_zero() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let m = Mods::new();
+            let d = KernelGeo::flash_next().d;
+            let (h, inter) = (d.h, d.inter);
+            let (k_p, rows_p) = (cuda::to_i32_dev(&[h as i32]), cuda::to_i32_dev(&[inter as i32]));
+            let (wg, wu) = (cuda::to_dev(&fp4_slab(inter, h, 0x241D1)), cuda::to_dev(&fp4_slab(inter, h, 0x241D2)));
+            let (gsg, gsu) = (cuda::to_f32_dev(&[0.031]), cuda::to_f32_dev(&[0.027]));
+            let cnt = cuda::alloc_zeroed(qp::CNT_ROWS * 4);
+            let gx = (inter / 64) as u32;
+            // consecutive launches on the SAME counters, new inputs each time, both k-split
+            // block sizes (KS 4 = 512 threads, the default of mma_bx(); KS 1 = 128)
+            let launches = [(1usize, 512u32, 0.7f32), (4, 512, 0.004), (1, 512, 25.0), (7, 128, 1.0), (2, 128, 0.02)];
+            for (i, &(t, bx, sc)) in launches.iter().enumerate() {
+                let mixed = cuda::to_f32_dev(&rows(h, t, &[sc, sc * 0.01, sc * 30.0], 0x241E0 + i as u64));
+                let xq = cuda::alloc_zeroed(t * xq_row_bytes(h / 64));
+                m.quant(t, mixed, xq, h);
+                let bytes = t * xq_row_bytes(inter / 64);
+                let (h2a, xqa, h2b, xqb) = (cuda::alloc_zeroed(t * inter * 4), cuda::alloc_zeroed(bytes), cuda::alloc_zeroed(t * inter * 4), cuda::alloc_zeroed(bytes));
+                launch_sync(m.main.get("sh_gate_up_q"), gx, t as u32, 1, bx, &[wg, wu, xq, gsg, gsu, h2a, xqa, k_p, rows_p]);
+                m.quant(t, h2a, xqa, inter);
+                launch_sync(m.qp.get("sh_gate_up_qp"), gx, t as u32, 1, bx, &[wg, wu, xq, gsg, gsu, h2b, xqb, k_p, rows_p, cnt]);
+                same(&format!("sh_gate_up_qp launch {i} block {bx}"), t, t * inter, t, inter / 64, (h2a, xqa), (h2b, xqb));
+                let c: Vec<u32> = cuda::dtoh_t(cnt, qp::CNT_ROWS);
+                assert!(c.iter().all(|&v| v == 0), "launch {i}: the counters are left at {c:?}");
             }
         }
     }
