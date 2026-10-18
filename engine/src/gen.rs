@@ -1709,14 +1709,18 @@ impl Engine {
         // stays opt-in (exact "1") since the activation-floor fix of
         // 2026-09-23 and keeps meaning "all fused" (both chains + the cascade
         // in the producers, unscaled: the old ue4m3 floor); CROW_HC_FUSE turns
-        // on the hc chain alone (default off until robin's measured acceptance).
+        // on the hc chain alone (default off until the owner's measured acceptance).
         // C5: the Residual::Hc arm only (a plain residual has no hc chain)
         if let Residual::Hc { .. } = geo.residual {
-            println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, activation cascade {}; CROW_HC_FUSE {}, CROW_QFUSE {} (each exact 1 = on, default off; CROW_QFUSE=1 = 19f hc + 19h shared + the unscaled fused cascade)",
+            println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, activation cascade {}; CROW_HC_FUSE {}, CROW_SH_FUSE {}, CROW_QFUSE {} (each exact 1 = on, default off; CROW_QFUSE=1 = 19f hc + 19h shared + the unscaled fused cascade)",
                 if hc_fuse_on() { "fused (19f, 4 launches per hc block)" } else { "unfused (default, 8 launches per hc block)" },
-                if sh_fuse_on() { "fused (19h opt-in, 3 launches)" } else { "unfused (default, 6 launches)" },
+                match (sh_fuse_on(), qfuse_on()) {
+                    (true, true) => "fused (19h, 3 launches per layer)",
+                    (true, false) => "fused (19h + the pre-scaled re-quantization of sh2, 4 launches per layer)",
+                    _ => "unfused (default, 7 launches per layer)",
+                },
                 if qfuse_on() { "fused in the producers, unscaled (factor 1.0)" } else { "pre-scaled (default, separate quant_x_fp4 launches)" },
-                env_or_unset("CROW_HC_FUSE"), env_or_unset("CROW_QFUSE"));
+                env_or_unset("CROW_HC_FUSE"), env_or_unset("CROW_SH_FUSE"), env_or_unset("CROW_QFUSE"));
         }
         // #10c, 2026-09-14: ONE line per engine process names the prefill
         // dense GEMM form, next to the [hc] line and for the same reason:
@@ -2421,7 +2425,12 @@ fn graph_on() -> bool {
 /// The NVFP4 activation cascade that feeds every MMA GEMV: `gx` row sets,
 /// 128 threads, args `[src, dst, n, 1, stride]` - the one spelling of all 13 sites.
 unsafe fn quant_x_now(k: &Kernels, p: &Params, gx: u32, src: u64, dst: u64, n_p: u64, stride_p: u64) {
-    launch_v(k.f("quant_x_fp4"), gx, 1, 1, 128, &[src, dst, n_p, p.one as u64, stride_p]);
+    quant_x_rows(k, p.one as u64, gx, src, dst, n_p, stride_p);
+}
+/// `quant_x_now` with the device scalar `1` passed in: the launch itself, for a caller that
+/// holds no `Params` (the #241 GPU tests drive the decode helpers below through it)
+unsafe fn quant_x_rows(k: &Kernels, one_p: u64, gx: u32, src: u64, dst: u64, n_p: u64, stride_p: u64) {
+    launch_v(k.f("quant_x_fp4"), gx, 1, 1, 128, &[src, dst, n_p, one_p, stride_p]);
 }
 /// the same launch, skipped when the producers already emit the cascade (CROW_QFUSE)
 unsafe fn quant_x_if_unfused(k: &Kernels, p: &Params, gx: u32, src: u64, dst: u64, n_p: u64, stride_p: u64) {
@@ -2533,7 +2542,7 @@ fn inj_1k_on() -> bool { env_flag!("CROW_INJ_1K", on) }
 /// 0.004 rows at ~7 percent relative error). Unset or any other value runs
 /// the pre-scaled whole-row quantizers (quant_x_fp4 / quant_tiles).
 fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
-/// #241 CROW_HC_FUSE (exact `1`; default OFF, opt-in until robin's measured
+/// #241 CROW_HC_FUSE (exact `1`; default OFF, opt-in until the owner's measured
 /// acceptance), or CROW_QFUSE=1, which keeps meaning "all fused": the hc_run
 /// (and head_run) decode chain fuses silu_div4 / sigmoid_el / sig2_div4 into
 /// the neighbouring GEMV epilogues and merges the 4-row inject GEMV
@@ -2605,7 +2614,33 @@ fn gdn_split_z_on() -> bool { env_flag!("CROW_GDN_SPLIT_Z", exact1) }
 /// gemv_fp4_bs fallback keep the separate launches verbatim.
 /// Opt-in (exact `1`) again since the activation-floor fix, 2026-09-23: the
 /// fused silu epilogue quantizes sh2 without the per-row pre-scale.
-fn sh_fuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
+/// #241 stage A2: CROW_SH_FUSE (exact `1`; default OFF, opt-in until the owner's
+/// measured acceptance) turns the fused chain on with the cascade SEPARATE;
+/// CROW_QFUSE=1 still turns it on too and keeps meaning "all fused". With the
+/// cascade separate `sh_gate_up_fused` re-quantizes sh2 into xq_s with the
+/// pre-scaled quant_x_fp4 after sh_gate_up_q, so gemv_fp4_mma_dg reads the
+/// default's cascade and row factor: 7 -> 4 launches per layer, no kernel
+/// change.
+fn sh_fuse_on() -> bool { env_flag!("CROW_SH_FUSE", exact1) || qfuse_on() }
+
+/// #19h / #241: the fused shared-expert gate|up launch of decode and the
+/// cascade it leaves in `xq_s` for `gemv_fp4_mma_dg`. `a` = the nine
+/// `sh_gate_up_q` arguments (wg, wu, xq_gu, gs_g, gs_u, sh2, xq_s, k_dim,
+/// rows), grid (`gx` = rows / 64, t), block `mma_bx()`. `sh_gate_up_q`
+/// quantizes sh2 in its epilogue with the factor 1.0 (it sees 64 values of
+/// the 640-wide row), which is the cascade of record only under CROW_QFUSE=1
+/// (`requant` false). #241 A2, `requant` true (the cascade separate): the
+/// pre-scaled quant_x_fp4 overwrites xq_s from sh2, the launch the unfused
+/// chain makes after silu_mul640. sh2 is the 19h-proven value, the quantizer
+/// and the row are the same, and `_dg` stores `sig * ((s0 * gs) * rs)` like
+/// gemv_fp4_mma_d + gate_shared (kernels.rs), so the chain is the default's
+/// by construction (`tests_241_gpu`).
+unsafe fn sh_gate_up_fused(k: &Kernels, one_p: u64, gx: u32, t: usize, a: &[u64; 9], requant: bool) {
+    launch_v(k.f("sh_gate_up_q"), gx, t as u32, 1, mma_bx(), a);
+    if requant {
+        quant_x_rows(k, one_p, t as u32, a[5], a[6], a[8], a[8]);
+    }
+}
 
 /// CROW_ATTN_SPLIT (default on): decode attention as S=8 partials + merge,
 /// QSA scores warp-per-block (both graph-static; cost no longer grows
@@ -4116,7 +4151,7 @@ impl Engine {
         // shared expert — gate|up into ONE [t][1280] buffer (p13 layout, the
         // contract silu_mul640 reads); explicit stride, never the grid
         let dense = dense_mma_on();
-        // #19h (CROW_QFUSE=1, exact "1"): decode regime (t < 8) fuses the
+        // #19h (#241: CROW_SH_FUSE=1 or CROW_QFUSE=1, exact "1"): decode regime (t < 8) fuses the
         // shared-expert chain: the two gate|up gemv_fp4_mma_d launches become
         // ONE launch (sh_gate_up_q) with the silu_mul640_q math as epilogue on
         // the two finished accumulators (writes s.sh2 + s.xq_s only; the sh12
@@ -4137,9 +4172,11 @@ impl Engine {
         let sh_fuse = sh_fuse_on() && mma && dense && t < 8
             && !m.sg.is_bf16() && !m.su.is_bf16() && !m.sdn.is_bf16();
         if sh_fuse {
-            launch_v(k.f("sh_gate_up_q"), (self.d.inter / 64) as u32, t as u32, 1, mma_bx(), &[
+            // #241 A2: with the cascade separate, the pre-scaled re-quantization of sh2
+            // follows the fused gate|up (7 -> 4 launches); under CROW_QFUSE=1 the 19h form
+            sh_gate_up_fused(k, p.one as u64, (self.d.inter / 64) as u32, t, &[
                 m.sg.w() as u64, m.su.w() as u64, s.xq_gu as u64, m.sg.gs() as u64,
-                m.su.gs() as u64, s.sh2 as u64, s.xq_s as u64, p.n2560 as u64, p.n640 as u64]);
+                m.su.gs() as u64, s.sh2 as u64, s.xq_s as u64, p.n2560 as u64, p.n640 as u64], !qfuse_on());
         } else {
             m.sg.or_bf16_s(k, self.d.inter, p.n640, t, p.t, mixed_m, s.sh12, p.n2560, p.n1280, |w, gs| {
                 if dense {
@@ -7200,18 +7237,19 @@ mod tests_241_switches {
     //! `tests_lock_pid_reuse::alone` pattern), started with none of the names set.
     const WANT: &str = "TESTS_241_SWITCHES_WANT";
     /// every switch the probe reads; the child starts with none of them set
-    const NAMES: &[&str] = &["CROW_HC_FUSE", "CROW_QFUSE"];
+    const NAMES: &[&str] = &["CROW_HC_FUSE", "CROW_SH_FUSE", "CROW_QFUSE"];
 
-    /// the states this process reads, one digit per switch: hc chain, cascade (CROW_QFUSE)
+    /// the states this process reads, one digit per switch: hc chain, shared chain, cascade
+    /// fused unscaled (CROW_QFUSE)
     fn states() -> String {
-        [super::hc_fuse_on(), super::qfuse_on()].iter().map(|&b| if b { '1' } else { '0' }).collect()
+        [super::hc_fuse_on(), super::sh_fuse_on(), super::qfuse_on()].iter().map(|&b| if b { '1' } else { '0' }).collect()
     }
 
     /// does nothing unless a test below started this process with `WANT` set
     #[test]
     fn the_switch_probe() {
         let Ok(want) = std::env::var(WANT) else { return };
-        assert_eq!(states(), want, "switch states (hc, qfuse)");
+        assert_eq!(states(), want, "switch states (hc, sh, qfuse)");
     }
 
     fn run(env: &[(&str, &str)], want: &str) {
@@ -7237,14 +7275,132 @@ mod tests_241_switches {
 
     #[test]
     fn each_fusion_reads_its_own_switch_and_qfuse_1_still_means_all_fused() {
-        run(&[], "00");
-        run(&[("CROW_HC_FUSE", "1")], "10");
+        run(&[], "000");
+        run(&[("CROW_HC_FUSE", "1")], "100");
+        run(&[("CROW_SH_FUSE", "1")], "010");
+        run(&[("CROW_HC_FUSE", "1"), ("CROW_SH_FUSE", "1")], "110");
         for other in ["0", "2", "true", "on", " 1", "1 ", "01"] {
-            run(&[("CROW_HC_FUSE", other)], "00");
+            run(&[("CROW_HC_FUSE", other), ("CROW_SH_FUSE", other)], "000");
         }
-        run(&[("CROW_QFUSE", "1")], "11");
-        run(&[("CROW_QFUSE", "1"), ("CROW_HC_FUSE", "0")], "11");
-        run(&[("CROW_QFUSE", "0"), ("CROW_HC_FUSE", "1")], "10");
-        run(&[("CROW_QFUSE", "true")], "00");
+        run(&[("CROW_QFUSE", "1")], "111");
+        run(&[("CROW_QFUSE", "1"), ("CROW_HC_FUSE", "0"), ("CROW_SH_FUSE", "0")], "111");
+        run(&[("CROW_QFUSE", "0"), ("CROW_HC_FUSE", "1"), ("CROW_SH_FUSE", "1")], "110");
+        run(&[("CROW_QFUSE", "true")], "000");
+    }
+}
+
+#[cfg(test)]
+mod tests_241_gpu {
+    //! #241 stage A2 on synthetic data (no model, no container): the fused shared-expert
+    //! chain with the cascade separate (`sh_gate_up_fused` with `requant`, the hoisted sgv
+    //! `gemv_b`, `gemv_fp4_mma_dg`: 4 launches) against the unfused default chain of
+    //! `moe_run` (gate and up `gemv_fp4_mma_d`, `silu_mul640`, `quant_x_fp4`, down
+    //! `gemv_fp4_mma_d`, `gemv_b`, `gate_shared`: 7 launches). Bit identity is required:
+    //! `sh2`, the cascade `xq_s` and `moe_out`. `#[ignore]`: CI has no GPU. Run with
+    //! `cargo test --release --lib tests_241_gpu -- --ignored --nocapture --test-threads 1`.
+    use super::{launch_v, mma_bx, quant_x_rows, sh_gate_up_fused, Kernels};
+    use crate::cuda;
+    use crate::kernels::act_cascade::xq_row_bytes;
+    use crate::kernels::KernelGeo;
+    use crate::sample::Rng;
+
+    /// rows of `n` values, each row at its own scale (the small rows are the ones the
+    /// per-row pre-scale exists for: under the factor 1.0 they quantize against the floor)
+    fn rows(n: usize, scales: &[f32], seed: u64) -> Vec<f32> {
+        let mut r = Rng::new(seed);
+        scales.iter().flat_map(|&sc| (0..n).map(|_| ((r.next_f64() * 2.0 - 1.0) as f32) * sc).collect::<Vec<_>>()).collect()
+    }
+
+    /// an NVFP4 weight slab, `rows` x `k` values in 36-byte 64-blocks: four ue4m3 sub-block
+    /// scales in [0.25, 1.875] (never the NaN byte), then 32 bytes of random e2m1 nibbles
+    fn fp4_slab(rows: usize, k: usize, seed: u64) -> Vec<u8> {
+        let mut r = Rng::new(seed);
+        let mut v = Vec::with_capacity(rows * (k / 64) * 36);
+        for _ in 0..rows * (k / 64) {
+            for _ in 0..4 {
+                v.push(0x28 + (r.next_u64() % 0x18) as u8);
+            }
+            for _ in 0..32 {
+                v.push((r.next_u64() & 0xFF) as u8);
+            }
+        }
+        v
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    #[test]
+    #[ignore = "needs the GPU: cargo test --release --lib tests_241_gpu -- --ignored --nocapture --test-threads 1"]
+    fn the_fused_shared_chain_with_the_separate_cascade_is_the_default_chain_bit_for_bit() {
+        unsafe {
+            let _ctx = cuda::Ctx::init();
+            let kg = KernelGeo::flash_next();
+            let module = cuda::compile(&kg.source());
+            let k = Kernels::new(&module, false);
+            let (h, inter) = (kg.d.h, kg.d.inter);
+            let i32p = |v: usize| cuda::to_i32_dev(&[v as i32]);
+            let (n2560, n640, n1280, one) = (i32p(h), i32p(inter), i32p(2 * inter), i32p(1));
+            let (wg, wu, wdn) = (
+                cuda::to_dev(&fp4_slab(inter, h, 0x241A1)),
+                cuda::to_dev(&fp4_slab(inter, h, 0x241A2)),
+                cuda::to_dev(&fp4_slab(h, inter, 0x241A3)),
+            );
+            let (gsg, gsu, gsdn) = (cuda::to_f32_dev(&[0.031]), cuda::to_f32_dev(&[0.027]), cuda::to_f32_dev(&[0.019]));
+            let sgate = cuda::to_f32_dev(&rows(h, &[0.05], 0x241A4));
+            // t = 1 (the decode step) and t = 4 (a short chunk, still t < 8), rows from
+            // sigma-like 1.0 down to 0.004 and up to 40
+            for (t, scales) in [(1usize, vec![0.7f32]), (4, vec![1.0, 0.004, 40.0, 0.03])] {
+                let mixed_m = cuda::to_f32_dev(&rows(h, &scales, 0x241B0 + t as u64));
+                let xq_gu = cuda::alloc_zeroed(t * xq_row_bytes(h / 64));
+                quant_x_rows(&k, one, t as u32, mixed_m, xq_gu, n2560, n2560);
+                let xq_bytes = t * xq_row_bytes(inter / 64);
+
+                // the unfused default chain of moe_run (dense, mma, t < 8)
+                let (sh12, sh2_a, xq_s_a) = (cuda::alloc_zeroed(t * 2 * inter * 4), cuda::alloc_zeroed(t * inter * 4), cuda::alloc_zeroed(xq_bytes));
+                let (sdown, sgv_a, out_a) = (cuda::alloc_zeroed(t * h * 4), cuda::alloc_zeroed(t * 4), cuda::alloc_zeroed(t * h * 4));
+                let gx_i = (inter / 64) as u32;
+                launch_v(k.f("gemv_fp4_mma_d"), gx_i, t as u32, 1, mma_bx(), &[wg, xq_gu, gsg, sh12, n2560, n640, n1280]);
+                launch_v(k.f("gemv_fp4_mma_d"), gx_i, t as u32, 1, mma_bx(), &[wu, xq_gu, gsu, sh12 + (inter * 4) as u64, n2560, n640, n1280]);
+                launch_v(k.f("silu_mul640"), inter.div_ceil(256) as u32, t as u32, 1, 256, &[sh12, sh2_a]);
+                quant_x_rows(&k, one, t as u32, sh2_a, xq_s_a, n640, n640);
+                launch_v(k.f("gemv_fp4_mma_d"), (h / 64) as u32, t as u32, 1, mma_bx(), &[wdn, xq_s_a, gsdn, sdown, n640, n2560, n2560]);
+                launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[sgate, mixed_m, sgv_a, n2560]);
+                launch_v(k.f("gate_shared"), (h / 256) as u32, t as u32, 1, 256, &[sdown, sgv_a, out_a]);
+
+                // #241 A2: the fused chain, cascade separate
+                let fused = |requant: bool| -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+                    let (sh2, xq_s) = (cuda::alloc_zeroed(t * inter * 4), cuda::alloc_zeroed(xq_bytes));
+                    let (sgv, out) = (cuda::alloc_zeroed(t * 4), cuda::alloc_zeroed(t * h * 4));
+                    sh_gate_up_fused(&k, one, gx_i, t, &[wg, wu, xq_gu, gsg, gsu, sh2, xq_s, n2560, n640], requant);
+                    launch_v(k.f("gemv_b"), 1, t as u32, 1, 256, &[sgate, mixed_m, sgv, n2560]);
+                    launch_v(k.f("gemv_fp4_mma_dg"), (h / 64) as u32, t as u32, 1, mma_bx(), &[wdn, xq_s, gsdn, sgv, out, n640, n2560, n2560]);
+                    cuda::sync();
+                    (cuda::dtoh(sh2, t * inter), cuda::dtoh_t(xq_s, xq_bytes), cuda::dtoh(out, t * h))
+                };
+                let (sh2_b, xq_s_b, out_b) = fused(true);
+                cuda::sync();
+                let (sh2_a, xq_s_a, out_a) = (cuda::dtoh(sh2_a, t * inter), cuda::dtoh_t::<u8>(xq_s_a, xq_bytes), cuda::dtoh(out_a, t * h));
+                assert!(out_a.iter().all(|v| v.is_finite()) && out_a.iter().any(|&v| v != 0.0), "t {t}: the default chain gave no usable output");
+                let factors: Vec<f32> = (0..t)
+                    .map(|r| {
+                        let o = r * xq_row_bytes(inter / 64) + (inter / 64) * 108;
+                        f32::from_le_bytes(xq_s_a[o..o + 4].try_into().unwrap())
+                    })
+                    .collect();
+                assert!(factors.iter().all(|&f| f != 1.0), "t {t}: a row factor of 1.0 cannot tell the pre-scale from none: {factors:?}");
+                assert_eq!(bits(&sh2_b), bits(&sh2_a), "t {t}: sh2 differs");
+                assert!(xq_s_b == xq_s_a, "t {t}: the cascade xq_s differs");
+                assert_eq!(bits(&out_b), bits(&out_a), "t {t}: moe_out differs");
+                // the negative control: without the re-quantization (the CROW_QFUSE=1 form) the
+                // cascade and moe_out differ, so the comparison above can tell
+                let (sh2_c, xq_s_c, out_c) = fused(false);
+                assert_eq!(bits(&sh2_c), bits(&sh2_a), "t {t}: sh2 does not depend on the cascade");
+                assert!(xq_s_c != xq_s_a && bits(&out_c) != bits(&out_a), "t {t}: the unscaled cascade is indistinguishable");
+                let diff = out_c.iter().zip(&out_a).filter(|(c, a)| c.to_bits() != a.to_bits()).count();
+                println!("t {t}: row factors {factors:?}; sh2, xq_s ({xq_bytes} B) and moe_out ({} values) bit-identical; the unscaled form differs on {diff} values", t * h);
+            }
+        }
     }
 }
