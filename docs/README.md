@@ -26,7 +26,7 @@ Crow's third operating point (robin, 2026-10-11, Crow #365); its operating set i
 
 - [architecture.md](architecture.md): the engine spec, sections 0-9 (approved by robin 2026-09-02, later sections added), with a table of contents.
 - [diagrams.md](diagrams.md): the eight living architecture diagrams of the spec (#14, rendered at `8bad310`, v0.3.1).
-- [env.md](env.md): every `CROW_*` environment variable the engine reads (190, guarded by `tools/check_env_docs.py`), with mode, default and evidence.
+- [env.md](env.md): every `CROW_*` environment variable the engine reads (194, guarded by `tools/check_env_docs.py`), with mode, default and evidence.
 - [numerics-diff.md](numerics-diff.md): GDN normalization and QSA sparse attention against the HF reference and llama.cpp (#89).
 - [cuda-rust-evaluation.md](cuda-rust-evaluation.md): NVIDIA's CUDA Rust tracks weighed against the engine (2026-09-17).
 
@@ -34,6 +34,7 @@ Crow's third operating point (robin, 2026-10-11, Crow #365); its operating set i
 
 - [model-card.md](model-card.md): the Hugging Face model card of Qwen3.8-Flash-Next-CNQ4.5-M (Flash-Next, NVFP4), with its front-matter.
 - [hotset-calibration.md](hotset-calibration.md): how the hot-set manifest `serve` loads is cut and accepted (#106).
+- [residency-replay.md](residency-replay.md): offline replay of Flash-Next route dumps through residency policies at 144 / 151 / 170 slots per layer, and the dump recipe (#245 step 1).
 - [quality-probe.md](quality-probe.md): the answer-quality probe against any OpenAI-compatible endpoint (#75, requant step 1).
 - [dense-originals.md](dense-originals.md): the BF16 originals of the dense path and their proof (#76, requant step 2).
 - [dense-overlay.md](dense-overlay.md): the dense path in BF16 as an overlay container (#77, requant step 3).
