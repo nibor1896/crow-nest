@@ -1705,16 +1705,18 @@ impl Engine {
         // #19f, 2026-09-13: ONE line per engine process names the hyper-
         // connection decode chain form, next to the [gdn] line and for the
         // same reason: every future log says which hc chain produced it.
-        // CROW_QFUSE is the SAME switch as the NVFP4 cascade above: opt-in
-        // (exact "1") since the activation-floor fix of 2026-09-23 (unset =
-        // pre-scaled quant_x_fp4 launches + unfused chains; "1" = all fused,
-        // the fused producers keep the unscaled ue4m3 floor).
+        // #241: each fusion names its own state and its own switch. CROW_QFUSE
+        // stays opt-in (exact "1") since the activation-floor fix of
+        // 2026-09-23 and keeps meaning "all fused" (both chains + the cascade
+        // in the producers, unscaled: the old ue4m3 floor); CROW_HC_FUSE turns
+        // on the hc chain alone (default off until robin's measured acceptance).
         // C5: the Residual::Hc arm only (a plain residual has no hc chain)
         if let Residual::Hc { .. } = geo.residual {
-            let hcf = env_or_unset("CROW_QFUSE");
-            println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, CROW_QFUSE {} (1 = 19f fused hc + 19h fused shared + fused unscaled cascade, unset = all off)",
-                if hc_fuse_on() { "fused (19f opt-in, 4 launches per hc block)" } else { "unfused (default since the activation-floor fix, 8 launches)" },
-                if sh_fuse_on() { "fused (19h opt-in, 3 launches)" } else { "unfused (default, 6 launches)" }, hcf);
+            println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, activation cascade {}; CROW_HC_FUSE {}, CROW_QFUSE {} (each exact 1 = on, default off; CROW_QFUSE=1 = 19f hc + 19h shared + the unscaled fused cascade)",
+                if hc_fuse_on() { "fused (19f, 4 launches per hc block)" } else { "unfused (default, 8 launches per hc block)" },
+                if sh_fuse_on() { "fused (19h opt-in, 3 launches)" } else { "unfused (default, 6 launches)" },
+                if qfuse_on() { "fused in the producers, unscaled (factor 1.0)" } else { "pre-scaled (default, separate quant_x_fp4 launches)" },
+                env_or_unset("CROW_HC_FUSE"), env_or_unset("CROW_QFUSE"));
         }
         // #10c, 2026-09-14: ONE line per engine process names the prefill
         // dense GEMM form, next to the [hc] line and for the same reason:
@@ -2531,25 +2533,26 @@ fn inj_1k_on() -> bool { env_flag!("CROW_INJ_1K", on) }
 /// 0.004 rows at ~7 percent relative error). Unset or any other value runs
 /// the pre-scaled whole-row quantizers (quant_x_fp4 / quant_tiles).
 fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
-/// CROW_QFUSE hc-fusion meaning, default on from #19g (2026-09-13) until the
-/// activation-floor fix (2026-09-23), now OPT-IN with the rest of the switch
-/// (exact `1` runs the fusion; unset / any other value selects the unfused
-/// 8-launch chain): the hc_run decode chain fuses silu_div4 / sigmoid_el
-/// / sig2_div4 into the neighbouring GEMV epilogues and merges the 4-row
-/// inject GEMV (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the
-/// b1k 1024-slot reduce emulated bit for bit on 256 threads; gemv_bf16_ws
-/// stores the sigmoid with the up row). NOTE the documented overload:
-/// CROW_QFUSE above already gates the NVFP4 cascade (default on); the two
-/// meanings now share ONE fallback value, so unset means cascade ON + chain
-/// FUSED and `0` means both OFF (the pre-19f default path; cascade on +
-/// unfused is no longer reachable, documented debt). Bit-identical by
-/// construction and by measurement (19f P8FUSE/PXFUSE, 62b P8FUSE/PXFUSE),
-/// so only the launch shape moves. t < 8 only: the prefill gemm_bf16_dense
-/// path keeps the separate launches, so prefill rows are untouched by
-/// construction. DEFAULT BASIS (#19g): the 19f pairs (-0.9806 ms per token,
-/// 3 of 3 pairs, decode_out/srv-19f.log) plus the combined 19g parity pass
-/// over both levers at once (decode_out/srv-19g.log).
-fn hc_fuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
+/// #241 CROW_HC_FUSE (exact `1`; default OFF, opt-in until robin's measured
+/// acceptance), or CROW_QFUSE=1, which keeps meaning "all fused": the hc_run
+/// (and head_run) decode chain fuses silu_div4 / sigmoid_el / sig2_div4 into
+/// the neighbouring GEMV epilogues and merges the 4-row inject GEMV
+/// (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the b1k 1024-slot
+/// reduce emulated bit for bit on 256 threads; gemv_bf16_ws stores the
+/// sigmoid with the up row), 8 -> 4 launches per hc block. Both fused kernels
+/// write f32 only (sil, injw, mixw) and no FP4 activation, so the activation
+/// floor of the unscaled cascade never applied to this fusion: it went off on
+/// 2026-09-23 (`488a840`) only because it read the CROW_QFUSE switch. With
+/// CROW_HC_FUSE=1 and CROW_QFUSE unset the fused chain feeds mix_streams and
+/// the pre-scaled quant_x_fp4 exactly as the unfused chain does, so the
+/// output is the default's by construction (the 19f argument: every epilogue
+/// is elementwise on the finished accumulator, the merged grid keeps each
+/// row's dot product). That combination never ran before #241: 19f to 19i
+/// always ran the fused cascade. t < 8 only: the prefill gemm_bf16_dense path
+/// keeps the separate launches. History: the CROW_QFUSE hc meaning, default on
+/// from #19g (2026-09-13; the 19f pairs -0.9806 ms per token, 3 of 3 pairs,
+/// decode_out/srv-19f.log) until the activation-floor fix (2026-09-23).
+fn hc_fuse_on() -> bool { env_flag!("CROW_HC_FUSE", exact1) || qfuse_on() }
 /// #62b CROW_GDN_FUSE_IN, DEFAULT ON SINCE #19g, 2026-09-13 (unset and any
 /// value but `0` run the grouped form; `0` selects the four per-slab
 /// gemv_fp4_mma_d launches, the fallback of record): one grouped dense-FP4
@@ -3104,8 +3107,8 @@ impl Engine {
         let p = &self.p;
         let s = &self.s;
         launch_v(k.f("rms_group"), self.d.hcn as u32, t as u32, 1, 256, &[x as u64, w.norm as u64, s.normed as u64]);
-        // #19f, opt-in (CROW_QFUSE=1; default on 19g..2026-09-23): decode regime
-        // (t < 8) fuses the
+        // #19f, opt-in (#241: CROW_HC_FUSE=1 or CROW_QFUSE=1; default on
+        // 19g..2026-09-23): decode regime (t < 8) fuses the
         // elementwise hc chain into the GEMV epilogues - hc_down_inj carries
         // down + silu_div4 + the 4-row inject GEMV + sig2_div4 in ONE launch
         // (the b1k 1024-slot reduce emulated bit for bit on 256 threads) and
@@ -4572,7 +4575,8 @@ impl Engine {
         let s = &self.s;
         launch_v(k.f("rms_group"), self.d.hcn as u32, rows as u32, 1, 256, &[
             s.h as u64, self.w.mx_norm as u64, s.normed as u64]);
-        // #19f: the same CROW_QFUSE epilogue fusion as hc_run. The mixer
+        // #19f: the same epilogue fusion as hc_run (hc_fuse_on: #241
+        // CROW_HC_FUSE=1 or CROW_QFUSE=1). The mixer
         // has no inject rows, so the hc_down_inj grid carries no inj blocks
         // and the fp4 params stay undereferenced (0 dummies).
         let fuse = hc_fuse_on() && bf16_w_on() && rows < 8
@@ -7185,5 +7189,62 @@ mod tests_215_params {
         assert_eq!(f(5).to_bits(), s.ln_min_p().to_bits(), "ln(min_p) is the host's constant");
         assert_eq!((f(6), f(7)), (1.0, 0.0));
         assert_eq!(n(8), SAMPLE_RING_MAX as i32, "last_n clamped to the ring");
+    }
+}
+
+#[cfg(test)]
+mod tests_241_switches {
+    //! #241: every decode fusion reads a switch of its own (exact `1`, default off) and
+    //! `CROW_QFUSE=1` still turns all of them on. The switches are `OnceLock`s read once per
+    //! process, so each environment runs in a test process of its own (the
+    //! `tests_lock_pid_reuse::alone` pattern), started with none of the names set.
+    const WANT: &str = "TESTS_241_SWITCHES_WANT";
+    /// every switch the probe reads; the child starts with none of them set
+    const NAMES: &[&str] = &["CROW_HC_FUSE", "CROW_QFUSE"];
+
+    /// the states this process reads, one digit per switch: hc chain, cascade (CROW_QFUSE)
+    fn states() -> String {
+        [super::hc_fuse_on(), super::qfuse_on()].iter().map(|&b| if b { '1' } else { '0' }).collect()
+    }
+
+    /// does nothing unless a test below started this process with `WANT` set
+    #[test]
+    fn the_switch_probe() {
+        let Ok(want) = std::env::var(WANT) else { return };
+        assert_eq!(states(), want, "switch states (hc, qfuse)");
+    }
+
+    fn run(env: &[(&str, &str)], want: &str) {
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, m)| m);
+        let name = format!("{module}::the_switch_probe");
+        let mut c = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        c.args([name.as_str(), "--exact", "--test-threads=1"]).env(WANT, want);
+        for n in NAMES {
+            c.env_remove(n);
+        }
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().expect("run the probe in a process of its own");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{env:?} should read {want}: {}\n{stdout}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn each_fusion_reads_its_own_switch_and_qfuse_1_still_means_all_fused() {
+        run(&[], "00");
+        run(&[("CROW_HC_FUSE", "1")], "10");
+        for other in ["0", "2", "true", "on", " 1", "1 ", "01"] {
+            run(&[("CROW_HC_FUSE", other)], "00");
+        }
+        run(&[("CROW_QFUSE", "1")], "11");
+        run(&[("CROW_QFUSE", "1"), ("CROW_HC_FUSE", "0")], "11");
+        run(&[("CROW_QFUSE", "0"), ("CROW_HC_FUSE", "1")], "10");
+        run(&[("CROW_QFUSE", "true")], "00");
     }
 }
