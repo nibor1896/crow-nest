@@ -6410,7 +6410,7 @@ mod tests_241_qp_gpu {
                 let c = cuda::to_f32_dev(&rows(core, t, &scales, seed + 5));
                 let g = cuda::to_f32_dev(&rows(core, t, &[6.0], seed + 6));
                 let (oa, qa, ob, qb) = (cuda::alloc_zeroed(t * core * 4), cuda::alloc_zeroed(t * xq_row_bytes(core / 64)), cuda::alloc_zeroed(t * core * 4), cuda::alloc_zeroed(t * xq_row_bytes(core / 64)));
-                launch_sync(m.main.get("gate_mul"), ((t * core + 255) / 256) as u32, 1, 1, 256, &[c, g, oa]);
+                launch_sync(m.main.get("gate_mul"), (t * core).div_ceil(256) as u32, 1, 1, 256, &[c, g, oa]);
                 m.quant(t, oa, qa, core);
                 launch_sync(m.qp.get("gate_mul_qp"), t as u32, 1, 1, qp::BX_ROW, &[c, g, ob, qb]);
                 same("gate_mul_qp", t, t * core, t, core / 64, (oa, qa), (ob, qb));
@@ -6420,7 +6420,7 @@ mod tests_241_qp_gpu {
                 let h1 = cuda::to_f32_dev(&rows(2 * inter, nc, &scales, seed + 7));
                 let n_flat = cuda::to_i32_dev(&[(nc * inter) as i32]);
                 let (oa, qa, ob, qb) = (cuda::alloc_zeroed(nc * inter * 4), cuda::alloc_zeroed(nc * xq_row_bytes(inter / 64)), cuda::alloc_zeroed(nc * inter * 4), cuda::alloc_zeroed(nc * xq_row_bytes(inter / 64)));
-                launch_sync(m.main.get("silu_mul_combo"), ((nc * inter + 255) / 256) as u32, 1, 1, 256, &[h1, oa, n_flat]);
+                launch_sync(m.main.get("silu_mul_combo"), (nc * inter).div_ceil(256) as u32, 1, 1, 256, &[h1, oa, n_flat]);
                 m.quant(nc, oa, qa, inter);
                 launch_sync(m.qp.get("silu_mul_combo_qp"), nc as u32, 1, 1, qp::BX_COMBO, &[h1, ob, qb]);
                 same("silu_mul_combo_qp", t, nc * inter, nc, inter / 64, (oa, qa), (ob, qb));

@@ -3266,7 +3266,7 @@ impl Engine {
         } else if xq != 0 && self.qp_emits(t) {
             // #241 B: one block per token row, the pre-scaled cascade in the same launch
             launch_v(k.f("mix_streams_qp"), t as u32, 1, 1, crate::kernels::qp::BX_ROW, &[
-                s.mixw as u64, s.normed as u64, mixed as u64, xq as u64]);
+                s.mixw, s.normed, mixed, xq]);
         } else {
             launch_v(k.f("mix_streams"), (self.d.h / 256) as u32, t as u32, 1, 256, &[
                 s.mixw as u64, s.normed as u64, mixed as u64]);
@@ -3525,7 +3525,7 @@ launch_v(k.f("l2norm_repeat"), self.d.gdn_vheads as u32, t as u32, 1, self.d.gd 
         } else if self.qp_emits(1) {
             // #241 B: the whole 6144-wide row in one block, the pre-scaled cascade with it
             launch_v(k.f("rmsnorm_gated_qp"), 1, 1, 1, crate::kernels::qp::BX_NORM, &[
-                s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64, s.xq_v as u64]);
+                s.gcore, s.gz, *norm, s.gnorm, s.xq_v]);
         } else {
             launch_v(k.f("rmsnorm_gated"), self.d.gdn_vheads as u32, 1, 1, self.d.gdv as u32, &[
                 s.gcore as u64, s.gz as u64, *norm as u64, s.gnorm as u64]);
@@ -3853,7 +3853,7 @@ impl Engine {
         } else if self.qp_emits(1) {
             // #241 B: the whole 6144-wide row in one block, the pre-scaled cascade with it
             launch_v(k.f("gate_mul_qp"), 1, 1, 1, crate::kernels::qp::BX_ROW, &[
-                s.aout as u64, s.agate as u64, s.agated as u64, s.xq_v as u64]);
+                s.aout, s.agate, s.agated, s.xq_v]);
         } else {
             launch_v(k.f("gate_mul"), (self.d.core as u32 + 255) / 256, 1, 1, 256, &[
                 s.aout as u64, s.agate as u64, s.agated as u64]);
@@ -4281,7 +4281,7 @@ impl Engine {
             } else {
                 ShCascade::Requant
             };
-            sh_gate_up_fused(k, p.one as u64, (self.d.inter / 64) as u32, t, &[
+            sh_gate_up_fused(k, p.one, (self.d.inter / 64) as u32, t, &[
                 m.sg.w() as u64, m.su.w() as u64, s.xq_gu as u64, m.sg.gs() as u64,
                 m.su.gs() as u64, s.sh2 as u64, s.xq_s as u64, p.n2560 as u64, p.n640 as u64], cascade);
         } else {
@@ -4497,7 +4497,7 @@ impl Engine {
         } else if self.qp_emits(t) {
             // #241 B: one block per combo row, the pre-scaled cascade with it
             launch_v(k.f("silu_mul_combo_qp"), (t * self.d.topk) as u32, 1, 1, crate::kernels::qp::BX_COMBO, &[
-                s.h1 as u64, s.h2 as u64, s.xq_dn as u64]);
+                s.h1, s.h2, s.xq_dn]);
         } else {
             launch_v(k.f("silu_mul_combo"), ((t * self.d.topk * self.d.inter + 255) / 256) as u32, 1, 1, 256, &[
                 s.h1 as u64, s.h2 as u64, p.nt_combo as u64]);
