@@ -772,7 +772,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
 - The prefill operating point that opened the compute levers: #10c, 2026-09-14 (the dense GEMM variant B, F50's named next dense form, lands as OPT-IN `CROW_PF_GEMM_B`, no default flip; the clean pairs measured -2.27 and -2.33 s = -11 percent on t1-read 16k, and the llama 922.5 tok/s prefill row stays open: 18.44 s = 871 tok/s is 1.03 s short of it and 0.51 s above the 17.93 s no-copy floor band of F50).
 - The Linux prefill of record crosses that row, on the same prompt and a different machine: the 16,064-id t1-read form (`decode run … 128`, `CROW_CHUNK` unset so the policy picks 2048, context fill 16,192, crow-nest CNQ4.5-M NVFP4 4.5 bpw) reads **16.60 s = 968 tok/s and 16.66 s = 964 tok/s** on 2026-09-17, RTX 5090 / Arch Linux, commit `1032bc5`, against **598 / 601 tok/s** on the same two runs of the preceding build — an interleaved A/B in one session, two runs per arm, identical id traces (`CHANGELOG.md` 2026-09-17, the PLE prefill floor). It is NOT a row of the table above and does not close the 922.5 row: the llama.cpp arm of record (17.41 s = 922.5 tok/s, 2026-09-11) is a WINDOWS measurement with GGUF Q2_K_XL at 2.4 bpw, and no llama.cpp arm has been run adjacent to it on this machine. Measured before the 2026-09-23 PLE fix (`85a48e7`). Section 8.7 holds the Linux values of record.
 - **The fused rows below are history since 2026-09-23.** The activation-floor fix (`488a840`, 4.2 item 2) made `CROW_QFUSE` opt-in (exact `1`): the engine default is now the pre-scaled separate-launch cascade with the UNFUSED 8-launch hc chain and 7-launch shared chain (6 launches plus its `quant_x_fp4`). The fusions' cost of record is 19f -0.98 and 19h -0.23 ms per token, so the unfused default is expected to be roughly 1.2 ms per token slower than the 22.43 ms all-fused row; that is an estimate, NOT a measurement — no decode time of the 2026-09-23 default has been taken yet.
-- **#241 (2026-10-18) splits the switch, the default is unchanged.** The two chain fusions went off on 2026-09-23 only because they read `CROW_QFUSE`; they now have opt-in switches of their own that keep the pre-scaled cascade: `CROW_HC_FUSE=1` (stage A1, the 19f chain, no FP4 write involved) and `CROW_SH_FUSE=1` (stage A2, the 19h chain plus the pre-scaled re-quantization of `sh2`, 4 launches per layer). `CROW_QP_FUSE=1` (stage B) moves the pre-scaled cascade into the decode producers (4.2 item 2). `CROW_QFUSE=1` keeps meaning all fused. All three are bit-identical to the default by construction and on synthetic data (`gen::tests_241_gpu`, `kernels::tests_241_qp_gpu`); none has a model run or a decode time yet. Stage A's estimate, transferred from the 2026-09-13 `decode run` pairs and NOT measured on today's path: about -1.21 ms per token. The acceptance thresholds (gate R N0 to N4, R3, R4; one Crow-window session, S1 median >= 41.5 tok/s at 7 to 9k context, S2, S3 for stage B) are fixed in issue #241; a default flips only after they pass.
+- **#241 (2026-10-18) splits the switch, and its three switches are the default.** The two chain fusions went off on 2026-09-23 only because they read `CROW_QFUSE`; they now have switches of their own that keep the pre-scaled cascade: `CROW_HC_FUSE` (stage A1, the 19f chain, no FP4 write involved) and `CROW_SH_FUSE` (stage A2, the 19h chain plus the pre-scaled re-quantization of `sh2`, 4 launches per layer). `CROW_QP_FUSE` (stage B) moves the pre-scaled cascade into the decode producers (4.2 item 2). `CROW_QFUSE=1` keeps meaning all fused. All three are bit-identical to the default by construction and on synthetic data (`gen::tests_241_gpu`, `kernels::tests_241_qp_gpu`); gate R has not run. Measured live in Crow on 2026-10-18 (Windows, the same prompt in one session per arm, about 50,8k tokens generated each, context 7.6k to 75k): stage A 40.54 tok/s weighted, stage B 42.13 (+3.9 %), 0 malformed tool calls in 135 requests (issue #241, `crow-lab/runs/fn-241-live-win-20261018/`). robin made stage B's configuration the default the same day: all three switches are on unless set to exactly `0`.
 - Every row of this table is one adjacent pair of one chain; the two crow-nest columns are the two arms of that pair.
 - The two arms run different weights: crow-nest CNQ4.5-M (NVFP4, 4.5 bpw); llama.cpp Qwen3.8-Flash-Next-UD-Q2_K_XL (GGUF, 2.4 bpw).
 - A tok/s figure is quoted only next to its adjacent arm in the same chain (#38, 0.5 rule 2). For a `serve` rate that rule is about the operating point since 2026-09-18 and not about the drift: `serve` (N 149, chunk 2048, trickle ticking) and `decode run` (N 142, chunk 4096, no tick) are different arms, so the adjacent `decode run` is what anchors the serve number.
@@ -849,9 +849,9 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      of record (8.7) moves on purpose; no new values of record and no decode time for the
      unfused default are measured yet (2026-09-23). Since #241 the pre-scaled cascade can
      also come out of row-owning producers (`CROW_QP_FUSE=1`, the last bullet of this item).
-   - hyper-connection decode chain — OPT-IN since 2026-09-23; since #241 (2026-10-18) on a
-     switch of its own, `CROW_HC_FUSE=1` (exact; `CROW_QFUSE=1` turns it on too; the default
-     is the unfused 8-launch chain). History: DEFAULT fused from #19g (2026-09-13;
+   - hyper-connection decode chain — OPT-IN from 2026-09-23 to 2026-10-18; since #241 on a
+     switch of its own, `CROW_HC_FUSE` (default ON since 2026-10-18, `0` = off; `CROW_QFUSE=1`
+     turns it on too). History: DEFAULT fused from #19g (2026-09-13;
      the 19f fusion of 2026-09-13 behind the flip) until 2026-09-23. Fused form: the eight launches
      of one hc block (`rms_group`, down `gemv_bf16_w`,
      `silu_div4`, up `gemv_bf16_w`, `sigmoid_el`, `mix_streams_q`, `gemv_fp4_b1k`,
@@ -880,9 +880,9 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      plus the 16,056-row PXBOTH form byte-identical with the 61b sha256 values of
      record, the double-fallback 8 rows identical, ten tasks 10 of 10 equal BOTH
      splits-8 records (`decode_out/srv-19g.log`).
-   - shared-expert decode chain — OPT-IN since 2026-09-23; since #241 (2026-10-18) on a
-     switch of its own, `CROW_SH_FUSE=1` (exact; `CROW_QFUSE=1` turns it on too; default:
-     the unfused chain, 6 launches plus its `quant_x_fp4`). History: fused by DEFAULT from #19i
+   - shared-expert decode chain — OPT-IN from 2026-09-23 to 2026-10-18; since #241 on a
+     switch of its own, `CROW_SH_FUSE` (default ON since 2026-10-18, `0` = off: the unfused
+     chain, 6 launches plus its `quant_x_fp4`; `CROW_QFUSE=1` turns it on too). History: fused by DEFAULT from #19i
      (2026-09-13; the #19h fusion behind the SAME `CROW_QFUSE`: then unset or any value
      but `0` = hc chain FUSED + shared chain FUSED + cascade, `0` all off) until
      2026-09-23. Fused form: the SIX launches
@@ -923,8 +923,8 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
      W + 3N form, no adjacent B arm post-flip) ids `5098f885ab3a` 4 of 4, the
      all-fused default 22.4266 ms per token = 44.6 tok/s, hard gate < 22.6999
      met (`decode_out/srv-19i.log`).
-   - pre-scaled fused producers — #241 stage B, OPT-IN `CROW_QP_FUSE=1` (exact; default
-     off; a switch of its own, never a further meaning of `CROW_QFUSE`, which wins when
+   - pre-scaled fused producers — #241 stage B, `CROW_QP_FUSE` (default ON since 2026-10-18,
+     `0` = off; a switch of its own, never a further meaning of `CROW_QFUSE`, which wins when
      both are set). In force (`qp_in_force`, `gen.rs:2611`) for Flash-Next's family with
      `CROW_MMA=1` and the dense MMA path on. Why: the fused producers above split each row
      over blocks (`mix_streams_q` 10 blocks per 2,560-wide row, `rmsnorm_gated_q` one per

@@ -1718,23 +1718,23 @@ impl Engine {
         // #241: each fusion names its own state and its own switch. CROW_QFUSE
         // stays opt-in (exact "1") since the activation-floor fix of
         // 2026-09-23 and keeps meaning "all fused" (both chains + the cascade
-        // in the producers, unscaled: the old ue4m3 floor); CROW_HC_FUSE turns
-        // on the hc chain alone (default off until the owner's measured acceptance).
+        // in the producers, unscaled: the old ue4m3 floor); CROW_HC_FUSE, CROW_SH_FUSE
+        // and CROW_QP_FUSE are on by default since 2026-10-18 and each is turned off by `0`.
         // C5: the Residual::Hc arm only (a plain residual has no hc chain)
         if let Residual::Hc { .. } = geo.residual {
-            println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, activation cascade {}; CROW_HC_FUSE {}, CROW_SH_FUSE {}, CROW_QFUSE {}, CROW_QP_FUSE {} (each exact 1 = on, default off; CROW_QFUSE=1 = 19f hc + 19h shared + the unscaled fused cascade, and it wins over CROW_QP_FUSE)",
-                if hc_fuse_on() { "fused (19f, 4 launches per hc block)" } else { "unfused (default, 8 launches per hc block)" },
+            println!("[hc] hyper-connection decode chain {}, shared-expert chain {}, activation cascade {}; CROW_HC_FUSE {}, CROW_SH_FUSE {}, CROW_QFUSE {}, CROW_QP_FUSE {} (HC/SH/QP default on, 0 = off; CROW_QFUSE exact 1 = 19f hc + 19h shared + the unscaled fused cascade, default off, and it wins over CROW_QP_FUSE)",
+                if hc_fuse_on() { "fused (19f, 4 launches per hc block)" } else { "unfused (CROW_HC_FUSE=0, 8 launches per hc block)" },
                 match (sh_fuse_on(), qfuse_on(), qp_in_force(&geo)) {
                     (true, true, _) => "fused (19h, 3 launches per layer)",
                     (true, false, true) => "fused (19h, sh_gate_up_qp quantizes sh2 pre-scaled, 3 launches per layer)",
                     (true, false, false) => "fused (19h + the pre-scaled re-quantization of sh2, 4 launches per layer)",
-                    (false, _, true) => "unfused (default, 7 launches per layer; CROW_QP_FUSE does not reach it)",
-                    _ => "unfused (default, 7 launches per layer)",
+                    (false, _, true) => "unfused (CROW_SH_FUSE=0, 7 launches per layer; CROW_QP_FUSE does not reach it)",
+                    _ => "unfused (CROW_SH_FUSE=0, 7 launches per layer)",
                 },
                 if qfuse_on() { "fused in the producers, unscaled (factor 1.0)".to_string() }
                 else if qp_in_force(&geo) { "pre-scaled in the decode producers (#241 B, the qp module, no separate quant_x_fp4 at t < 8)".to_string() }
-                else if qp_fuse_on() { "pre-scaled (default, separate quant_x_fp4 launches; CROW_QP_FUSE=1 not in force: it needs CROW_MMA=1 and the dense MMA path)".to_string() }
-                else { "pre-scaled (default, separate quant_x_fp4 launches)".to_string() },
+                else if qp_fuse_on() { "pre-scaled (separate quant_x_fp4 launches; CROW_QP_FUSE not in force: it needs CROW_MMA=1 and the dense MMA path)".to_string() }
+                else { "pre-scaled (CROW_QP_FUSE=0, separate quant_x_fp4 launches)".to_string() },
                 env_or_unset("CROW_HC_FUSE"), env_or_unset("CROW_SH_FUSE"), env_or_unset("CROW_QFUSE"), env_or_unset("CROW_QP_FUSE"));
         }
         // #10c, 2026-09-14: ONE line per engine process names the prefill
@@ -2571,8 +2571,8 @@ fn inj_1k_on() -> bool { env_flag!("CROW_INJ_1K", on) }
 /// 0.004 rows at ~7 percent relative error). Unset or any other value runs
 /// the pre-scaled whole-row quantizers (quant_x_fp4 / quant_tiles).
 fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
-/// #241 CROW_HC_FUSE (exact `1`; default OFF, opt-in until the owner's measured
-/// acceptance), or CROW_QFUSE=1, which keeps meaning "all fused": the hc_run
+/// #241 CROW_HC_FUSE (default ON since the owner's Crow session of 2026-10-18;
+/// exactly `0` turns it off), or CROW_QFUSE=1, which keeps meaning "all fused": the hc_run
 /// (and head_run) decode chain fuses silu_div4 / sigmoid_el / sig2_div4 into
 /// the neighbouring GEMV epilogues and merges the 4-row inject GEMV
 /// (gemv_fp4_b1k) into the down GEMV launch (hc_down_inj, the b1k 1024-slot
@@ -2590,9 +2590,9 @@ fn qfuse_on() -> bool { env_flag!("CROW_QFUSE", exact1) }
 /// keeps the separate launches. History: the CROW_QFUSE hc meaning, default on
 /// from #19g (2026-09-13; the 19f pairs -0.9806 ms per token, 3 of 3 pairs,
 /// decode_out/srv-19f.log) until the activation-floor fix (2026-09-23).
-fn hc_fuse_on() -> bool { env_flag!("CROW_HC_FUSE", exact1) || qfuse_on() }
-/// #241 stage B CROW_QP_FUSE (exact `1`; default OFF, opt-in until the owner's
-/// measured acceptance; a switch of its own, never a further meaning of
+fn hc_fuse_on() -> bool { env_flag!("CROW_HC_FUSE", on) || qfuse_on() }
+/// #241 stage B CROW_QP_FUSE (default ON since the owner's Crow session of
+/// 2026-10-18, exactly `0` turns it off; a switch of its own, never a further meaning of
 /// CROW_QFUSE): the decode producers (t < 8) own whole rows and write the
 /// PRE-SCALED cascade themselves - mix_streams_qp (xq_m / xq_gu),
 /// rmsnorm_gated_qp and gate_mul_qp (xq_v), silu_mul_combo_qp (xq_dn) and, in
@@ -2603,8 +2603,8 @@ fn hc_fuse_on() -> bool { env_flag!("CROW_HC_FUSE", exact1) || qfuse_on() }
 /// (the same f32 values, the same deterministic whole-row quantizer, cut out
 /// of KERNEL_SRC verbatim) and on synthetic data (`kernels::tests_241_qp_gpu`).
 /// In force only through `qp_in_force`.
-fn qp_fuse_on() -> bool { env_flag!("CROW_QP_FUSE", exact1) }
-/// #241 stage B: CROW_QP_FUSE=1 applies to Flash-Next's family only (the producers are its
+fn qp_fuse_on() -> bool { env_flag!("CROW_QP_FUSE", on) }
+/// #241 stage B: CROW_QP_FUSE applies to Flash-Next's family only (the producers are its
 /// decode kernels; `KernelGeo::p2` false), with both MMA paths on (the cascade feeds MMA
 /// consumers only) and CROW_QFUSE not 1 (that one keeps fusing the UNSCALED cascade into the
 /// same producers and keeps its meaning, so it wins)
@@ -2663,14 +2663,14 @@ fn gdn_split_z_on() -> bool { env_flag!("CROW_GDN_SPLIT_Z", exact1) }
 /// gemv_fp4_bs fallback keep the separate launches verbatim.
 /// Opt-in (exact `1`) again since the activation-floor fix, 2026-09-23: the
 /// fused silu epilogue quantizes sh2 without the per-row pre-scale.
-/// #241 stage A2: CROW_SH_FUSE (exact `1`; default OFF, opt-in until the owner's
-/// measured acceptance) turns the fused chain on with the cascade SEPARATE;
+/// #241 stage A2: CROW_SH_FUSE (default ON since the owner's Crow session of
+/// 2026-10-18, exactly `0` turns it off) runs the fused chain with the cascade SEPARATE;
 /// CROW_QFUSE=1 still turns it on too and keeps meaning "all fused". With the
 /// cascade separate `sh_gate_up_fused` re-quantizes sh2 into xq_s with the
 /// pre-scaled quant_x_fp4 after sh_gate_up_q, so gemv_fp4_mma_dg reads the
 /// default's cascade and row factor: 7 -> 4 launches per layer, no kernel
 /// change.
-fn sh_fuse_on() -> bool { env_flag!("CROW_SH_FUSE", exact1) || qfuse_on() }
+fn sh_fuse_on() -> bool { env_flag!("CROW_SH_FUSE", on) || qfuse_on() }
 
 /// #241: how `sh_gate_up_fused` leaves the cascade `xq_s`
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7344,7 +7344,7 @@ mod tests_215_params {
 
 #[cfg(test)]
 mod tests_241_switches {
-    //! #241: every decode fusion reads a switch of its own (exact `1`, default off) and
+    //! #241: every decode fusion reads a switch of its own (default on, exactly `0` = off) and
     //! `CROW_QFUSE=1` still turns all of them on. The switches are `OnceLock`s read once per
     //! process, so each environment runs in a test process of its own (the
     //! `tests_lock_pid_reuse::alone` pattern), started with none of the names set.
@@ -7398,25 +7398,25 @@ mod tests_241_switches {
     }
 
     #[test]
-    fn each_fusion_reads_its_own_switch_and_qfuse_1_still_means_all_fused() {
-        run(&[], "000000");
-        run(&[("CROW_HC_FUSE", "1")], "100000");
-        run(&[("CROW_SH_FUSE", "1")], "010000");
-        run(&[("CROW_HC_FUSE", "1"), ("CROW_SH_FUSE", "1")], "110000");
-        for other in ["0", "2", "true", "on", " 1", "1 ", "01"] {
-            run(&[("CROW_HC_FUSE", other), ("CROW_SH_FUSE", other), ("CROW_QP_FUSE", other), ("CROW_MMA", "1")], "000000");
+    fn each_fusion_is_on_unless_its_switch_is_0_and_qfuse_1_still_means_all_fused() {
+        // the owner, 2026-10-18: stage B's configuration is the default
+        run(&[], "110100");
+        run(&[("CROW_MMA", "1")], "110110");
+        run(&[("CROW_HC_FUSE", "0")], "010100");
+        run(&[("CROW_SH_FUSE", "0")], "100100");
+        run(&[("CROW_HC_FUSE", "0"), ("CROW_SH_FUSE", "0"), ("CROW_QP_FUSE", "0"), ("CROW_MMA", "1")], "000000");
+        for other in ["1", "2", "true", "off", " 0", "0 ", "00"] {
+            run(&[("CROW_HC_FUSE", other), ("CROW_SH_FUSE", other), ("CROW_QP_FUSE", other), ("CROW_MMA", "1")], "110110");
         }
-        run(&[("CROW_QFUSE", "1")], "111000");
-        run(&[("CROW_QFUSE", "1"), ("CROW_HC_FUSE", "0"), ("CROW_SH_FUSE", "0")], "111000");
-        run(&[("CROW_QFUSE", "0"), ("CROW_HC_FUSE", "1"), ("CROW_SH_FUSE", "1")], "110000");
-        run(&[("CROW_QFUSE", "true")], "000000");
-        // stage B: its own switch, in force for Flash-Next with both MMA paths on and
-        // CROW_QFUSE not 1; never for the dense family
-        run(&[("CROW_QP_FUSE", "1")], "000100");
-        run(&[("CROW_QP_FUSE", "1"), ("CROW_MMA", "1")], "000110");
-        run(&[("CROW_QP_FUSE", "1"), ("CROW_MMA", "1"), ("CROW_MMA_DENSE", "0")], "000100");
-        run(&[("CROW_QP_FUSE", "1"), ("CROW_MMA", "1"), ("CROW_QFUSE", "1")], "111100");
-        run(&[("CROW_QP_FUSE", "1"), ("CROW_MMA", "1"), ("CROW_HC_FUSE", "1"), ("CROW_SH_FUSE", "1")], "110110");
+        run(&[("CROW_QFUSE", "1")], "111100");
+        run(&[("CROW_QFUSE", "1"), ("CROW_HC_FUSE", "0"), ("CROW_SH_FUSE", "0")], "111100");
+        run(&[("CROW_QFUSE", "0"), ("CROW_HC_FUSE", "0"), ("CROW_SH_FUSE", "0")], "000100");
+        run(&[("CROW_QFUSE", "true")], "110100");
+        // stage B: in force for Flash-Next with both MMA paths on and CROW_QFUSE not 1;
+        // never for the dense family
+        run(&[("CROW_MMA", "1"), ("CROW_MMA_DENSE", "0")], "110100");
+        run(&[("CROW_MMA", "1"), ("CROW_QFUSE", "1")], "111100");
+        run(&[("CROW_MMA", "1"), ("CROW_QP_FUSE", "0")], "110000");
     }
 }
 
