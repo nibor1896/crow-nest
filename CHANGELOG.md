@@ -6,6 +6,16 @@
 
 ## Unreleased
 
+## 2026-10-18 — v0.14.0
+
+**Flash-Next decodes faster in Crow: the launch fusions are on again by default.** v0.14.0 gives each decode fusion that `488a840` switched off a switch of its own and turns all three on, after one Crow session per stage on 2026-10-18 (stage B 42.13 tok/s weighted against stage A's 40.54, same prompt). It also ships the offline residency replay of #245 and the pre-download tools of #240:
+
+- `CROW_HC_FUSE`, `CROW_SH_FUSE`, `CROW_QP_FUSE`, default on, each off with `0` (#241);
+- `tools/residency_replay.py`, the policy replay for Flash-Next's expert residency, step 1 of #245;
+- `tools/prequal.py` and `tools/hf_headers.py`: size, placement and decode ceiling of a new model without a download (#240).
+
+The 27B and GLM-5.3-Flash keep their path. Gate R and the Linux gate have not run on this release (Known limitations).
+
 ### Added
 
 - **`tools/prequal.py`: size, placement and decode ceiling of a new model before any download** (#240, 2026-10-17): from the shard headers and `config.json` alone, without a GPU, it prints the pre-qualification block of the model runbook (markdown; `--json` beside it), every number with its source. A family the converter knows goes through `converter plan --headers` and, for glm5_next, `states --plan`, both taken unchanged. Any other family takes a generic path, printed as `estimate: no recipe`: tensors classified by name and shape after the converter's keep rules, CNQ4.5 at 36 B per 64 values and MUL1 K=3 expert records, the KV cache from `config.json` (GQA / MHA, MLA, sliding window, linear states), a VRAM / pinned / NVMe split, and per-stage decode ceilings. The engine constants it plans with are parsed from `engine/src/*.rs` at run time. The calibration band comes in as `--band LO,HI`; the repo holds no copy of it. Measured 2026-10-17 at `8f9752f` on this machine's rates (B 6.994 GB/s measured, `docs/nvme-read-rate.md:16`; PCIe 47.78 GB/s measured; DRAM 89.6 and VRAM 1,792 GB/s nominal): GLM-5.3-Flash @ `eb9eb208` over the network, 24,812,140 B transferred in 66 requests for the 62 headers; CNQ4.5 178,478,618,624 B, equal to `converter plan`; MUL1 placement 50 / 124 / 114 experts per MoE layer, equal to `states --plan`; NVMe ceiling 19.97 / 17.58 tok/s at m 0.11 / 0.125 (the hand forecast of record said 18–20). The generic path forced on the same headers: size −0.19 %, split 54 / 124 / 110 (+8.0 / 0 / −3.5 %). Qwen3.8-27B @ `1d4bf0f2`: decode ceiling 122.6 tok/s at 190 tokens, all in VRAM (the forecast of record said ≈ 120, Crow #300). Tests: `tools/test_prequal.py`. Docs: `docs/prequal.md`.
