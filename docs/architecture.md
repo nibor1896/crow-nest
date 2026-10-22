@@ -1881,6 +1881,13 @@ in both arms, and every pair is faster with the flag. The Windows halving does n
 Not measured: Windows, and a live Crow window session (the replay is the request path, not robin's
 hands on it). The default is unchanged; robin decides.
 
+**Flipped on Linux (2026-10-22, robin's decision).** robin's live Crow window on the Linux box the same
+day, with the flag and the head anchor (7.17) on, read a decode median of 50.77 tok/s over 16 requests,
+against 46.77 (n 8) and 48.89 (n 7) in his sessions of the morning without it; different tasks, so this
+is a check that nothing breaks, not a pairing. Since then an unset `CROW_STAGE_PAR` is ON on Linux and
+OFF on Windows (`stage_par_from`); `1` and `0` decide on both. Windows stays off because the v0.9.4
+halving there was never explained.
+
 
 ---
 
