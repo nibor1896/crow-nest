@@ -6,6 +6,10 @@
 
 ## Unreleased
 
+### Added
+
+- **A Windows engine for v0.15.0** (2026-10-22). The v0.15.0 release carries `crow-nest-engine-0.15.0-win-x64.zip` (4,637,569 B, sha256 `43743eec…`). Built from the v0.15.0 tree on Windows with `tools/pack-engine.ps1` (rustc 1.97.0): `serve.exe` (12,627,968 B, sha256 `564bd6e9…`, no VC++ runtime import), `fetch-nvrtc.ps1`, `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt` and `MANIFEST.json`, privacy scan 0 hits in 5 files, `tools/engine_notices.py` PASS, no NVIDIA file. Downloaded back from the release, it matches the local build byte for byte. Not run on Windows yet; Crow 4.3.0 on Windows keeps installing v0.13.2.
+
 ## 2026-10-22 — v0.15.0
 
 **A stop frees the engine at once, a new chat starts warm, and Flash-Next decodes faster on Linux.** Four changes from a review of NVIDIA's Flare inference server against this engine, each measured on the RTX 5090 and checked live in Crow on the Linux box:
