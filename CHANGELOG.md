@@ -10,9 +10,13 @@
 
 - **A Linux engine for v0.14.0** (2026-10-22). The v0.14.0 release carries `crow-nest-engine-0.14.0-linux-x64.tar.gz` (5,241,136 B, sha256 `6663f44b…`), the first Linux engine package since v0.9.0. Built from the v0.14.0 tree on the Linux box with `tools/pack-engine.sh` (rustc 1.97.0): `serve`, `fetch-nvrtc.sh`, `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt` and `MANIFEST.json`, glibc_min 2.34 (highest symbol GLIBC_2.34), privacy scan 0 hits in 5 files, `tools/engine_notices.py` PASS, no NVIDIA file. Crow's `CrowSetup-linux-x64` (Crow v4.2.0 release) installs it. The README downloads it instead of building.
 
+### Measured
+
+- **The Linux gate on v0.14.0** (2026-10-22, `tools/gate-linux.sh` at `7f155cf` = v0.14.0 + docs, RTX 5090, driver 615.78.08, rustc 1.97.0, the Flash-Next container read from the Windows checkout): parity8 (sha256 `148cb72e…`), parity512 (`6e9cb25f…`), p8tf (`8f5e5ce8…`) and run32 GREEN on the unchanged values of record. v0.14.0 itself shipped without it (PR #247). The two pins were RED and are re-pinned in the script: 816 tests / 0 failed (+4 lib tests of #241, as PR #247 announced) and clippy 1604 against 1679; `83d16c2`, where 1679 was pinned, also reads 1604 on this box with the same toolchain, so the difference is not a code change.
+- **The Linux package unpacks and starts** (2026-10-22): 5 files against `MANIFEST.json`, 0 sha256 mismatches; `fetch-nvrtc.sh` placed NVRTC 13.3.33 (each file matches the wheel's `RECORD`); `serve` starts. The packed `serve` itself did not run the gate: the gate runs `engine/target/release/decode` from the same tree.
+
 ### Known limitations
 
-- **`tools/gate-linux.sh` was not run for the Linux package** (2026-10-22): the Linux box has no models and no container, so no parity sha or run-32 ids were read on this binary. v0.14.0 itself shipped without the Linux gate (PR #247). Checked instead: unpacked against `MANIFEST.json` (5 files, 0 sha256 mismatches), `fetch-nvrtc.sh` placed NVRTC 13.3.33 (each file matches the wheel's `RECORD`), `serve` starts.
 - **`tools/pack-engine.sh --selftest` reads 45 of 46 under a UTF-8 locale** (2026-10-22, `LANG=en_US.UTF-8`): the check "the package is exactly serve, fetch-nvrtc.sh, …" compares `sort` output against the C-locale order. Under `LC_ALL=C` it is 46 of 46. The packer itself does not sort.
 - **Crow's engine updater still finds no Linux engine**: it asks for `crow-nest-engine-<v>-linux-x64.zip` (see v0.13.2).
 
