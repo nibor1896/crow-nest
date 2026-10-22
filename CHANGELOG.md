@@ -14,6 +14,7 @@
 
 - **The Linux gate on v0.14.0** (2026-10-22, `tools/gate-linux.sh` at `7f155cf` = v0.14.0 + docs, RTX 5090, driver 615.78.08, rustc 1.97.0, the Flash-Next container read from the Windows checkout): parity8 (sha256 `148cb72e…`), parity512 (`6e9cb25f…`), p8tf (`8f5e5ce8…`) and run32 GREEN on the unchanged values of record. v0.14.0 itself shipped without it (PR #247). The two pins were RED and are re-pinned in the script: 816 tests / 0 failed (+4 lib tests of #241, as PR #247 announced) and clippy 1604 against 1679; `83d16c2`, where 1679 was pinned, also reads 1604 on this box with the same toolchain, so the difference is not a code change.
 - **The Linux package unpacks and starts** (2026-10-22): 5 files against `MANIFEST.json`, 0 sha256 mismatches; `fetch-nvrtc.sh` placed NVRTC 13.3.33 (each file matches the wheel's `RECORD`); `serve` starts. The packed `serve` itself did not run the gate: the gate runs `engine/target/release/decode` from the same tree.
+- **The packed `serve` serves Flash-Next in Crow** (2026-10-22, robin's live check on the Linux box, RTX 5090). Crow's `CrowSetup-linux-x64` from the Crow v4.2.0 release installed this package with point `flash-next`; Crow then ran a multi-step coding task with tool calls to the end on `<install>/bin/serve` (sha256 `d1e3ac42…`, the one in this package's `MANIFEST.json`), with the NVRTC that CrowSetup fetched from NVIDIA's wheel.
 
 ### Known limitations
 
