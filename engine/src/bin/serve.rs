@@ -35,6 +35,8 @@
 //! - The write half is shut down after the response is flushed.
 //! - #54: a `stream:false` generation is ended when its client is gone.
 //! - The probe is one `poll(POLLRDHUP)` on the request socket between two decode steps.
+//! - The same probe runs between two prefill chunks on both paths (2026-10-22): a text request
+//!   whose client is gone stops at that chunk boundary and keeps its state there (7.11.18).
 //! - Linux only (`POLLRDHUP`); elsewhere the probe is inert and that path is as it was.
 //! - A client that only half-closed its write side still gets its document (7.11.18).
 //! - The parsed body is kept as `Vec<u8>` for A3 and A4; A2 routes ignore it.
@@ -4311,8 +4313,9 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
         return "200 OK (client gone)";
     }
     srv.stream_head_sent = true;
+    let client = socket_fd(stream);
     let mut sink = SseSink::new(stream);
-    let out = chat_generate(srv, req, ids, tk, &mut sink);
+    let out = chat_generate(srv, req, ids, tk, &mut sink, client);
     if out.aborted {
         "200 OK (client gone)"
     } else {
@@ -4337,8 +4340,9 @@ fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u3
         Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(500, e)),
     };
     // #54: the sink watches the request socket from here on - see `ClientProbe`
+    let client = socket_fd(stream);
     let mut sink = CollectSink::watching(stream);
-    let out = chat_generate(srv, req, ids, tk, &mut sink);
+    let out = chat_generate(srv, req, ids, tk, &mut sink, client);
     let mut doc = completion_json(
         &ChunkCtx::new(&out.id, out.created, &req.model),
         &sink.content,
@@ -4391,6 +4395,13 @@ fn trickle_ready(eng: &Engine) -> bool {
     eng.residency().lb.is_none() && eng.residency().stride > eng.residency().n
 }
 
+/// the ids that open a user turn in the chat template (`<|im_start|>user\n` on Qwen): where
+/// the head anchor sits (`cache::anchor_point`). `None` if the tokenizer cannot say.
+fn user_turn_ids(tk: &crow_nest_engine::tokenizer::ChatTokenizer) -> Option<Vec<i64>> {
+    let ids = tk.encode_raw("<|im_start|>user\n").ok()?;
+    (!ids.is_empty()).then(|| ids.into_iter().map(i64::from).collect())
+}
+
 /// - #118: the park part of the `[serve] prefix cache` boot line: the row cap and the
 ///   host RAM a full park takes (`Engine::park_host_bytes`), allocated at the first park only
 fn park_boot_note(cache_on: bool, cap: usize, bytes: usize) -> String {
@@ -4424,12 +4435,17 @@ fn image_note(cache_on: bool, held_imgs: usize, req_imgs: usize, l_ids: usize, l
 /// - #54: one `ChatSink::still_there` probe between two decode steps, which is how the
 ///   `stream:false` path ends a generation whose client is gone (the stream path answers
 ///   `true` there and learns the same thing from its next failed flush)
+/// - one `ClientProbe` of `client` between two prefill chunks, on both paths: neither writes
+///   during the prefill, so a client that left during a long prompt held this slot to its
+///   end. A text request stops at the chunk boundary, keeps the state there (the snapshot
+///   below) and runs no decode; an image request prefills to the end as before.
 fn chat_generate(
     srv: &mut Srv,
     req: &ChatReq,
     ids: &[u32],
     tk: &'static crow_nest_engine::tokenizer::ChatTokenizer,
     sink: &mut dyn ChatSink,
+    client: Option<i32>,
 ) -> GenOut {
     srv.seq += 1;
     let created = SystemTime::now()
@@ -4541,17 +4557,66 @@ fn chat_generate(
     // #27 A5: the timed window is the prefill CALL alone, the same window `decode run` prints
     // as `prefill done in X s`; the rollback, the reset and the tokenizer are outside it.
     let mut collect = dump_dir.as_ref().map(|_| Vec::new());
+    // the prefill's gone-client watch: text only, because an image request's spans describe
+    // the whole prompt and a VIT dump needs every row, so both prefill to the end as before.
+    // A #82 shutdown stops it at the same boundary.
+    let mut probe = ClientProbe::new(client.filter(|_| req_imgs.is_empty() && dump_dir.is_none()));
+    let mut left: Option<(&'static str, bool)> = None;
+    let mut stop = || {
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            left = Some(("the server is shutting down", true));
+        } else if let Some(why) = probe.gone(0) {
+            left = Some((why, false));
+        }
+        left.is_some()
+    };
+    // the head anchor (`CROW_PREFIX_ANCHOR=1`): a text request whose prefill crosses its first
+    // user turn stops there once, keeps that state as the anchor and prefills the rest. A new
+    // chat with the same system prompt and tools then rolls back onto it instead of going cold.
+    let head = if srv.cache.anchor() && req_imgs.is_empty() && dump_dir.is_none() {
+        user_turn_ids(tk).and_then(|turn| crow_nest_engine::cache::anchor_point(&prompt, &turn, cached_n))
+    } else {
+        None
+    };
+    let mut head_note = String::new();
     let t_pre = Instant::now();
-    let mut next = unsafe {
+    let (mut next, prefill_done) = unsafe {
         match (plan.reuse, collect.as_mut()) {
             // #100: the whole prompt is held: the snapshot's logits row goes back into
             // `s.logits` and its greedy id stands in for what `prefill` would return
-            (Some((slot, p)), None) if p == prompt.len() => srv.cache.restore_logits(srv.eng, slot),
-            (_, Some(c)) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], Some(c)),
-            (_, None) => srv.eng.prefill(srv.cnq, &prompt[cached_n..], None),
+            (Some((slot, p)), None) if p == prompt.len() => (srv.cache.restore_logits(srv.eng, slot), 0),
+            (_, c) => match head {
+                Some(b) => {
+                    let (g, d) = srv.eng.prefill_until(srv.cnq, &prompt[cached_n..b], None, &mut stop);
+                    if cached_n + d < b {
+                        (g, d)
+                    } else {
+                        let ms = srv.cache.snapshot_head(srv.eng, g);
+                        head_note = format!(
+                            "[cache] head anchor at pos {b} (the first user turn), DtoH {ms:.3} ms, \
+                             {d} tok prefilled before it"
+                        );
+                        let (g2, d2) = srv.eng.prefill_until(srv.cnq, &prompt[b..], None, &mut stop);
+                        (g2, d + d2)
+                    }
+                }
+                None => srv.eng.prefill_until(srv.cnq, &prompt[cached_n..], c, &mut stop),
+            },
         }
     };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    if !head_note.is_empty() {
+        tracing::info!(target: "cache", "{head_note}");
+    }
+    if let Some((why, _)) = left {
+        tracing::info!(target: "chat",
+            "[chat] the prefill stopped after {prefill_done} of {prefilled} tok ({why}): the state \
+             is kept at pos {} for the next request (snapshot point 1 below), no decode runs",
+            srv.eng.pos()
+        );
+    }
+    // what actually ran: all of `prefilled`, or the chunks before a stop
+    let prefilled = prefill_done;
     // #114: `history` now holds this prompt, so its image spans are this request's
     srv.eng.set_history_images(&req_imgs);
     if let Some(dir) = dump_dir.as_ref() {
@@ -4721,10 +4786,11 @@ fn chat_generate(
 
     // the id/created/model triple of this response, once
     let cx = ChunkCtx::new(&id, created, &model);
-    let mut aborted = !sink.open(&cx);
+    // a prefill stopped by a gone client or a shutdown is an abort before the first token
+    let mut aborted = left.is_some() || !sink.open(&cx);
     // #99: an abort caused by the #82 shutdown signal rather than by a gone client; only
     // the `[chat]` line tells the two apart, both finish as `abort`
-    let mut shutdown = false;
+    let mut shutdown = left.is_some_and(|(_, s)| s);
 
     // #27 A5: the decode window opens at the FIRST `decode_step` and closes when the last one
     // returns, so the detokenize and the sink call of token 1 are not counted as decode
@@ -7886,11 +7952,12 @@ fn main() {
     // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
     tracing::info!(target: "serve",
-        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}, {}",
+        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs){}, QSA ring rows {}, {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
         eng.geo.vocab * 4,
-        SLOTS,
+        SLOTS + usize::from(cache.anchor()),
+        if cache.anchor() { ", one of them the head anchor (CROW_PREFIX_ANCHOR=1)" } else { "" },
         eng.qsa_ring_rows(),
         park_boot_note(cache.enabled(), cache.park_cap(), eng.park_host_bytes(cache.park_cap()))
     );

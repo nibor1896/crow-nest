@@ -650,8 +650,8 @@ pub struct Engine {
     pa_ev_plan: cudarc::driver::sys::CUevent,
     pa_ev_filled: [cudarc::driver::sys::CUevent; 2],
     pa_ev_done: [cudarc::driver::sys::CUevent; 2],
-    /// CROW_STAGE_PAR=1 (#19j): the decode staging side stream and its fork/join
-    /// event pair; null / unused with the switch off
+    /// CROW_STAGE_PAR (#19j, default on on Linux): the decode staging side stream and its
+    /// fork/join event pair; null / unused with the switch off
     st_stream: cudarc::driver::sys::CUstream,
     st_ev_go: cudarc::driver::sys::CUevent,
     st_ev_done: cudarc::driver::sys::CUevent,
@@ -1301,7 +1301,9 @@ pub fn stage_blocks() -> u32 {
     *V.get_or_init(|| env_parse("CROW_STAGE_BLOCKS").filter(|&g| (8..=512).contains(&g)).unwrap_or(40))
 }
 
-/// CROW_STAGE_PAR (#19j, exact `1` enables; DEFAULT OFF): `stage_cold_ca` is issued on
+/// CROW_STAGE_PAR (#19j): `1` enables and `0` disables on every platform; unset (or any other
+/// value) is the platform default, ON on Linux since 2026-10-22 and OFF elsewhere (see
+/// `stage_par_from`). Enabled, `stage_cold_ca` is issued on
 /// a SIDE STREAM instead of the compute stream, so the shared-expert chain of the same
 /// layer — which reads no staged byte — runs while the PCIe copy is in flight; the
 /// compute stream waits on the staging event again before the first routed GEMV, which
@@ -1315,7 +1317,23 @@ pub fn stage_blocks() -> u32 {
 /// decomposition (`docs/architecture.md` 4.8) reads `stage_cold_ca` as bandwidth bound
 /// at ~51 GB/s over PCIe with 40 x 256 threads resident, so the card has 130 of its 170
 /// SMs idle for the 11.5 ms per decode token the row costs.
-pub fn stage_par_on() -> bool { env_flag!("CROW_STAGE_PAR", exact1) }
+pub fn stage_par_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| stage_par_from(std::env::var("CROW_STAGE_PAR").ok().as_deref(), cfg!(target_os = "linux")))
+}
+
+/// - the `CROW_STAGE_PAR` decision: `1` on, `0` off, anything else the platform default
+/// - the default is ON on Linux by the owner's word of 2026-10-22, after the Crow-path A/B on
+///   Linux read +4.6 % decode with every request pair faster (`docs/architecture.md` 4.8.1)
+/// - and OFF elsewhere: the v0.9.4 default halved Flash-Next in a Windows Crow session
+///   (2026-10-06) and that cause was never measured
+fn stage_par_from(v: Option<&str>, linux: bool) -> bool {
+    match v {
+        Some("1") => true,
+        Some("0") => false,
+        _ => linux,
+    }
+}
 
 impl Engine {
     /// Full load: dense weights → states (with N clamp) → residency → scratch.
@@ -1658,7 +1676,7 @@ impl Engine {
             // that is the one thing about this launch a later log cannot infer
             println!("[stage] kernel stage_cold_ca, CROW_STAGE_KERNEL {} (default 2), {} blocks x 256 threads, 4096 B tiles (gate_up {} B = {} tiles, down {} B = {} tiles), {}",
                 sk, stage_blocks(), slabs.gu_bytes, slabs.gu_bytes / 4096, slabs.dn_bytes, slabs.dn_bytes / 4096,
-                if stage_par_on() { "CROW_STAGE_PAR=1: side stream, joined before the routed GEMV" } else { "compute stream (CROW_STAGE_PAR unset = default)" });
+                if stage_par_on() { "CROW_STAGE_PAR: side stream, joined before the routed GEMV" } else { "CROW_STAGE_PAR off: compute stream" });
         } else {
             println!("[stage] kernel stage_cold, CROW_STAGE_KERNEL {}, grid t * TOPK x 2 x {} (CROW_STAGE_SPLIT) x 256 threads (gate_up {} B, down {} B)",
                 sk, stage_split(), slabs.gu_bytes, slabs.dn_bytes);
@@ -4214,7 +4232,7 @@ impl Engine {
                     "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); CROW_STAGE_KERNEL=1 falls back to stage_cold",
                     self.stage.gu_bytes, self.stage.dn_bytes);
                 sc[9] = (t * self.d.topk) as u64;
-                // #19j (CROW_STAGE_PAR=1, default off): fork the copy onto the
+                // #19j (CROW_STAGE_PAR, default on on Linux): fork the copy onto the
                 // side stream and join before the routed GEMV below, so the
                 // shared-expert chain overlaps the PCIe pull. The fork depends on
                 // everything already issued on the compute stream — router_top10
@@ -5026,8 +5044,25 @@ impl Engine {
         &mut self,
         cnq: &mut Cnq,
         ids: &[i64],
-        mut collect_logits: Option<&mut Vec<Vec<f32>>>,
+        collect_logits: Option<&mut Vec<Vec<f32>>>,
     ) -> usize {
+        self.prefill_until(cnq, ids, collect_logits, &mut || false).0
+    }
+
+    /// - `prefill`, asking `stop` after every chunk but the last: `true` ends it at that chunk
+    ///   boundary, where the state is prefill clean (`pos`, `done_blocks` and `history` moved
+    ///   with the chunk, the head's argmax holds the chunk's last row), so a snapshot can be
+    ///   taken there and a later prefill of the rest resumes on the same chunk cut
+    /// - returns the greedy token of the last row prefilled and how many of `ids` that was
+    /// - serve's gone-client probe of the prefill: a stopped client no longer holds the one
+    ///   slot of this process for the whole prompt
+    pub unsafe fn prefill_until(
+        &mut self,
+        cnq: &mut Cnq,
+        ids: &[i64],
+        mut collect_logits: Option<&mut Vec<Vec<f32>>>,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> (usize, usize) {
         // crow-nest #95: new tokens follow; a pass `spec_step` left open is settled first
         if self.spec.is_some() {
             self.spec_finish();
@@ -5369,9 +5404,17 @@ impl Engine {
             if self.w.mtp.is_some() {
                 self.mtp_prefill_chunk(chunk, pos_base);
             }
+            if start < ids.len() && stop() {
+                // the next chunk's PLE rows are being fetched for a chunk that will not run
+                if let Some(h) = prefetch.take() {
+                    let _ = h.join();
+                }
+                tracing::info!(target: "prefill", "[prefill] STOPPED at {start}/{pre_total} tok, a chunk boundary");
+                break;
+            }
         }
         let tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
-        tok
+        (tok, start)
     }
 
     /// crow-nest #95: the MTP pairs of one prefill chunk (`mixed_final` rows 0..t = the main
@@ -7101,6 +7144,23 @@ mod vit_tower_line {
         assert!(out.contains("INFO"), "not an INFO event: {out:?}");
         assert!(out.contains("vit:"), "not target vit: {out:?}");
         assert!(out.contains("[vit] visual tower loaded: mode f16"), "line missing: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests_19j_default {
+    use super::stage_par_from;
+
+    /// on by default on Linux only; `1` and `0` decide on every platform
+    #[test]
+    fn stage_par_is_on_by_default_on_linux_only_and_the_switch_wins_everywhere() {
+        assert!(stage_par_from(None, true));
+        assert!(!stage_par_from(None, false));
+        for linux in [true, false] {
+            assert!(stage_par_from(Some("1"), linux));
+            assert!(!stage_par_from(Some("0"), linux));
+            assert_eq!(stage_par_from(Some("yes"), linux), linux, "another value is the default");
+        }
     }
 }
 

@@ -67,6 +67,7 @@
   - [7.14 The PLE row path, and what a warm turn actually pays (TASK H, 2026-09-17)](#714-the-ple-row-path-and-what-a-warm-turn-actually-pays-task-h-2026-09-17)
   - [7.15 VRAM lending to a co-resident renderer (#117, 2026-09-25)](#715-vram-lending-to-a-co-resident-renderer-117-2026-09-25)
   - [7.16 Parking the held conversation for a short unrelated request (#118, 2026-09-25)](#716-parking-the-held-conversation-for-a-short-unrelated-request-118-2026-09-25)
+  - [7.17 The head anchor: a new chat with the same head starts warm (2026-10-22)](#717-the-head-anchor-a-new-chat-with-the-same-head-starts-warm-2026-10-22)
 - [Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2, C5 family switches in 8.11, 8.12 the dense path with Crow #300 phase 2)](#section-8--the-code-map-2026-09-17-89-and-810-added-2026-09-18-logrs-2026-09-18-with-13-re-read-at-8bad310-v031-2026-09-18-811-added-2026-09-26-with-crow-300-c1c2-c4-kernel-rule-amended-in-82-c5-family-switches-in-811-812-the-dense-path-with-crow-300-phase-2)
   - [8.0 The tree at v0.11.0 (line counts, 2026-10-10)](#80-the-tree-at-v0110-line-counts-2026-10-10)
   - [8.1 The module graph](#81-the-module-graph)
@@ -1861,6 +1862,32 @@ flip would owe: this is the first parallel branch in the decode graph, so a `ser
 captured there too, with a different chunk policy and N 149) and one ten-task run for the record —
 nothing numeric, but the capture shape is new.
 
+**On Crow's path, Linux (2026-10-22).** The v0.9.4 default halved Flash-Next in robin's Windows Crow
+session (2026-10-06, CHANGELOG v0.9.5), and the cause was never measured; since then a speed lever is
+measured on Crow's own requests before a default changes. `tools/crow-path-ab.sh` boots the installed
+v0.14.0 `serve` the way Crow boots the flash-next point (its binary, cwd and env from
+`manifests/stack.json`) and replays a Crow session through `tools/corruption-replay-probe.py`, so every
+body is Crow's own (tools, tool grammar, Crow's sampling row, streaming). Run: today's 16-message Crow
+session, replay points 5, 9 and 13 (7,464 / 9,311 / 11,004 prompt ids), 4 seeds each, `max_tokens`
+512, boots O S O S O S, RTX 5090:
+
+| arm | decode median, 36 requests | per boot | prefill median (9 requests) |
+|---|---|---|---|
+| O, Crow's point as shipped | 47.72 tok/s | 47.51 / 47.54 / 47.96 | 846.0 tok/s |
+| S, the same plus `CROW_STAGE_PAR=1` | **49.92 tok/s (+4.6 %)** | 49.77 / 50.15 / 50.16 | 859.7 tok/s |
+
+Every one of the 36 request pairs generated the same number of tokens with the same cold-expert count
+in both arms, and every pair is faster with the flag. The Windows halving does not appear on Linux.
+Not measured: Windows, and a live Crow window session (the replay is the request path, not robin's
+hands on it). The default is unchanged; robin decides.
+
+**Flipped on Linux (2026-10-22, robin's decision).** robin's live Crow window on the Linux box the same
+day, with the flag and the head anchor (7.17) on, read a decode median of 50.77 tok/s over 16 requests,
+against 46.77 (n 8) and 48.89 (n 7) in his sessions of the morning without it; different tasks, so this
+is a check that nothing breaks, not a pairing. Since then an unset `CROW_STAGE_PAR` is ON on Linux and
+OFF on Windows (`stage_par_from`); `1` and `0` decide on both. Windows stays off because the v0.9.4
+halving there was never explained.
+
 
 ---
 
@@ -3103,7 +3130,7 @@ and Crow dropped that string when it arrived as a frame mid-stream.
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
 | headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:2099` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
-| a client that is GONE | since `#54` (2026-09-18) the generation ENDS instead of running the whole `max_tokens` budget out: one `poll(POLLRDHUP)` on the request socket between two decode steps, `PROBE_EVERY = 1` (7.11.18). A client that only half-closed its write side still gets its document. | `ClientProbe`, `CollectSink::still_there`, `chat_document` | — |
+| a client that is GONE | since `#54` (2026-09-18) the generation ENDS instead of running the whole `max_tokens` budget out: one `poll(POLLRDHUP)` on the request socket between two decode steps, `PROBE_EVERY = 1` (7.11.18); since 2026-10-22 between two prefill chunks as well, on both paths, and the state is kept at that chunk boundary. A client that only half-closed its write side still gets its document. | `ClientProbe`, `CollectSink::still_there`, `chat_document` | — |
 
 **The decisions #39 took, and why:**
 
@@ -3522,6 +3549,28 @@ either. The one thing a probe cannot do is separate the two meanings of a FIN by
   **13.585 / 13.589 / 13.595 ms** after. The probe is below the reading's own spread.
 - Streaming identity: the same greedy prompt answers with the same 355 bytes,
   `sha256 39cbf9a3fd5d2d61...`, on both builds.
+
+**The prefill probe (2026-10-22).** Neither sink writes during the prefill, so a client that
+left during a long prompt held the one slot until the whole prompt was in (a 118k re-prefill is
+139.5 s, 7.16). `chat_generate` now asks the same `ClientProbe` between two prefill chunks, on
+both paths (`Engine::prefill_until`; `prefill` is that call with a stop that never fires), and a
+#82 shutdown stops it at the same point. A stop ends the prefill at the chunk boundary, where
+the state is prefill clean; snapshot point 1 is taken there, no decode runs and the request
+finishes `abort`. The next request that shares the prompt resumes WARM from that snapshot on the
+same chunk cut. Image requests and a VIT dump keep prefilling to the end: their spans describe
+the whole prompt. Linux only, like the decode probe.
+
+- The client half: Crow's stop closed its response, and that close waits for the reader's
+  lock while the reader sits in a read, so during a prefill nothing reached serve (measured on a
+  loopback server that sent the SSE head and then wrote nothing: the close returned after
+  11.0 s, and the server never saw the client leave). Crow now shuts the socket down first
+  (Crow `_hang_up`): the server sees the FIN at once.
+- Measured 2026-10-22, RTX 5090, `tools/prefill_stop_check.py --port 8199` against a fresh
+  serve with `CROW_PREFIX_PARK_ROWS=0`: a 16,622-token prompt (the first 48,000 characters of
+  this file), greedy, 96 tokens. The uninterrupted cold run took 21.2 s. The same prompt as a
+  stream, hung up 4.0 s after the head, logged `[prefill] STOPPED at 4096/16622 tok`. The next
+  request was `WARM ... P 4096` with 4,096 cached tokens, prefilled 12,526 in 15.4 s and answered
+  with the same 96 tokens as the uninterrupted run.
 
 **7.11.19 The cross-turn repeat counter (#68, 2026-09-18)**
 
@@ -4288,6 +4337,44 @@ seed 1118, `reasoning_effort none`, card non-thinking row; main = an 8,640-token
 | next main turn | `WARM L 8642 (held 1370), P 8640 ... prefill 28 of 8668 tok ... parked conversation restored (KV rows 8192, HtoD 10.190 ms)`; prefill 196.6 ms against 8,312-9,239 ms for the cold 8,640-token prompt; with a 32-token answer `prefill 37 of 8677`, HtoD 9.111 ms |
 | output | the main turn's answer byte-identical with and without the side request, for a 2-token and a 32-token answer |
 | long side request | 12,087 tokens (longer than the held conversation): the snapshots are dropped, the old rule |
+
+### 7.17 The head anchor: a new chat with the same head starts warm (2026-10-22)
+
+**The case.** The snapshots of 7.3 sit at the ends of prompts, so a new chat whose system prompt and
+tools equal the held conversation's shares `L` thousands of ids with it and still finds no snapshot at
+or below `L`: it goes COLD and the held conversation is parked (7.16). Crow's Windows engine log of
+2026-10-18 holds four of these, with `L` 7,012 to 7,191 and a full prefill of about 7.2k ids each.
+
+**The rule** (`CROW_PREFIX_ANCHOR=1`, default off): `PrefixCache` holds one slot more than `SLOTS`. A
+text request whose prefill crosses its first user turn (`cache::anchor_point`: the first
+`<|im_start|>user\n`, at or above `ANCHOR_MIN` = 1,024 ids, above the reused `P`) prefills up to that
+id, snapshots the state as the head anchor (`snapshot_head`), and prefills the rest. The anchor is an
+ordinary prefill-clean slot of the held conversation (it names a prefix of `history`), so `decide`,
+`rollback`, the park and the slot rules of #100 / #101 / #118 hold for it unchanged; `claim` takes it
+last on both sides, so turn snapshots do not evict it and a new anchor replaces the old one first. A
+new chat with the same head finds the anchor as the largest snapshot at or below `L` and rolls back
+onto it; the rollback forgets the old chat's turn snapshots above it (#101), where the cold start of
+7.16 parked them. Image requests and a VIT dump take no anchor.
+
+**Why the output does not move.** The anchor cuts the prefill at a chunk boundary of its own, and the
+per-token math does not depend on the cut (7.3, A9); the rows below the anchor are prefill rows, so
+7.5 holds.
+
+**Measured 2026-10-22**, RTX 5090, `tools/head_anchor_check.py` against `serve` booted twice through
+`tools/serve-linux.sh`, once with `CROW_PREFIX_ANCHOR=0` and once with `1`: a system prompt of the first
+24,000 characters of `docs/env.md`, chat A (7,988 ids) and then a new chat B (7,991 ids) with the same
+system prompt, greedy, 64 tokens each.
+
+| | anchor off | anchor on |
+|---|---|---|
+| A, cold | prefill 8,813.2 ms | 8,897.4 ms, anchor at pos 7,968 (DtoH 9.0 ms) |
+| B, the new chat | COLD, 7,991 ids, 8,063.9 ms, wall 9.50 s | WARM at P 7,968, 23 ids, 180.3 ms, wall 1.52 s |
+| answers | | A and B the same as with the anchor off |
+
+- Cost: one host slot (130,646,016 B + the 993,280 B logits row), and about 1 % on the one cold request
+  that takes the anchor (one more chunk cut).
+- Not measured: a live Crow window, and how often Crow's own heads stay equal between chats (its system
+  prompt names the working folder and the memory, so a chat in another folder shares less).
 
 ## Section 8 — the code map (2026-09-17, 8.9 and 8.10 added 2026-09-18, `log.rs` 2026-09-18 with #13; re-read at `8bad310`, v0.3.1, 2026-09-18; 8.11 added 2026-09-26 with Crow #300 C1/C2, C4 kernel rule amended in 8.2, C5 family switches in 8.11, 8.12 the dense path with Crow #300 phase 2)
 
