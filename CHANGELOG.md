@@ -6,6 +6,17 @@
 
 ## Unreleased
 
+## 2026-10-22 — v0.15.0
+
+**A stop frees the engine at once, a new chat starts warm, and Flash-Next decodes faster on Linux.** Four changes from a review of NVIDIA's Flare inference server against this engine, each measured on the RTX 5090 and checked live in Crow on the Linux box:
+
+- a client that leaves during the prefill ends it at the next 2,048-token chunk and the state there is kept (`2593c4a`);
+- `CROW_PREFIX_ANCHOR=1`, the head anchor: a new chat with the same system prompt and tools rolls back onto the state at its first user turn instead of prefilling everything (`c9eef94`);
+- `CROW_STAGE_PAR` is on by default on Linux, +4.6 % decode on Crow's own requests (`727010e`);
+- every refusal is an error object, so Crow sees a failure mid-answer (`b4231f4`).
+
+Linux only: the Windows engine package of v0.15.0 is not built yet (Known limitations).
+
 ### Added
 
 - **The head anchor: a new chat with the same system prompt starts warm** (2026-10-22, `CROW_PREFIX_ANCHOR=1`, default off). A new chat whose system prompt and tools equal the held conversation's shared thousands of ids with it and still went COLD, because every snapshot sits at the end of a prompt (four such cold starts with 7,012 to 7,191 shared ids in Crow's Windows engine log of 2026-10-18). With the switch the prefix cache holds one slot more, the head anchor: a text request whose prefill crosses its first user turn stops there once, snapshots that state and prefills the rest, and a new chat with the same head rolls back onto it. `claim` evicts it last (`docs/architecture.md` 7.17, `docs/env.md`). Measured on the RTX 5090 with the new `tools/head_anchor_check.py`, a 7,988-id system prompt: the new chat went from COLD, 8,063.9 ms prefill and 9.50 s wall, to WARM at P 7,968 with 23 ids, 180.3 ms and 1.52 s; the cold request that takes the anchor cost 8,897.4 against 8,813.2 ms; both answers (64 greedy tokens each) the same as with the switch off. Host checks: cargo test 819 passed / 0 failed (+3 `cache` tests, `tools/gate-linux.sh` re-pinned), clippy 1604. Not measured: a live Crow window. Cost: one host slot, 130,646,016 B + the 993,280 B logits row.
@@ -26,6 +37,7 @@
 
 ### Known limitations
 
+- **No Windows engine package yet** (2026-10-22): v0.15.0 was released from the Linux box and carries `crow-nest-engine-0.15.0-linux-x64.tar.gz` only; `crow-nest-engine-0.15.0-win-x64.zip` is built with `tools/pack-engine.ps1` on Windows. Windows keeps v0.14.0 until then. The prefill stop's probe is Linux only, as the decode probe of #54 is.
 - **`tools/pack-engine.sh --selftest` reads 45 of 46 under a UTF-8 locale** (2026-10-22, `LANG=en_US.UTF-8`): the check "the package is exactly serve, fetch-nvrtc.sh, …" compares `sort` output against the C-locale order. Under `LC_ALL=C` it is 46 of 46. The packer itself does not sort.
 - **Crow's engine updater still finds no Linux engine**: it asks for `crow-nest-engine-<v>-linux-x64.zip` (see v0.13.2).
 
