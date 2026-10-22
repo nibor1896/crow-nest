@@ -801,6 +801,8 @@ impl PrefixCache {
             s.done_blocks = done_blocks;
             // #100: a slot file carries no logits row
             s.greedy = None;
+            // a slot file holds a prompt end, never the head anchor
+            s.head = false;
         }
     }
 
@@ -814,6 +816,7 @@ impl PrefixCache {
             s.prefill_clean = false;
             s.greedy = None;
             s.parked = false;
+            s.head = false;
         }
         self.park = None;
     }
@@ -1657,7 +1660,10 @@ mod tests {
         c.claim(150, true);
         c.name(SLOT_PROMPT, 150, true, 37, Some(1));
         assert_eq!(c.positions(), vec![Some(150), Some(600), Some(500), Some(400)]);
-        assert_eq!(c.head_position(), Some(150));
+        assert_eq!(c.head_position(), Some(150));        // a slot file restore fills slot 0 after `invalidate`: a prompt end, not the anchor
+        c.invalidate();
+        c.set_prompt_slot(150, 37);
+        assert_eq!(c.head_position(), None);
     }
 
     /// the case it exists for: a new chat with the same head rolls back onto the anchor
