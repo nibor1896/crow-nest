@@ -5026,8 +5026,25 @@ impl Engine {
         &mut self,
         cnq: &mut Cnq,
         ids: &[i64],
-        mut collect_logits: Option<&mut Vec<Vec<f32>>>,
+        collect_logits: Option<&mut Vec<Vec<f32>>>,
     ) -> usize {
+        self.prefill_until(cnq, ids, collect_logits, &mut || false).0
+    }
+
+    /// - `prefill`, asking `stop` after every chunk but the last: `true` ends it at that chunk
+    ///   boundary, where the state is prefill clean (`pos`, `done_blocks` and `history` moved
+    ///   with the chunk, the head's argmax holds the chunk's last row), so a snapshot can be
+    ///   taken there and a later prefill of the rest resumes on the same chunk cut
+    /// - returns the greedy token of the last row prefilled and how many of `ids` that was
+    /// - serve's gone-client probe of the prefill: a stopped client no longer holds the one
+    ///   slot of this process for the whole prompt
+    pub unsafe fn prefill_until(
+        &mut self,
+        cnq: &mut Cnq,
+        ids: &[i64],
+        mut collect_logits: Option<&mut Vec<Vec<f32>>>,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> (usize, usize) {
         // crow-nest #95: new tokens follow; a pass `spec_step` left open is settled first
         if self.spec.is_some() {
             self.spec_finish();
@@ -5369,9 +5386,17 @@ impl Engine {
             if self.w.mtp.is_some() {
                 self.mtp_prefill_chunk(chunk, pos_base);
             }
+            if start < ids.len() && stop() {
+                // the next chunk's PLE rows are being fetched for a chunk that will not run
+                if let Some(h) = prefetch.take() {
+                    let _ = h.join();
+                }
+                tracing::info!(target: "prefill", "[prefill] STOPPED at {start}/{pre_total} tok, a chunk boundary");
+                break;
+            }
         }
         let tok = cuda::dtoh_i32(self.s.argmax, 1)[0] as usize;
-        tok
+        (tok, start)
     }
 
     /// crow-nest #95: the MTP pairs of one prefill chunk (`mixed_final` rows 0..t = the main

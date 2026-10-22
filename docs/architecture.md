@@ -3096,7 +3096,7 @@ C:/x/y.md
 | `usage` | `usage_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1109` (`usage_json`), `serve.rs:1477` | `probe-suite.py:681-683` (`completion_tokens`) |
 | `timings` | `timings_json`, the object of the final stream chunk, ALWAYS present | `serve.rs:1122` (`timings_json`), `serve.rs:1477` | neither caller reads it |
 | headers | `application/json`, `Content-Length`, `Connection: close`, as on every other JSON route | `serve.rs:2099` (`chat_document`), `serve.rs:1947` (`respond`) | `urllib.request` in both callers |
-| a client that is GONE | since `#54` (2026-09-18) the generation ENDS instead of running the whole `max_tokens` budget out: one `poll(POLLRDHUP)` on the request socket between two decode steps, `PROBE_EVERY = 1` (7.11.18). A client that only half-closed its write side still gets its document. | `ClientProbe`, `CollectSink::still_there`, `chat_document` | — |
+| a client that is GONE | since `#54` (2026-09-18) the generation ENDS instead of running the whole `max_tokens` budget out: one `poll(POLLRDHUP)` on the request socket between two decode steps, `PROBE_EVERY = 1` (7.11.18); since 2026-10-22 between two prefill chunks as well, on both paths, and the state is kept at that chunk boundary. A client that only half-closed its write side still gets its document. | `ClientProbe`, `CollectSink::still_there`, `chat_document` | — |
 
 **The decisions #39 took, and why:**
 
@@ -3515,6 +3515,28 @@ either. The one thing a probe cannot do is separate the two meanings of a FIN by
   **13.585 / 13.589 / 13.595 ms** after. The probe is below the reading's own spread.
 - Streaming identity: the same greedy prompt answers with the same 355 bytes,
   `sha256 39cbf9a3fd5d2d61...`, on both builds.
+
+**The prefill probe (2026-10-22).** Neither sink writes during the prefill, so a client that
+left during a long prompt held the one slot until the whole prompt was in (a 118k re-prefill is
+139.5 s, 7.16). `chat_generate` now asks the same `ClientProbe` between two prefill chunks, on
+both paths (`Engine::prefill_until`; `prefill` is that call with a stop that never fires), and a
+#82 shutdown stops it at the same point. A stop ends the prefill at the chunk boundary, where
+the state is prefill clean; snapshot point 1 is taken there, no decode runs and the request
+finishes `abort`. The next request that shares the prompt resumes WARM from that snapshot on the
+same chunk cut. Image requests and a VIT dump keep prefilling to the end: their spans describe
+the whole prompt. Linux only, like the decode probe.
+
+- The client half: Crow's stop closed its response, and that close waits for the reader's
+  lock while the reader sits in a read, so during a prefill nothing reached serve (measured on a
+  loopback server that sent the SSE head and then wrote nothing: the close returned after
+  11.0 s, and the server never saw the client leave). Crow now shuts the socket down first
+  (Crow `_hang_up`): the server sees the FIN at once.
+- Measured 2026-10-22, RTX 5090, `tools/prefill_stop_check.py --port 8199` against a fresh
+  serve with `CROW_PREFIX_PARK_ROWS=0`: a 16,622-token prompt (the first 48,000 characters of
+  this file), greedy, 96 tokens. The uninterrupted cold run took 21.2 s. The same prompt as a
+  stream, hung up 4.0 s after the head, logged `[prefill] STOPPED at 4096/16622 tok`. The next
+  request was `WARM ... P 4096` with 4,096 cached tokens, prefilled 12,526 in 15.4 s and answered
+  with the same 96 tokens as the uninterrupted run.
 
 **7.11.19 The cross-turn repeat counter (#68, 2026-09-18)**
 
