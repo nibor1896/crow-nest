@@ -53,7 +53,13 @@ powershell -ExecutionPolicy Bypass -File crow-nest-engine\fetch-nvrtc.ps1 -Targe
 $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe --port 8099
 ```
 
-**Linux engine without building**: no Linux package at the moment (the v0.9.0 tarball carried NVRTC and is withdrawn); build from source as above, then `tools/fetch-nvrtc.sh --target engine/target/release`.
+**Linux engine without building** (`serve` from the release, NVRTC from NVIDIA's own wheel, glibc 2.34+)
+
+```bash
+curl -fLO https://github.com/nibor1896/crow-nest/releases/download/v0.14.0/crow-nest-engine-0.14.0-linux-x64.tar.gz; mkdir -p crow-nest-engine && tar -xzf crow-nest-engine-0.14.0-linux-x64.tar.gz -C crow-nest-engine
+bash crow-nest-engine/fetch-nvrtc.sh --target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the tarball holds no NVIDIA file
+LD_LIBRARY_PATH=$PWD/crow-nest-engine CROW_CNQ=converter/Qwen3.8-27B-CNQ4.5.cnq crow-nest-engine/serve --port 8099
+```
 
 **GLM-5.3-Flash**, Crow's third operating point (3-bit container: 124.6 GB from Hugging Face, [conversion](docs/glm-mul1-conversion.md); operating set [`arm4.env`](runs/glm53-flash/quick/README.md))
 
