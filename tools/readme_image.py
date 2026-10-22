@@ -123,7 +123,7 @@ FEATURES = [
  ("MTP on the 27B", "speculative decode, output identical to plain", "sub"),
  ("Vision", "both Qwen models, 1,024 to 1,280 tokens per image", "ok"),
  ("Hot set", "Flash-Next, calibrated on Crow traffic (#106)", "gold"),
- ("Prefix cache", "a side request parks the main conversation", "sub"),
+ ("Prefix cache", "side requests park, new chats start warm", "sub"),
  ("GPU sharing", "lends VRAM to Crow's renderer while idle", "ok"),
  ("Image generation", "the 27B at 64k leaves room for Qwen-Image 2.1", "gold"),
  ("Sampling", "the model card's row, never greedy (#111)", "sub"),
@@ -150,7 +150,9 @@ MEAS = [("60 → 0", C["ok"], "corrupt tokens, live agent|run 2026-09-23 (#91)")
         ("120 / 123.05", C["gold"], "27B MTP decode vs llama.cpp|MTP, 2026-09-27 (#95)"),
         ("byte-identical", C["sub"], "27B MTP output against|plain decode, 2026-09-27"),
         ("11 / 11", C["mark"], "27B colour probe, own F16|projector, 2026-09-27 (#122)"),
-        ("1137 / 16.8", C["ok"], "GLM-5.3-Flash tok/s prefill /|decode, cold, 2026-10-10")]
+        ("1137 / 16.8", C["ok"], "GLM-5.3-Flash tok/s prefill /|decode, cold, 2026-10-10"),
+        ("50.8", C["gold"], "tok/s Flash-Next decode in|Crow, Linux, 2026-10-22"),
+        ("8.8 → 0.2 s", C["sub"], "new-chat prefill with the|head anchor, 2026-10-22")]
 MROWS = (len(MEAS) + 3) // 4
 card(X0, y, 800, 60 + MROWS * 100)
 for i, (v, col, d) in enumerate(MEAS):
