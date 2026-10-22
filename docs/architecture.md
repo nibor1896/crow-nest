@@ -2991,10 +2991,17 @@ C:/x/y.md
 
 **7.11.8 Refusals and status codes**
 
+Every JSON refusal below, and the SSE error frame that replaces it once the 200 head is out, is one
+document: `{"error":{"code":<status>,"message":"<reason>","type":"<kind>"}}`, llama-server's shape
+(`error_json`). `type` is `invalid_request_error` for 400, 409, 413 and 431, `not_found_error` for 404,
+`not_supported_error` for 501, `unavailable_error` for 503 and `server_error` for 500. Until the
+error-object fix (2026-10-22) every refusal but the 404 carried a bare string, `{"error":"<reason>"}`,
+and Crow dropped that string when it arrived as a frame mid-stream.
+
 | case | answer | crow-nest anchor |
 |---|---|---|
 | unknown route, or a wrong method on a known path | 404 JSON naming every route this server answers | `serve.rs:903` (`not_found_json`), `serve.rs:541` (`route`) |
-| garbage request line | 400 JSON `{"error":"bad request"}` | `serve.rs:2563` (`read_head_from`) |
+| garbage request line | 400 JSON, message `bad request` | `serve.rs:2563` (`read_head_from`) |
 | malformed or repeated `Content-Length` | 400 JSON | `serve.rs:2563` |
 | head (request line plus headers) over 64 KiB | 431 JSON, then close | `serve.rs:501`, `serve.rs:2563` |
 | body over 100 MiB (16 MiB until #113, 2026-09-24: under one Crow image of up to 32 MiB, 42.7 MiB as base64; 100 MiB is llama-server's cpp-httplib cap) | 413 JSON, then close | `MAX_BODY_BYTES`, `read_head_from` |

@@ -30,7 +30,7 @@
 //! - The body is read and discarded before the response is written.
 //! - Body capped at 100 MiB (#113, llama-server's cpp-httplib cap); over the cap: 413 JSON, then close.
 //! - A bodied POST to an unknown route therefore gets the 404 JSON, not a reset.
-//! - A garbage request line answers 400 JSON with `{"error":"bad request"}`.
+//! - A garbage request line answers 400 JSON with `{"error":{"code":400,"message":"bad request","type":"invalid_request_error"}}`.
 //! - A client that sent nothing is closed silently, without a response.
 //! - The write half is shut down after the response is flushed.
 //! - #54: a `stream:false` generation is ended when its client is gone.
@@ -1210,14 +1210,28 @@ fn slot_filename(body: &[u8]) -> Result<String, String> {
 }
 
 fn not_found_json(path: &str) -> serde_json::Value {
-    serde_json::json!({
-        "error": { "code": 404, "message": format!("no route {path} (serve answers GET /health, GET /props, POST /v1/chat/completions, GET /slots, POST /slots/0)") }
-    })
+    error_json(404, &format!("no route {path} (serve answers GET /health, GET /props, POST /v1/chat/completions, GET /slots, POST /slots/0)"))
 }
 
-/// flat error document for 400, 413, 431 and 501
-fn error_json(msg: &str) -> serde_json::Value {
-    serde_json::json!({ "error": msg })
+/// the error document of every refusal and of the SSE error frame after a 200 head:
+/// `{"error":{"code","message","type"}}`, llama-server's shape, so a client reads
+/// `error.message` on every route (it was a bare string beside the 404's object until the
+/// error-object fix, 2026-10-22, and Crow dropped the string frame mid-stream)
+fn error_json(code: u16, msg: &str) -> serde_json::Value {
+    let kind = match code {
+        404 => "not_found_error",
+        400..=499 => "invalid_request_error",
+        501 => "not_supported_error",
+        503 => "unavailable_error",
+        _ => "server_error",
+    };
+    serde_json::json!({ "error": { "code": code, "message": msg, "type": kind } })
+}
+
+/// the number of a status line (`"400 Bad Request"` -> 400), for a refusal whose status is a
+/// value; 500 if it has none
+fn status_code(status: &str) -> u16 {
+    status.get(..3).and_then(|c| c.parse().ok()).unwrap_or(500)
 }
 
 // ------------------------------------------------ #185: the family dispatch
@@ -4172,11 +4186,11 @@ fn render_ids(
 fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static str {
     let mut req = match parse_chat_as(body, ServeEngine::vocab(&*srv.eng), srv.markup) {
         Ok(r) => r,
-        Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
+        Err(e) => return respond_json(stream, "400 Bad Request", &error_json(400, &e)),
     };
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
-        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(500, e)),
     };
     // #29 A7: `tools` is rendered, and an assistant turn's `arguments` string is turned into
     // the object the template's `|items` needs. Both are the request as Crow sends it.
@@ -4189,7 +4203,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
     }
     if let Err(e) = check_messages(&msgs) {
         log_messages_400(&e, &req.messages);
-        return respond_json(stream, "400 Bad Request", &error_json(&e));
+        return respond_json(stream, "400 Bad Request", &error_json(400, &e));
     }
     // #74: `reasoning_effort` rides as the fourth template variable. It is `None` for every
     // request that does not think, so the ids of a request that names neither door are the
@@ -4200,11 +4214,11 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
             // a render that still fails is a shape `check_messages` does not know: the dump
             // is what turns the next one into a fix instead of another bisect
             log_messages_400(&e, &req.messages);
-            return respond_json(stream, "400 Bad Request", &error_json(&e));
+            return respond_json(stream, "400 Bad Request", &error_json(400, &e));
         }
     };
     if ids.is_empty() {
-        return respond_json(stream, "400 Bad Request", &error_json("the rendered prompt is empty"));
+        return respond_json(stream, "400 Bad Request", &error_json(400, "the rendered prompt is empty"));
     }
     // #VIT: run the visual tower for the request's images, expand every
     // image_pad into its visual tokens, arm the mrope span tables. With
@@ -4216,13 +4230,13 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
         for (i, url) in req.images.iter().enumerate() {
             match decode_data_url(url) {
                 Ok((_mime, raw)) => bytes.push(raw),
-                Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&format!("image {i}: {e}"))),
+                Err(e) => return respond_json(stream, "400 Bad Request", &error_json(400, &format!("image {i}: {e}"))),
             }
         }
         let vit_t0 = std::time::Instant::now();
         let plan = match unsafe { srv.eng.build_vision_plan(&ids, &bytes) } {
             Ok(p) => p,
-            Err(e) => return respond_json(stream, "400 Bad Request", &error_json(&e)),
+            Err(e) => return respond_json(stream, "400 Bad Request", &error_json(400, &e)),
         };
         let vit_ms = vit_t0.elapsed().as_secs_f64() * 1e3;
         // TASK K: free VRAM and the engine's live allocation count ride this line.
@@ -4260,7 +4274,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
         Some(n) => n,
         None => {
             let m = format!("prompt {} tokens over n_ctx {}", ids.len(), srv.n_ctx);
-            return respond_json(stream, "413 Payload Too Large", &error_json(&m));
+            return respond_json(stream, "413 Payload Too Large", &error_json(413, &m));
         }
     };
     if budget != req.max_tokens {
@@ -4289,7 +4303,7 @@ fn chat_route(stream: &mut TcpStream, srv: &mut Srv, body: &[u8]) -> &'static st
 fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
-        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(500, e)),
     };
 
     const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -4320,7 +4334,7 @@ fn chat_stream(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]
 fn chat_document(stream: &mut TcpStream, srv: &mut Srv, req: &ChatReq, ids: &[u32]) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
-        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(500, e)),
     };
     // #54: the sink watches the request socket from here on - see `ClientProbe`
     let mut sink = CollectSink::watching(stream);
@@ -5667,7 +5681,7 @@ where
     srv.eng.end_vision();
     srv.cache.invalidate();
     unsafe { srv.eng.reset_to_zero() };
-    let body = error_json(&format!(
+    let body = error_json(503, &format!(
         "{}. The request was dropped and the engine is up; retry with fewer or smaller images, \
          a shorter prompt, or restart with a larger CROW_VIT_RESERVE_MB",
         failed.message()
@@ -5689,7 +5703,7 @@ where
 fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_json::Value) {
     let refuse = |msg: String| {
         tracing::warn!(target: "slot", "[slot] refused: {msg}");
-        ("400 Bad Request", error_json(&msg))
+        ("400 Bad Request", error_json(400, &msg))
     };
     let Some(action) = query_param(target, "action") else {
         return refuse("no action in the query string (save or restore)".to_string());
@@ -5710,7 +5724,7 @@ fn slot_route(srv: &mut Srv, target: &str, body: &[u8]) -> (&'static str, serde_
             if srv.cache.prompt_slot().is_none() {
                 let m = "no prefill clean state is held; run one chat request first".to_string();
                 tracing::warn!(target: "slot", "[slot] refused: {m}");
-                return ("409 Conflict", error_json(&m));
+                return ("409 Conflict", error_json(409, &m));
             }
             // unsafe: device to host copies only; the engine state is not written
             match unsafe { slot::save(srv.eng, &srv.cache, srv.model_path, &path) } {
@@ -5770,15 +5784,15 @@ fn vram_lend(srv: &mut Srv, body: &[u8]) -> (&'static str, serde_json::Value) {
     use crow_nest_engine::lend::{parse_lend, Refusal};
     let (lendable, _, _) = crow_nest_engine::cuda::lendable_bytes();
     if !crow_nest_engine::cuda::lend_enabled() || lendable == 0 {
-        return ("501 Not Implemented", error_json("VRAM lending is off in this serve (CROW_VRAM_LEND=0 or nothing lendable)"));
+        return ("501 Not Implemented", error_json(501, "VRAM lending is off in this serve (CROW_VRAM_LEND=0 or nothing lendable)"));
     }
     let p = match parse_lend(body).and_then(|p| srv.lend.check_lend().map(|_| p)) {
         Ok(p) => p,
         Err(Refusal::AlreadyLent) => {
-            return ("409 Conflict", error_json(&format!(
+            return ("409 Conflict", error_json(409, &format!(
                 "VRAM is already lent ({:.0} MiB); POST /v1/crow/vram/return first", srv.lend.lent_bytes() as f64 / MIB_F)));
         }
-        Err(Refusal::BadRequest(m)) => return ("400 Bad Request", error_json(&m)),
+        Err(Refusal::BadRequest(m)) => return ("400 Bad Request", error_json(400, &m)),
     };
     // SAFETY: the context is current (this thread loaded the engine); no request
     // runs until the return, because every engine route is parked while lent
@@ -5837,7 +5851,7 @@ fn vram_return(srv: &mut Srv, why: &str) -> (&'static str, serde_json::Value) {
             tracing::warn!(target: "lend",
                 "[lend] return failed ({why}): {msg} - the VRAM is still held by another process; retrying in 1 s, {} request(s) wait",
                 srv.parked.len());
-            ("503 Service Unavailable", error_json(&format!("return failed, serve retries every second: {msg}")))
+            ("503 Service Unavailable", error_json(503, &format!("return failed, serve retries every second: {msg}")))
         }
     }
 }
@@ -5907,22 +5921,22 @@ fn dispatch(stream: &mut TcpStream, srv: &mut Srv, head: Head) {
         Head::Bad => (
             "<no HTTP request line>".to_string(),
             "400 Bad Request",
-            error_json("bad request"),
+            error_json(400, "bad request"),
         ),
         Head::HeadTooLarge => (
             format!("<head over {MAX_HEAD_BYTES} bytes>"),
             "431 Request Header Fields Too Large",
-            error_json("request header fields too large"),
+            error_json(431, "request header fields too large"),
         ),
         Head::BodyTooLarge(n) => (
             format!("<Content-Length {n} over {MAX_BODY_BYTES} bytes>"),
             "413 Payload Too Large",
-            error_json("payload too large"),
+            error_json(413, "payload too large"),
         ),
         Head::Chunked => (
             "<Transfer-Encoding: chunked>".to_string(),
             "501 Not Implemented",
-            error_json("chunked transfer encoding not supported"),
+            error_json(501, "chunked transfer encoding not supported"),
         ),
         Head::Req { method, target, body } => {
             let path = route_path(&target).to_string();
@@ -6935,7 +6949,7 @@ impl GlmDoor for GlmBatchDoor {
     fn chat(&mut self, stream: &mut TcpStream, body: &[u8]) -> &'static str {
         let tk = match crow_nest_engine::tokenizer::global() {
             Ok(t) => t,
-            Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+            Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(500, e)),
         };
         let sh = &*self.shared;
         glm_batch_guarded(stream, |stream, head_sent| {
@@ -7005,21 +7019,21 @@ fn glm_batch_serve<R: Rows>(listener: TcpListener, eng: &mut Glm5Engine<R>, mode
 fn glm_dispatch(stream: &mut TcpStream, srv: &mut dyn GlmDoor, head: Head) {
     let (label, status, doc) = match head {
         Head::Empty => return,
-        Head::Bad => ("<no HTTP request line>".to_string(), "400 Bad Request", error_json("bad request")),
+        Head::Bad => ("<no HTTP request line>".to_string(), "400 Bad Request", error_json(400, "bad request")),
         Head::HeadTooLarge => (
             format!("<head over {MAX_HEAD_BYTES} bytes>"),
             "431 Request Header Fields Too Large",
-            error_json("request header fields too large"),
+            error_json(431, "request header fields too large"),
         ),
         Head::BodyTooLarge(n) => (
             format!("<Content-Length {n} over {MAX_BODY_BYTES} bytes>"),
             "413 Payload Too Large",
-            error_json("payload too large"),
+            error_json(413, "payload too large"),
         ),
         Head::Chunked => (
             "<Transfer-Encoding: chunked>".to_string(),
             "501 Not Implemented",
-            error_json("chunked transfer encoding not supported"),
+            error_json(501, "chunked transfer encoding not supported"),
         ),
         Head::Req { method, target, body } => {
             let path = route_path(&target).to_string();
@@ -7034,8 +7048,8 @@ fn glm_dispatch(stream: &mut TcpStream, srv: &mut dyn GlmDoor, head: Head) {
                 Route::Health => (label, "200 OK", serde_json::json!({ "status": "ok" })),
                 Route::Props => (label, "200 OK", props_json(srv.model_path(), srv.n_ctx(), GLM_PROMPT_CHUNK, false)),
                 Route::Slots => (label, "200 OK", slots_json(srv.n_ctx(), srv.snapshot_pos().unwrap_or(0))),
-                Route::Slot0 => (label, "501 Not Implemented", error_json("slot files are not built for glm5_next (#185): its prompt snapshot lives in this process only")),
-                Route::VramLend => (label, "501 Not Implemented", error_json("VRAM lending is not built for glm5_next (#185)")),
+                Route::Slot0 => (label, "501 Not Implemented", error_json(501, "slot files are not built for glm5_next (#185): its prompt snapshot lives in this process only")),
+                Route::VramLend => (label, "501 Not Implemented", error_json(501, "VRAM lending is not built for glm5_next (#185)")),
                 Route::VramReturn => (label, "200 OK", serde_json::json!({ "returned_mib": 0, "note": "nothing lent" })),
                 Route::VramStatus => (
                     label,
@@ -7086,7 +7100,7 @@ fn glm_alloc_503(stream: &mut TcpStream, head_sent: bool, failed: &crow_nest_eng
         "[serve] the request was dropped: {} - the engine stays up, the next request is served",
         failed.message()
     );
-    let body = error_json(&format!("{}. The request was dropped and the engine is up; retry with a shorter prompt", failed.message()));
+    let body = error_json(503, &format!("{}. The request was dropped and the engine is up; retry with a shorter prompt", failed.message()));
     glm_fail(stream, head_sent, "503 Service Unavailable", body)
 }
 
@@ -7094,7 +7108,7 @@ fn glm_alloc_503(stream: &mut TcpStream, head_sent: bool, failed: &crow_nest_eng
 ///   reaches only the client), then the 500
 fn glm_engine_500(stream: &mut TcpStream, head_sent: bool, e: &str) -> &'static str {
     tracing::info!(target: "serve", "[serve] the request failed: {e}");
-    glm_fail(stream, head_sent, "500 Internal Server Error", error_json(e))
+    glm_fail(stream, head_sent, "500 Internal Server Error", error_json(500, e))
 }
 
 /// - #185 part 2: an error after the request was accepted: a JSON answer while no head left the
@@ -7158,7 +7172,7 @@ fn glm_request(
 fn glm_chat_route<R: Rows>(stream: &mut TcpStream, srv: &mut GlmSrv<R>, body: &[u8]) -> &'static str {
     let tk = match crow_nest_engine::tokenizer::global() {
         Ok(t) => t,
-        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(e)),
+        Err(e) => return respond_json(stream, "500 Internal Server Error", &error_json(500, e)),
     };
     let GlmSrv { eng, markup, n_ctx, stream_head_sent, book, .. } = srv;
     glm_chat_on(stream, tk, &mut **eng, book, *markup, *n_ctx, stream_head_sent, body)
@@ -7179,7 +7193,7 @@ fn glm_chat_on(
 ) -> &'static str {
     let (req, ids) = match glm_request(tk, seq.consts().vocab(), markup, n_ctx, body) {
         Ok(x) => x,
-        Err((status, e)) => return respond_json(stream, status, &error_json(&e)),
+        Err((status, e)) => return respond_json(stream, status, &error_json(status_code(status), &e)),
     };
     if req.stream {
         const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -8237,10 +8251,31 @@ mod tests {
         }
     }
 
+    /// one shape on every route, the SSE error frame included: Crow reads `error.message`
+    /// and dropped a bare-string frame mid-stream (error-object fix, 2026-10-22)
     #[test]
-    fn flat_error_documents_name_the_reason() {
-        assert_eq!(error_json("bad request")["error"], "bad request");
-        assert_eq!(error_json("payload too large")["error"], "payload too large");
+    fn error_documents_are_objects_with_code_message_and_type() {
+        for (code, kind) in [
+            (400, "invalid_request_error"),
+            (404, "not_found_error"),
+            (409, "invalid_request_error"),
+            (413, "invalid_request_error"),
+            (431, "invalid_request_error"),
+            (500, "server_error"),
+            (501, "not_supported_error"),
+            (503, "unavailable_error"),
+        ] {
+            let doc = error_json(code, "payload too large");
+            assert_eq!(doc["error"]["code"], code);
+            assert_eq!(doc["error"]["message"], "payload too large");
+            assert_eq!(doc["error"]["type"], kind, "status {code}");
+        }
+        assert_eq!(not_found_json("/x")["error"]["type"], "not_found_error");
+        assert_eq!((status_code("400 Bad Request"), status_code("413 Payload Too Large"), status_code("")), (400, 413, 500));
+        let frame = sse_frame(&serde_json::json!({ "error": error_json(503, "out of VRAM")["error"] }));
+        let doc: serde_json::Value = serde_json::from_str(frame.trim().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(doc["error"]["message"], "out of VRAM");
+        assert_eq!(doc["error"]["code"], 503);
     }
     // ------------------------------------------------ chat completions (#26 A4)
 
@@ -10741,7 +10776,7 @@ Red is #FF0000."), "{off}");
         let mut c = Cursor::new(b"POST /x HTTP/1.1\r\ntransfer-encoding: gzip, Chunked\r\n\r\n".to_vec());
         assert_eq!(read_head_from(&mut c).unwrap(), Head::Chunked);
         assert_eq!(
-            error_json("chunked transfer encoding not supported")["error"],
+            error_json(501, "chunked transfer encoding not supported")["error"]["message"],
             "chunked transfer encoding not supported"
         );
     }
