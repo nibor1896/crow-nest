@@ -282,8 +282,16 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="812"
-CLIPPY="1679"
+TESTS="816"
+CLIPPY="1604"
+#   tests 812 -> 816 / clippy 1679 -> 1604   the Linux gate of v0.14.0 (2026-10-22, 7f155cf = v0.14.0 + docs, RTX 5090 /
+#                              Arch / driver 615.78.08, rustc and clippy 1.97.0 from rustup, a fresh install):
+#                              parity8, parity512, p8tf and run32 GREEN on the unchanged values of record; only
+#                              the two pins were RED. 816 = lib 651 + serve 143 + glm5_run 11 + parity 6 + decode 5:
+#                              +4 lib tests of #241, announced in PR #247 (v0.14.0 shipped without this gate).
+#                              clippy -75 is NOT a code change: 83d16c2, where 1679 was pinned, reads 1604 on this
+#                              box with the same toolchain (same `^warning: ` count). The 1679 run's toolchain is not
+#                              recorded; 1.97.0 is the one CI pins.
 #   tests 810 -> 812 / clippy 1679 (unchanged)   crow-nest #230, the glm5_next pinned tier on Linux (2026-10-14): +2
 #                              `cuda::reg_pieces::*` (a record arena is registered in whole records). The
 #                              nvme_source tests now run apart and single-threaded (the cargo test step below).
