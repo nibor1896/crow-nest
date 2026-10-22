@@ -1861,6 +1861,25 @@ flip would owe: this is the first parallel branch in the decode graph, so a `ser
 captured there too, with a different chunk policy and N 149) and one ten-task run for the record —
 nothing numeric, but the capture shape is new.
 
+**On Crow's path, Linux (2026-10-22).** The v0.9.4 default halved Flash-Next in robin's Windows Crow
+session (2026-10-06, CHANGELOG v0.9.5), and the cause was never measured; since then a speed lever is
+measured on Crow's own requests before a default changes. `tools/crow-path-ab.sh` boots the installed
+v0.14.0 `serve` the way Crow boots the flash-next point (its binary, cwd and env from
+`manifests/stack.json`) and replays a Crow session through `tools/corruption-replay-probe.py`, so every
+body is Crow's own (tools, tool grammar, Crow's sampling row, streaming). Run: today's 16-message Crow
+session, replay points 5, 9 and 13 (7,464 / 9,311 / 11,004 prompt ids), 4 seeds each, `max_tokens`
+512, boots O S O S O S, RTX 5090:
+
+| arm | decode median, 36 requests | per boot | prefill median (9 requests) |
+|---|---|---|---|
+| O, Crow's point as shipped | 47.72 tok/s | 47.51 / 47.54 / 47.96 | 846.0 tok/s |
+| S, the same plus `CROW_STAGE_PAR=1` | **49.92 tok/s (+4.6 %)** | 49.77 / 50.15 / 50.16 | 859.7 tok/s |
+
+Every one of the 36 request pairs generated the same number of tokens with the same cold-expert count
+in both arms, and every pair is faster with the flag. The Windows halving does not appear on Linux.
+Not measured: Windows, and a live Crow window session (the replay is the request path, not robin's
+hands on it). The default is unchanged; robin decides.
+
 
 ---
 
