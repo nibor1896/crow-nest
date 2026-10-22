@@ -1,8 +1,8 @@
 <picture>
-  <source media="(max-width: 700px) and (prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-mobile-dark.svg?v=20261012">
-  <source media="(max-width: 700px)" srcset="docs/images/readme/crow-nest-mobile-light.svg?v=20261012">
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-dark.svg?v=20261012">
-  <img src="docs/images/readme/crow-nest-light.svg?v=20261012" width="100%" alt="crow-nest: one GPU, its own quant, three model families. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M, the dense Qwen3.8-27B as CNQ4.5 with MTP and its own F16 vision projector, and GLM-5.3-Flash as MUL1K3 (EXL3 3.05 bpw experts), OpenAI-compatible, the engine behind Crow.">
+  <source media="(max-width: 700px) and (prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-mobile-dark.svg?v=20261022">
+  <source media="(max-width: 700px)" srcset="docs/images/readme/crow-nest-mobile-light.svg?v=20261022">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme/crow-nest-dark.svg?v=20261022">
+  <img src="docs/images/readme/crow-nest-light.svg?v=20261022" width="100%" alt="crow-nest: one GPU, its own quant, three model families. An inference engine in Rust and CUDA for Qwen3.8-Flash-Next as CNQ4.5-M, the dense Qwen3.8-27B as CNQ4.5 with MTP and its own F16 vision projector, and GLM-5.3-Flash as MUL1K3 (EXL3 3.05 bpw experts), OpenAI-compatible, the engine behind Crow.">
 </picture>
 
 **Build** (Flash-Next container: 104.7 GB from Hugging Face)
@@ -56,7 +56,7 @@ $env:CROW_CNQ = "converter\Qwen3.8-27B-CNQ4.5.cnq"; crow-nest-engine\serve.exe -
 **Linux engine without building** (`serve` from the release, NVRTC from NVIDIA's own wheel, glibc 2.34+)
 
 ```bash
-curl -fLO https://github.com/nibor1896/crow-nest/releases/download/v0.14.0/crow-nest-engine-0.14.0-linux-x64.tar.gz; mkdir -p crow-nest-engine && tar -xzf crow-nest-engine-0.14.0-linux-x64.tar.gz -C crow-nest-engine
+curl -fLO https://github.com/nibor1896/crow-nest/releases/download/v0.15.0/crow-nest-engine-0.15.0-linux-x64.tar.gz; mkdir -p crow-nest-engine && tar -xzf crow-nest-engine-0.15.0-linux-x64.tar.gz -C crow-nest-engine
 bash crow-nest-engine/fetch-nvrtc.sh --target crow-nest-engine   # NVRTC 13.3.33 from NVIDIA's PyPI wheel, verified; the tarball holds no NVIDIA file
 LD_LIBRARY_PATH=$PWD/crow-nest-engine CROW_CNQ=converter/Qwen3.8-27B-CNQ4.5.cnq crow-nest-engine/serve --port 8099
 ```

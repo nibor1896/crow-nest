@@ -490,6 +490,10 @@ struct Snapshot {
     greedy: Option<usize>,
     /// #118: the slot belongs to the PARKED conversation, not to `Engine::history`
     parked: bool,
+    /// the head anchor (`CROW_PREFIX_ANCHOR`): the state at the first user turn, which a new
+    /// chat with the same system prompt and tools rolls back onto; `claim` takes it last.
+    /// Meaningful only while `pos` is `Some`.
+    head: bool,
 }
 
 /// #118: a conversation set aside while an unrelated request uses the one KV buffer
@@ -541,6 +545,7 @@ impl Snapshot {
             logits: faulted(vocab),
             greedy: None,
             parked: false,
+            head: false,
         }
     }
 }
@@ -578,6 +583,30 @@ pub struct PrefixCache {
     park_kv: Vec<u8>,
     /// #118: pooled QSA blocks `0..blocks` of the parked conversation, per attention layer
     park_pooled: Vec<u8>,
+    /// `CROW_PREFIX_ANCHOR=1`: one slot more than `SLOTS`, for the head anchor
+    anchor: bool,
+}
+
+/// `CROW_PREFIX_ANCHOR`: exact `1` keeps a head anchor (one slot more); default off
+pub fn anchor_on() -> bool {
+    std::env::var("CROW_PREFIX_ANCHOR").as_deref() == Ok("1")
+}
+
+/// the head anchor is not taken below this many prompt ids: a short head is cheap to prefill
+/// and the extra chunk cut would cost more than it saves (GLM's `ANCHOR_MIN`, #217)
+pub const ANCHOR_MIN: usize = 1024;
+
+/// - where the head anchor of `prompt` sits: the first id of the first user turn (`turn` is
+///   the template's user-turn opening, `<|im_start|>user\n` on Qwen), so the anchor holds the
+///   system prompt and the tools
+/// - `None` when the prompt has no user turn, when it sits below `ANCHOR_MIN`, when this
+///   request reuses past it (`cached_n`), or when nothing of the prompt follows it
+pub fn anchor_point(prompt: &[i64], turn: &[i64], cached_n: usize) -> Option<usize> {
+    if turn.is_empty() {
+        return None;
+    }
+    let b = prompt.windows(turn.len()).position(|w| w == turn)?;
+    (b >= ANCHOR_MIN && b > cached_n && b < prompt.len()).then_some(b)
 }
 
 impl PrefixCache {
@@ -585,9 +614,10 @@ impl PrefixCache {
     /// - reads the shape off the loaded states, so it can never outlive its load
     pub fn new(eng: &Engine) -> PrefixCache {
         let enabled = std::env::var("CROW_PREFIX_CACHE").as_deref() != Ok("0");
+        let anchor = enabled && anchor_on();
         let shape = Shape::of(eng);
         let slots = if enabled {
-            (0..SLOTS).map(|_| Snapshot::new(&shape, eng.geo.vocab)).collect()
+            (0..SLOTS + usize::from(anchor)).map(|_| Snapshot::new(&shape, eng.geo.vocab)).collect()
         } else {
             Vec::new()
         };
@@ -599,7 +629,18 @@ impl PrefixCache {
             park: None,
             park_kv: Vec::new(),
             park_pooled: Vec::new(),
+            anchor,
         }
+    }
+
+    /// `CROW_PREFIX_ANCHOR=1` with the cache on: `serve` takes head anchors
+    pub fn anchor(&self) -> bool {
+        self.anchor
+    }
+
+    /// the position of the live head anchor, if one is held
+    pub fn head_position(&self) -> Option<usize> {
+        self.slots.iter().find(|s| s.head && !s.parked && s.pos.is_some()).and_then(|s| s.pos)
     }
 
     /// #118: the row cap of a park in force for this process (0 = parking off)
@@ -760,6 +801,8 @@ impl PrefixCache {
             s.done_blocks = done_blocks;
             // #100: a slot file carries no logits row
             s.greedy = None;
+            // a slot file holds a prompt end, never the head anchor
+            s.head = false;
         }
     }
 
@@ -773,6 +816,7 @@ impl PrefixCache {
             s.prefill_clean = false;
             s.greedy = None;
             s.parked = false;
+            s.head = false;
         }
         self.park = None;
     }
@@ -965,13 +1009,28 @@ impl PrefixCache {
     /// - a CUDA context must be current, as for every other engine call
     /// - no kernel of this engine may be in flight on another thread
     pub unsafe fn snapshot(&mut self, eng: &Engine, prefill_clean: bool, greedy: usize) -> f64 {
+        self.snapshot_as(eng, prefill_clean, greedy, false)
+    }
+
+    /// - the head anchor: `snapshot` of the state at the first user turn, which `serve` stops
+    ///   the prefill at (`anchor_point`); prefill clean by construction, like every prompt point
+    /// - its slot is the one `claim` takes last, so the turn snapshots after it do not evict it
+    ///
+    /// # Safety
+    ///
+    /// - as `snapshot`
+    pub unsafe fn snapshot_head(&mut self, eng: &Engine, greedy: usize) -> f64 {
+        self.snapshot_as(eng, true, greedy, true)
+    }
+
+    unsafe fn snapshot_as(&mut self, eng: &Engine, prefill_clean: bool, greedy: usize, head: bool) -> f64 {
         if !self.enabled || self.slots.is_empty() {
             return 0.0;
         }
         let t0 = std::time::Instant::now();
         // whatever the last launch left in flight must land before the copy reads it
         cuda::sync();
-        let slot = self.claim(eng.pos);
+        let slot = self.claim(eng.pos, head);
         let s = &mut self.slots[slot];
         for (i, buf) in s.gdn_s.iter_mut().enumerate() {
             dtoh_into(buf, eng.st.gdn_s[i]);
@@ -1000,14 +1059,18 @@ impl PrefixCache {
     ///   when no empty and no live slot is left, the smallest parked one, and never the
     ///   parked conversation's LAST slot while another exists; taking the last one drops
     ///   the park
-    fn claim(&mut self, pos: usize) -> usize {
+    fn claim(&mut self, pos: usize, head: bool) -> usize {
         let n = self.slots.len();
         let same = self.slots.iter().position(|s| !s.parked && s.pos == Some(pos));
         let empty = || self.slots.iter().position(|s| s.pos.is_none());
+        // the head anchor is taken last on both sides: a turn snapshot never evicts it while
+        // another slot of its side is there, and a new anchor replaces the old one first
         let smallest_of = |parked: bool| {
-            (0..n)
-                .filter(|&i| self.slots[i].parked == parked && self.slots[i].pos.is_some())
-                .min_by_key(|&i| self.slots[i].pos.unwrap_or(0))
+            let side = |i: &usize| self.slots[*i].parked == parked && self.slots[*i].pos.is_some();
+            let by_pos = |i: &usize| self.slots[*i].pos.unwrap_or(0);
+            let anchors = || (0..n).filter(side).filter(|&i| self.slots[i].head).min_by_key(by_pos);
+            let others = || (0..n).filter(side).filter(|&i| !self.slots[i].head).min_by_key(by_pos);
+            if head { anchors().or_else(others) } else { others().or_else(anchors) }
         };
         let parked_n = self.slots.iter().filter(|s| s.parked).count();
         let spare_parked = || if parked_n > 1 { smallest_of(true) } else { None };
@@ -1018,6 +1081,7 @@ impl PrefixCache {
             .or_else(|| smallest_of(true))
             .unwrap_or(SLOT_PROMPT);
         self.slots[i].parked = false;
+        self.slots[i].head = head;
         if !self.slots.iter().any(|s| s.parked) {
             self.park = None;
         }
@@ -1140,7 +1204,16 @@ impl PrefixCache {
             park: None,
             park_kv: Vec::new(),
             park_pooled: Vec::new(),
+            anchor: false,
         }
+    }
+
+    /// - `for_shape` with the head anchor on: `SLOTS + 1` host slots
+    fn for_shape_anchored(shape: Shape) -> PrefixCache {
+        let mut c = PrefixCache::for_shape(shape, true);
+        c.slots.push(Snapshot::new(&shape, 4));
+        c.anchor = true;
+        c
     }
 
     /// - name a slot's position and its prefill clean flag without a device copy
@@ -1456,7 +1529,7 @@ mod tests {
             }
         };
         history.extend_from_slice(&prompt[cached..]);
-        let slot = c.claim(history.len());
+        let slot = c.claim(history.len(), false);
         c.name(slot, history.len(), true, history.len() / 4, Some(7));
         history.extend_from_slice(answer);
         cached
@@ -1532,7 +1605,7 @@ mod tests {
         for (i, p) in [300usize, 200, 100].into_iter().enumerate() {
             c.set_slot(i, p, true);
         }
-        assert_eq!(c.claim(200), SLOT_PROMPT);
+        assert_eq!(c.claim(200, false), SLOT_PROMPT);
         c.name(SLOT_PROMPT, 200, true, 50, Some(1));
         assert_eq!(c.positions(), vec![Some(200), Some(300), Some(100)]);
     }
@@ -1542,15 +1615,84 @@ mod tests {
     fn a_new_snapshot_takes_an_empty_slot_else_the_smallest_position() {
         let mut c = PrefixCache::for_shape(tiny(), true);
         c.set_slot(0, 100, true);
-        c.claim(200);
+        c.claim(200, false);
         c.name(SLOT_PROMPT, 200, true, 50, Some(1));
         assert_eq!(c.positions(), vec![Some(200), Some(100), None]);
-        c.claim(300);
+        c.claim(300, false);
         c.name(SLOT_PROMPT, 300, true, 75, Some(1));
         assert_eq!(c.positions(), vec![Some(300), Some(200), Some(100)]);
-        c.claim(400);
+        c.claim(400, false);
         c.name(SLOT_PROMPT, 400, true, 100, Some(1));
         assert_eq!(c.positions(), vec![Some(400), Some(300), Some(200)]);
+    }
+
+    /// the head anchor sits on the first user turn, and only where it saves a prefill
+    #[test]
+    fn the_head_anchor_sits_on_the_first_user_turn_above_the_minimum() {
+        let turn = [7i64, 8, 9];
+        let mut prompt: Vec<i64> = vec![1; ANCHOR_MIN + 10];
+        prompt.extend_from_slice(&turn);
+        prompt.extend_from_slice(&[5, 5]);
+        prompt.extend_from_slice(&turn);
+        let b = ANCHOR_MIN + 10;
+        assert_eq!(anchor_point(&prompt, &turn, 0), Some(b), "the FIRST user turn");
+        assert_eq!(anchor_point(&prompt, &turn, b - 1), Some(b));
+        assert_eq!(anchor_point(&prompt, &turn, b), None, "this request reuses past it");
+        assert_eq!(anchor_point(&prompt[..b], &turn, 0), None, "no user turn");
+        assert_eq!(anchor_point(&prompt, &[], 0), None);
+        let short: Vec<i64> = [&[1i64; 8][..], &turn, &[5]].concat();
+        assert_eq!(anchor_point(&short, &turn, 0), None, "a head below ANCHOR_MIN");
+    }
+
+    /// the turn snapshots after the anchor take the other slots; the anchor stays
+    #[test]
+    fn turn_snapshots_never_evict_the_head_anchor() {
+        let mut c = PrefixCache::for_shape_anchored(tiny());
+        c.claim(100, true);
+        c.name(SLOT_PROMPT, 100, true, 25, Some(1));
+        for p in [200usize, 300, 400, 500, 600] {
+            c.claim(p, false);
+            c.name(SLOT_PROMPT, p, true, p / 4, Some(1));
+        }
+        assert_eq!(c.positions(), vec![Some(600), Some(500), Some(400), Some(100)]);
+        assert_eq!(c.head_position(), Some(100));
+        // a new anchor replaces the old one, not a turn snapshot
+        c.claim(150, true);
+        c.name(SLOT_PROMPT, 150, true, 37, Some(1));
+        assert_eq!(c.positions(), vec![Some(150), Some(600), Some(500), Some(400)]);
+        assert_eq!(c.head_position(), Some(150));        // a slot file restore fills slot 0 after `invalidate`: a prompt end, not the anchor
+        c.invalidate();
+        c.set_prompt_slot(150, 37);
+        assert_eq!(c.head_position(), None);
+    }
+
+    /// the case it exists for: a new chat with the same head rolls back onto the anchor
+    /// instead of going cold, and the old chat's turn snapshots above it are forgotten
+    #[test]
+    fn a_new_chat_with_the_same_head_rolls_back_onto_the_anchor() {
+        let mut c = PrefixCache::for_shape_anchored(tiny());
+        let head: Vec<i64> = (0..100).collect();
+        let chat_a: Vec<i64> = [&head[..], &[500i64; 300][..]].concat();
+        c.claim(100, true);
+        c.name(SLOT_PROMPT, 100, true, 25, Some(1));
+        for p in [250usize, 400] {
+            c.claim(p, false);
+            c.name(SLOT_PROMPT, p, true, p / 4, Some(1));
+        }
+        let chat_b: Vec<i64> = [&head[..], &[600i64; 50][..]].concat();
+        let d = c.decide(&chat_a, &chat_b);
+        assert_eq!(d.l, 100);
+        let (slot, p) = d.reuse.expect("the anchor is a reuse point");
+        assert_eq!(p, 100);
+        c.rolled_back(slot, chat_a.len());
+        assert_eq!(c.head_position(), Some(100));
+        assert_eq!(c.positions().iter().flatten().copied().collect::<Vec<_>>(), vec![100]);
+        // without the anchor the same pair is the cold start of today
+        let mut plain = PrefixCache::for_shape(tiny(), true);
+        for (i, p) in [400usize, 250].into_iter().enumerate() {
+            plain.set_slot(i, p, true);
+        }
+        assert_eq!(plain.decide(&chat_a, &chat_b).reuse, None);
     }
 
     /// #100 + #32 A10: a slot filled from a slot file has no logits row, so an identical
@@ -1766,7 +1908,7 @@ mod tests {
             dev.kv[i] = id;
         }
         dev.history.extend_from_slice(&prompt[cached..]);
-        let slot = c.claim(dev.history.len());
+        let slot = c.claim(dev.history.len(), false);
         c.name(slot, dev.history.len(), true, dev.history.len() / 4, Some(7));
         for &id in answer {
             dev.kv[dev.history.len()] = id;
@@ -1927,7 +2069,7 @@ mod tests {
         c.apply_cold(ColdPlan::Park { rows: 500 }, (0..500).collect(), Vec::new(), 126);
         assert_eq!(c.parked_positions(), vec![Some(500), None, None]);
         for p in [10usize, 20, 30, 40] {
-            c.claim(p);
+            c.claim(p, false);
             c.name(SLOT_PROMPT, p, true, p / 4, Some(1));
         }
         assert_eq!(c.parked_positions().into_iter().flatten().collect::<Vec<_>>(), vec![500]);

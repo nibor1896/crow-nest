@@ -282,8 +282,17 @@ BYTES8="11919360"
 SHA512="6e9cb25fff4370f95b574ca5100f566cea23d5b5b52442da1d3e64a1ded8f4a1"
 SHAP8="8f5e5ce8dcec9067ce9c69fdb9cf9824984cd0d32ad35363e36c3e72024af994"
 IDS32="[13, 248046, 198, 248045, 74455, 198, 248068, 198, 760, 1156, 682, 3766, 264, 1575, 20654, 93530, 2319, 25, 328, 760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 1149, 1061, 11316, 5435]"
-TESTS="816"
+TESTS="820"
 CLIPPY="1604"
+#   tests 819 -> 820 / clippy 1604 (unchanged)   CROW_STAGE_PAR on by default on Linux (2026-10-22): +1
+#                              `gen::tests_19j_default::stage_par_is_on_by_default_on_linux_only_and_the_switch_wins_everywhere`.
+#                              The GPU rows run with the side stream from now on; bit-identical by construction
+#                              (docs/architecture.md 4.8.1), so the values of record do not move. Not rerun here.
+#   tests 816 -> 819 / clippy 1604 (unchanged)   the head anchor (2026-10-22, branch head-anchor): +3
+#                              `cache::tests::the_head_anchor_sits_on_the_first_user_turn_above_the_minimum`,
+#                              `..::turn_snapshots_never_evict_the_head_anchor`,
+#                              `..::a_new_chat_with_the_same_head_rolls_back_onto_the_anchor`; 819 = lib 654 + serve 143
+#                              + glm5_run 11 + parity 6 + decode 5. Host steps only; the GPU rows did not run.
 #   tests 812 -> 816 / clippy 1679 -> 1604   the Linux gate of v0.14.0 (2026-10-22, 7f155cf = v0.14.0 + docs, RTX 5090 /
 #                              Arch / driver 615.78.08, rustc and clippy 1.97.0 from rustup, a fresh install):
 #                              parity8, parity512, p8tf and run32 GREEN on the unchanged values of record; only
