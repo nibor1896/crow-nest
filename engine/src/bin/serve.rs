@@ -4381,6 +4381,13 @@ fn trickle_ready(eng: &Engine) -> bool {
     eng.residency().lb.is_none() && eng.residency().stride > eng.residency().n
 }
 
+/// the ids that open a user turn in the chat template (`<|im_start|>user\n` on Qwen): where
+/// the head anchor sits (`cache::anchor_point`). `None` if the tokenizer cannot say.
+fn user_turn_ids(tk: &crow_nest_engine::tokenizer::ChatTokenizer) -> Option<Vec<i64>> {
+    let ids = tk.encode_raw("<|im_start|>user\n").ok()?;
+    (!ids.is_empty()).then(|| ids.into_iter().map(i64::from).collect())
+}
+
 /// - #118: the park part of the `[serve] prefix cache` boot line: the row cap and the
 ///   host RAM a full park takes (`Engine::park_host_bytes`), allocated at the first park only
 fn park_boot_note(cache_on: bool, cap: usize, bytes: usize) -> String {
@@ -4549,16 +4556,44 @@ fn chat_generate(
         }
         left.is_some()
     };
+    // the head anchor (`CROW_PREFIX_ANCHOR=1`): a text request whose prefill crosses its first
+    // user turn stops there once, keeps that state as the anchor and prefills the rest. A new
+    // chat with the same system prompt and tools then rolls back onto it instead of going cold.
+    let head = if srv.cache.anchor() && req_imgs.is_empty() && dump_dir.is_none() {
+        user_turn_ids(tk).and_then(|turn| crow_nest_engine::cache::anchor_point(&prompt, &turn, cached_n))
+    } else {
+        None
+    };
+    let mut head_note = String::new();
     let t_pre = Instant::now();
     let (mut next, prefill_done) = unsafe {
         match (plan.reuse, collect.as_mut()) {
             // #100: the whole prompt is held: the snapshot's logits row goes back into
             // `s.logits` and its greedy id stands in for what `prefill` would return
             (Some((slot, p)), None) if p == prompt.len() => (srv.cache.restore_logits(srv.eng, slot), 0),
-            (_, c) => srv.eng.prefill_until(srv.cnq, &prompt[cached_n..], c, &mut stop),
+            (_, c) => match head {
+                Some(b) => {
+                    let (g, d) = srv.eng.prefill_until(srv.cnq, &prompt[cached_n..b], None, &mut stop);
+                    if cached_n + d < b {
+                        (g, d)
+                    } else {
+                        let ms = srv.cache.snapshot_head(srv.eng, g);
+                        head_note = format!(
+                            "[cache] head anchor at pos {b} (the first user turn), DtoH {ms:.3} ms, \
+                             {d} tok prefilled before it"
+                        );
+                        let (g2, d2) = srv.eng.prefill_until(srv.cnq, &prompt[b..], None, &mut stop);
+                        (g2, d + d2)
+                    }
+                }
+                None => srv.eng.prefill_until(srv.cnq, &prompt[cached_n..], c, &mut stop),
+            },
         }
     };
     let prefill_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    if !head_note.is_empty() {
+        tracing::info!(target: "cache", "{head_note}");
+    }
     if let Some((why, _)) = left {
         tracing::info!(target: "chat",
             "[chat] the prefill stopped after {prefill_done} of {prefilled} tok ({why}): the state \
@@ -7903,11 +7938,12 @@ fn main() {
     // #36 M2b: SLOTS is 1, and the line below reads it instead of naming a count of its own.
     let cache = PrefixCache::new(&eng);
     tracing::info!(target: "serve",
-        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs), QSA ring rows {}, {}",
+        "[serve] prefix cache {}, {} B per snapshot + {} B logits row (#100), {} snapshot(s) in HOST RAM (#72: never VRAM, see cache.rs){}, QSA ring rows {}, {}",
         if cache.enabled() { "on" } else { "off (CROW_PREFIX_CACHE=0)" },
         cache.shape().snapshot_bytes(),
         eng.geo.vocab * 4,
-        SLOTS,
+        SLOTS + usize::from(cache.anchor()),
+        if cache.anchor() { ", one of them the head anchor (CROW_PREFIX_ANCHOR=1)" } else { "" },
         eng.qsa_ring_rows(),
         park_boot_note(cache.enabled(), cache.park_cap(), eng.park_host_bytes(cache.park_cap()))
     );
