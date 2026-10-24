@@ -650,7 +650,7 @@ pub struct Engine {
     pa_ev_plan: cudarc::driver::sys::CUevent,
     pa_ev_filled: [cudarc::driver::sys::CUevent; 2],
     pa_ev_done: [cudarc::driver::sys::CUevent; 2],
-    /// CROW_STAGE_PAR (#19j, default on on Linux): the decode staging side stream and its
+    /// CROW_STAGE_PAR (#19j, default on): the decode staging side stream and its
     /// fork/join event pair; null / unused with the switch off
     st_stream: cudarc::driver::sys::CUstream,
     st_ev_go: cudarc::driver::sys::CUevent,
@@ -1301,9 +1301,9 @@ pub fn stage_blocks() -> u32 {
     *V.get_or_init(|| env_parse("CROW_STAGE_BLOCKS").filter(|&g| (8..=512).contains(&g)).unwrap_or(40))
 }
 
-/// CROW_STAGE_PAR (#19j): `1` enables and `0` disables on every platform; unset (or any other
-/// value) is the platform default, ON on Linux since 2026-10-22 and OFF elsewhere (see
-/// `stage_par_from`). Enabled, `stage_cold_ca` is issued on
+/// CROW_STAGE_PAR (#19j): `0` disables; unset, `1` and any other value enable it, on Linux
+/// since 2026-10-22 and on Windows since 2026-10-24 (see `stage_par_from`). Enabled,
+/// `stage_cold_ca` is issued on
 /// a SIDE STREAM instead of the compute stream, so the shared-expert chain of the same
 /// layer — which reads no staged byte — runs while the PCIe copy is in flight; the
 /// compute stream waits on the staging event again before the first routed GEMV, which
@@ -1319,20 +1319,17 @@ pub fn stage_blocks() -> u32 {
 /// SMs idle for the 11.5 ms per decode token the row costs.
 pub fn stage_par_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| stage_par_from(std::env::var("CROW_STAGE_PAR").ok().as_deref(), cfg!(target_os = "linux")))
+    *ON.get_or_init(|| stage_par_from(std::env::var("CROW_STAGE_PAR").ok().as_deref()))
 }
 
-/// - the `CROW_STAGE_PAR` decision: `1` on, `0` off, anything else the platform default
-/// - the default is ON on Linux by the owner's word of 2026-10-22, after the Crow-path A/B on
-///   Linux read +4.6 % decode with every request pair faster (`docs/architecture.md` 4.8.1)
-/// - and OFF elsewhere: the v0.9.4 default halved Flash-Next in a Windows Crow session
-///   (2026-10-06) and that cause was never measured
-fn stage_par_from(v: Option<&str>, linux: bool) -> bool {
-    match v {
-        Some("1") => true,
-        Some("0") => false,
-        _ => linux,
-    }
+/// - the `CROW_STAGE_PAR` decision: `0` off, anything else on
+/// - ON on Linux by the owner's word of 2026-10-22, after the Crow-path A/B on Linux read
+///   +4.6 % decode with every request pair faster (`docs/architecture.md` 4.8.1)
+/// - and ON on Windows by the owner's word of 2026-10-24, after the Crow-path A/B on Windows
+///   (+2.9 / +3.35 %, all 12 request pairs faster) and his live Crow window (+4.6 %): the
+///   v0.9.4 halving of 2026-10-06 did not come back after Crow #368 (4.8.1)
+fn stage_par_from(v: Option<&str>) -> bool {
+    v != Some("0")
 }
 
 impl Engine {
@@ -4232,7 +4229,7 @@ impl Engine {
                     "stage_cold_ca needs both staged byte counts to be multiples of 4096 (gate_up {} B, down {} B); CROW_STAGE_KERNEL=1 falls back to stage_cold",
                     self.stage.gu_bytes, self.stage.dn_bytes);
                 sc[9] = (t * self.d.topk) as u64;
-                // #19j (CROW_STAGE_PAR, default on on Linux): fork the copy onto the
+                // #19j (CROW_STAGE_PAR, default on): fork the copy onto the
                 // side stream and join before the routed GEMV below, so the
                 // shared-expert chain overlaps the PCIe pull. The fork depends on
                 // everything already issued on the compute stream — router_top10
@@ -7151,16 +7148,13 @@ mod vit_tower_line {
 mod tests_19j_default {
     use super::stage_par_from;
 
-    /// on by default on Linux only; `1` and `0` decide on every platform
+    /// on by default on every platform since 2026-10-24; only `0` turns it off
     #[test]
-    fn stage_par_is_on_by_default_on_linux_only_and_the_switch_wins_everywhere() {
-        assert!(stage_par_from(None, true));
-        assert!(!stage_par_from(None, false));
-        for linux in [true, false] {
-            assert!(stage_par_from(Some("1"), linux));
-            assert!(!stage_par_from(Some("0"), linux));
-            assert_eq!(stage_par_from(Some("yes"), linux), linux, "another value is the default");
-        }
+    fn stage_par_is_on_by_default_and_only_0_turns_it_off() {
+        assert!(stage_par_from(None));
+        assert!(stage_par_from(Some("1")));
+        assert!(!stage_par_from(Some("0")));
+        assert!(stage_par_from(Some("yes")), "another value is the default");
     }
 }
 

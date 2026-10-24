@@ -741,7 +741,7 @@ benefit for driver-API handoffs (4.7 vs 3.1 ms).
   load and `gen.rs:2048` again at the launch site; both panic messages name
   `CROW_STAGE_KERNEL=1` as the fallback. This container: `gate_up` 1843200 B = 450 tiles,
   `down` 921600 B = 225 tiles.
-- **`CROW_STAGE_PAR=1` (#19j, 2026-09-18, default off; a `serve` default in v0.9.4 only, reverted in v0.9.5)**: the same kernel, the same
+- **`CROW_STAGE_PAR=1` (#19j, 2026-09-18; a `serve` default in v0.9.4, reverted in v0.9.5; default on again on Linux since 2026-10-22 and on Windows since 2026-10-24, 4.8.1)**: the same kernel, the same
   bytes, issued on a side stream with an event pair — `cuEventRecord` on the compute
   stream, `cuStreamWaitEvent` on the side stream, the launch, and the join immediately
   before the routed gate|up GEMV, the first reader of the pointers the kernel rewrites.
@@ -1887,6 +1887,15 @@ against 46.77 (n 8) and 48.89 (n 7) in his sessions of the morning without it; d
 is a check that nothing breaks, not a pairing. Since then an unset `CROW_STAGE_PAR` is ON on Linux and
 OFF on Windows (`stage_par_from`); `1` and `0` decide on both. Windows stays off because the v0.9.4
 halving there was never explained.
+
+**Flipped on Windows (2026-10-24, robin's decision).** The Crow-path A/B on Windows, the installed
+v0.15.0 `serve.exe` booted the way Crow boots the flash-next point and answering robin's Crow session of
+2026-10-23 through Crow's own `stream_reply`, read 44.98 tok/s off and 46.40 on over four interleaved
+boots: +2.91 % and +3.35 % per adjacent pair, all 12 request pairs faster, the same answer lengths in
+every boot. robin's live Crow window the same day, vision off, the same prompt per arm, read 42.72 off
+and 44.67 on (+4.6 %, one session each, so part of it can be drift). The v0.9.4 halving of 2026-10-06
+did not come back; it was measured before Crow #368 took the window's WebView2 off the GPU. Since then
+an unset `CROW_STAGE_PAR` is ON on every platform and only `0` turns it off (`stage_par_from`).
 
 
 ---
