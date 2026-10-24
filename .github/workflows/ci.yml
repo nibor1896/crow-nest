@@ -214,11 +214,19 @@ jobs:
             --skip the_source_compiles_and_the_scale_split_is_visible_in_the_ptx \
             --skip token_bytes_concatenate_to_the_exact_text \
             --skip token_masks_on_the_real_vocabulary_agree_with_the_per_token_check \
+            --skip nvme_source::tests:: \
             2>&1 | tee target_ci/engine-tests.txt
+          # the nvme_source tests race the test thread against the reader workers; beside the rest
+          # of the suite the thread is preempted longer than the workers need, so they run apart and
+          # single-threaded, as tools/gate-linux.sh does since #230 (ubuntu-latest = 26.04 failed 1-2
+          # of them per run on unchanged main 6eea044, 2026-10-24)
+          cargo test --release --target-dir target_ci --lib nvme_source::tests:: -- --test-threads=1 \
+            2>&1 | tee -a target_ci/engine-tests.txt
           {
             echo "### test: engine"
             echo ""
             echo "- 36 tests skipped, no weights / no NVRTC on the runner"
+            echo "- nvme_source tests run apart and single-threaded, as tools/gate-linux.sh"
             echo '```'
             grep -E '^(     Running|   Doc-tests|test result:)' target_ci/engine-tests.txt || true
             echo '```'

@@ -10,6 +10,19 @@
 
 - **A Windows engine for v0.15.0** (2026-10-22). The v0.15.0 release carries `crow-nest-engine-0.15.0-win-x64.zip` (4,637,569 B, sha256 `43743eec…`). Built from the v0.15.0 tree on Windows with `tools/pack-engine.ps1` (rustc 1.97.0): `serve.exe` (12,627,968 B, sha256 `564bd6e9…`, no VC++ runtime import), `fetch-nvrtc.ps1`, `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt` and `MANIFEST.json`, privacy scan 0 hits in 5 files, `tools/engine_notices.py` PASS, no NVIDIA file. Downloaded back from the release, it matches the local build byte for byte. Not run on Windows yet; Crow 4.3.0 on Windows keeps installing v0.13.2.
 
+### Changed
+
+- **`CROW_STAGE_PAR` is on by default on Windows too** (2026-10-24, robin's decision). Unset and every value but `0` now run the decode staging copy on its side stream on every platform; `0` keeps the compute stream (`stage_par_from`). Behind it: the Crow-path A/B on Windows (+2.9 % and +3.35 %, every one of 12 request pairs faster) and robin's live Crow window the same day (+4.6 %), both under Measured. The v0.9.4 halving of 2026-10-06 did not come back after Crow #368. Bit-identical by construction, so the gate's values of record do not move (`docs/architecture.md` 4.8.1).
+
+### Fixed
+
+- **CI runs the nvme_source tests apart and single-threaded** (2026-10-24, `.github/workflows/ci.yml`). GitHub moved `ubuntu-latest` from 24.04 to 26.04 between 2026-10-22 and 2026-10-24, and the host test job failed 1 to 2 of the `nvme_source` ordering tests per run, on unchanged main (`6eea044`, green on 24.04 on 2026-10-22) as on this branch. These tests race the test thread against the reader workers, and beside the rest of the suite the thread is preempted longer than the workers need; `tools/gate-linux.sh` runs them apart and single-threaded since #230 for that reason. The CI step now does the same. No test changed.
+
+### Measured
+
+- **`CROW_STAGE_PAR` on Crow's path, Windows: +2.9 % and +3.35 % decode** (2026-10-24, RTX 5090, driver 616.56). The `serve.exe` of the Crow 4.3.0 install (the v0.15.0 tree, sha256 `564bd6e9…`), booted with Crow's own `crow_boot.plan_point("flash-next")` (vision on, N 151, `CROW_PREFIX_ANCHOR=1`), answered robin's Crow session of 2026-10-23 through Crow's own `stream_reply` (tools, Crow's sampling, reasoning budget 1024, streaming; images dropped) at 40,295, 59,443 and 70,170 prompt tokens, two rounds with fixed seeds. Four boots interleaved off, on, off, on: decode weighted 44.98 tok/s off and 46.40 on; each on-boot against the off-boot before it +2.91 % and +3.35 %, every one of 12 pairs +2.6 to +3.8 %; the same answer lengths in all four boots (7,666 tokens per arm); cold prefill 675-680 tok/s on 40,295 tokens in both arms. Crow's window closed. Raw runs in crow-lab `runs/fn-baseline-stagepar-win-20261024/`, outside this repository.
+- **`CROW_STAGE_PAR` in robin's live Crow window, Windows: +4.6 % decode** (2026-10-24). Flash-Next with vision off (`CROW_VIT=0`, N 153 of 160), the same prompt in a new chat per arm, 32 requests each at 7k-32k context: decode weighted 44.67 tok/s on and 42.72 off, requests of 500 tokens and more 45.58 and 43.44. One session per arm with different answers (the window draws its own seeds), the on-arm first, so part of the difference can be drift. No halving: the v0.9.4 reading of 2026-10-06 (20-24 instead of 39-41 tok/s) does not come back. Raw runs in crow-lab `runs/fn-stagepar-live-win-20261024/`.
+
 ## 2026-10-22 — v0.15.0
 
 **A stop frees the engine at once, a new chat starts warm, and Flash-Next decodes faster on Linux.** Four changes from a review of NVIDIA's Flare inference server against this engine, each measured on the RTX 5090 and checked live in Crow on the Linux box:
